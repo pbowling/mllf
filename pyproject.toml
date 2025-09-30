@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mllf"
+version = "0.0.0"
+description = "MLLF bias coefficient file handling"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
+maintainers = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
+keywords = ["machine learning", "neural networks", "molecular dynamics", "multisite lambda dynamics"]
+requires-python = ">=3.8"
+
+dependencies = []
+
+[project.urls]
+"Repository" = "https://example.com/"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "flake8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
