@@ -23,3 +23,10 @@ def parse_old(filename):
 def parse_new(filename):
     pass
 
+
+def read_bias_coeff(filename):
+    """Reads a bias coefficient file and returns a dictionary of parameter types and values."""
+    if ".inp" in filename:
+        return parse_old(filename)
+    else:
+        return parse_new(filename)
