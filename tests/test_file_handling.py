@@ -2,6 +2,7 @@ import os
 import math
 
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
+from mllf.file_handling.read_rtf import parse_rtf_file, parse_rtf_dir
 
 
 def test_read_bias_coeff_parses_old_file():
@@ -52,5 +53,29 @@ def test_read_bias_coeff_parses_new_file():
 	# The second block (i=2) should start with 0.0 as well (after encountering a 0.0 that isn't at j=1)
 	# find a sample from the second block: according to file lams2s1 == 0.0 and lams2s2 == -11.629999999999999
 	assert math.isclose(data['lams']['lams2s1'], 0.0, rel_tol=1e-6)
-	assert math.isclose(data['lams']['lams2s2'], -11.629999999999999, rel_tol=1e-6)
+	assert math.isclose(data['lams']['lams2s2'], -11.62999, rel_tol=1e-6)
+
+
+def test_parse_rtf_file_and_dir():
+	"""Test parse_rtf_file and parse_rtf_dir on the example PRES file."""
+	here = os.path.dirname(os.path.dirname(__file__))
+	rtf_path = os.path.join(here, 'examples', 'training_files', '14benz_vac', 'site1_sub1_pres.rtf')
+
+	parsed = parse_rtf_file(rtf_path)
+
+	# site and sub should be detected from the filename
+	assert parsed['site'] == 1
+	assert parsed['sub'] == 1
+
+	# atom_types should include the two types in the file
+	assert 'C261' in parsed['atom_types']
+	assert 'HG61' in parsed['atom_types']
+
+	# total_charge should be the sum of -0.115000 and 0.115000 -> 0.0
+	assert math.isclose(parsed['total_charge'], 0.0, abs_tol=1e-9)
+
+	# parse directory and ensure key exists
+	d = os.path.join(here, 'examples', 'training_files', '14benz_vac')
+	results = parse_rtf_dir(d)
+	assert 'site1_sub1' in results
 
