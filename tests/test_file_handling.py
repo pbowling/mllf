@@ -1,7 +1,7 @@
 import os
 import math
 
-from src.file_handling.read_bias_coeff import read_bias_coeff
+from mllf.file_handling.read_bias_coeff import read_bias_coeff
 
 
 def test_read_bias_coeff_parses_old_file():

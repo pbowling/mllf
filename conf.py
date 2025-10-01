@@ -9,7 +9,7 @@
 project = 'Machine Learned Landscape Flattening'
 copyright = '2025, Paige E. Bowling, Charles L. Brooks III'
 author = 'Paige E. Bowling, Charles L. Brooks III'
-release = '0.1'
+release = '0.1.0'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
