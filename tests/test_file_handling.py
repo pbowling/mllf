@@ -59,7 +59,7 @@ def test_read_bias_coeff_parses_new_file():
 def test_parse_rtf_file_and_dir():
 	"""Test parse_rtf_file and parse_rtf_dir on the example PRES file."""
 	here = os.path.dirname(os.path.dirname(__file__))
-	rtf_path = os.path.join(here, 'examples', 'training_files', '14benz_vac', 'site1_sub1_pres.rtf')
+	rtf_path = os.path.join(here, 'examples', 'training_files', '14benz_vac_5.5', 'site1_sub1_pres.rtf')
 
 	parsed = parse_rtf_file(rtf_path)
 
@@ -75,7 +75,7 @@ def test_parse_rtf_file_and_dir():
 	assert math.isclose(parsed['total_charge'], 0.0, abs_tol=1e-9)
 
 	# parse directory and ensure key exists
-	d = os.path.join(here, 'examples', 'training_files', '14benz_vac')
+	d = os.path.join(here, 'examples', 'training_files', '14benz_vac_5.5')
 	results = parse_rtf_dir(d)
 	assert 'site1_sub1' in results
 
