@@ -118,6 +118,75 @@ def assemble_pairs_for_run(run_path: str) -> Dict[str, Dict[str, Any]]:
             if lams_vector:
                 entry['biases']['lams_vector'] = lams_vector
 
+            # build ordered pairwise linear biases for this site: map (a,b) -> lams[b]-lams[a]
+            # stored under 'pairwise_lams' as keys 'pair_{a}_{b}' and numeric values.
+            if lams_vector:
+                pairwise = {}
+                nsubs = len(lams_vector)
+                for a in range(1, nsubs + 1):
+                    for b in range(1, nsubs + 1):
+                        if a == b:
+                            continue
+                        # indices in lams_vector are zero-based
+                        val = float(lams_vector[b - 1]) - float(lams_vector[a - 1])
+                        pair_key = f'pair_{a}_{b}'
+                        pairwise[pair_key] = val
+                if pairwise:
+                    entry['biases']['pairwise_lams'] = pairwise
+
+            # Build pairwise biases across groups (lams, cs, xs, ss) and store under 'pairwise_biases'
+            # For lams we can directly compute per-sub differences; for cs/xs/ss we derive a per-sub
+            # representative scalar by averaging any entries that reference that sub index (heuristic).
+            pairwise_all = {}
+            # helper to compute pairwise mapping from a per-sub list
+            def compute_pairwise_from_list(vals):
+                out = {}
+                m = len(vals)
+                for a in range(1, m + 1):
+                    for b in range(1, m + 1):
+                        if a == b:
+                            continue
+                        out[f'pair_{a}_{b}'] = float(vals[b - 1]) - float(vals[a - 1])
+                return out
+
+            if lams_vector:
+                pairwise_all['lams'] = compute_pairwise_from_list(lams_vector)
+
+            # derive per-sub scalars for cs/xs/ss by averaging entries that include the sub index
+            def derive_per_sub_scalar(group_dict):
+                # group_dict: mapping key->value where keys contain integers referring to sub indices
+                if not group_dict:
+                    return []
+                nums_map = {}
+                for k, v in group_dict.items():
+                    nums = re.findall(r"(\d+)", k)
+                    if not nums:
+                        continue
+                    # assume the first number found is the primary sub index for this entry
+                    primary = int(nums[0])
+                    nums_map.setdefault(primary, []).append(float(v))
+                # build list from 1..max_sub, fill missing with 0.0
+                if not nums_map:
+                    return []
+                max_sub = max(nums_map.keys())
+                scalars = []
+                for i in range(1, max_sub + 1):
+                    vals = nums_map.get(i, [])
+                    if vals:
+                        scalars.append(sum(vals) / len(vals))
+                    else:
+                        scalars.append(0.0)
+                return scalars
+
+            for group in ('cs', 'xs', 'ss'):
+                if group in biases:
+                    scalars = derive_per_sub_scalar(biases[group])
+                    if scalars:
+                        pairwise_all[group] = compute_pairwise_from_list(scalars)
+
+            if pairwise_all:
+                entry['biases']['pairwise_biases'] = pairwise_all
+
             # For cs/xs/ss, parse integer indices from keys and include entries that reference this site
             def key_numbers(k: str):
                 nums = re.findall(r"(\d+)", k)
