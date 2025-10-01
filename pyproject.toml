@@ -13,7 +13,9 @@ maintainers = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
 keywords = ["machine learning", "neural networks", "molecular dynamics", "multisite lambda dynamics"]
 requires-python = ">=3.8"
 
-dependencies = []
+dependencies = [
+    "numpy>=1.24",
+]
 
 [project.urls]
 "Repository" = "https://example.com/"
