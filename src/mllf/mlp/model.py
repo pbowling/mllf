@@ -54,7 +54,7 @@ class SimpleMLP:
 	def predict(self, X: np.ndarray) -> np.ndarray:
 		return self.forward(X)
 
-	def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 10, batch_size: int = 32):
+	def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 10, batch_size: int = 32, weight_decay: float = 0.0):
 		# Very small and naive gradient descent for demonstration only.
 		n = X.shape[0]
 		for epoch in range(epochs):
@@ -91,8 +91,11 @@ class SimpleMLP:
 					dW = a_prev.T @ grad
 					db = np.sum(grad, axis=0)
 
-					# update
-					self.weights[i] -= self.lr * dW
+					# update with optional L2 weight decay
+					if weight_decay and weight_decay > 0.0:
+						self.weights[i] -= self.lr * (dW + weight_decay * self.weights[i])
+					else:
+						self.weights[i] -= self.lr * dW
 					self.biases[i] -= self.lr * db
 
 					# propagate gradient to previous layer if not input
