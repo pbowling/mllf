@@ -152,37 +152,91 @@ def assemble_pairs_for_run(run_path: str) -> Dict[str, Dict[str, Any]]:
             if lams_vector:
                 pairwise_all['lams'] = compute_pairwise_from_list(lams_vector)
 
-            # derive per-sub scalars for cs/xs/ss by averaging entries that include the sub index
-            def derive_per_sub_scalar(group_dict):
-                # group_dict: mapping key->value where keys contain integers referring to sub indices
-                if not group_dict:
-                    return []
-                nums_map = {}
-                for k, v in group_dict.items():
-                    nums = re.findall(r"(\d+)", k)
-                    if not nums:
-                        continue
-                    # assume the first number found is the primary sub index for this entry
-                    primary = int(nums[0])
-                    nums_map.setdefault(primary, []).append(float(v))
-                # build list from 1..max_sub, fill missing with 0.0
-                if not nums_map:
-                    return []
-                max_sub = max(nums_map.keys())
-                scalars = []
-                for i in range(1, max_sub + 1):
-                    vals = nums_map.get(i, [])
-                    if vals:
-                        scalars.append(sum(vals) / len(vals))
-                    else:
-                        scalars.append(0.0)
-                return scalars
-
+            # derive direct ordered-pair mappings for cs/xs/ss when keys encode both subs
+            # Expected key format examples: cs1s1s1s2 -> site1 sub1 site1 sub2
             for group in ('cs', 'xs', 'ss'):
                 if group in biases:
-                    scalars = derive_per_sub_scalar(biases[group])
-                    if scalars:
-                        pairwise_all[group] = compute_pairwise_from_list(scalars)
+                    group_map = biases[group]
+                    # attempt direct mapping: keys with four numeric parts -> pair_{a}_{b}
+                    direct_map = {}
+                    for k, v in group_map.items():
+                        nums = re.findall(r"(\d+)", k)
+                        if len(nums) >= 4:
+                            s1 = int(nums[0])
+                            a = int(nums[1])
+                            s2 = int(nums[2])
+                            b = int(nums[3])
+                            # only map if both site indices match this fragment's site
+                            if site is not None and s1 == site and s2 == site:
+                                pair_key = f'pair_{a}_{b}'
+                                direct_map[pair_key] = float(v)
+                                # also set reversed sign for the opposite ordering
+                                direct_map[f'pair_{b}_{a}'] = -float(v)
+                    # Start with direct_map if present; then attempt to fill any missing
+                    # pair_{a}_{b} entries from derived per-sub scalars so that direct
+                    # mappings always take precedence.
+                    if direct_map:
+                        merged = dict(direct_map)
+
+                        # derive per-sub scalars to fill any missing pair entries
+                        def derive_per_sub_scalar(group_dict):
+                            if not group_dict:
+                                return []
+                            nums_map = {}
+                            for k, v in group_dict.items():
+                                nums = re.findall(r"(\d+)", k)
+                                if not nums:
+                                    continue
+                                # pick the most common sub index referenced as the primary
+                                primary = int(nums[0])
+                                nums_map.setdefault(primary, []).append(float(v))
+                            if not nums_map:
+                                return []
+                            max_sub = max(nums_map.keys())
+                            scalars = []
+                            for i in range(1, max_sub + 1):
+                                vals = nums_map.get(i, [])
+                                if vals:
+                                    scalars.append(sum(vals) / len(vals))
+                                else:
+                                    scalars.append(0.0)
+                            return scalars
+
+                        scalars = derive_per_sub_scalar(group_map)
+                        if scalars:
+                            computed = compute_pairwise_from_list(scalars)
+                            # fill in missing entries only
+                            for k2, v2 in computed.items():
+                                merged.setdefault(k2, v2)
+
+                        pairwise_all[group] = merged
+                    else:
+                        # fallback: derive per-sub scalars by averaging entries that include the sub index
+                        def derive_per_sub_scalar(group_dict):
+                            if not group_dict:
+                                return []
+                            nums_map = {}
+                            for k, v in group_dict.items():
+                                nums = re.findall(r"(\d+)", k)
+                                if not nums:
+                                    continue
+                                primary = int(nums[0])
+                                nums_map.setdefault(primary, []).append(float(v))
+                            if not nums_map:
+                                return []
+                            max_sub = max(nums_map.keys())
+                            scalars = []
+                            for i in range(1, max_sub + 1):
+                                vals = nums_map.get(i, [])
+                                if vals:
+                                    scalars.append(sum(vals) / len(vals))
+                                else:
+                                    scalars.append(0.0)
+                            return scalars
+
+                        scalars = derive_per_sub_scalar(group_map)
+                        if scalars:
+                            pairwise_all[group] = compute_pairwise_from_list(scalars)
 
             if pairwise_all:
                 entry['biases']['pairwise_biases'] = pairwise_all
