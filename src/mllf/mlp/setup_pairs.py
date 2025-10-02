@@ -152,94 +152,164 @@ def assemble_pairs_for_run(run_path: str) -> Dict[str, Dict[str, Any]]:
             if lams_vector:
                 pairwise_all['lams'] = compute_pairwise_from_list(lams_vector)
 
-            # derive direct ordered-pair mappings for cs/xs/ss when keys encode both subs
-            # Expected key format examples: cs1s1s1s2 -> site1 sub1 site1 sub2
+            # Build deterministic pairwise mappings for cs/xs/ss.
+            # For each ordered pair (a,b) we first look for an explicit scalar
+            # entry in the biases[group] keys that references both subs
+            # (e.g., 'cs1s1s1s2'). If found, use that value for pair_{a}_{b} and
+            # -value for pair_{b}_{a}. If no explicit keys are present for the
+            # group, fall back to deriving a per-sub scalar list and computing
+            # differences.
             for group in ('cs', 'xs', 'ss'):
-                if group in biases:
-                    group_map = biases[group]
-                    # attempt direct mapping: keys with four numeric parts -> pair_{a}_{b}
-                    direct_map = {}
+                if group not in biases:
+                    continue
+                group_map = biases[group]
+                # determine number of subs from lams_vector if available, else
+                # infer from keys in group_map
+                nsubs = None
+                if lams_vector:
+                    nsubs = len(lams_vector)
+                else:
+                    # infer max sub index referenced in group_map
+                    max_sub = 0
+                    for kk in group_map.keys():
+                        nums = re.findall(r"(\d+)", kk)
+                        if nums:
+                            max_sub = max(max_sub, max(int(x) for x in nums))
+                    nsubs = max_sub
+
+                if not nsubs or nsubs < 1:
+                    continue
+
+                grp_pairs = {}
+                # try explicit per-pair keys first
+                for a in range(1, nsubs + 1):
+                    for b in range(1, nsubs + 1):
+                        if a == b:
+                            continue
+                        found = False
+                        for k, v in group_map.items():
+                            nums = re.findall(r"(\d+)", k)
+                            if len(nums) >= 4:
+                                s1 = int(nums[0])
+                                aa = int(nums[1])
+                                s2 = int(nums[2])
+                                bb = int(nums[3])
+                                if site is not None and s1 == site and s2 == site and aa == a and bb == b:
+                                    grp_pairs[f'pair_{a}_{b}'] = float(v)
+                                    # ensure reverse order present with opposite sign
+                                    grp_pairs[f'pair_{b}_{a}'] = -float(v)
+                                    found = True
+                                    break
+                        if not found:
+                            # leave to fallback derivation
+                            continue
+
+                # if any explicit pairs were found, fill missing entries from
+                # derived per-sub scalars (so explicit mappings take precedence)
+                if grp_pairs:
+                    # derive per-sub scalars by grouping on primary sub index
+                    nums_map = {}
                     for k, v in group_map.items():
                         nums = re.findall(r"(\d+)", k)
-                        if len(nums) >= 4:
-                            s1 = int(nums[0])
-                            a = int(nums[1])
-                            s2 = int(nums[2])
-                            b = int(nums[3])
-                            # only map if both site indices match this fragment's site
-                            if site is not None and s1 == site and s2 == site:
-                                pair_key = f'pair_{a}_{b}'
-                                direct_map[pair_key] = float(v)
-                                # also set reversed sign for the opposite ordering
-                                direct_map[f'pair_{b}_{a}'] = -float(v)
-                    # Start with direct_map if present; then attempt to fill any missing
-                    # pair_{a}_{b} entries from derived per-sub scalars so that direct
-                    # mappings always take precedence.
-                    if direct_map:
-                        merged = dict(direct_map)
-
-                        # derive per-sub scalars to fill any missing pair entries
-                        def derive_per_sub_scalar(group_dict):
-                            if not group_dict:
-                                return []
-                            nums_map = {}
-                            for k, v in group_dict.items():
-                                nums = re.findall(r"(\d+)", k)
-                                if not nums:
-                                    continue
-                                # pick the most common sub index referenced as the primary
-                                primary = int(nums[0])
-                                nums_map.setdefault(primary, []).append(float(v))
-                            if not nums_map:
-                                return []
-                            max_sub = max(nums_map.keys())
-                            scalars = []
-                            for i in range(1, max_sub + 1):
-                                vals = nums_map.get(i, [])
-                                if vals:
-                                    scalars.append(sum(vals) / len(vals))
-                                else:
-                                    scalars.append(0.0)
-                            return scalars
-
-                        scalars = derive_per_sub_scalar(group_map)
-                        if scalars:
-                            computed = compute_pairwise_from_list(scalars)
-                            # fill in missing entries only
-                            for k2, v2 in computed.items():
-                                merged.setdefault(k2, v2)
-
-                        pairwise_all[group] = merged
-                    else:
-                        # fallback: derive per-sub scalars by averaging entries that include the sub index
-                        def derive_per_sub_scalar(group_dict):
-                            if not group_dict:
-                                return []
-                            nums_map = {}
-                            for k, v in group_dict.items():
-                                nums = re.findall(r"(\d+)", k)
-                                if not nums:
-                                    continue
-                                primary = int(nums[0])
-                                nums_map.setdefault(primary, []).append(float(v))
-                            if not nums_map:
-                                return []
-                            max_sub = max(nums_map.keys())
-                            scalars = []
-                            for i in range(1, max_sub + 1):
-                                vals = nums_map.get(i, [])
-                                if vals:
-                                    scalars.append(sum(vals) / len(vals))
-                                else:
-                                    scalars.append(0.0)
-                            return scalars
-
-                        scalars = derive_per_sub_scalar(group_map)
-                        if scalars:
-                            pairwise_all[group] = compute_pairwise_from_list(scalars)
+                        if not nums:
+                            continue
+                        primary = int(nums[0])
+                        nums_map.setdefault(primary, []).append(float(v))
+                    scalars = []
+                    max_sub = nsubs
+                    for i in range(1, max_sub + 1):
+                        vals = nums_map.get(i, [])
+                        if vals:
+                            scalars.append(sum(vals) / len(vals))
+                        else:
+                            scalars.append(0.0)
+                    if scalars:
+                        computed = compute_pairwise_from_list(scalars)
+                        for k2, v2 in computed.items():
+                            grp_pairs.setdefault(k2, v2)
+                    pairwise_all[group] = grp_pairs
+                else:
+                    # no explicit pairs, derive entirely from per-sub scalars
+                    nums_map = {}
+                    for k, v in group_map.items():
+                        nums = re.findall(r"(\d+)", k)
+                        if not nums:
+                            continue
+                        primary = int(nums[0])
+                        nums_map.setdefault(primary, []).append(float(v))
+                    if nums_map:
+                        max_sub = nsubs
+                        scalars = []
+                        for i in range(1, max_sub + 1):
+                            vals = nums_map.get(i, [])
+                            if vals:
+                                scalars.append(sum(vals) / len(vals))
+                            else:
+                                scalars.append(0.0)
+                        pairwise_all[group] = compute_pairwise_from_list(scalars)
 
             if pairwise_all:
                 entry['biases']['pairwise_biases'] = pairwise_all
+
+                # Build a unified per-pair mapping so each ordered pair has
+                # exactly one scalar for each group (lams, cs, xs, ss).
+                # Precedence: use computed/merged pairwise_all values for
+                # cs/xs/ss, and pairwise_lams for lams (which is the
+                # difference lams[b]-lams[a]). If a value is missing for a
+                # group, the entry is omitted (or left as None).
+                pairs_map = {}
+                # collect all pair keys across groups
+                pair_keys = set()
+                # lams pairwise map (from earlier computation) preferred
+                lams_map = entry['biases'].get('pairwise_lams', {})
+                if isinstance(lams_map, dict):
+                    pair_keys.update(lams_map.keys())
+                for grp, grp_map in pairwise_all.items():
+                    if isinstance(grp_map, dict):
+                        pair_keys.update(grp_map.keys())
+
+                for pk in sorted(pair_keys):
+                    pd = {}
+                    # extract numeric a,b from pair key
+                    m = re.match(r'pair_(\d+)_(\d+)', pk)
+                    if not m:
+                        continue
+                    a = int(m.group(1))
+                    b = int(m.group(2))
+
+                    # Only include pairs that involve this fragment's sub index.
+                    # For a fragment with `sub`, keep only pairs where a==sub or b==sub.
+                    if sub is not None and not (a == sub or b == sub):
+                        continue
+
+                    # lams: prefer explicit pairwise_lams, else use pairwise_all['lams']
+                    if pk in lams_map:
+                        pd['lams'] = float(lams_map[pk])
+                    else:
+                        lm = pairwise_all.get('lams', {})
+                        if pk in lm:
+                            pd['lams'] = float(lm[pk])
+
+                    # For cs/xs/ss, prefer explicit scalar keys in the original
+                    # biases dict (e.g., 'cs1s1s1s2') if present; otherwise fall
+                    # back to pairwise_all computed values.
+                    for grp in ('cs', 'xs', 'ss'):
+                        # construct explicit key name for this run/site/a/b
+                        explicit_key = f"{grp}{site}s{a}s{site}s{b}"
+                        val = None
+                        if grp in biases and explicit_key in biases[grp]:
+                            val = biases[grp][explicit_key]
+                        else:
+                            gm = pairwise_all.get(grp, {})
+                            if pk in gm:
+                                val = gm[pk]
+                        if val is not None:
+                            pd[grp] = float(val)
+
+                    pairs_map[pk] = pd
+
+                if pairs_map:
+                    entry['biases']['pairs'] = pairs_map
 
             # For cs/xs/ss, parse integer indices from keys and include entries that reference this site
             def key_numbers(k: str):
@@ -278,3 +348,45 @@ def assemble_pairs(root_training_dir: str) -> Dict[str, Dict[str, Dict[str, Any]
         results[entry] = pairs
 
     return results
+
+
+if __name__ == '__main__':
+    # quick smoke test to run against the example training files directory
+    # If a run directory name is passed as the first argument, print only that
+    # run's pairs (e.g., `14benz_vac_5.5`). Otherwise default to that name.
+    import json
+    import sys
+
+    here = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'examples', 'training_files')
+    here = os.path.abspath(here)
+    out = assemble_pairs(here)
+
+    run_name = sys.argv[1] if len(sys.argv) > 1 else '14benz_vac_5.5'
+    if run_name not in out:
+        available = sorted(out.keys())
+        print(f"Run '{run_name}' not found. Available runs:\n{available}")
+        sys.exit(1)
+
+    run = out[run_name]
+    # Print a readable per-fragment listing: site_sub -> pairs -> bias coefficients
+    for site_sub in sorted(run.keys()):
+        entry = run[site_sub]
+        print(f"{site_sub}:")
+        pairs = entry.get('biases', {}).get('pairs', {})
+        if not pairs:
+            print("  (no pairs)")
+            continue
+        # list pair keys
+        keys = sorted(pairs.keys())
+        print(f"  pairs ({len(keys)}): {keys}")
+        # print each pair with its bias coefficients
+        for pk in keys:
+            coeffs = pairs.get(pk, {})
+            if not coeffs:
+                print(f"    {pk}: {{}}")
+                continue
+            pretty = json.dumps(coeffs, indent=4)
+            # indent multi-line JSON for readability
+            pretty_indented = '\n'.join('    ' + line for line in pretty.splitlines())
+            print(pretty_indented)
+        print()

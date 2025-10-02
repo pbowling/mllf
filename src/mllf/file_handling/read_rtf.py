@@ -52,7 +52,11 @@ def parse_rtf_file(path: str) -> Dict[str, object]:
 				# ignore unparsable charges
 				continue
 
-	return {
+		# eliminate tiny floating-point residues from summation
+		if abs(total_charge) < 1e-8:
+			total_charge = 0.0
+
+		return {
 		"site": site,
 		"sub": sub,
 		"atom_types": atom_types,
@@ -84,7 +88,7 @@ def parse_rtf_dir(directory: str) -> Dict[str, Dict[str, object]]:
 if __name__ == '__main__':
 	# quick smoke test when run directly
 	import json
-	here = os.path.join(os.path.dirname(__file__), '..', '..', 'examples', 'training_files', '14benz_vac')
+	here = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'examples', 'training_files', '14benz_vac_5.5')
 	here = os.path.abspath(here)
 	out = parse_rtf_dir(here)
 	print(json.dumps(out, indent=2))
