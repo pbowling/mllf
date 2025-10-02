@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mllf"
-version = "0.0.0"
+version = "0.1.0"
 description = "MLLF bias coefficient file handling"
 readme = "README.md"
 license = {text = "MIT"}
@@ -13,10 +13,13 @@ maintainers = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
 keywords = ["machine learning", "neural networks", "molecular dynamics", "multisite lambda dynamics"]
 requires-python = ">=3.8"
 
-dependencies = []
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+]
 
 [project.urls]
-"Repository" = "https://example.com/"
+"Repository" = "https://github.com/pbowling/mllf"
 
 [project.optional-dependencies]
 dev = [
