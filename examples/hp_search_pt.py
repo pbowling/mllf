@@ -30,14 +30,15 @@ from mllf.mlp.pt_model import PTMLP, train_one_epoch, evaluate
 ROOT = os.path.join(os.path.dirname(__file__), 'training_files')
 
 
-def build_qual_dataset():
+def build_qual_dataset(include_fnex: bool = False):
     runs = assemble_pairs(ROOT)
     vocab = {}
     idx = 0
+    # build a small vocab of atom types seen
     for run, pairs in runs.items():
         for key, p in pairs.items():
             for at in p.get('atom_types', []):
-                if at not in vocab and len(vocab) < 20:
+                if at not in vocab and len(vocab) < 200:
                     vocab[at] = idx
                     idx += 1
 
@@ -71,24 +72,35 @@ def build_qual_dataset():
                     if not ok:
                         continue
                     p_b = subs[b]
-                    fa = np.zeros((len(vocab) + 1,), dtype=float)
-                    fb = np.zeros((len(vocab) + 1,), dtype=float)
-                    for at in set(p_a.get('atom_types', [])):
+
+                    # compute atom-type count difference vector (a - b)
+                    fa_counts = [0] * (len(vocab))
+                    fb_counts = [0] * (len(vocab))
+                    for at in p_a.get('atom_types', []):
                         if at in vocab:
-                            fa[vocab[at]] = 1.0
-                    for at in set(p_b.get('atom_types', [])):
+                            fa_counts[vocab[at]] += 1
+                    for at in p_b.get('atom_types', []):
                         if at in vocab:
-                            fb[vocab[at]] = 1.0
-                    fa[-1] = float(p_a.get('total_charge', 0.0))
-                    fb[-1] = float(p_b.get('total_charge', 0.0))
-                    fnex = p_a.get('fnex') or p_b.get('fnex')
-                    try:
-                        fnex_val = float(fnex) if fnex is not None else 0.0
-                    except Exception:
-                        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(fnex))
-                        fnex_val = float(m.group(1)) if m else 0.0
-                    feat = np.concatenate([fa, fb, [fnex_val, 0.0]])
-                    X_list.append(feat)
+                            fb_counts[vocab[at]] += 1
+                    diff = np.array([fa_counts[i] - fb_counts[i] for i in range(len(vocab))], dtype=float)
+
+                    # total charge difference (a - b)
+                    charge_diff = float(p_a.get('total_charge', 0.0)) - float(p_b.get('total_charge', 0.0))
+
+                    feat = diff.tolist()
+                    feat.append(charge_diff)
+
+                    # optional fnex
+                    if include_fnex:
+                        fnex = p_a.get('fnex') or p_b.get('fnex')
+                        try:
+                            fnex_val = float(fnex) if fnex is not None else 0.0
+                        except Exception:
+                            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(fnex))
+                            fnex_val = float(m.group(1)) if m else 0.0
+                        feat.append(fnex_val)
+
+                    X_list.append(np.array(feat, dtype=float))
                     y_list.append(vals)
     if not X_list:
         return None

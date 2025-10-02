@@ -1,14 +1,20 @@
-"""Train a PyTorch MLP on the assembled dataset from examples/training_files."""
+"""Train a PyTorch MLP on the assembled dataset from examples/training_files.
+
+Featurization changes:
+- atom-type difference counts (a - b) across a small vocabulary (top 20 seen types)
+- total charge difference (a - b)
+- optional fnex inclusion via include_fnex flag
+"""
 from __future__ import annotations
 
 import os
 import re
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 
 # Ensure `src/` is on sys.path so `mllf` can be imported when running this script.
-import sys
 repo_root = os.path.dirname(os.path.dirname(__file__))
 src_path = os.path.join(repo_root, 'src')
 if src_path not in sys.path:
@@ -21,9 +27,9 @@ from mllf.mlp.data_split import split_train_val_test
 ROOT = os.path.join(os.path.dirname(__file__), 'training_files')
 
 
-def build_dataset():
+def build_dataset(include_fnex: bool = False):
     runs = assemble_pairs(ROOT)
-    # reuse same featurization as examples/train_mlp.py but keep small vocab
+    # build a small vocab of atom types seen
     vocab = {}
     idx = 0
     for run, pairs in runs.items():
@@ -60,25 +66,51 @@ def build_dataset():
                     xs = pw.get('xs', {}).get(key)
                     if lams is None or cs is None or ss is None or xs is None:
                         continue
-                    fa = np.zeros((len(vocab) + 1,), dtype=float)
-                    fb = np.zeros((len(vocab) + 1,), dtype=float)
-                    for at in set(p_a.get('atom_types', [])):
+
+                    # compute atom-type count difference vector (a - b)
+                    va = np.zeros((len(vocab),), dtype=float)
+                    vb = np.zeros((len(vocab),), dtype=float)
+                    for at in p_a.get('atom_types', []):
                         if at in vocab:
-                            fa[vocab[at]] = 1.0
-                    for at in set(p_b.get('atom_types', [])):
+                            va[vocab[at]] += 1.0
+                    for at in p_b.get('atom_types', []):
                         if at in vocab:
-                            fb[vocab[at]] = 1.0
-                    fa[-1] = float(p_a.get('total_charge', 0.0))
-                    fb[-1] = float(p_b.get('total_charge', 0.0))
-                    fnex = p_a.get('fnex') or p_b.get('fnex')
-                    try:
-                        fnex_val = float(fnex) if fnex is not None else 0.0
-                    except Exception:
-                        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(fnex))
-                        fnex_val = float(m.group(1)) if m else 0.0
-                    solvent = p_a.get('solvent') or p_b.get('solvent')
-                    solvent_val = 0.0
-                    feat = np.concatenate([fa, fb, [fnex_val, float(solvent_val)]])
+                            vb[vocab[at]] += 1.0
+                    diff = va - vb
+
+                    # total charge difference (a - b)
+                    charge_diff = float(p_a.get('total_charge', 0.0)) - float(p_b.get('total_charge', 0.0))
+
+                    elems = [diff]
+                    if include_fnex:
+                        fnex = p_a.get('fnex') or p_b.get('fnex')
+                        try:
+                            fnex_val = float(fnex) if fnex is not None else 0.0
+                        except Exception:
+                            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(fnex))
+                            fnex_val = float(m.group(1)) if m else 0.0
+                        elems.append(np.array([fnex_val]))
+
+                    elems.append(np.array([charge_diff]))
+                    feat = np.concatenate(elems)
+                    X_list.append(feat)
+                    y_list.append([float(lams), float(cs), float(ss), float(xs)])
+                    # compute atom-type count difference (a - b)
+                    fa_counts = [0] * (len(vocab))
+                    fb_counts = [0] * (len(vocab))
+                    for at in p_a.get('atom_types', []):
+                        if at in vocab:
+                            fa_counts[vocab[at]] += 1
+                    for at in p_b.get('atom_types', []):
+                        if at in vocab:
+                            fb_counts[vocab[at]] += 1
+                    diff = np.array([fa_counts[i] - fb_counts[i] for i in range(len(vocab))], dtype=float)
+
+                    # total charge difference (a - b)
+                    charge_diff = float(p_a.get('total_charge', 0.0)) - float(p_b.get('total_charge', 0.0))
+
+                    # solvent currently unused; fnex optional (not included by default)
+                    feat = np.concatenate([diff, [charge_diff, 0.0]])
                     X_list.append(feat)
                     y_list.append([float(lams), float(cs), float(ss), float(xs)])
     if not X_list:
