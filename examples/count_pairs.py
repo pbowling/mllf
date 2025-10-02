@@ -1,5 +1,4 @@
-import sys, os
-sys.path.insert(0, os.path.join(os.getcwd(), 'src'))
+import os
 from mllf.mlp.setup_pairs import assemble_pairs
 
 runs = assemble_pairs(os.path.join('examples', 'training_files'))

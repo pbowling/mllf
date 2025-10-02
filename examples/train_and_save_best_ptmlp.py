@@ -11,9 +11,6 @@ import torch
 import torch.nn as nn
 
 repo_root = os.path.dirname(os.path.dirname(__file__))
-src_path = os.path.join(repo_root, 'src')
-if src_path not in sys.path:
-    sys.path.insert(0, src_path)
 
 from mllf.mlp.pt_model import PTMLP, train_one_epoch, evaluate
 from mllf.mlp.setup_pairs import assemble_pairs

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mllf"
-version = "0.0.0"
+version = "0.1.0"
 description = "MLLF bias coefficient file handling"
 readme = "README.md"
 license = {text = "MIT"}
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.urls]
-"Repository" = "https://example.com/"
+"Repository" = "https://github.com/pbowling/mllf"
 
 [project.optional-dependencies]
 dev = [

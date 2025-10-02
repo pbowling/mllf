@@ -18,11 +18,7 @@ import torch
 import torch.nn as nn
 from itertools import product
 
-# ensure src on path
 repo_root = os.path.dirname(os.path.dirname(__file__))
-src_path = os.path.join(repo_root, 'src')
-if src_path not in sys.path:
-    sys.path.insert(0, src_path)
 
 from mllf.mlp.setup_pairs import assemble_pairs
 from mllf.mlp.pt_model import PTMLP, train_one_epoch, evaluate

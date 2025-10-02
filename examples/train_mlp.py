@@ -22,13 +22,8 @@ from collections import Counter, defaultdict
 
 import numpy as np
 
-# Ensure the `src/` directory is on sys.path so `mllf` can be imported when
-# running this script directly from the repository root (e.g. `python examples/train_mlp.py`).
-import sys
 repo_root = os.path.dirname(os.path.dirname(__file__))
-src_path = os.path.join(repo_root, 'src')
-if src_path not in sys.path:
-    sys.path.insert(0, src_path)
+
 
 from mllf.mlp.setup_pairs import assemble_pairs
 from mllf.mlp.model import SimpleMLP
