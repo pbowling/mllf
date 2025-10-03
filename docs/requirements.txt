@@ -1,5 +1,4 @@
-sphinx>=4.0
+sphinx>=6.0
 sphinx-rtd-theme
 sphinx-autobuild
-napoleon
 sphinxcontrib-bibtex
