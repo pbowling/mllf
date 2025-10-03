@@ -10,6 +10,13 @@ build:
   tools:
     python: "3.11"
   image: latest
+  commands:
+    # Install project and docs requirements in RTD environment
+    - pip install --upgrade pip
+    - pip install -e .
+    - pip install -r docs/requirements.txt
+    # Build docs into the RTD-provided output directory
+    - sphinx-build -b html . "$READTHEDOCS_OUTPUT/html"
 
 # Build documentation using the project's top-level conf.py
 sphinx:
