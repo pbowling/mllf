@@ -6,7 +6,7 @@ from mllf.mlp.setup_pairs import assemble_pairs
 
 
 def test_faah_site1_pairs_and_cs_key():
-    root = os.path.join('examples', 'training_files')
+    root = os.path.join('examples', 'mlp', 'training_files')
     results = assemble_pairs(root)
 
     # find the faah solv run (we want the solvent run which contains variables117.py)
@@ -44,7 +44,7 @@ def test_faah_site1_pairs_and_cs_key():
 
 
 def test_no_cross_site_pairs_14benz():
-    root = os.path.join('examples', 'training_files')
+    root = os.path.join('examples', 'mlp', 'training_files')
     runs = assemble_pairs(root)
 
     for rn, pairs in runs.items():
@@ -79,7 +79,7 @@ def test_no_cross_site_pairs_14benz():
 
 
 def test_assemble_pairs_has_lams_and_cs():
-    root = os.path.join('examples', 'training_files')
+    root = os.path.join('examples', 'mlp', 'training_files')
     results = assemble_pairs(root)
 
     # find a run that contains site1_sub1 (examples may vary)
@@ -108,7 +108,7 @@ def test_pair_linear_bias_between_subs():
     Uses site2_sub2 and site2_sub3 from the example training run where
     variables62.py contains the lams for site 2. Expect lams2s3 - lams2s2 ≈ 9.68
     """
-    root = os.path.join('examples', 'training_files')
+    root = os.path.join('examples', 'mlp', 'training_files')
     results = assemble_pairs(root)
 
     # find a run that contains both site2_sub2 and site2_sub3
@@ -139,7 +139,7 @@ def test_pair_linear_bias_between_subs():
 
 def test_pair_sign_inversion_on_reverse():
     """Ensure that reversing an ordered pair in pairwise_lams flips the sign."""
-    root = os.path.join('examples', 'training_files')
+    root = os.path.join('examples', 'mlp', 'training_files')
     results = assemble_pairs(root)
 
     # find a run that contains both site2_sub2 and site2_sub3

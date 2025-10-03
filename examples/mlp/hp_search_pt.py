@@ -6,7 +6,7 @@ hidden layer tuples, learning rates, and weight decay values, and prints the
 average validation MSE per config.
 
 Run with:
-    python examples/hp_search_pt.py
+    python examples/mlp/hp_search_pt.py
 """
 from __future__ import annotations
 

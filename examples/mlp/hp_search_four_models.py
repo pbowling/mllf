@@ -7,7 +7,7 @@ train a final model on the full dataset with the best config, and save the model
 to `models/ptmlp_{bias}.pth`.
 
 Run with:
-    python examples/hp_search_four_models.py
+    python examples/mlp/hp_search_four_models.py
 """
 from __future__ import annotations
 

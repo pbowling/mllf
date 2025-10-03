@@ -10,7 +10,7 @@ Target: the pairwise linear bias for a canonical ordered pair (pair_1_2 if prese
 fall back to first available pair in the mapping).
 
 Run with:
-    python examples/train_mlp.py
+    python examples/mlp/train_mlp.py
 
 """
 

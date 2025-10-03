@@ -35,5 +35,5 @@ flake8
 
 ## Notes
 
-- The repository uses a `src/` layout. The test suite currently contains a test for `read_bias_coeff` which parses an example `examples/variables85.inp` file.
+- The repository uses a `src/` layout. The test suite currently contains a test for `read_bias_coeff` which parses an example `examples/mlp/variables85.inp` file.
 - If you add runtime dependencies, list them under `[project.dependencies]` in `pyproject.toml` so they are installed by pip.
