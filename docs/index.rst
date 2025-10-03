@@ -1,5 +1,5 @@
 Machine Learned Landscape Flattening (mllf)
-=========================================
+===========================================
 
 Brief introduction
 ------------------

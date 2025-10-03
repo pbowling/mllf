@@ -1,5 +1,5 @@
 Running examples
-===============
+================
 
 The repository includes small example scripts under ``examples/mlp/`` that
 assemble training data and run quick experiments. Typical workflows:
