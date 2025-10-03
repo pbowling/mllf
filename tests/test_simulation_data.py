@@ -1,4 +1,4 @@
-from rl.file_handling.read_output import (
+from mllf.file_handling.read_output import (
 	terminated_normally,
 	parse_single_population,
 	parse_transitions_and_rates,
