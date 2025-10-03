@@ -9,6 +9,7 @@ build:
   os: ubuntu-24.04
   tools:
     python: "3.11"
+  image: latest
 
 # Build documentation using the project's top-level conf.py
 sphinx:
@@ -20,10 +21,8 @@ python:
       path: .
     - requirements: docs/requirements.txt
 
-# ReadTheDocs now expects builds to write to the environment provided output
+# ReadTheDocs expects builds to write to the environment-provided output
 # path. Avoid committing _build/html into the repo; RTD will use
 # $READTHEDOCS_OUTPUT/html as the output directory.
-build:
-  image: latest
         
 
