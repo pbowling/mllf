@@ -1,3 +1,7 @@
+.. image:: mllf_logo.png
+  :align: center
+  :width: 300px
+
 Machine Learned Landscape Flattening (mllf)
 ===========================================
 

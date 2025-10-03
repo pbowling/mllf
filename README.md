@@ -1,4 +1,6 @@
 # mllf
+![mllf logo](docs/mllf_logo.png)
+
 Machine Learning Landscape Flattening model building and training
 
 ## Installation
