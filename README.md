@@ -33,7 +33,7 @@ Optional: run flake8 for linting (installed via dev extras):
 flake8
 ```
 
-## Notes
+## Documentation
 
-- The repository uses a `src/` layout. The test suite currently contains a test for `read_bias_coeff` which parses an example `examples/mlp/variables85.inp` file.
-- If you add runtime dependencies, list them under `[project.dependencies]` in `pyproject.toml` so they are installed by pip.
+Please see full documentation at https://mllf.readthedocs.io/en/latest for more detailed information.
+
