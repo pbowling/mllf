@@ -1,0 +1,153 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mllf.mlp.setup_pairs &mdash; Machine Learned Landscape Flattening 0.1.0 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../../_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="../../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../../_static/documentation_options.js?v=01f34227"></script>
+      <script src="../../_static/doctools.js?v=9bcbadda"></script>
+      <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="mllf.mlp.pt_model" href="mllf.mlp.pt_model.html" />
+    <link rel="prev" title="mllf API" href="../api.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../../index.html" class="icon icon-home">
+            Machine Learned Landscape Flattening
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="../index.html">Welcome to the mllf documentation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mlp_model.html">PyTorch MLP (PTMLP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../mlp_model.html#example-quick-training-loop">Example: quick training loop</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../examples.html">Running examples</a></li>
+<li class="toctree-l1 current"><a class="reference internal" href="../api.html">mllf API</a><ul class="current">
+<li class="toctree-l2 current"><a class="current reference internal" href="#">mllf.mlp.setup_pairs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mllf.mlp.pt_model.html">mllf.mlp.pt_model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mllf.file_handling.read_bias_coeff.html">mllf.file_handling.read_bias_coeff</a></li>
+<li class="toctree-l2"><a class="reference internal" href="mllf.file_handling.read_rtf.html">mllf.file_handling.read_rtf</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../index.html">Machine Learned Landscape Flattening</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../../index.html" class="icon icon-home" aria-label="Home"></a></li>
+          <li class="breadcrumb-item"><a href="../index.html">Welcome to the mllf documentation</a></li>
+          <li class="breadcrumb-item"><a href="../api.html">mllf API</a></li>
+      <li class="breadcrumb-item active">mllf.mlp.setup_pairs</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../../_sources/docs/api/mllf.mlp.setup_pairs.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="module-mllf.mlp.setup_pairs">
+<span id="mllf-mlp-setup-pairs"></span><h1>mllf.mlp.setup_pairs<a class="headerlink" href="#module-mllf.mlp.setup_pairs" title="Link to this heading"></a></h1>
+<p>Utilities to assemble training pairs for the MLP.</p>
+<p>This module discovers training run directories named like
+<cite>system_solvent_fnex</cite> (for example <cite>14benz_solv_5.5</cite>), parses RTF fragment
+files to extract atom types and charges, finds the matching variables file
+(variables*.py or variables*.inp) with bias coefficients, and assembles a
+structure mapping each site_sub to a pair dict containing:</p>
+<ul class="simple">
+<li><p>system, solvent, fnex</p></li>
+<li><p>site, sub</p></li>
+<li><p>atom_types (list)</p></li>
+<li><p>total_charge (float)</p></li>
+<li><p>bias coefficients (lams, cs, xs, ss when available)</p></li>
+</ul>
+<p>The main entrypoint is <cite>assemble_pairs(root_training_dir)</cite> which returns a
+dictionary keyed by run_dir -&gt; mapping of site_sub -&gt; pair dict.</p>
+<p class="rubric">Functions</p>
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">assemble_pairs</span></code>(root_training_dir)</p></td>
+<td><p>Walk run subdirectories under root_training_dir and assemble pairs for each run.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">assemble_pairs_for_run</span></code>(run_path)</p></td>
+<td><p>Assemble pairs for a single run directory.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">find_variables_file</span></code>(directory)</p></td>
+<td><p>Find the variables file in a directory.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="xref py py-obj docutils literal notranslate"><span class="pre">parse_run_dirname</span></code>(dirname)</p></td>
+<td><p>Parse a run directory name into metadata: system, solvent, fnex.</p></td>
+</tr>
+</tbody>
+</table>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="../api.html" class="btn btn-neutral float-left" title="mllf API" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="mllf.mlp.pt_model.html" class="btn btn-neutral float-right" title="mllf.mlp.pt_model" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, Paige E. Bowling, Charles L. Brooks III.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
