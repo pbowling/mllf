@@ -32,9 +32,9 @@ def test_write_matches_example(tmp_path):
 
     subs = [3, 4, 8, 8, 8]
     out = tmp_path / "generated.inp"
-    write_bias_inp_from_graph(g, str(out), sub_counts=subs)
-
     example = os.path.join('examples', 'rl', 'variables85.inp')
+    # use the example file as the header source so non-bias lines are copied verbatim
+    write_bias_inp_from_graph(g, str(out), sub_counts=subs, header_source=example)
     gen_names = set(_read_set_names(str(out)))
     ex_names = set(_read_set_names(example))
 

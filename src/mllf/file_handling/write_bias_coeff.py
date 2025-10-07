@@ -22,7 +22,7 @@ from .read_bias_coeff import parse_old  # kept for tests/debug
 
 
 def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequence[int]] = None,
-                              mapping: Optional[dict] = None) -> None:
+                              mapping: Optional[dict] = None, header_source: Optional[str] = None) -> None:
     """Write a `.inp` file from a Graph instance.
 
     This writes single-sub (lams) and two-sub (cs) entries.
@@ -55,21 +55,36 @@ def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequenc
 
     lines = []
 
-    # Header variables present in example files (names matter for tests)
-    # values are placeholders; the test compares only parameter names
-    lines.append("set minimizeflag = 0\n")
-    lines.append("set nblocks = 0\n")
-    lines.append("set ncentral = 0\n")
-    lines.append(f"set nnodes = {n}\n")
-    lines.append("set nreps = 0\n")
-    lines.append(f"set nsites = {n}\n")
-    # nsubs per site
-    for idx, sc in enumerate(sub_counts, start=1):
-        lines.append(f"set nsubs{idx} = {sc}\n")
-    lines.append("set restartfile = ''\n")
-    # other header items present in example
-    lines.append("set sysname = ''\n")
-    lines.append("set temp = 0\n")
+    # If a header_source is provided, copy non-bias lines verbatim from it.
+    # Lines considered "bias" start with a 'set ' and a name beginning with
+    # one of the bias prefixes (lams, cs, ss, xs). Those are skipped when
+    # copying so we can append freshly generated bias lines below.
+    if header_source is not None:
+        if not os.path.exists(header_source):
+            raise FileNotFoundError(f"header_source not found: {header_source}")
+        with open(header_source, "r", encoding="utf-8") as hf:
+            for ln in hf:
+                s = ln.strip()
+                if not s:
+                    # preserve blank lines
+                    lines.append(ln if ln.endswith("\n") else ln + "\n")
+                    continue
+                if not s.startswith("set "):
+                    lines.append(ln if ln.endswith("\n") else ln + "\n")
+                    continue
+                # extract parameter name
+                parts = ln.split("=")
+                left = parts[0].strip()
+                try:
+                    _, name = left.split(None, 1)
+                except ValueError:
+                    # unexpected format, copy verbatim
+                    lines.append(ln if ln.endswith("\n") else ln + "\n")
+                    continue
+                # skip bias coefficients (we'll generate them below)
+                if name.startswith(("lams", "cs", "ss", "xs")):
+                    continue
+                lines.append(ln if ln.endswith("\n") else ln + "\n")
 
     # Single-sub (lams): write one line per substituent per site (example file lists all)
     for i in range(n):
