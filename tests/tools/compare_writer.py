@@ -26,7 +26,7 @@ if __name__ == '__main__':
             g.set_edge(i, j, [0.0, 0.0, 0.0, 0.0])
     subs = [3, 4, 8, 8, 8]
     write_bias_inp_from_graph(g, out_path, sub_counts=subs)
-    example = os.path.join(os.path.dirname(__file__), '..', 'examples', 'rl', 'variables85.inp')
+    example = os.path.join(os.path.dirname(__file__), '..', '..', 'examples', 'rl', 'variables85.inp')
     example = os.path.abspath(example)
     gen_names = set(_read_set_names(out_path))
     ex_names = set(_read_set_names(example))

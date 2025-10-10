@@ -31,13 +31,22 @@ class GraphEnv(gym.Env):
 
     def __init__(self, num_nodes: int = 3, max_steps: int = 50, coeff_limit: float = 10.0,
                  output_text: Optional[str] = None, target_lambda: float = 0.99, simulation_runner: Optional[Callable[[Any], Any]] = None,
-                 out_inp_template: Optional[str] = None):
+                 out_inp_template: Optional[str] = None, initial_graph: Optional[Graph] = None,
+                 observation_format: str = "flat"):
         super().__init__()
         self.max_steps = max_steps
-        self.num_nodes = num_nodes
-        self.graph = Graph(num_nodes)
+        # allow passing an initialized Graph (with node metadata) to the env
+        self._template_graph = None
+        if initial_graph is not None:
+            self._template_graph = initial_graph
+            self.graph = initial_graph
+            self.num_nodes = initial_graph.num_nodes
+        else:
+            self._template_graph = None
+            self.num_nodes = num_nodes
+            self.graph = Graph(num_nodes)
         self._step_count = 0
-        n_edges = num_nodes * (num_nodes - 1) // 2
+        n_edges = self.num_nodes * (self.num_nodes - 1) // 2
         self.obs_dim = n_edges * 4
         self.coeff_limit = coeff_limit
         # optional external metrics loaded from an output text using read_output parser
@@ -50,6 +59,9 @@ class GraphEnv(gym.Env):
         # optional template for writing .inp files per step; may contain {step}
         # e.g. 'examples/rl/variables{step}.inp'
         self.out_inp_template = out_inp_template
+        # observation_format: 'flat' (default) returns flat vector of edge coeffs,
+        # 'graph' returns a GraphInstance (nodes, edges, edge_links) using graph_space
+        self.observation_format = observation_format
         if output_text is not None:
             try:
                 self.update_metrics_from_output_text(output_text)
@@ -57,10 +69,20 @@ class GraphEnv(gym.Env):
             except Exception:
                 # if parsing fails, fallback to internal proxies
                 self._external_metrics = False
-        low = -coeff_limit * np.ones(self.obs_dim, dtype=np.float32)
-        high = coeff_limit * np.ones(self.obs_dim, dtype=np.float32)
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
-        # Actions are continuous additive updates to the coefficients
+        low = -self.coeff_limit * np.ones(self.obs_dim, dtype=np.float32)
+        high = self.coeff_limit * np.ones(self.obs_dim, dtype=np.float32)
+        if self.observation_format == "flat":
+            # flat vector of edge coefficients
+            self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        else:
+            # graph observation: return a dict of fixed-size arrays so RLlib can
+            # batch them. We pad to self.num_nodes and n_edges.
+            n_edges = self.num_nodes * (self.num_nodes - 1) // 2
+            node_box = spaces.Box(low=-self.coeff_limit, high=self.coeff_limit, shape=(self.num_nodes, 4), dtype=np.float32)
+            edge_box = spaces.Box(low=-self.coeff_limit, high=self.coeff_limit, shape=(n_edges, 4), dtype=np.float32)
+            link_box = spaces.Box(low=0, high=max(0, self.num_nodes - 1), shape=(n_edges, 2), dtype=np.int32)
+            self.observation_space = spaces.Dict({"nodes": node_box, "edges": edge_box, "edge_links": link_box})
+        # Actions are continuous additive updates to the coefficients (always flat)
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.obs_dim,), dtype=np.float32)
         # placeholders to track previous means for reward deltas
         self._prev_mean_population = None
@@ -68,8 +90,15 @@ class GraphEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         self._step_count = 0
-        # reset graph to zero coefficients
-        self.graph = Graph(self.num_nodes)
+        # reset graph to zero coefficients but preserve node metadata if available
+        if self._template_graph is not None:
+            # create a fresh copy padded to the same size and zero its edge coeffs
+            newg = self._template_graph.padded_copy(self.num_nodes)
+            for k in list(newg.edges.keys()):
+                newg.edges[k] = type(newg.edges[k])()  # reset to default EdgeCoeffs
+            self.graph = newg
+        else:
+            self.graph = Graph(self.num_nodes)
         # initialize previous metrics to the current values so first step has zero delta
         if self._external_metrics and (self._external_pops is not None):
             pops = self._external_pops
@@ -79,7 +108,7 @@ class GraphEnv(gym.Env):
             rates = self._compute_transition_rates()
         self._prev_mean_population = float(np.mean(pops))
         self._prev_mean_rate = float(np.mean(rates))
-        return self.graph.as_vector()
+        return self._build_graph_observation() if self.observation_format == "graph" else self.graph.as_vector()
 
     def step(self, action) -> Tuple[np.ndarray, float, bool, dict]:
         action = np.asarray(action, dtype=float).flatten()
@@ -161,7 +190,9 @@ class GraphEnv(gym.Env):
                 done = True
 
         info = {"site_populations": pops, "site_rates": rates}
-        return new, float(reward), bool(done), info
+
+        obs = self._build_graph_observation() if self.observation_format == "graph" else new
+        return obs, float(reward), bool(done), info
 
     def update_metrics_from_output_text(self, text: str):
         """Parse an output text and populate `_external_pops` and `_external_rates` arrays.
@@ -282,6 +313,87 @@ class GraphEnv(gym.Env):
                 vals.append(abs(e.skew) + 0.5 * abs(e.linear))
             rates[i] = float(np.mean(vals)) if vals else 0.0
         return rates
+
+    def _build_graph_observation(self):
+        """Return an RLlib-friendly padded observation dict.
+
+        nodes: (N,4) float32
+        edges: (E,4) float32 in the same ordering as Graph.as_vector
+        edge_links: (E,2) int32 with source/dest indices
+        """
+        n = self.num_nodes
+        n_edges = n * (n - 1) // 2
+
+        # Node features (float): [num_subs, total_charge, distinct_atom_count, solvent_code]
+        # solvent_code: 0.0=unknown, 1.0=solv, 2.0=gas, 3.0=protein
+        nodes_arr = np.zeros((n, 4), dtype=np.float32)
+        node_mask = np.ones((n,), dtype=np.float32)
+        for i in range(n):
+            info = self.graph.get_node_info(i)
+            # num_subs
+            subs = info.get('subs') or []
+            nodes_arr[i, 0] = float(len(subs))
+            # total_charge: if present on meta (for single-sub graphs), otherwise sum per-sub
+            total_charge = 0.0
+            if 'total_charge' in info:
+                total_charge = float(info.get('total_charge', 0.0) or 0.0)
+            else:
+                subs_meta = info.get('subs_meta') or {}
+                if subs_meta:
+                    # sum total_charge across subs as a proxy
+                    total_charge = sum(float(s.get('total_charge', 0.0) or 0.0) for s in subs_meta.values())
+            nodes_arr[i, 1] = float(total_charge)
+
+            # distinct_atom_count: preserve duplicates, so count length of distinct_atom_types if present
+            distinct = []
+            if 'distinct_atom_types' in info:
+                distinct = info.get('distinct_atom_types') or []
+            else:
+                # older subs_meta structure
+                subs_meta = info.get('subs_meta') or {}
+                # aggregate distinct counts across subs
+                for s in subs_meta.values():
+                    if isinstance(s.get('distinct_atom_types'), list):
+                        distinct.extend(s.get('distinct_atom_types'))
+            nodes_arr[i, 2] = float(len(distinct))
+
+            # solvent_code mapping
+            sol = info.get('solvent')
+            if sol is None:
+                # try subs_meta
+                subs_meta = info.get('subs_meta') or {}
+                for sdata in subs_meta.values():
+                    sol = sdata.get('solvent')
+                    if sol is not None:
+                        break
+            sol_map = {'unknown': 0.0, 'solv': 1.0, 'gas': 2.0, 'protein': 3.0}
+            nodes_arr[i, 3] = float(sol_map.get(sol, 0.0))
+
+        # edges and edge_links follow Graph ordering
+        edge_list = []
+        link_list = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                e = self.graph.get_edge(i, j)
+                edge_list.append([e.linear, e.quadratic, e.skew, e.end])
+                link_list.append([i, j])
+
+        edges_arr = np.zeros((n_edges, 4), dtype=np.float32) if n_edges > 0 else np.zeros((0, 4), dtype=np.float32)
+        links_arr = np.zeros((n_edges, 2), dtype=np.int32) if n_edges > 0 else np.zeros((0, 2), dtype=np.int32)
+        if edge_list:
+            edges_arr[:] = np.array(edge_list, dtype=np.float32)
+            links_arr[:] = np.array(link_list, dtype=np.int32)
+
+        # edge mask (1 for real edges; for fully-populated graph all are 1)
+        edge_mask = np.ones((n_edges,), dtype=np.float32) if n_edges > 0 else np.zeros((0,), dtype=np.float32)
+
+        return {
+            "nodes": nodes_arr,
+            "edges": edges_arr,
+            "edge_links": links_arr,
+            "node_mask": node_mask,
+            "edge_mask": edge_mask,
+        }
 
     def render(self, mode="human"):
         print(f"Step {self._step_count}: graph_vector={self.graph.as_vector()}\n")

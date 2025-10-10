@@ -29,8 +29,8 @@ dev = [
 ]
 
 rl = [
-    "stable-baselines3>=2.0.0",
     "gym>=0.21.0",
+    "ray[rllib]>=2.4.0,<3.0.0",
 ]
 
 [tool.setuptools.packages.find]

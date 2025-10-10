@@ -62,6 +62,7 @@ def parse_rtf_file(path: str) -> Dict[str, object]:
 		"atom_types": atom_types,
 		"total_charge": total_charge,
 		"filename": basename,
+		"filepath": path,
 	}
 
 

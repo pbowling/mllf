@@ -1,0 +1,10 @@
+# Example training config for mllf RL
+# This file demonstrates the expected structure for training simulations.
+# Each entry should include 'out_dir' and 'prep_dir'.
+
+simulations:
+  - out_dir: ./training/
+    prep_dir: ./examples/training_files/14benz_vac_5.5
+
+# You can list multiple simulation entries if you want to run or queue
+# multiple training sessions with different prep directories or outputs.
