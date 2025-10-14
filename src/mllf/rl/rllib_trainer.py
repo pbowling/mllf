@@ -29,6 +29,7 @@ import torch.nn as nn
 
 from mllf.rl.gnn_policy import GNNPolicy
 from mllf.rl.env import GraphEnv
+from mllf.rl.train import build_graphs_from_config
 from mllf.rl.graph_space import GraphInstance
 
 
@@ -96,7 +97,7 @@ def register_model():
     ModelCatalog.register_custom_model("rllib_gnn", RLlibGNNModel)
 
 
-def train(num_iters: int = 100, config_overrides: Optional[Dict[str, Any]] = None, stop: Optional[Dict[str, Any]] = None):
+def train(num_iters: int = 100, config_overrides: Optional[Dict[str, Any]] = None, stop: Optional[Dict[str, Any]] = None, config_path: Optional[str] = None):
     """Start a small RLlib PPO training run using the GraphEnv and the GNN model.
 
     Args:
@@ -118,6 +119,15 @@ def train(num_iters: int = 100, config_overrides: Optional[Dict[str, Any]] = Non
     }
     if config_overrides:
         base_config.update(config_overrides)
+
+    # If a config_path is provided, use build_graphs_from_config to initialize sims
+    # and pass the first graph as a template to the environment so the env starts
+    # from an initialized state. build_graphs_from_config initializes by default.
+    if config_path:
+        graphs = build_graphs_from_config(config_path, initialize=True)
+        if graphs:
+            # pass a pickled/simple representation? Graph is picklable; pass directly
+            base_config['env_config']['initial_graph'] = graphs[0]
 
     ray.init(ignore_reinit_error=True)
     # Use the registered algorithm name with tune.run for compatibility across

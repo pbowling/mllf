@@ -135,3 +135,35 @@ def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequenc
     os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
     with open(filename, "w", encoding="utf-8") as fh:
         fh.writelines(lines)
+
+
+def create_variables_py_from_template(template_path: str, out_path: str, minimizeflag: bool = False):
+    """Create a variables#.py file by copying a template and setting minimizeflag.
+
+    This is a simple textual transform: it replaces an assignment like
+    'minimizeflag=True' (possibly with surrounding whitespace) with the
+    requested value. If the template is not a .py file or the token isn't
+    found, the template is copied verbatim with a appended 'minimizeflag'
+    assignment.
+    """
+    import re
+
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(template_path)
+
+    with open(template_path, 'r', encoding='utf-8') as fh:
+        content = fh.read()
+
+    # replace existing minimizeflag assignment
+    flag_str = 'minimizeflag=True'
+    flag_false = 'minimizeflag=False'
+    # tolerant regex to match minimizeflag = True with optional spaces
+    new_content, nsub = re.subn(r"minimizeflag\s*=\s*True", flag_false if not minimizeflag else flag_str, content)
+    if nsub == 0:
+        # if not present, append at end
+        new_content = content + f"\n{flag_false if not minimizeflag else flag_str}\n"
+
+    # write out
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
+    with open(out_path, 'w', encoding='utf-8') as fh:
+        fh.write(new_content)
