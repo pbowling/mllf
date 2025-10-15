@@ -531,9 +531,9 @@ lam_file.close()
 #if blade: pycharmm.lingo.charmm_script('blade off')
 
 # # collect lambda statistics
-# proc_lam = pycharmm.CharmmFile(file_name='res/{}_{}.lmd'.format(info['name'],'flat'), 
-#            file_unit=33,formatted=False,read_only=False)
-# pycharmm.lingo.charmm_script('traj lamb print ctlo 0.95 cthi 0.99 first {} nunit {}'.format(proc_lam.file_unit,1))
+proc_lam = pycharmm.CharmmFile(file_name='res/{}_{}.lmd'.format(info['name'],'flat'), 
+            file_unit=33,formatted=False,read_only=False)
+pycharmm.lingo.charmm_script('traj lamb print ctlo 0.95 cthi 0.99 first {} nunit {}'.format(proc_lam.file_unit,1))
 
 
 ##############################################
