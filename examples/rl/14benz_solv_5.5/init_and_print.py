@@ -1,14 +1,23 @@
-"""Create variables0.py, run optional initialization, and print the Graph.
+"""Create initial variables0.py in run_01/step_0, submit initialization job, and print the Graph.
 
-Usage:
-  python init_and_print.py
-
-Set environment variable RUN_INIT=1 to run `msld_flat.py --vars-file <path>` after creating variables0.py.
+This version writes `variables0.py` directly into `run_01/step_0/`
+and places the submit script at `run_01/step_0/submit_init.sh`.
 """
 import os
 import subprocess
 from pathlib import Path
-from pprint import pprint
+
+from mllf.file_handling.write_bias_coeff import create_variables_py_from_template
+from mllf.file_handling.read_rtf import parse_rtf_dir
+"""Create initial variables0.py in run_01/step_0, submit initialization job, and print the Graph.
+
+This version writes `variables0.py` directly into `run_01/step_0/` and places the
+submit script at `run_01/step_0/submit_init.sh`. The job runs from the example
+directory so `prep/` is found by `msld_flat.py`.
+"""
+import os
+import subprocess
+from pathlib import Path
 
 from mllf.file_handling.write_bias_coeff import create_variables_py_from_template
 from mllf.file_handling.read_rtf import parse_rtf_dir
@@ -16,18 +25,18 @@ from mllf.rl.graph import Graph
 
 
 def main():
-    # repo_root: go up from tests/tools/... to the project root
-    repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(__file__).resolve().parents[3]
     example_dir = repo_root / 'examples' / 'rl' / '14benz_solv_5.5'
     if not example_dir.is_dir():
         raise RuntimeError(f'Example directory not found: {example_dir}')
 
-    out_dir = example_dir / 'init_example_results'
-    out_dir.mkdir(exist_ok=True)
+    # per-step dir (no extra subdirs)
+    step_dir = example_dir / 'run_01' / 'step_0'
+    step_dir.mkdir(parents=True, exist_ok=True)
 
     # template variables file in the example dir
     template = example_dir / 'variablesflat.py'
-    vars0 = out_dir / 'variables0.py'
+    vars0 = step_dir / 'variables0.py'
 
     if template.exists():
         create_variables_py_from_template(str(template), str(vars0), minimizeflag=False)
@@ -40,51 +49,34 @@ def main():
     # Optionally run initialization: call msld_flat.py with --vars-file
     if os.environ.get('RUN_INIT'):
         print('RUN_INIT set; submitting initialization job (may require scheduler/pyCHARMM)')
-        submit_script = out_dir / 'submit_init.sh'
-        # create an sbatch-style submit script that calls msld_flat.py with our vars file
+        submit_script = step_dir / 'submit_init.sh'
+        # compute a path for vars file relative to example_dir so msld_flat can find 'prep/'
+        vars_rel = vars0.relative_to(example_dir)
         submit_contents = f"""#!/bin/bash
 #SBATCH --job-name=init_14benz
-#SBATCH --output=init_14benz.%j.out
+#SBATCH --output={'init_14benz.%j.out'}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
+#SBATCH -p gpu2080 --gres=gpu:1 
+#SBATCH --export=ALL
 #SBATCH --time=01:00:00
 
+module load charmm
+
 cd {example_dir}
-python {example_dir / 'msld_flat.py'} --vars-file {vars0}
+python3 msld_flat.py --vars-file {vars_rel} --out-dir {vars_rel.parent}
 """
         submit_script.write_text(submit_contents)
         try:
             # try to submit via sbatch
             res = subprocess.run(['sbatch', str(submit_script)], check=True, capture_output=True, text=True)
             print('Submitted with sbatch:', res.stdout.strip())
-            # attempt to extract job id and wait until the job no longer appears in squeue
-            out = res.stdout.strip()
-            # typical sbatch response: "Submitted batch job 123456"
-            jid = None
-            for part in out.split():
-                if part.isdigit():
-                    jid = part
-                    break
-            if jid:
-                # if squeue is available, wait for job to finish
-                try:
-                    import shutil, time
-
-                    if shutil.which('squeue') and os.environ.get('WAIT_FOR_JOB'):
-                        print(f'Waiting for job {jid} to finish...')
-                        while True:
-                            sq = subprocess.run(['squeue', '-j', jid], capture_output=True, text=True)
-                            if jid not in sq.stdout:
-                                break
-                            time.sleep(5)
-                        print(f'Job {jid} no longer in squeue.')
-                except Exception:
-                    pass
         except FileNotFoundError:
             # sbatch not available; fallback to local run (may fail if pyCHARMM not installed)
             print('sbatch not found: falling back to running msld_flat.py locally (may fail if pyCHARMM not configured)')
             try:
-                subprocess.run(['python3', str(example_dir / 'msld_flat.py'), '--vars-file', str(vars0)], check=True)
+                # run from example_dir so prep/ is visible; pass out-dir as relative path to step
+                subprocess.run(['python3', str(example_dir / 'msld_flat.py'), '--vars-file', str(vars_rel), '--out-dir', str(vars_rel.parent)], check=True, cwd=str(example_dir))
                 print('Local initialization run finished.')
             except subprocess.CalledProcessError as e:
                 print('Local initialization run failed: ', e)

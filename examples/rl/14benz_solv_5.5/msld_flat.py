@@ -97,6 +97,7 @@ def _load_variables_module():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--vars-file', '-v', type=str, help='Path to variables python file')
     parser.add_argument('--step', '-s', type=int, help='Step number to select variables{step}.py')
+    parser.add_argument('--out-dir', '-o', type=str, help='Output directory for simulation outputs (res/, dcd/, logs/)')
     # parse only known args so this file can be embedded in other runs
     args, _ = parser.parse_known_args()
 
@@ -139,6 +140,10 @@ def _load_variables_module():
     # also merge any dict named 'info' entries into local info (if present)
     if 'info' in vns and isinstance(vns['info'], dict):
         info.update(vns['info'])
+
+    # expose chosen out-dir to module globals so the rest of the script can
+    # place res/, dcd/, and other output folders under that location
+    globals()['out_dir'] = args.out_dir if hasattr(args, 'out_dir') else None
 
     return vars_path
 
@@ -429,9 +434,18 @@ dyn.set_fbetas(np.full((psf.get_natom()),gscal,dtype=float))
 # initialize blade
 pycharmm.lingo.charmm_script('energy blade')
 
-# set up output directories
-if not os.path.isdir('res'): os.system('mkdir res')
-if not os.path.isdir('dcd'): os.system('mkdir dcd')
+# set up output directories (allow overriding via --out-dir)
+_out_dir = globals().get('out_dir')
+if _out_dir:
+    out_base = _out_dir
+else:
+    out_base = '.'
+
+res_dir = os.path.join(out_base, 'res')
+dcd_dir = os.path.join(out_base, 'dcd')
+
+os.makedirs(res_dir, exist_ok=True)
+os.makedirs(dcd_dir, exist_ok=True)
 
 # set up dynamics dictionary of parameters
 dynamics_dict = {'cpt':cpt_on,'leap':True,'langevin':True,
@@ -464,11 +478,14 @@ if blade:
 
 
 # MD equilibration
-dcd_file = pycharmm.CharmmFile(file_name='dcd/{}_{}.dcd'.format(info['name'],'heat'), 
+heat_dcd_path = os.path.join(dcd_dir, '{}_{}.dcd'.format(info['name'],'heat'))
+dcd_file = pycharmm.CharmmFile(file_name=heat_dcd_path, 
                file_unit=1,formatted=False,read_only=False)
-res_file = pycharmm.CharmmFile(file_name='res/{}_{}.res'.format(info['name'],'heat'), 
+heat_res_path = os.path.join(res_dir, '{}_{}.res'.format(info['name'],'heat'))
+res_file = pycharmm.CharmmFile(file_name=heat_res_path, 
                file_unit=2,formatted=True,read_only=False)
-lam_file = pycharmm.CharmmFile(file_name='res/{}_{}.lmd'.format(info['name'],'heat'), 
+lam_path = os.path.join(res_dir, '{}_{}.lmd'.format(info['name'],'heat'))
+lam_file = pycharmm.CharmmFile(file_name=lam_path, 
                file_unit=3,formatted=False,read_only=False)
 
 if not 'restartfile' in locals():
@@ -476,7 +493,8 @@ if not 'restartfile' in locals():
     dynamics_dict['restart']= False
     dynamics_dict['iunrea'] = -1
 else:
-    prv_rest = pycharmm.CharmmFile(file_name=restartfile, 
+    # restartfile may or may not be set by variables; guard access
+    prv_rest = pycharmm.CharmmFile(file_name=locals().get('restartfile'), 
                    file_unit=4,formatted=True,read_only=False)
     dynamics_dict['start']  = False
     dynamics_dict['restart']= True
@@ -496,17 +514,19 @@ dcd_file.close()
 res_file.close()
 lam_file.close()
 
-write.coor_pdb('dcd/{}_fframe.{}.pdb'.format(info['name'],'equil')) # write out final frame
+write.coor_pdb(os.path.join(dcd_dir, '{}_fframe.{}.pdb'.format(info['name'],'equil'))) # write out final frame
 
 
 # MD production
-dcd_file = pycharmm.CharmmFile(file_name='dcd/{}_{}.dcd'.format(info['name'],'flat'), 
+flat_dcd_path = os.path.join(dcd_dir, '{}_{}.dcd'.format(info['name'],'flat'))
+dcd_file = pycharmm.CharmmFile(file_name=flat_dcd_path, 
                file_unit=1,formatted=False,read_only=False)
-res_file = pycharmm.CharmmFile(file_name='res/{}_{}.res'.format(info['name'],'flat'), 
+flat_res_path = os.path.join(res_dir, '{}_{}.res'.format(info['name'],'flat'))
+res_file = pycharmm.CharmmFile(file_name=flat_res_path, 
                file_unit=2,formatted=True,read_only=False)
-prv_rest = pycharmm.CharmmFile(file_name='res/{}_{}.res'.format(info['name'],'heat'), 
+prv_rest = pycharmm.CharmmFile(file_name=heat_res_path, 
                file_unit=4,formatted=True,read_only=False)
-lam_file = pycharmm.CharmmFile(file_name='res/{}_{}.lmd'.format(info['name'],'flat'), 
+lam_file = pycharmm.CharmmFile(file_name=os.path.join(res_dir, '{}_{}.lmd'.format(info['name'],'flat')), 
                file_unit=3,formatted=False,read_only=False)
 
 dynamics_dict['start']  = False
@@ -531,7 +551,7 @@ lam_file.close()
 #if blade: pycharmm.lingo.charmm_script('blade off')
 
 # # collect lambda statistics
-proc_lam = pycharmm.CharmmFile(file_name='res/{}_{}.lmd'.format(info['name'],'flat'), 
+proc_lam = pycharmm.CharmmFile(file_name=os.path.join(res_dir, '{}_{}.lmd'.format(info['name'],'flat')), 
             file_unit=33,formatted=False,read_only=False)
 pycharmm.lingo.charmm_script('traj lamb print ctlo 0.95 cthi 0.99 first {} nunit {}'.format(proc_lam.file_unit,1))
 
