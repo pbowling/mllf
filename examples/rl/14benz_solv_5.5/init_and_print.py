@@ -64,7 +64,7 @@ def main():
 module load charmm
 
 cd {example_dir}
-python3 msld_flat.py --vars-file {vars_rel} --out-dir {vars_rel.parent}
+python3 msld_flat.py --vars-file {vars_rel} --out-dir {vars_rel.parent} > {vars_rel.parent}/output.out
 """
         submit_script.write_text(submit_contents)
         try:
