@@ -1,0 +1,9 @@
+/export/apps/RockyOS8/charmm/c51a1/bin/charmm
+--------------------------------------------------------------------------
+Open MPI failed an OFI Libfabric library call (fi_endpoint).  This is highly
+unusual; your job may behave unpredictably (and/or abort) after this.
+
+  Local host: gollum153
+  Location: mtl_ofi_component.c:515
+  Error: No data available (61)
+--------------------------------------------------------------------------

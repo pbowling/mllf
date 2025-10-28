@@ -62,6 +62,7 @@ def main():
 #SBATCH --time=01:00:00
 
 module load charmm
+export CHARMMEXEC='/home/dave/bin/charmm_6123706'
 
 cd {example_dir}
 python3 msld_flat.py --vars-file {vars_rel} --out-dir {vars_rel.parent} > {vars_rel.parent}/output.out
