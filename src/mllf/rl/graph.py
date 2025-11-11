@@ -38,6 +38,13 @@ class Graph:
             for j in range(i + 1, num_nodes):
                 self.edges[(i, j)] = EdgeCoeffs()
 
+        # per-edge masks indicating whether a particular coeff type is active
+        # e.g. self.edge_mask[(i,j)] = {'linear': True, 'quadratic': True, 'skew': True, 'end': True}
+        self.edge_mask: Dict[Tuple[int, int], Dict[str, bool]] = {}
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                self.edge_mask[(i, j)] = {'linear': True, 'quadratic': True, 'skew': True, 'end': True}
+
         # initialize empty node metadata
         for i in range(num_nodes):
             self.nodes[i] = {}
@@ -152,6 +159,15 @@ class Graph:
 
             info = {'site': site_idx, 'subs': sorted(list(per_sub.keys())), 'rtf': per_sub, 'subs_meta': subs_meta}
             self.set_node_info(site_idx - 1, info)
+
+        # after populating node metadata, apply default connectivity rules
+        # so that inter-site edges are disabled by default and intra-site
+        # connectivity can be controlled by specific rules (see apply_site_connectivity_rules)
+        try:
+            self.apply_site_connectivity_rules()
+        except Exception:
+            # be defensive: do not fail setup if masking cannot be applied
+            pass
 
     @classmethod
     def from_rtf_results(cls, rtf_results: Dict[str, Dict], solvent_override: Optional[str] = None) -> "Graph":
@@ -272,7 +288,67 @@ class Graph:
             # store the metadata directly at this node index
             g.set_node_info(idx, subs_meta)
 
+        # apply connectivity rules now that node metadata is populated
+        g.apply_site_connectivity_rules()
         return g
+
+    def apply_site_connectivity_rules(self):
+        """Apply default connectivity rules per-site.
+
+        Rules implemented:
+        - Inter-site edges: all coefficient masks set to False (no coupling between sites)
+        - Intra-site edges:
+            * 'linear' coefficients allowed only for edges that include sub==1 (the primary sub)
+              i.e., sub1 connected to each other sub; edges between non-sub1 subs have linear disabled.
+            * 'quadratic', 'skew', and 'end' coefficients are allowed for all intra-site pairs
+
+        This method relies on node metadata stored via `set_node_info` / `from_rtf_results`.
+        If node metadata is missing for a node, conservative defaults (all False for inter-site) are used.
+        """
+        # build mapping node -> site, sub
+        node_site = {}
+        node_sub = {}
+        for n, info in self.nodes.items():
+            try:
+                node_site[n] = int(info.get('site'))
+            except Exception:
+                node_site[n] = None
+            try:
+                node_sub[n] = int(info.get('sub'))
+            except Exception:
+                node_sub[n] = None
+
+        for (i, j) in list(self.edges.keys()):
+            si = node_site.get(i)
+            sj = node_site.get(j)
+            # default: disable everything
+            mask = {'linear': False, 'quadratic': False, 'skew': False, 'end': False}
+            if si is not None and sj is not None and si == sj:
+                # intra-site pair
+                # linear allowed only if one of the subs is sub==1
+                subi = node_sub.get(i)
+                subj = node_sub.get(j)
+                is_linear = (subi == 1) or (subj == 1)
+                mask['linear'] = bool(is_linear)
+                # quadratic/skew/end: fully connected among subs within same site
+                mask['quadratic'] = True
+                mask['skew'] = True
+                mask['end'] = True
+            # store
+            self.edge_mask[(i, j)] = mask
+
+    def get_allowed_edges_for_bias(self, bias_name: str) -> List[Tuple[int, int]]:
+        """Return list of edge (i,j) pairs where given bias_name mask is True.
+
+        bias_name should be one of: 'linear', 'quadratic', 'skew', 'end'.
+        """
+        if bias_name not in ('linear', 'quadratic', 'skew', 'end'):
+            raise ValueError(f'Unknown bias name: {bias_name}')
+        out = []
+        for (i, j), mask in self.edge_mask.items():
+            if mask.get(bias_name):
+                out.append((i, j))
+        return out
 
     def padded_copy(self, new_num_nodes: int) -> "Graph":
         """Return a copy of this graph in a larger Graph of size new_num_nodes.
@@ -286,6 +362,9 @@ class Graph:
         # copy edges
         for (i, j), coeffs in self.edges.items():
             newg.edges[(i, j)] = EdgeCoeffs(coeffs.linear, coeffs.quadratic, coeffs.skew, coeffs.end)
+        # copy masks as well
+        for (i, j), mask in self.edge_mask.items():
+            newg.edge_mask[(i, j)] = dict(mask)
         # copy node metadata
         for idx, info in self.nodes.items():
             newg.nodes[idx] = dict(info)

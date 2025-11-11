@@ -1,0 +1,18 @@
+# Configuration for 14benz_solv_5.5 example runs
+
+runs:
+  - name: run_01
+    run_dir: ./run_01
+    # Per-step runs will be organized under <run_dir>/step_<step>/ so that each
+    vars_template: ./variablesflat.py
+    # Only the initial variables0.py is created ahead of time. Subsequent
+    # variables files are created on-demand by the RL loop since their
+    # coefficients come from the policy.
+    prepare_initial_step: true
+    initial_step: 0
+    sbatch:
+      partition: gpu2080
+      gpus: 1
+      cpus_per_task: 1
+      time: "01:00:00"
+      job_name: "init_14benz"
