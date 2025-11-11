@@ -10,6 +10,8 @@ on:
     - './examples/**'
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+    - './examples/**'
 
 jobs:
   build:
