@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from mllf.file_handling.read_rtf import parse_rtf_dir
-from mllf.rl.graph import Graph
+from mllf.cb.graph import Graph
 
 
 def test_build_graph_from_example_print():
