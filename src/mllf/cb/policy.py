@@ -71,3 +71,20 @@ class EdgePolicy(nn.Module):
             actions = dist.rsample()
             logp = dist.log_prob(actions)
         return actions, logp, mean, std
+
+    @classmethod
+    def from_pyg_data(cls, encoder: nn.Module, emb_dim: int, data, mlp_hidden: int = 64):
+        """Construct an EdgePolicy using a PyG `data` object to infer edge_feat_dim.
+
+        This helper reads `data.edge_attr` (if present) to determine the
+        per-edge feature size so the internal MLP has the correct fixed input
+        dimension: 2*emb_dim + edge_feat_dim.
+        """
+        edge_feat_dim = 0
+        if hasattr(data, 'edge_attr') and data.edge_attr is not None:
+            # edge_attr is [E, F]
+            try:
+                edge_feat_dim = int(data.edge_attr.shape[1])
+            except Exception:
+                edge_feat_dim = 0
+        return cls(encoder, emb_dim, edge_feat_dim, mlp_hidden)

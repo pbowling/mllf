@@ -5,9 +5,8 @@
 ##
 
 import os
-import sys
 import numpy as np
-import pandas
+import argparse
 
 ##############################################
 # Load pyCHARMM libraries
@@ -92,7 +91,6 @@ def _load_variables_module():
     (info, info['temp'], box, nsites, nsubs, bias, etc.) are merged into this module's
     globals when present.
     """
-    import argparse
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--vars-file', '-v', type=str, help='Path to variables python file')
@@ -249,7 +247,7 @@ pycharmm.lingo.charmm_script('set charge = ?cgtot')
 netQ = pycharmm.lingo.get_charmm_variable('CHARGE')
 tol=1e-8
 if (netQ > tol) or (netQ < (-1*tol)):
-    print("ERROR: system net charge not equal to zero!! Exiting...")
+    print("ERROR: system net charge not equal to zero!")
     #pycharmm.lingo.charmm_script('stop')
 
 

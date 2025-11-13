@@ -38,7 +38,20 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None) -> Tuple[obj
     """
 
     if relation_names is None:
-        relation_names = ['linear', 'quadratic', 'skew', 'end']
+        base_relation_names = ['linear', 'quadratic', 'skew', 'end']
+    else:
+        base_relation_names = list(relation_names)
+
+    # Expand base relations into directed relation types: e.g. 'linear_fwd', 'linear_bwd'
+    relation_names = []
+    base_relation_map = {}
+    for r in base_relation_names:
+        fwd = f"{r}_fwd"
+        bwd = f"{r}_bwd"
+        base_relation_map[r] = (fwd, bwd)
+        relation_names.append(fwd)
+        relation_names.append(bwd)
+
     rel_to_idx = {r: i for i, r in enumerate(relation_names)}
 
     # collect node features
@@ -48,7 +61,9 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None) -> Tuple[obj
         node_feats.append(_node_feature_from_meta(meta))
     x = torch.stack(node_feats, dim=0)
 
-    # expand edges: for each undirected (i,j) and for each bias that is allowed
+    # expand edges: for each undirected (i,j) and for each bias that is allowed.
+    # For each base bias we create two directed relation types so that A->B and B->A
+    # are represented by distinct relation ids and can be learned separately.
     src = []
     dst = []
     edge_type_list = []
@@ -60,41 +75,44 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None) -> Tuple[obj
         mask = None
         if hasattr(g, 'edge_mask'):
             mask = g.edge_mask.get((i, j))
-        for bias in relation_names:
+        for bias in base_relation_names:
             allowed = True if mask is None else bool(mask.get(bias, False))
             if not allowed:
                 continue
-            # add directed edge i->j for this bias relation (add both directions for symmetry)
+            fwd_name, bwd_name = base_relation_map[bias]
+            fwd_idx = rel_to_idx[fwd_name]
+            bwd_idx = rel_to_idx[bwd_name]
+            # add directed edge i->j as the forward relation for this bias
             src.append(int(i))
             dst.append(int(j))
-            edge_type_list.append(rel_to_idx[bias])
-            # edge_attr: use the current coefficient value for this bias
-            val = 0.0
-            if hasattr(coeffs, bias):
-                val = float(getattr(coeffs, bias))
-            # build one-hot for relation and append coefficient as last element
+            edge_type_list.append(fwd_idx)
+            # edge_attr: only include one-hot over directed relation types
             k = len(relation_names)
             one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot[rel_to_idx[bias]] = 1.0
-            edge_attr_list.append(torch.cat([one_hot, torch.tensor([val], dtype=torch.get_default_dtype())]))
-            # also add the reverse direction so message passing is symmetric
+            one_hot[fwd_idx] = 1.0
+            edge_attr_list.append(one_hot)
+            # add reverse direction j->i as the backward relation type
             src.append(int(j))
             dst.append(int(i))
-            edge_type_list.append(rel_to_idx[bias])
+            edge_type_list.append(bwd_idx)
             one_hot_r = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot_r[rel_to_idx[bias]] = 1.0
-            edge_attr_list.append(torch.cat([one_hot_r, torch.tensor([val], dtype=torch.get_default_dtype())]))
+            one_hot_r[bwd_idx] = 1.0
+            edge_attr_list.append(one_hot_r)
 
     k = len(relation_names)
     if len(src) == 0:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         edge_type = torch.zeros((0,), dtype=torch.long)
-        edge_attr = torch.zeros((0, k + 1), dtype=torch.get_default_dtype())
+        edge_attr = torch.zeros((0, k), dtype=torch.get_default_dtype())
     else:
         edge_index = torch.tensor([src, dst], dtype=torch.long)
         edge_type = torch.tensor(edge_type_list, dtype=torch.long)
         edge_attr = torch.stack(edge_attr_list, dim=0)
 
     data = Data(x=x, edge_index=edge_index, edge_type=edge_type, edge_attr=edge_attr)
-    extras = {'relation_names': relation_names, 'relation_map': rel_to_idx}
+    extras = {
+        'relation_names': relation_names,
+        'relation_map': rel_to_idx,
+        'base_relation_map': base_relation_map,
+    }
     return data, extras
