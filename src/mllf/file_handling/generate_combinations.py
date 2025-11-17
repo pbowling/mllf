@@ -64,7 +64,7 @@ def find_site_sub_files(input_dir: Path) -> Dict[int, Dict[int, Dict[Tuple[str, 
         label = m.group(3)
         ext = m.group(4)
         # store keyed by (label, ext) so we preserve per-file suffixes like
-        # `_pres.rft` and `_frag.pdb` and allow arbitrary additional files.
+        # `_pres.rtf` and `_frag.pdb` and allow arbitrary additional files.
         found.setdefault(site, {}).setdefault(sub, {})[(label, ext)] = p.resolve()
     return found
 
@@ -184,7 +184,35 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                     if dry_run:
                         print(f"DRY: would copy {src_path} -> {dest}")
                     else:
+                        # copy first to preserve metadata, then fix any RTF PRES token
                         copy2(src_path, dest)
+                        # If this is an RTF-like fragment with a PRES line, update the
+                        # internal id token (e.g. `PRES  p1_1  0.000`) so that the
+                        # `p{site}_{sub}` is renumbered to the new per-site index
+                        # `p{site}_{new_index}` inside the copied file.
+                        try:
+                            if ext.lower() in ("rtf"):
+                                # Read the copied file, replace the PRES token only
+                                # on the PRES line. We limit replacement to the first
+                                # PRES line occurrence to avoid accidental edits.
+                                txt = dest.read_text()
+
+                                def _replace_pres_line(m: re.Match) -> str:
+                                    line = m.group(0)
+                                    # replace the exact original token p{site}_{chosen_sub}
+                                    old_token = f"p{site}_{chosen_sub}"
+                                    new_token = f"p{site}_{new_index}"
+                                    if old_token in line:
+                                        return line.replace(old_token, new_token)
+                                    return line
+
+                                new_txt, nsub = re.subn(r"(?m)^PRES.*$", _replace_pres_line, txt, count=1)
+                                if nsub:
+                                    dest.write_text(new_txt)
+                        except Exception:
+                            # Best-effort: don't fail the whole generation if a single
+                            # file can't be rewritten. Leave the copied file as-is.
+                            pass
 
         # optionally copy additional files matching include_patterns into each combo dir
         if include_patterns:

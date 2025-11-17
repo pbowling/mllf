@@ -1,22 +1,14 @@
-"""Write bias coefficient files in the old `.inp` style used by the simulator.
+"""Write bias coefficient files in the old `.inp` or `.py` style used by the simulator.
 
-This module provides helpers to write a simple `.inp` file with lines of the
-form `set <param> = <value>` so the existing parser (`read_bias_coeff.parse_old`)
-can read it back.
+This module provides helpers to write a simple `.inp` or `.py` file with lines of the
+form `set <param> = <value>` so the existing parser can read it back.
 
-We map each undirected edge (i,j) to four parameters using the `cs` prefix:
-  set cs_i_j_linear = ...
-  set cs_i_j_quadratic = ...
-  set cs_i_j_skew = ...
-  set cs_i_j_end = ...
-
-Parameter names are alphanumeric/underscore so the old parser will classify
-them under the `cs` group.
 """
 from __future__ import annotations
 
 from typing import Union, Sequence, Optional
 import os
+import re
 
 from .read_bias_coeff import parse_old  # kept for tests/debug
 
@@ -146,7 +138,6 @@ def create_variables_py_from_template(template_path: str, out_path: str, minimiz
     found, the template is copied verbatim with a appended 'minimizeflag'
     assignment.
     """
-    import re
 
     if not os.path.exists(template_path):
         raise FileNotFoundError(template_path)
@@ -167,3 +158,152 @@ def create_variables_py_from_template(template_path: str, out_path: str, minimiz
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as fh:
         fh.write(new_content)
+
+
+def write_variables_py_from_inp(inp_path: str, out_path: str):
+    """Convert an old-style `.inp` variables file into a `variables.py`-style
+    file containing scalar entries that `parse_new` can read.
+
+    This is a simple translator used for tests and for creating variables.py
+    files from ALF/ALF-generated `.inp` outputs. It reads the `.inp` using the
+    existing `parse_old` helper and writes out a small Python file containing
+    scalar lines of the form `param: value` (one per line). A minimal
+    `bias_string` is included to be compatible with existing templates.
+    """
+    if not os.path.exists(inp_path):
+        raise FileNotFoundError(inp_path)
+
+    data = parse_old(inp_path)
+
+    # Prepare header (imports + empty bias_string to mimic variablesNN.py layout)
+    # Header: imports only; bias_string block will be inserted below
+    header = "import yaml\nimport numpy as np\n\n"
+
+    lines = [header]
+
+    # Build bias_string matrices (b, c, x, s) in YAML list-of-lists format.
+    # Map: lams -> b, cs -> c, xs -> x, ss -> s
+    def _extract_site_sub_map(group_keys):
+        """Return dict site -> dict(sub -> value) parsed from parameter keys like lams1s2 or cs1s1s1s2."""
+        site_map = {}
+        for k, v in group_keys.items():
+            nums = re.findall(r"(\d+)", k)
+            if not nums:
+                continue
+            # For lams: pattern lams{site}s{sub} -> nums [site, sub]
+            # For cs/xs/ss: pattern grp{site}s{a}s{site}s{b} or similar -> take primary site from first number
+            if k.startswith('lams') and len(nums) >= 2:
+                site = int(nums[0])
+                sub = int(nums[1])
+            else:
+                # for cs/xs/ss pick primary site as first number and sub index as second when possible
+                site = int(nums[0])
+                sub = int(nums[1]) if len(nums) >= 2 else 1
+            site_map.setdefault(site, {})[sub] = float(v)
+        return site_map
+
+    lams_map = _extract_site_sub_map(data.get('lams', {}))
+    cs_map = _extract_site_sub_map(data.get('cs', {}))
+    xs_map = _extract_site_sub_map(data.get('xs', {}))
+    ss_map = _extract_site_sub_map(data.get('ss', {}))
+
+    # determine list of sites and per-site counts
+    sites = sorted(set(lams_map.keys()) | set(cs_map.keys()) | set(xs_map.keys()) | set(ss_map.keys()))
+    per_site_counts = {}
+    for s in sites:
+        count = max(
+            max(lams_map.get(s, {}).keys()) if lams_map.get(s) else 0,
+            max(cs_map.get(s, {}).keys()) if cs_map.get(s) else 0,
+            max(xs_map.get(s, {}).keys()) if xs_map.get(s) else 0,
+            max(ss_map.get(s, {}).keys()) if ss_map.get(s) else 0,
+        )
+        per_site_counts[s] = count
+
+    # create flattened global ordering of substituents across sites
+    global_index = {}
+    idx = 1
+    for s in sites:
+        for sub in range(1, per_site_counts[s] + 1):
+            global_index[(s, sub)] = idx
+            idx += 1
+    total_subs = idx - 1
+
+    # build b vector (flattened lams in global order)
+    b_vec = [0.0] * total_subs
+    for (s, sub), g in global_index.items():
+        b_vec[g - 1] = float(lams_map.get(s, {}).get(sub, 0.0))
+
+    # helper to initialize NxN matrix and fill from group dict by parsing keys
+    def build_matrix_from_group(group_dict):
+        mat = [[0.0 for _ in range(total_subs)] for _ in range(total_subs)]
+        for k, v in group_dict.items():
+            nums = re.findall(r"(\d+)", k)
+            if len(nums) >= 4:
+                s1 = int(nums[0]); a = int(nums[1]); s2 = int(nums[2]); b = int(nums[3])
+                i = global_index.get((s1, a))
+                j = global_index.get((s2, b))
+                if i is not None and j is not None:
+                    mat[i - 1][j - 1] = float(v)
+            elif len(nums) >= 2:
+                # fallback: treat as site/sub -> value mapping (diagonal)
+                s1 = int(nums[0]); a = int(nums[1])
+                i = global_index.get((s1, a))
+                if i is not None:
+                    mat[i - 1][i - 1] = float(v)
+        return mat
+
+    c_mat = build_matrix_from_group(data.get('cs', {}))
+    x_mat = build_matrix_from_group(data.get('xs', {}))
+    s_mat = build_matrix_from_group(data.get('ss', {}))
+
+    # Compose bias_string block with b (single row) and full NxN matrices for c/x/s
+    bias_lines = ["bias_string=\"\"\"\n"]
+    # b: single row
+    bias_lines.append("b:\n")
+    if total_subs > 0:
+        bias_lines.append(f"- - {b_vec[0]}\n")
+        for v in b_vec[1:]:
+            bias_lines.append(f"  - {v}\n")
+    else:
+        bias_lines.append("- - 0.0\n")
+
+    def _mat_to_lines(mat):
+        out = []
+        for row in mat:
+            out.append(f"- - {row[0]}\n")
+            for val in row[1:]:
+                out.append(f"  - {val}\n")
+        return out
+
+    bias_lines.append("c:\n")
+    bias_lines.extend(_mat_to_lines(c_mat))
+    bias_lines.append("x:\n")
+    bias_lines.extend(_mat_to_lines(x_mat))
+    bias_lines.append("s:\n")
+    bias_lines.extend(_mat_to_lines(s_mat))
+
+
+    # include textual scalar entries inside the bias_string (single copy)
+    for group in ('lams', 'cs', 'xs', 'ss'):
+        grp = data.get(group, {})
+        if grp:
+            for k in sorted(grp.keys()):
+                # write as YAML scalar entries inside the bias_string block
+                bias_lines.append(f"{k}: {repr(float(grp[k]))}\n")
+
+    # close bias_string block
+    bias_lines.append('\"\"\"\n\n')
+
+    # write header + bias_string
+    lines = [header] + bias_lines
+
+    # (scalars are included inside the bias_string above; do not duplicate them here)
+
+    # Ensure output directory exists
+    out_dir = os.path.dirname(os.path.abspath(out_path)) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+
+    with open(out_path, 'w', encoding='utf-8') as fh:
+        fh.writelines(lines)
+
+    return out_path

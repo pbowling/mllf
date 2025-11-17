@@ -1,6 +1,8 @@
 import os
+import yaml
+import numpy as np
 from mllf.rl.graph import Graph
-from mllf.file_handling.write_bias_coeff import write_bias_inp_from_graph
+from mllf.file_handling.write_bias_coeff import write_bias_inp_from_graph, write_variables_py_from_inp
 
 
 def _read_set_names(path):
@@ -40,3 +42,45 @@ def test_write_matches_example(tmp_path):
 
     # assert generated parameter names equal the example's parameter names
     assert gen_names == ex_names
+
+
+def test_variables_py_contains_bias(tmp_path):
+    """Generate a variables.py from an .inp and assert:
+
+    - a triple-quoted `bias_string` exists
+    - the YAML inside contains keys 'b','c','x','s'
+    - b flattens to the same length as the c/x/s matrices
+    - no textual scalar lines (lams/cs/xs/ss) appear after the closing triple quotes
+    """
+
+    inp = os.path.join('examples', 'cb', 'variables85.inp')
+    out = tmp_path / "variables.py"
+    write_variables_py_from_inp(inp, str(out))
+
+    s = out.read_text(encoding='utf-8')
+    assert 'bias_string="""' in s
+
+    start = s.find('bias_string="""') + len('bias_string="""')
+    end = s.find('"""', start)
+    assert end != -1, "closing triple quotes for bias_string not found"
+
+    bias_text = s[start:end]
+    bias = yaml.load(bias_text, Loader=yaml.Loader)
+
+    # ensure required keys exist
+    for key in ('b', 'c', 'x', 's'):
+        assert key in bias
+
+    # flatten b and compare with c matrix shape
+    flat_b = []
+    for row in bias.get('b', []):
+        flat_b.extend(row if isinstance(row, list) else [row])
+
+    c = np.array(bias.get('c', []))
+    assert c.ndim == 2 and c.shape[0] == c.shape[1]
+    assert len(flat_b) == c.shape[0]
+
+    # ensure no duplicate scalar lines after the bias_string closing quotes
+    after = s[end + 3 :]
+    dup_lines = [ln for ln in after.splitlines() if ln.strip().startswith(('lams', 'cs', 'xs', 'ss'))]
+    assert dup_lines == []
