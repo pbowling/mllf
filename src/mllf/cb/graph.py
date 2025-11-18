@@ -1,4 +1,4 @@
-"""Graph structure for contextual bandit (copied from rl.graph).
+"""Graph structure for contextual bandit.
 
 Placed here so CB code can evolve independently while keeping the same
 interface (Graph, EdgeCoeffs) used by the tests and helpers.
