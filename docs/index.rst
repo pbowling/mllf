@@ -38,10 +38,13 @@ Contents (top-level)
 --------------------
 
 .. toctree::
-   :maxdepth: 1
+   :maxdepth: 2
+   :caption: Contents:
 
    background
    installation
+   workflow
+   cb_setup
    mlp_model
    examples
    references

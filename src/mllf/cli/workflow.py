@@ -1,9 +1,13 @@
 """High-level workflow utilities for preparing combos, training and running sims.
 
-This module centralizes common steps used by the example orchestration so
-other scripts can call a simple YAML/JSON-driven CLI to create combos,
-split manifests, run a quick training epoch, run simulations (concurrently)
-and compress completed runs.
+This module centralizes common steps used for contextual bandit training workflows:
+  1. Generate combination directories from site/sub fragment files
+  2. Split manifests into train/validation sets
+  3. Build PyG graphs from RTF fragments or variables.py files
+  4. Run quick training epochs for testing
+  5. Execute simulations concurrently with Slurm support
+  6. Archive completed runs
+
 """
 from __future__ import annotations
 
@@ -27,8 +31,18 @@ from mllf.cli.sim import run_simulation_batch, parse_simulation_results
 
 
 def load_bias_from_variables(py_path: str) -> Dict[str, Any]:
+    """Load the YAML bias mapping embedded inside a `variables.py` file.
+
+    Args:
+        py_path: Path to a `variables.py` file containing a triple-quoted
+                 `bias_string` variable with YAML content.
+
+    Returns:
+        Dict parsed from the `bias_string` YAML block with keys 'b', 'c', 'x', 's',
+        or {} if the bias_string is not found or cannot be parsed.
+    """
     text = Path(py_path).read_text(encoding='utf-8')
-    m = __import__('re').search(r"bias_string\s*=\s*(?:\"\"\"|''')([\s\S]*?)(?:\"\"\"|''')", text, __import__('re').S)
+    m = __import__('re').search(r"bias_string\s*=\s*(?:\"\"\"|'''')([\s\S]*?)(?:\"\"\"|'''')", text, __import__('re').S)
     if not m:
         return {}
     try:
@@ -38,6 +52,24 @@ def load_bias_from_variables(py_path: str) -> Dict[str, Any]:
 
 
 def graph_from_bias(bias: Dict[str, Any]) -> Graph:
+    """Build an mllf Graph from a bias dict.
+
+    The returned Graph will have explicit EdgeCoeffs only for pairs where the
+    input bias matrices contain non-zero values. This allows the graph structure
+    to be determined by existing bias values while leaving coefficient predictions
+    to the policy/MLP.
+
+    Args:
+        bias: Dict with keys:
+              - 'b': per-node linear biases (flat list or NxN matrix)
+              - 'c': NxN quadratic bias matrix
+              - 'x': NxN skew bias matrix
+              - 's': NxN end bias matrix
+
+    Returns:
+        Graph instance sized by the length of 'b' (or 1 if missing).
+        Edges are only created for node pairs with non-zero c/x/s values.
+    """
     b = bias.get('b', [])
     if isinstance(b, list) and b and isinstance(b[0], list):
         flat_b = [float(x) for row in b for x in row]
@@ -72,6 +104,31 @@ def graph_from_bias(bias: Dict[str, Any]) -> Graph:
 
 
 def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadratic', verify_graph: bool = False):
+    """Build PyG Data object and per-edge targets from a combo directory.
+
+    This function prefers RTF fragments when available (Graph.from_rtf_results).
+    If no RTF fragments are found, it falls back to reading variables.py and
+    constructing a Graph from the embedded YAML bias_string.
+
+    Args:
+        combo_dir: Path to a combo directory containing either RTF fragments
+                   (site*_sub*_*_pres.rtf files) or a variables.py file.
+        base_bias: Legacy parameter (currently unused, kept for compatibility).
+        verify_graph: If True, verify that PyG edge expansion matches Graph.edge_mask.
+                      Useful for debugging but adds runtime overhead.
+
+    Returns:
+        Tuple of (data, targets, extras) where:
+        - data: PyG Data object with node features, edge_index, edge_type, edge_attr
+        - targets: List of per-directed-edge multi-dimensional target vectors
+                   (one D-length vector per directed edge in data.edge_index)
+        - extras: Dict with 'relation_names' (list of relation names) and
+                  'base_relation_map' (dict mapping base -> (fwd_name, bwd_name))
+
+    Raises:
+        FileNotFoundError: If neither RTF fragments nor variables.py are present.
+        RuntimeError: If verify_graph=True and graph verification fails.
+    """
     bias: Dict[str, Any] = {}
     rtf_results = parse_rtf_dir(combo_dir)
     if rtf_results:
@@ -181,6 +238,29 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
 
 
 def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: torch.Tensor, out_name: str = 'variables.py') -> None:
+    """Write a variables.py file from per-directed-edge policy actions.
+
+    This function maps directed relation actions back to base biases (quadratic, skew,
+    end, linear) using a canonical forward-only representation. For each undirected
+    pair (i,j), we store a single forward value and set the backward value as its
+    negative (AB = v, BA = -v) to maintain antisymmetry. Per-edge linear values are
+    aggregated into per-node 'b' by averaging incident edges.
+
+    Args:
+        combo_dir: Path to combo directory where variables.py will be written.
+        data: PyG Data object with edge_index and edge_type (from build_data_and_targets_from_combo).
+        extras: Dict with 'relation_names' and 'base_relation_map' (from build_data_and_targets_from_combo).
+        actions: Tensor of per-directed-edge scalar actions (shape [E] where E = data.edge_index.shape[1]).
+                 Each action corresponds to one directed edge in data.edge_index.
+        out_name: Name of output file (default: 'variables.py').
+
+    Returns:
+        None. Writes a Python file containing a triple-quoted YAML bias_string with keys:
+        - 'b': per-node linear bias vector (length N)
+        - 'c': NxN antisymmetric quadratic bias matrix
+        - 'x': NxN antisymmetric skew bias matrix
+        - 's': NxN antisymmetric end bias matrix
+    """
     combo_dir = Path(combo_dir)
     N = int(data.x.shape[0])
     base_map = extras.get('base_relation_map', {})
@@ -201,10 +281,11 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             rel_to_base[fwd] = base
             rel_to_base[bwd] = base
 
-    # collect per-undirected-pair forward-only values. For each directed edge
+    # Collect per-undirected-pair forward-only values. For each directed edge,
     # the canonical forward relation (e.g. 'quadratic_fwd') is the source of
-    # truth for the undirected pair. If only the backward relation is present
+    # truth for the undirected pair. If only the backward relation is present,
     # we invert its sign to produce the forward value (forward = -backward).
+    # This ensures each undirected pair (i,j) has exactly one canonical value.
     per_base_forward = {name: {} for name in base_order}
     ei = data.edge_index
     et = data.edge_type
@@ -219,8 +300,11 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         if base is None:
             continue
         fwd_name, bwd_name = base_map.get(base, (f"{base}_fwd", f"{base}_bwd"))
+        # Canonical pair: always (min, max) for consistency
         pair = (min(src, dst), max(src, dst))
-        # extract scalar value from action tensor/array
+        
+        # Extract scalar value from action tensor/array
+        # (handles both scalar tensors and vector tensors with single element)
         try:
             a = actions[k]
             if hasattr(a, 'dim') and a.dim() == 0:
@@ -234,12 +318,15 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             except Exception:
                 val = 0.0
 
+        # Store forward value if this is the forward relation and we haven't seen this pair yet
         if rel_name == fwd_name and (pair not in per_base_forward[base]):
             per_base_forward[base][pair] = val
+        # If only backward exists, store its negative as the canonical forward value
         elif rel_name == bwd_name and (pair not in per_base_forward[base]):
             per_base_forward[base][pair] = -val
 
-    # assemble antisymmetric matrices (AB = v, BA = -v)
+    # Assemble antisymmetric matrices (AB = v, BA = -v)
+    # This maintains the physical constraint that bias interactions are directional
     def build_mat_for(base_name: str):
         mat = [[0.0 for _ in range(N)] for _ in range(N)]
         vals_map = per_base_forward.get(base_name, {})
@@ -248,6 +335,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 v = float(val)
             except Exception:
                 v = 0.0
+            # Set forward (i,j) to value and backward (j,i) to negative
             mat[i][j] = v
             mat[j][i] = -v
         return mat
@@ -256,12 +344,15 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     x_mat = build_mat_for('skew')
     s_mat = build_mat_for('end')
 
-    # derive per-node linear b from per-edge linear forward values (average incident edges)
+    # Derive per-node linear bias 'b' from per-edge linear values
+    # Strategy: average the linear values of all incident edges for each node
+    # This converts edge-level predictions into the node-level 'b' vector expected by the simulator
     b_vec = [0.0 for _ in range(N)]
     linear_vals = per_base_forward.get('linear', {})
     if linear_vals:
         sums = [0.0 for _ in range(N)]
         counts = [0 for _ in range(N)]
+        # Accumulate contributions from each edge to both its endpoints
         for (i, j), val in linear_vals.items():
             try:
                 avg = float(val)
@@ -271,6 +362,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             sums[j] += avg
             counts[i] += 1
             counts[j] += 1
+        # Average the accumulated values
         for idx in range(N):
             if counts[idx] > 0:
                 b_vec[idx] = sums[idx] / counts[idx]
@@ -293,6 +385,19 @@ bias_string = '''\
 
 
 def default_env_reward(actions: torch.Tensor, target_vals: List[float]) -> float:
+    """Compute reward as negative MSE between actions and target values.
+
+    This is a simple supervised-style reward used as a fallback when simulation
+    results are not available or fail. Real training typically uses simulation
+    outputs (transition counts, population metrics) for reward.
+
+    Args:
+        actions: Tensor of predicted actions (typically per-edge coefficients).
+        target_vals: List of target values (same length as actions).
+
+    Returns:
+        Scalar reward: -MSE(actions, targets). Returns -inf on error.
+    """
     try:
         targ = torch.tensor(target_vals, dtype=actions.dtype, device=actions.device)
         mse = torch.mean((actions - targ) ** 2).item()
@@ -302,6 +407,21 @@ def default_env_reward(actions: torch.Tensor, target_vals: List[float]) -> float
 
 
 def create_and_manifest(input_dir: str, out_dir: str, dry_run: bool = False) -> str:
+    """Generate combination directories and create a manifest file.
+
+    This function scans input_dir for site/sub files (e.g., site1_sub2_*_pres.rtf),
+    generates all valid combinations (respecting the constraint that combinations
+    differing only in tail permutations are treated as duplicates), and creates
+    a manifest listing all generated combo directories.
+
+    Args:
+        input_dir: Directory containing site{n}_sub{m}_*_{pres|frag}.{rtf|pdb} files.
+        out_dir: Output directory where combo subdirectories will be created.
+        dry_run: If True, print actions without creating directories or copying files.
+
+    Returns:
+        Path to the generated manifest.txt file (one combo directory path per line).
+    """
     created = create_combination_dirs(Path(input_dir), Path(out_dir), dry_run=dry_run)
     manifest_path = Path(out_dir) / 'manifest.txt'
     with manifest_path.open('w') as fh:
@@ -311,6 +431,17 @@ def create_and_manifest(input_dir: str, out_dir: str, dry_run: bool = False) -> 
 
 
 def split_manifest(manifest: str, train_frac: float = 0.8, seed: int = 0) -> Tuple[str, str]:
+    """Split a manifest file into training and validation sets.
+
+    Args:
+        manifest: Path to manifest.txt file listing combo directories (one per line).
+        train_frac: Fraction of combos to use for training (default: 0.8 = 80%).
+        seed: Random seed for shuffling (default: 0 for reproducibility).
+
+    Returns:
+        Tuple of (train_manifest_path, val_manifest_path).
+        Creates manifest.train.txt and manifest.val.txt in the same directory as manifest.
+    """
     with open(manifest, 'r', encoding='utf-8') as fh:
         combos = [ln.strip() for ln in fh if ln.strip()]
     random.Random(seed).shuffle(combos)
@@ -325,6 +456,20 @@ def split_manifest(manifest: str, train_frac: float = 0.8, seed: int = 0) -> Tup
 
 
 def run_quick_epoch_for_combo(combo_dir: str, base_bias: str = 'quadratic') -> Dict[str, Any]:
+    """Run a single training epoch for demonstration/testing purposes.
+
+    This function builds a small RGCN encoder and EdgePolicy, performs one forward
+    pass with action sampling, computes a supervised reward (negative MSE vs targets),
+    and updates the policy with REINFORCE. It's intended for quick validation and
+    testing, not for full training runs.
+
+    Args:
+        combo_dir: Path to combo directory with RTF fragments or variables.py.
+        base_bias: Legacy parameter (currently unused, kept for compatibility).
+
+    Returns:
+        Dict with key 'reward' containing the scalar reward from the epoch.
+    """
     data, targets, extras = build_data_and_targets_from_combo(combo_dir, base_bias=base_bias)
     sample_data = data
     in_dim = sample_data.x.shape[1]
@@ -348,11 +493,17 @@ def run_quick_epoch_for_combo(combo_dir: str, base_bias: str = 'quadratic') -> D
     return {'reward': float(reward)}
 
 
-def run_simulations_and_collect(manifest: str, sim_cmd: Optional[str] = None, max_workers: int = 4, timeout: Optional[int] = None) -> Dict[str, Any]:
-    return run_simulation_batch(manifest, sim_cmd=sim_cmd, max_workers=max_workers, timeout=timeout)
-
-
 def compress_runs(manifest: str, out_tar: str) -> str:
+    """Create a gzipped tar archive of the directory containing combo runs.
+
+    Args:
+        manifest: Path to manifest file. The parent directory of this file will be archived.
+        out_tar: Desired output archive path (e.g., 'combos_archive'). The '.tar.gz'
+                 extension will be added automatically if not present.
+
+    Returns:
+        Path to the created .tar.gz archive file.
+    """
     base = Path(manifest).parent
     tar = Path(out_tar)
     # make a tar.gz of the directory containing combos
@@ -361,6 +512,46 @@ def compress_runs(manifest: str, out_tar: str) -> str:
 
 
 def run_from_config(config_path: str) -> Dict[str, Any]:
+    """Execute a complete workflow based on a YAML configuration file.
+
+    This is the main entry point for running the full pipeline: combo generation,
+    train/val split, quick epoch demo, concurrent simulations, and archiving.
+
+    YAML Configuration Options:
+        create_combos:          # (optional) Generate combo directories
+          input_dir: str        # Directory with site_sub files
+          out_dir: str          # Output directory for combos
+          dry_run: bool         # If true, print actions without creating files
+        
+        manifest: str           # (alternative to create_combos) Path to existing manifest
+        
+        split:                  # (optional) Split manifest into train/val
+          train_frac: float     # Fraction for training (e.g., 0.8)
+          seed: int             # Random seed for reproducibility
+        
+        base_bias: str          # Legacy parameter (currently unused)
+        
+        run_sims: bool          # If true, run simulations concurrently
+        sim_cmd: str            # Shell command to run in each combo (default: './run.sh')
+        max_workers: int        # Max concurrent simulations (default: 4)
+        timeout: int            # Per-simulation timeout in seconds (optional)
+        
+        compress_after:         # (optional) Create archive after completion
+          out_tar: str          # Output archive path
+
+    Args:
+        config_path: Path to YAML configuration file.
+
+    Returns:
+        Dict with keys:
+        - 'manifest': Path to manifest file
+        - 'train_manifest': Path to train manifest (if split requested)
+        - 'val_manifest': Path to val manifest (if split requested)
+        - 'example_combo': Path to first combo (used for quick epoch)
+        - 'quick_epoch': Dict with 'reward' from quick training pass
+        - 'sim_results': Dict with simulation results (if run_sims=True)
+        - 'archive': Path to created archive (if compress_after specified)
+    """
     cfg = yaml.safe_load(Path(config_path).read_text(encoding='utf-8'))
     results: Dict[str, Any] = {}
     # Step 1: create combos
@@ -393,7 +584,7 @@ def run_from_config(config_path: str) -> Dict[str, Any]:
         sim_cmd = cfg.get('sim_cmd')
         max_workers = cfg.get('max_workers', 4)
         timeout = cfg.get('timeout')
-        sim_results = run_simulations_and_collect(manifest, sim_cmd=sim_cmd, max_workers=max_workers, timeout=timeout)
+        sim_results = run_simulation_batch(manifest, sim_cmd=sim_cmd, max_workers=max_workers, timeout=timeout)
         results['sim_results'] = sim_results
 
     # Step 6: compress if requested
@@ -405,9 +596,16 @@ def run_from_config(config_path: str) -> Dict[str, Any]:
 
 
 if __name__ == '__main__':
+    # Command-line interface: run the full workflow from a YAML config file
+    # Usage: python -m mllf.cli.workflow config.yaml
+    # Or: python src/mllf/cli/workflow.py config.yaml
     import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument('config', help='YAML config describing workflow')
+    p = argparse.ArgumentParser(
+        description='Run contextual bandit workflow from YAML config',
+        epilog='Example: python -m mllf.cli.workflow examples/workflow_sample.yaml'
+    )
+    p.add_argument('config', help='Path to YAML config file describing workflow steps')
     args = p.parse_args()
     out = run_from_config(args.config)
+    # Print results as YAML for easy inspection
     print(yaml.safe_dump(out, sort_keys=False))

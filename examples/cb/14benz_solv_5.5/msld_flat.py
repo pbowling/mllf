@@ -7,6 +7,7 @@
 import os
 import numpy as np
 import argparse
+import yaml
 
 ##############################################
 # Load pyCHARMM libraries
@@ -32,21 +33,22 @@ import pycharmm.shake as shake
 import pycharmm.scalar as scalar
 from pycharmm.lib import charmm as libcharmm
 
-##############################################
-
-info={}
-info['name']='14benz'
-info['nsubs']=[5,6]
-info['nblocks']=np.sum(info['nsubs'])
-info['ncentral']=0
-info['nreps']=1
-info['nnodes']=1
-info['enginepath']=os.environ['CHARMMEXEC']
-info['temp']=298.15
-
 
 ##############################################
 # Set up global parameters
+
+# Load info dictionary from info.py
+import sys
+if os.path.exists('info.py'):
+    sys.path.insert(0, os.path.dirname(os.path.abspath('info.py')))
+    from info import info
+else:
+    # Initialize default info if file not found
+    info = {}
+    info['name'] = '14benz'
+    info['nsubs'] = [5, 6]
+    info['temp'] = 298.15
+    info['nblocks'] = np.sum(info['nsubs'])
 
 # variables
 box = 32.964000
@@ -123,21 +125,50 @@ def _load_variables_module():
         raise FileNotFoundError('No variables file found (check --vars-file, MSLD_VARS_FILE, or current directory)')
 
     # execute the variables file in an isolated namespace and merge results
-    vns = {}
+    vns = {'np': np, 'yaml': yaml}
     with open(vars_path, 'r') as vf:
         code = vf.read()
     exec(compile(code, vars_path, 'exec'), vns)
 
+    # Extract bias from bias_string if present
+    if 'bias_string' in vns:
+        try:
+            bias_dict = yaml.safe_load(vns['bias_string'])
+            # Convert to numpy arrays and ensure proper format
+            bias = {}
+            bias['b'] = np.array(bias_dict.get('b', []), dtype=float)
+            bias['c'] = np.array(bias_dict.get('c', []), dtype=float)
+            bias['x'] = np.array(bias_dict.get('x', []), dtype=float)
+            bias['s'] = np.array(bias_dict.get('s', []), dtype=float)
+            globals()['bias'] = bias
+        except Exception as e:
+            print(f"Warning: Could not parse bias_string from {vars_path}: {e}")
+            # Initialize empty bias structure
+            nsubs_total = np.sum(info['nsubs'])
+            globals()['bias'] = {
+                'b': np.zeros((1, nsubs_total), dtype=float),
+                'c': np.zeros((nsubs_total, nsubs_total), dtype=float),
+                'x': np.zeros((nsubs_total, nsubs_total), dtype=float),
+                's': np.zeros((nsubs_total, nsubs_total), dtype=float)
+            }
+    elif 'bias' in vns:
+        globals()['bias'] = vns['bias']
+    else:
+        # Initialize empty bias structure if not found
+        nsubs_total = np.sum(info['nsubs'])
+        globals()['bias'] = {
+            'b': np.zeros((1, nsubs_total), dtype=float),
+            'c': np.zeros((nsubs_total, nsubs_total), dtype=float),
+            'x': np.zeros((nsubs_total, nsubs_total), dtype=float),
+            's': np.zeros((nsubs_total, nsubs_total), dtype=float)
+        }
+
     # merge commonly expected names into this module's globals
-    merges = ['info', 'temp', 'box', 'pmegrid', 'fnex', 'nsubs', 'nsites', 'nblocks', 'ncentral',
-              'nreps', 'nnodes', 'bias', 'name', 'minimizeflag', 'nsavc', 'nsteps', 'esteps']
+    merges = ['temp', 'box', 'pmegrid', 'fnex', 'nsubs', 'nsites', 'nblocks', 'ncentral',
+              'nreps', 'nnodes', 'name', 'minimizeflag', 'nsavc', 'nsteps', 'esteps']
     for name in merges:
         if name in vns:
             globals()[name] = vns[name]
-
-    # also merge any dict named 'info' entries into local info (if present)
-    if 'info' in vns and isinstance(vns['info'], dict):
-        info.update(vns['info'])
 
     # expose chosen out-dir to module globals so the rest of the script can
     # place res/, dcd/, and other output folders under that location
@@ -146,9 +177,24 @@ def _load_variables_module():
     return vars_path
 
 
+# Initialize default values before loading variables
+if 'minimizeflag' not in globals():
+    minimizeflag = True
+
 # perform the load (this may inspect CLI args or env vars)
 _vars_file_used = _load_variables_module()
 print(f"Loaded variables from {_vars_file_used}")
+
+# Ensure bias is initialized after loading
+if 'bias' not in globals():
+    nsubs_total = np.sum(info['nsubs'])
+    bias = {
+        'b': np.zeros((1, nsubs_total), dtype=float),
+        'c': np.zeros((nsubs_total, nsubs_total), dtype=float),
+        'x': np.zeros((nsubs_total, nsubs_total), dtype=float),
+        's': np.zeros((nsubs_total, nsubs_total), dtype=float)
+    }
+    print("Warning: No bias found in variables file, initialized with zeros")
 
 ##############################################
 # Read in toppar files, coordinate files, etc.

@@ -1,36 +1,49 @@
 """Generate all combinations of site/sub files into separate directories.
 
-This utility scans an input directory for files named like
-`site{site}_sub{sub}.{ext}` (for example `site1_sub2.rtf`, `site1_sub2.pdb`)
-and then creates a set of output subdirectories, one per combination of
-site selections. For each combination it copies the relevant files into the
-directory and renames the files so that sub-indices start at 1 for each site
-within the new directory.
+This utility scans an input directory for files matching the pattern
+`site{site}_sub{sub}_{label}.{ext}` (e.g., `site1_sub2_pres.rtf`, `site1_sub2_frag.pdb`)
+and creates output subdirectories, one per combination. For each combination, it copies
+the relevant files, renaming them so sub-indices start at 1 within the new directory.
+
+Each generated combination directory contains:
+- Renamed RTF/PDB files with updated sub-indices
+- `mapping.json`: Records original file paths and new names
+- `info.py`: Configuration dict with nsubs, nblocks, temp, etc.
+- `run.sh`: Executable SLURM submission script for running simulations
 
 Example:
   input_dir/
-    site1_sub1.rtf
-    site1_sub2.rtf
-    site2_sub1.rtf
+    site1_sub1_pres.rtf
+    site1_sub1_frag.pdb
+    site1_sub2_pres.rtf
+    site1_sub2_frag.pdb
+    site1_sub3_pres.rtf
+    site1_sub3_frag.pdb
 
 Running:
   python -m mllf.file_handling.generate_combinations input_dir --out combos_out
 
 Will produce directories like:
-  combos_out/comb_0001_site1_1/  (site1_sub1)
-  combos_out/comb_0002_site1_2/  (site1_sub2)
-  combos_out/comb_0003_site2_1/  (site2_sub1)
-  combos_out/comb_0004_site1_1__site2_1/  (site1_sub1 + site2_sub1)
+  combos_out/comb_0001_site1_1__site1_2/
+    ├── site1_sub1_pres.rtf      (renamed from site1_sub1_pres.rtf)
+    ├── site1_sub1_frag.pdb
+    ├── site1_sub2_pres.rtf      (renamed from site1_sub2_pres.rtf)
+    ├── site1_sub2_frag.pdb
+    ├── mapping.json
+    ├── info.py
+    └── run.sh
 
-Each combination dir contains the renamed files and a `mapping.json` which
-records original file paths and their new names inside the combo dir.
+Combination Generation Logic:
+- Generates within-site combinations of size >= 2 (pairs, triplets, etc.)
+- First substituent is fixed as anchor; remaining form unordered sets
+- Example: [1,2,3] and [1,3,2] are considered identical (same tail)
+- But [2,1,3] is different (different anchor)
+- This reduces combinatorial explosion while maintaining diversity
 
-Notes / assumptions:
-- This implementation generates all non-empty subsets of sites, and for each
-  chosen subset enumerates the Cartesian product of subs at those sites.
-  This produces single-site and multi-site combos.
-- If you need multi-substituent-per-site combinations (e.g. pairs within the
-  same site) we can extend the script; tell me and I'll add that mode.
+Additional Features:
+- RTF PRES tokens are automatically renumbered to match new indices
+- Include patterns allow copying extra files (e.g., prep/, msld_flat.py)
+- Archive mode creates .tar.gz files for storage
 """
 from __future__ import annotations
 
@@ -48,9 +61,16 @@ SITE_SUB_RE = re.compile(r"site(\d+)_sub(\d+)_([A-Za-z0-9_-]+)\.([A-Za-z0-9]+)$"
 
 
 def find_site_sub_files(input_dir: Path) -> Dict[int, Dict[int, Dict[Tuple[str, str], Path]]]:
-    """Scan input_dir and return mapping: site -> sub -> {ext: Path}.
+    """Scan input_dir and return mapping: site -> sub -> {(label, ext): Path}.
 
-    Only files matching the pattern `site{site}_sub{sub}.{ext}` are considered.
+    Only files matching the pattern `site{site}_sub{sub}_{label}.{ext}` are considered.
+    For example: site1_sub2_pres.rtf, site1_sub2_frag.pdb
+
+    Args:
+        input_dir: Directory containing site/sub files.
+
+    Returns:
+        Nested dict mapping site ID -> sub ID -> (label, ext) -> file path.
     """
     found: Dict[int, Dict[int, Dict[str, Path]]] = {}
     for p in input_dir.iterdir():
@@ -70,16 +90,24 @@ def find_site_sub_files(input_dir: Path) -> Dict[int, Dict[int, Dict[Tuple[str, 
 
 
 def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> List[Tuple[List[int], List[int]]]:
-    """Return list of within-site combinations.
+    """Generate all within-site combinations with fixed-anchor constraint.
 
-    For each site independently, enumerate all non-empty subsets of its
-    substituents of size >= 2 (pairs, triplets, ...). Each returned entry is
-    a tuple (sites_list, subs_list) where sites_list contains a single site
-    id and subs_list contains the selected sub indices for that site.
-    
-    The first substituent is considered a fixed "anchor" and the remaining
-    substituents are treated as an unordered set. For example, [1,2,3] and
-    [1,3,2] are considered the same combination, but [2,1,3] is different.
+    For each site independently, enumerate all subsets of substituents of size >= 2.
+    The first substituent serves as a fixed "anchor" and the remaining substituents
+    form an unordered set. This reduces redundancy while maintaining diversity.
+
+    Constraint examples:
+    - [1,2,3] and [1,3,2] are considered identical (same anchor 1, same tail {2,3})
+    - [2,1,3] is different (different anchor 2)
+    - [1,2], [1,3], [2,3] are all distinct combinations
+
+    Args:
+        found: Nested dict mapping site -> sub -> {(label, ext): Path}.
+
+    Returns:
+        List of (sites_list, subs_list) tuples where:
+        - sites_list: List containing single site ID (e.g., [1])
+        - subs_list: List of selected sub indices (e.g., [2, 3, 4])
     """
     combos = []
     # For each site, fix the first substituent and enumerate unordered
@@ -101,6 +129,16 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
 
 
 def make_combo_dir_name(counter: int, sites: List[int], subs: List[int]) -> str:
+    """Generate a directory name for a combination.
+
+    Args:
+        counter: Sequential combination number (for comb_NNNN prefix).
+        sites: List of site IDs in this combination.
+        subs: List of substituent IDs in this combination.
+
+    Returns:
+        Directory name like 'comb_0001_site1_2__site1_3__site1_4'.
+    """
     parts = []
     # If there is a single site with multiple selected subs, list each sub
     # for that site. If there are multiple sites and equal-length subs list,
@@ -128,6 +166,26 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int]) -> str:
 
 
 def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = False, include_patterns: List[str] | None = None) -> List[Path]:
+    """Create combination directories with renamed files and support files.
+
+    For each valid combination:
+    1. Create directory with name like 'comb_0001_site1_2__site1_3'
+    2. Copy and rename RTF/PDB files (sub indices start at 1)
+    3. Update PRES tokens in RTF files to match new indices
+    4. Generate mapping.json with file tracking info
+    5. Generate info.py with configuration dictionary
+    6. Generate run.sh executable script for job submission
+    7. Copy any additional files matching include_patterns
+
+    Args:
+        input_dir: Directory containing site{n}_sub{m}_{label}.{ext} files.
+        out_dir: Output directory where combination subdirs will be created.
+        dry_run: If True, print actions without creating files.
+        include_patterns: Glob patterns for extra files to copy (e.g., ['prep/*', '*.py']).
+
+    Returns:
+        List of created directory paths.
+    """
     found = find_site_sub_files(input_dir)
     if not found:
         raise RuntimeError(f"No site_sub files found in {input_dir}")
@@ -251,17 +309,70 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
             mapping_path = combo_path / 'mapping.json'
             with mapping_path.open('w') as fh:
                 json.dump({'combo': name, 'entries': mapping}, fh, indent=2)
+            
+            # write info.py file
+            info_path = combo_path / 'info.py'
+            # Count number of substituents per site for this combination
+            nsubs_per_site = []
+            for site in sorted(per_site_selected.keys()):
+                nsubs_per_site.append(len(per_site_selected[site]))
+            
+            # Generate info.py configuration file
+            info_content = f"""import numpy as np
+import os
+
+info = {{}}
+info['name'] = '{name}'
+info['nsubs'] = {nsubs_per_site}
+info['nblocks'] = np.sum(info['nsubs'])
+info['ncentral'] = 0
+info['nreps'] = 1
+info['nnodes'] = 1
+info['enginepath'] = os.environ.get('CHARMMEXEC', '')
+info['temp'] = 298.15
+"""
+            info_path.write_text(info_content)
+
+            # Generate run.sh submission script
+            run_sh_path = combo_path / 'run.sh'
+            run_sh_content = f"""#!/bin/bash
+#SBATCH --job-name={name}
+#SBATCH --output={name}.%j.out
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH -p gpu2080 --gres=gpu:1 
+#SBATCH --export=ALL
+#SBATCH --time=01:00:00
+
+module load charmm
+export CHARMMEXEC='/home/dave/bin/charmm_6123706'
+
+# Run msld_flat.py with variables.py from this directory
+python3 msld_flat.py --vars-file variables.py --out-dir . > output.out
+"""
+            run_sh_path.write_text(run_sh_content)
+            # Make run.sh executable
+            run_sh_path.chmod(0o755)
+
             created_dirs.append(combo_path)
 
     return created_dirs
 
 
 def archive_combo_dirs(out_dir: Path, pattern: str = 'comb_*', remove: bool = False):
-    """Archive all combo directories under out_dir matching pattern.
+    """Archive combination directories as .tar.gz files.
 
-    For each matching directory, create a gzipped tar archive
-    `{dir}.tar.gz` in the same parent directory. If `remove` is True,
-    the original directory will be removed after successful archiving.
+    For each matching directory, create a gzipped tar archive `{dir}.tar.gz`
+    in the same parent directory. Optionally removes original directories
+    after successful archiving to save disk space.
+
+    Args:
+        out_dir: Directory containing combination subdirectories.
+        pattern: Glob pattern for matching directories (default: 'comb_*').
+        remove: If True, remove original directories after archiving.
+
+    Returns:
+        List of created archive file paths.
     """
     from glob import glob
     matches = sorted(glob(str(out_dir / pattern)))

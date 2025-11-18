@@ -21,12 +21,12 @@ from pathlib import Path
 
 from mllf.file_handling.write_bias_coeff import create_variables_py_from_template
 from mllf.file_handling.read_rtf import parse_rtf_dir
-from mllf.rl.graph import Graph
+from mllf.cb.graph import Graph
 
 
 def main():
     repo_root = Path(__file__).resolve().parents[3]
-    example_dir = repo_root / 'examples' / 'rl' / '14benz_solv_5.5'
+    example_dir = repo_root / 'examples' / 'cb' / '14benz_solv_5.5'
     if not example_dir.is_dir():
         raise RuntimeError(f'Example directory not found: {example_dir}')
 
