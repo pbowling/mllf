@@ -1,7 +1,7 @@
 import os
 import yaml
 import numpy as np
-from mllf.rl.graph import Graph
+from mllf.cb.graph import Graph
 from mllf.file_handling.write_bias_coeff import write_bias_inp_from_graph, write_variables_py_from_inp
 
 
@@ -34,7 +34,7 @@ def test_write_matches_example(tmp_path):
 
     subs = [3, 4, 8, 8, 8]
     out = tmp_path / "generated.inp"
-    example = os.path.join('examples', 'rl', 'variables85.inp')
+    example = os.path.join('examples', 'cb', 'variables85.inp')
     # use the example file as the header source so non-bias lines are copied verbatim
     write_bias_inp_from_graph(g, str(out), sub_counts=subs, header_source=example)
     gen_names = set(_read_set_names(str(out)))

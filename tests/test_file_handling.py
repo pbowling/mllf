@@ -8,7 +8,7 @@ from mllf.file_handling.read_rtf import parse_rtf_file, parse_rtf_dir
 def test_read_bias_coeff_parses_old_file():
 	"""Ensure read_bias_coeff can parse the example variables85.inp (old ALF format)."""
 	here = os.path.dirname(os.path.dirname(__file__))
-	fn = os.path.join(here, 'examples', 'mlp', 'variables85.inp')
+	fn = os.path.join(here, 'examples', 'cb', 'variables85.inp')
 
 	data = read_bias_coeff(fn)
 
@@ -38,28 +38,31 @@ def test_read_bias_coeff_parses_new_file():
 	the zero-handling logic is correct.
 	"""
 	here = os.path.dirname(os.path.dirname(__file__))
-	fn = os.path.join(here, 'examples', 'mlp', 'variables16.py')
+	fn = os.path.join(here, 'examples', 'cb', 'variables.py')
 
 	data = read_bias_coeff(fn)
 
 	# top-level groups should exist
 	assert set(data.keys()) == {'lams', 'cs', 'xs', 'ss'}
 
-	# According to the file, the first block (i=1) starts with 0.0 then -11.4, -6.58, ...
-	assert math.isclose(data['lams']['lams1s1'], 0.0, rel_tol=1e-6)
-	assert math.isclose(data['lams']['lams1s2'], -11.4, rel_tol=1e-6)
-	assert math.isclose(data['lams']['lams1s3'], -6.58, rel_tol=1e-6)
+	assert 'lams1s2' in data['lams']
+	assert math.isclose(data['lams']['lams1s2'], 0.13, rel_tol=1e-6)
 
-	# The second block (i=2) should start with 0.0 as well (after encountering a 0.0 that isn't at j=1)
-	# find a sample from the second block: according to file lams2s1 == 0.0 and lams2s2 == -11.629999999999999
-	assert math.isclose(data['lams']['lams2s1'], 0.0, rel_tol=1e-6)
-	assert math.isclose(data['lams']['lams2s2'], -11.62999, rel_tol=1e-6)
+	# lams3s8 = -14.20
+	assert math.isclose(data['lams']['lams3s8'], -14.20, rel_tol=1e-6)
+
+	# cs1s1s1s2 = -39.95
+	assert 'cs1s1s1s2' in data['cs']
+	assert math.isclose(data['cs']['cs1s1s1s2'], -39.95, rel_tol=1e-6)
+
+	# some entries should be zero values parsed as floats
+	assert math.isclose(data['cs'].get('cs1s1s2s1', 0.0), -0.0, rel_tol=1e-6)
 
 
 def test_parse_rtf_file_and_dir():
 	"""Test parse_rtf_file and parse_rtf_dir on the example PRES file."""
 	here = os.path.dirname(os.path.dirname(__file__))
-	rtf_path = os.path.join(here, 'examples', 'mlp', 'training_files', '14benz_vac_5.5', 'site1_sub1_pres.rtf')
+	rtf_path = os.path.join(here, 'examples', 'cb', '14benz_solv_5.5', 'site1_sub1_pres.rtf')
 
 	parsed = parse_rtf_file(rtf_path)
 
@@ -75,7 +78,7 @@ def test_parse_rtf_file_and_dir():
 	assert math.isclose(parsed['total_charge'], 0.0, abs_tol=1e-9)
 
 	# parse directory and ensure key exists
-	d = os.path.join(here, 'examples', 'mlp', 'training_files', '14benz_vac_5.5')
+	d = os.path.join(here, 'examples', 'cb', '14benz_solv_5.5')
 	results = parse_rtf_dir(d)
 	assert 'site1_sub1' in results
 

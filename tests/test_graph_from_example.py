@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from mllf.file_handling.read_rtf import parse_rtf_dir
-from mllf.rl.graph import Graph
+from mllf.cb.graph import Graph
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -15,7 +15,7 @@ def _find_repo_root(start: Path) -> Path:
 
 def test_graph_construction_from_example():
     repo = _find_repo_root(Path(__file__))
-    examples_dir = repo / 'examples' / 'rl' / '14benz_solv_5.5'
+    examples_dir = repo / 'examples' / 'cb' / '14benz_solv_5.5'
     assert examples_dir.is_dir(), f"example dir not found: {examples_dir}"
 
     rtf_results = parse_rtf_dir(str(examples_dir))
