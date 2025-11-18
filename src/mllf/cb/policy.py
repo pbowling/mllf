@@ -1,8 +1,11 @@
 """Edge value policy built on top of a node encoder.
 
-Policy outputs a mean value per edge (continuous) and uses a global learnable
-log-std to create a Gaussian policy. It returns sampled actions and log
-probabilities for use with REINFORCE.
+For each directed edge this policy produces a vector of means and a vector
+of log-standard-deviations (one per predicted coefficient). The MLP outputs
+concatenated [mu_1,...,mu_D, logsigma_1,...,logsigma_D] which are split
+and used to parameterize a per-edge independent Gaussian distribution.
+The agent samples continuous actions v_ij ~ N(mu_ij, sigma_ij^2) for every
+directed edge and returns sampled values plus per-edge log-probabilities.
 """
 from typing import Optional
 
@@ -13,6 +16,11 @@ import torch.nn.functional as F
 
 class EdgeValueMLP(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 64, out_dim: int = 1):
+        """Simple MLP producing `out_dim` outputs per input.
+
+        Note: callers may request `out_dim = D*2` so the output can be split
+        into means and log-stds for D predicted coefficients.
+        """
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -30,9 +38,9 @@ class EdgePolicy(nn.Module):
         self.encoder = encoder
         # input to edge-mlp is concat([emb_u, emb_v, edge_feat])
         # mlp_out_dim controls how many coefficients per directed edge
-        self.edge_mlp = EdgeValueMLP(2 * emb_dim + edge_feat_dim, mlp_hidden, mlp_out_dim)
-        # global learnable log std (scalar) applied to all output dims
-        self.log_std = nn.Parameter(torch.tensor(-1.0))
+        # The MLP produces D means and D log-stds concatenated -> 2*D outputs
+        self.mlp_out_dim = int(mlp_out_dim)
+        self.edge_mlp = EdgeValueMLP(2 * emb_dim + edge_feat_dim, mlp_hidden, self.mlp_out_dim * 2)
 
     def forward_node_embeddings(self, x, edge_index, edge_type):
         return self.encoder(x, edge_index, edge_type)
@@ -51,37 +59,51 @@ class EdgePolicy(nn.Module):
 
     def forward_edges(self, node_emb: torch.Tensor, edge_index: torch.LongTensor, edge_feat: Optional[torch.Tensor] = None):
         inp = self.edge_inputs(node_emb, edge_index, edge_feat)
-        mean = self.edge_mlp(inp)  # [E, out_dim]
-        std = torch.exp(self.log_std)
-        return mean, std
+        out = self.edge_mlp(inp)  # [E, 2*D]
+        # ensure 2D
+        if out.dim() == 1:
+            out = out.unsqueeze(0)
+        E, C = out.shape
+        D = self.mlp_out_dim
+        if C != 2 * D:
+            # fallback: if out dimension doesn't match expectation, treat as D=1
+            D = C // 2 if C >= 2 else 1
+        mean = out[:, :D]
+        log_std = out[:, D: D + D]
+        return mean, log_std
 
     def get_actions(self, x, edge_index, edge_type, edge_feat: Optional[torch.Tensor] = None, deterministic: bool = False):
-        """Return actions and log_probs for every edge.
+        """Return sampled actions and log-probabilities for every directed edge.
 
-        actions: [E]
-        log_probs: [E]
+        Returns:
+            actions: Tensor of shape [E] or [E, D]
+            logp: per-edge scalar log-prob Tensor [E]
+            mean: Tensor of shape [E, D]
+            log_std: Tensor of shape [E, D]
         """
         node_emb = self.forward_node_embeddings(x, edge_index, edge_type)
-        mean, std = self.forward_edges(node_emb, edge_index, edge_feat)
-        # mean: [E, D] or [E] depending on out_dim; ensure 2D
+        mean, log_std = self.forward_edges(node_emb, edge_index, edge_feat)
+        # ensure 2D
         if mean.dim() == 1:
             mean = mean.unsqueeze(-1)
+        if log_std.dim() == 1:
+            log_std = log_std.unsqueeze(-1)
+
         if deterministic:
             actions = mean
-            # deterministic: treat logp as zeros per-output then sum
             logp_per = torch.zeros_like(mean)
         else:
-            # std is scalar; broadcast to mean shape
-            std_b = std if isinstance(std, torch.Tensor) else torch.tensor(std, device=mean.device, dtype=mean.dtype)
-            dist = torch.distributions.Normal(mean, std_b)
+            std = torch.exp(log_std)
+            dist = torch.distributions.Normal(mean, std)
             actions = dist.rsample()
-            logp_per = dist.log_prob(actions)  # [E, D]
+            logp_per = dist.log_prob(actions)
+
         # sum logp across output dims to get per-edge scalar logp
         logp = logp_per.sum(dim=-1)
         # if single-dim, squeeze actions to [E]
         if actions.shape[-1] == 1:
             actions = actions.squeeze(-1)
-        return actions, logp, mean, std
+        return actions, logp, mean, log_std
 
     @classmethod
     def from_pyg_data(cls, encoder: nn.Module, emb_dim: int, data, mlp_hidden: int = 64, mlp_out_dim: int = 1):

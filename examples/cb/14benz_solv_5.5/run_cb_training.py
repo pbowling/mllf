@@ -36,8 +36,7 @@ from mllf.cb import train as cb_train
 from mllf.cb import graph_utils
 from mllf.file_handling.read_output import parse_transitions_and_rates, parse_single_population, terminated_normally
 from mllf.file_handling.generate_combinations import create_combination_dirs
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
+from mllf.cli.sim import run_simulation_command, parse_simulation_results, run_simulation_batch
 
 import math
 import torch.nn as nn
@@ -115,92 +114,11 @@ def graph_from_bias(bias: Dict[str, Any]) -> Graph:
     return g
 
 
-def run_simulation_command(combo_dir: str, cmd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
-    """Run a simulation command in `combo_dir` and capture output.
-
-    Args:
-        combo_dir: working directory to run the command in.
-        cmd: shell command to run. If None, default is to run `./run.sh` if
-             present and executable. If no command found, returns (0,'','').
-        timeout: optional timeout in seconds for the run.
-
-    Returns:
-        Tuple of (returncode, stdout, stderr). On unexpected exceptions the
-        function returns (1, '', str(exception)).
-    """
-    cwd = Path(combo_dir)
-    if cmd is None:
-        # default: look for run.sh
-        run_sh = cwd / 'run.sh'
-        if run_sh.exists() and os.access(str(run_sh), os.X_OK):
-            cmd = './run.sh'
-        else:
-            return 0, '', ''
-
-    try:
-        proc = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr
-    except Exception as e:
-        return 1, '', str(e)
+# run_simulation_command/imported from mllf.cli.sim
+# Using shared implementation from mllf.cli.sim: run_simulation_command
 
 
-def parse_simulation_results(combo_dir: str) -> Dict[str, Any]:
-    """Discover simulation output in `combo_dir` and parse known metrics.
-
-    The parser looks for a small set of candidate filenames (e.g. 'msld.out')
-    and, failing that, inspects files for the string 'NORMAL TERMINATION'. If
-    output is found and the file indicates normal termination, this function
-    attempts to parse both transitions/rates and single-population blocks and
-    returns a dict with keys 'terminated', 'transitions', 'rates', 'population'.
-
-    Args:
-        combo_dir: directory where the simulator wrote outputs.
-
-    Returns:
-        dict summarizing parsed outputs. If no output is found returns {}.
-    """
-    # try to discover output files; callers may adapt to their sim output layout
-    p = Path(combo_dir)
-    # common filenames we look for
-    candidates = ['msld.out', 'output.txt', 'output.log', 'population.txt', 'results.txt']
-    found = None
-    for c in candidates:
-        f = p / c
-        if f.exists():
-            found = f
-            break
-    if found is None:
-        # fallback: inspect all files for a string 'NORMAL TERMINATION'
-        for f in p.glob('*'):
-            if f.is_file():
-                txt = f.read_text(errors='ignore')
-                if 'NORMAL TERMINATION' in txt:
-                    found = f
-                    break
-    if found is None:
-        return {}
-
-    txt = found.read_text()
-    if not terminated_normally(txt):
-        return {'terminated': False}
-
-    # attempt to parse both transitions/rates and single populations.
-    out: Dict[str, Any] = {'terminated': True}
-    try:
-        trans, rates = parse_transitions_and_rates(txt)
-        out['transitions'] = trans
-        out['rates'] = rates
-    except Exception:
-        out['transitions'] = {}
-        out['rates'] = {}
-
-    try:
-        pops = parse_single_population(txt)
-        out['population'] = pops
-    except Exception:
-        out['population'] = {}
-
-    return out
+# parse_simulation_results: using shared implementation from mllf.cli.sim
 
 
 def save_checkpoint(out_dir: str, policy: torch.nn.Module, optim: torch.optim.Optimizer, epoch: int, step: int, keep: int = 5):
@@ -270,22 +188,34 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
 
     data, extras = graph_utils.build_pyg_graph_from_mllf_graph(g)
 
-    # build per-edge targets similar to earlier helper
-    rel_names = extras['relation_names']
-    base_map = extras['base_relation_map']
-    rel_to_base = {}
-    for base, (fwd, bwd) in base_map.items():
-        rel_to_base[fwd] = base
-        rel_to_base[bwd] = base
+    # build per-edge multi-dimensional targets aligned to data.edge_index.
+    # We produce a vector per directed edge containing values for each base
+    # relation (e.g. [quadratic, skew, end]) in the order given by
+    # extras['base_relation_map']. This supports edges that have different
+    # relation types and allows the policy to predict all bases simultaneously.
+    rel_names = extras.get('relation_names', [])
+    base_map = extras.get('base_relation_map', {})
+    # base_order determines output ordering for multi-dim targets
+    # Ensure 'linear' (b) is included as a base if not present — some graphs
+    # represent node-level linear biases as a base relation as well.
+    base_order = list(base_map.keys()) if isinstance(base_map, dict) else ['quadratic', 'skew', 'end']
+    if 'linear' not in base_order:
+        base_order.append('linear')
+    D = len(base_order)
 
-    if base_bias == 'quadratic':
-        target_matrix = bias.get('c', [])
-    elif base_bias == 'skew':
-        target_matrix = bias.get('x', [])
-    elif base_bias == 'end':
-        target_matrix = bias.get('s', [])
-    else:
-        target_matrix = bias.get('c', [])
+    # map relation name -> base index
+    relname_to_baseidx = {}
+    for b_idx, (base, (fwd, bwd)) in enumerate(base_map.items()):
+        relname_to_baseidx[fwd] = b_idx
+        relname_to_baseidx[bwd] = b_idx
+
+    # helper to access bias matrices by base name
+    base_to_matrix = {
+        'quadratic': bias.get('c', []),
+        'skew': bias.get('x', []),
+        'end': bias.get('s', []),
+        'linear': bias.get('b', []),
+    }
 
     targets = []
     ei = data.edge_index
@@ -293,16 +223,43 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
         src = int(ei[0, k].item())
         dst = int(ei[1, k].item())
         rel_idx = int(data.edge_type[k].item()) if hasattr(data, 'edge_type') and data.edge_type.numel() > k else None
-        rel_name = rel_names[rel_idx] if rel_idx is not None else None
-        t = 0.0
+        rel_name = rel_names[rel_idx] if rel_idx is not None and rel_idx < len(rel_names) else None
+
+        # initialize zero vector for all bases
+        vec = [0.0 for _ in range(D)]
         if rel_name is not None:
-            base = rel_to_base.get(rel_name)
-            if base == base_bias:
+            base_idx = relname_to_baseidx.get(rel_name)
+            if base_idx is not None:
+                base_name = base_order[base_idx]
+                mat = base_to_matrix.get(base_name, [])
                 try:
-                    t = float(target_matrix[src][dst])
+                    if base_name == 'linear':
+                        # b may be a flat list of length N (per-node) or an NxN matrix.
+                        bmat = mat
+                        if isinstance(bmat, list) and bmat:
+                            # matrix-like
+                            if isinstance(bmat[0], list):
+                                val = float(bmat[src][dst]) if len(bmat) > src and len(bmat[src]) > dst else 0.0
+                            else:
+                                # flat list: use average of node b's as edge-level target
+                                try:
+                                    lhs = float(bmat[src])
+                                except Exception:
+                                    lhs = 0.0
+                                try:
+                                    rhs = float(bmat[dst])
+                                except Exception:
+                                    rhs = 0.0
+                                val = 0.5 * (lhs + rhs)
+                        else:
+                            val = 0.0
+                    else:
+                        val = float(mat[src][dst]) if mat and len(mat) > src and len(mat[src]) > dst else 0.0
                 except Exception:
-                    t = 0.0
-        targets.append(t)
+                    val = 0.0
+                vec[base_idx] = val
+
+        targets.append(vec)
 
     return data, targets, extras
 
@@ -327,67 +284,90 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
 
     # base output ordering (used when edge actions are vector-valued)
     base_order = list(base_map.keys()) if isinstance(base_map, dict) else ['quadratic', 'skew', 'end']
+    if 'linear' not in base_order:
+        base_order.append('linear')
 
-    # collect per-undirected-pair lists
-    per_base_vals = { 'quadratic': {}, 'skew': {}, 'end': {}, 'linear': {} }
-
+    # collect per-undirected-pair forward-only values. For each directed edge
+    # we only accept the forward relation (e.g. 'quadratic_fwd') as the canonical
+    # source of truth for the pair; the reverse value is the negative of the
+    # forward one (AB = -BA). If forward is missing, we fall back to using the
+    # backward value with inverted sign.
+    per_base_forward = {name: {} for name in base_order}
     ei = data.edge_index
     et = data.edge_type
     for k in range(ei.shape[1]):
         src = int(ei[0, k].item())
         dst = int(ei[1, k].item())
-        pair = (min(src, dst), max(src, dst))
-        # extract action value(s) for this directed edge
-        try:
-            a = actions[k]
-        except Exception:
-            # actions may be a tuple (edge_actions, node_b) handled earlier
-            # but here we only expect the edge portion
+        rel_idx = int(et[k].item()) if hasattr(data, 'edge_type') and data.edge_type.numel() > k else None
+        rel_name = rel_names[rel_idx] if rel_idx is not None and rel_idx < len(rel_names) else None
+        if rel_name is None:
             continue
-
-        # if scalar, treat as single-dim vector
-        if isinstance(a, (int, float)) or (hasattr(a, 'dim') and a.dim() == 0):
-            val_list = [float(a.item() if hasattr(a, 'item') else a)]
-        else:
-            # assume a is iterable / tensor with multiple outputs
+        base = rel_to_base.get(rel_name)
+        if base is None:
+            continue
+        # determine if this directed relation is forward or backward for the pair
+        fwd_name, bwd_name = base_map.get(base, (f"{base}_fwd", f"{base}_bwd"))
+        pair = (min(src, dst), max(src, dst))
+        if rel_name == fwd_name and (pair not in per_base_forward[base]):
+            # canonical forward value for this undirected pair
             try:
-                vals = a.detach().cpu().numpy().tolist() if hasattr(a, 'detach') else list(a)
-                # ensure list of floats
-                val_list = [float(x) for x in (vals if isinstance(vals, list) else [vals])]
+                a = actions[k]
+                val = float(a.item()) if hasattr(a, 'dim') and a.dim() == 0 else float(a.detach().cpu().numpy().tolist())
             except Exception:
-                # fallback to single scalar
                 try:
-                    val_list = [float(a)]
+                    val = float(actions[k])
                 except Exception:
-                    val_list = [0.0]
-
-        # map val_list entries to base names in base_order
-        for idx, v in enumerate(val_list):
-            if idx < len(base_order):
-                base_name = base_order[idx]
-            else:
-                # extra values, ignore
-                continue
-            per_base_vals.setdefault(base_name, {})
-            per_base_vals[base_name].setdefault(pair, []).append(float(v))
+                    val = 0.0
+            per_base_forward[base][pair] = val
+        elif rel_name == bwd_name and (pair not in per_base_forward[base]):
+            # we only have backward; store inverse so forward= -backward
+            try:
+                a = actions[k]
+                val = float(a.item()) if hasattr(a, 'dim') and a.dim() == 0 else float(a.detach().cpu().numpy().tolist())
+            except Exception:
+                try:
+                    val = float(actions[k])
+                except Exception:
+                    val = 0.0
+            per_base_forward[base][pair] = -val
 
     # assemble matrices
     def build_mat_for(base_name: str):
         mat = [[0.0 for _ in range(N)] for _ in range(N)]
-        for (i, j), vals in per_base_vals.get(base_name, {}).items():
+        vals_map = per_base_forward.get(base_name, {})
+        for (i, j), val in vals_map.items():
             try:
-                avg = sum(vals) / len(vals)
+                v = float(val)
             except Exception:
-                avg = 0.0
-            mat[i][j] = avg
-            mat[j][i] = avg
+                v = 0.0
+            # forward/backward are inverses: set AB = v and BA = -v
+            mat[i][j] = v
+            mat[j][i] = -v
         return mat
 
     c_mat = build_mat_for('quadratic')
     x_mat = build_mat_for('skew')
     s_mat = build_mat_for('end')
-    # flattened b as zeros by default
+    # derive per-node linear b from per-edge linear values (average incident edges)
     b_vec = [0.0 for _ in range(N)]
+    linear_vals = per_base_forward.get('linear', {})
+    if linear_vals:
+        sums = [0.0 for _ in range(N)]
+        counts = [0 for _ in range(N)]
+        for (i, j), val in linear_vals.items():
+            try:
+                avg = float(val)
+            except Exception:
+                avg = 0.0
+            sums[i] += avg
+            sums[j] += avg
+            counts[i] += 1
+            counts[j] += 1
+        for idx in range(N):
+            if counts[idx] > 0:
+                b_vec[idx] = sums[idx] / counts[idx]
+            else:
+                b_vec[idx] = 0.0
 
     # if caller provided a special attribute on actions container with node-level
     # b values (convention: actions may be a tuple (edge_actions, node_b_actions)
@@ -483,41 +463,10 @@ def run_training(manifest: str, out_dir: str, epochs: int = 10, lr: float = 1e-3
     policy = EdgePolicy.from_pyg_data(encoder, 32, sample_data, mlp_hidden=64, mlp_out_dim=edge_out_dim)
     policy.train()
 
-    # Node-level stochastic head to predict per-node linear bias `b` (mean, log_std)
-    class NodePolicy(nn.Module):
-        def __init__(self, in_dim: int, hidden: int = 32):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(in_dim, hidden),
-                nn.ReLU(),
-                nn.Linear(hidden, 2),
-            )
-
-        def forward(self, node_emb: torch.Tensor):
-            # returns mean, std for each node as tensors [N]
-            out = self.net(node_emb)
-            mean = out[:, 0]
-            log_std = out[:, 1]
-            # clamp log_std to reasonable range
-            log_std = torch.clamp(log_std, min=-10.0, max=2.0)
-            std = torch.exp(log_std)
-            return mean, std
-
-        def get_actions(self, node_emb: torch.Tensor, deterministic: bool = False):
-            mean, std = self.forward(node_emb)
-            if deterministic:
-                actions = mean
-                logp = torch.zeros_like(mean)
-            else:
-                dist = torch.distributions.Normal(mean, std)
-                actions = dist.rsample()
-                logp = dist.log_prob(actions)
-            return actions, logp, mean, std
-
-    node_policy = NodePolicy(in_dim=32, hidden=32)
-    node_policy.train()
-
-    optim = torch.optim.Adam(list(policy.parameters()) + list(node_policy.parameters()), lr=lr)
+    # We predict all biases from per-edge MLP outputs; do not use a separate
+    # node-level stochastic head. The EdgePolicy will produce per-edge means
+    # and log-stds for the requested coefficient types.
+    optim = torch.optim.Adam(list(policy.parameters()), lr=lr)
 
     step = 0
     best_score = float('-inf')
@@ -587,27 +536,23 @@ def run_training(manifest: str, out_dir: str, epochs: int = 10, lr: float = 1e-3
 
             # Custom REINFORCE step combining edge- and node-level stochastic policies
             policy.train()
-            node_policy.train()
             optim.zero_grad()
 
-            # node embeddings
+            # node embeddings (provided by encoder)
             node_emb = policy.forward_node_embeddings(data.x, data.edge_index, data.edge_type)
 
-            # edge actions and log-probs
-            edge_actions, edge_logp, edge_mean, edge_std = policy.get_actions(data.x, data.edge_index, data.edge_type, getattr(data, 'edge_attr', None), deterministic=False)
-
-            # node b actions and log-probs
-            node_actions, node_logp, node_mean, node_std = node_policy.get_actions(node_emb, deterministic=False)
+            # edge actions and log-probs (policy returns actions, logp, mean, log_std)
+            edge_actions, edge_logp, edge_mean, edge_logstd = policy.get_actions(data.x, data.edge_index, data.edge_type, getattr(data, 'edge_attr', None), deterministic=False)
 
             # call environment to get scalar reward (run sims/writing variables inside env)
             with torch.no_grad():
                 try:
-                    reward = float(env_reward_fn(edge_actions.detach(), node_actions.detach()))
+                    reward = float(env_reward_fn(edge_actions.detach()))
                 except Exception:
                     reward = float(default_env_reward(edge_actions.detach(), targets, None))
 
-            # combine log-probs and apply REINFORCE update
-            total_logp = edge_logp.sum() + node_logp.sum()
+            # combine log-probs and apply REINFORCE update (edge-only)
+            total_logp = edge_logp.sum()
             adv = reward - 0.0
             loss = -(total_logp * adv)
             loss.backward()
@@ -625,61 +570,6 @@ def run_training(manifest: str, out_dir: str, epochs: int = 10, lr: float = 1e-3
             best_score = avg_reward
             save_checkpoint(out_dir, policy, optim, epoch, step, keep=keep)
 
-
-def run_simulation_batch(manifest: str, sim_cmd: Optional[str] = None, max_workers: int = 4, timeout: Optional[int] = None) -> Dict[str, Any]:
-    """Run simulations for all combos in a manifest concurrently.
-
-    This helper reads a manifest file (one combo dir per line), runs the
-    simulation command for each combo concurrently using a thread pool, waits
-    for completion (or timeout) and returns a summary mapping each combo to
-    its parsed results.
-
-    Args:
-        manifest: path to a manifest file listing combo directories (one per line).
-        sim_cmd: shell command to run for each combo; if None the command
-                 selection logic in `run_simulation_command` applies (./run.sh if present).
-        max_workers: maximum concurrent worker threads to use.
-        timeout: per-job timeout in seconds (passed to `run_simulation_command`).
-
-    Returns:
-        Dict mapping combo_dir -> parsed simulation results (as returned by
-        `parse_simulation_results`). The function also prints a small progress
-        summary to stdout.
-    """
-    with open(manifest, 'r', encoding='utf-8') as fh:
-        combos = [ln.strip() for ln in fh if ln.strip()]
-    results: Dict[str, Any] = {}
-    if not combos:
-        return results
-
-    futures = {}
-    start_ts = time.time()
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for c in combos:
-            # submit a blocking call into the threadpool which will run the subprocess
-            futures[ex.submit(run_simulation_command, c, sim_cmd, timeout)] = c
-
-        for fut in as_completed(futures):
-            combo_dir = futures[fut]
-            try:
-                rc, so, se = fut.result()
-            except Exception as e:
-                results[combo_dir] = {'error': str(e)}
-                continue
-
-            if rc != 0:
-                # include stderr for diagnostics
-                results[combo_dir] = {'returncode': rc, 'stdout': so, 'stderr': se}
-            else:
-                # parse outputs (if any)
-                parsed = parse_simulation_results(combo_dir)
-                results[combo_dir] = parsed
-
-    dur = time.time() - start_ts
-    # small summary
-    ok = sum(1 for v in results.values() if v and v.get('terminated') is True)
-    print(f"Batch run completed in {dur:.1f}s: {ok}/{len(combos)} terminated normally")
-    return results
 
 
 def _cli():

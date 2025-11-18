@@ -1,0 +1,10 @@
+manifest: examples/manifest_example.txt
+split:
+  train_frac: 0.8
+  seed: 0
+base_bias: quadratic
+run_sims: false
+sim_cmd: null
+max_workers: 4
+compress_after:
+  out_tar: examples/combos_archive
