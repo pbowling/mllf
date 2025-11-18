@@ -76,17 +76,27 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
     substituents of size >= 2 (pairs, triplets, ...). Each returned entry is
     a tuple (sites_list, subs_list) where sites_list contains a single site
     id and subs_list contains the selected sub indices for that site.
+    
+    The first substituent is considered a fixed "anchor" and the remaining
+    substituents are treated as an unordered set. For example, [1,2,3] and
+    [1,3,2] are considered the same combination, but [2,1,3] is different.
     """
     combos = []
-    # Use ordered permutations so that directional possibilities (A->B vs B->A)
-    # are treated as distinct combinations. For each site, enumerate all
-    # permutations of length >=2.
+    # For each site, fix the first substituent and enumerate unordered
+    # combinations of the remaining substituents.
     for site in sorted(found.keys()):
         subs = sorted(found[site].keys())
-        # only consider ordered tuples of size >= 2
+        # only consider tuples of size >= 2
         for r in range(2, len(subs) + 1):
-            for combo in itertools.permutations(subs, r):
-                combos.append(([site], list(combo)))
+            # For each possible first element
+            for first_sub in subs:
+                # Get remaining subs (all except the chosen first)
+                remaining = [s for s in subs if s != first_sub]
+                # Generate unordered combinations of size (r-1) from remaining
+                for tail_combo in itertools.combinations(remaining, r - 1):
+                    # Combine first element with the sorted tail to create canonical form
+                    combo_list = [first_sub] + sorted(tail_combo)
+                    combos.append(([site], combo_list))
     return combos
 
 
