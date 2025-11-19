@@ -67,45 +67,59 @@ SITE_SUB_RE = re.compile(r"site(\d+)_sub(\d+)_([A-Za-z0-9_-]+)\.([A-Za-z0-9]+)$"
 
 
 def find_site_sub_files(input_dir: Path) -> Dict[int, Dict[int, Dict[Tuple[str, str], Path]]]:
-    """Scan input_dir and return mapping: site -> sub -> {(label, ext): Path}.
+    """Scan input_dir and prep subdirectory for site/sub files.
 
     Only files matching the pattern `site{site}_sub{sub}_{label}.{ext}` are considered.
     For example: site1_sub2_pres.rtf, site1_sub2_frag.pdb
+    Searches both input_dir and input_dir/prep if it exists.
 
     Args:
-        input_dir: Directory containing site/sub files.
+        input_dir: Directory containing site/sub files or prep subdirectory.
 
     Returns:
         Nested dict mapping site ID -> sub ID -> (label, ext) -> file path.
     """
     found: Dict[int, Dict[int, Dict[str, Path]]] = {}
-    for p in input_dir.iterdir():
-        if not p.is_file():
-            continue
-        m = SITE_SUB_RE.match(p.name)
-        if not m:
-            continue
-        site = int(m.group(1))
-        sub = int(m.group(2))
-        label = m.group(3)
-        ext = m.group(4)
-        # store keyed by (label, ext) so we preserve per-file suffixes like
-        # `_pres.rtf` and `_frag.pdb` and allow arbitrary additional files.
-        found.setdefault(site, {}).setdefault(sub, {})[(label, ext)] = p.resolve()
+    
+    # Search in both the input_dir and input_dir/prep
+    search_dirs = [input_dir]
+    prep_dir = input_dir / 'prep'
+    if prep_dir.exists() and prep_dir.is_dir():
+        search_dirs.append(prep_dir)
+    
+    for search_path in search_dirs:
+        for p in search_path.iterdir():
+            if not p.is_file():
+                continue
+            m = SITE_SUB_RE.match(p.name)
+            if not m:
+                continue
+            site = int(m.group(1))
+            sub = int(m.group(2))
+            label = m.group(3)
+            ext = m.group(4)
+            # store keyed by (label, ext) so we preserve per-file suffixes like
+            # `_pres.rtf` and `_frag.pdb` and allow arbitrary additional files.
+            # Don't overwrite if already found (input_dir takes precedence over prep/)
+            key = (label, ext)
+            if key not in found.setdefault(site, {}).setdefault(sub, {}):
+                found[site][sub][key] = p.resolve()
     return found
 
 
 def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> List[Tuple[List[int], List[int]]]:
-    """Generate all within-site combinations with fixed-anchor constraint.
+    """Generate all within-site ordered combinations with rotating anchor.
 
     For each site independently, enumerate all subsets of substituents of size >= 2.
-    The first substituent serves as a fixed "anchor" and the remaining substituents
-    form an unordered set. This reduces redundancy while maintaining diversity.
+    For EACH substituent as anchor, generate all unordered combinations with the
+    remaining substituents. This creates ordered tuples where position matters.
 
-    Constraint examples:
-    - [1,2,3] and [1,3,2] are considered identical (same anchor 1, same tail {2,3})
-    - [2,1,3] is different (different anchor 2)
-    - [1,2], [1,3], [2,3] are all distinct combinations
+    Strategy:
+    - For each sub as "anchor", generate combinations from remaining subs
+    - Example with subs [1,2,3,4,5]:
+      - Anchor 1: [1,2], [1,3], [1,4], [1,5], [1,2,3], [1,2,4], ...
+      - Anchor 2: [2,1], [2,3], [2,4], [2,5], [2,1,3], [2,1,4], ...
+      - etc.
 
     Args:
         found: Nested dict mapping site -> sub -> {(label, ext): Path}.
@@ -113,23 +127,25 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
     Returns:
         List of (sites_list, subs_list) tuples where:
         - sites_list: List containing single site ID (e.g., [1])
-        - subs_list: List of selected sub indices (e.g., [2, 3, 4])
+        - subs_list: List of selected sub indices (e.g., [1, 2, 3])
     """
     combos = []
-    # For each site, fix the first substituent and enumerate unordered
-    # combinations of the remaining substituents.
+    # For each site, iterate over each substituent as anchor
     for site in sorted(found.keys()):
         subs = sorted(found[site].keys())
-        # only consider tuples of size >= 2
-        for r in range(2, len(subs) + 1):
-            # For each possible first element
-            for first_sub in subs:
-                # Get remaining subs (all except the chosen first)
-                remaining = [s for s in subs if s != first_sub]
-                # Generate unordered combinations of size (r-1) from remaining
-                for tail_combo in itertools.combinations(remaining, r - 1):
-                    # Combine first element with the sorted tail to create canonical form
-                    combo_list = [first_sub] + sorted(tail_combo)
+        if len(subs) < 2:
+            continue  # Need at least 2 subs to form a combination
+        
+        # Try each sub as anchor
+        for anchor in subs:
+            remaining = [s for s in subs if s != anchor]
+            
+            # Generate all combinations of size >= 1 from remaining subs
+            # Combined with anchor, this gives combinations of size >= 2
+            for r in range(1, len(remaining) + 1):
+                for tail_combo in itertools.combinations(remaining, r):
+                    # Anchor always first, followed by sorted tail
+                    combo_list = [anchor] + list(tail_combo)
                     combos.append(([site], combo_list))
     return combos
 
@@ -241,53 +257,13 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                 for i, site in enumerate(sites):
                     per_site_selected[site] = [subs[i]] if i < len(subs) else []
 
-        for site, selected_subs in per_site_selected.items():
-            for new_index, chosen_sub in enumerate(selected_subs, start=1):
-                files_for_sub = found[site].get(chosen_sub, {})
-                for (label, ext), src_path in files_for_sub.items():
-                    new_name = f"site{site}_sub{new_index}_{label}.{ext}"
-                    dest = combo_path / new_name
-                    mapping.append({
-                        'site': site,
-                        'original_sub': chosen_sub,
-                        'original_label': label,
-                        'original_ext': ext,
-                        'original_path': str(src_path),
-                        'new_name': new_name,
-                        'dest_path': str(dest),
-                    })
-                    if dry_run:
-                        print(f"DRY: would copy {src_path} -> {dest}")
-                    else:
-                        # copy first to preserve metadata, then fix any RTF PRES token
-                        copy2(src_path, dest)
-                        # If this is an RTF-like fragment with a PRES line, update the
-                        # internal id token (e.g. `PRES  p1_1  0.000`) so that the
-                        # `p{site}_{sub}` is renumbered to the new per-site index
-                        # `p{site}_{new_index}` inside the copied file.
-                        try:
-                            if ext.lower() in ("rtf"):
-                                # Read the copied file, replace the PRES token only
-                                # on the PRES line. We limit replacement to the first
-                                # PRES line occurrence to avoid accidental edits.
-                                txt = dest.read_text()
-
-                                def _replace_pres_line(m: re.Match) -> str:
-                                    line = m.group(0)
-                                    # replace the exact original token p{site}_{chosen_sub}
-                                    old_token = f"p{site}_{chosen_sub}"
-                                    new_token = f"p{site}_{new_index}"
-                                    if old_token in line:
-                                        return line.replace(old_token, new_token)
-                                    return line
-
-                                new_txt, nsub = re.subn(r"(?m)^PRES.*$", _replace_pres_line, txt, count=1)
-                                if nsub:
-                                    dest.write_text(new_txt)
-                        except Exception:
-                            # Best-effort: don't fail the whole generation if a single
-                            # file can't be rewritten. Leave the copied file as-is.
-                            pass
+        # Store the file info for later copying to prep directory
+        # Don't copy to combo root - only to prep subdirectory
+        
+        # Renumber sites to start from 1 if needed
+        # If we only have site2, rename it to site1 in the output
+        all_sites = sorted(per_site_selected.keys())
+        site_renumber_map = {old_site: new_site for new_site, old_site in enumerate(all_sites, start=1)}
 
         # Copy prep directory if it exists in input_dir
         prep_src = input_dir / 'prep'
@@ -298,62 +274,83 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
             else:
                 prep_dest.mkdir(exist_ok=True)
             
-            # Copy all files from prep directory
+            # Build mapping from (site, original_sub) -> new_sub_index
+            sub_renaming = {}
+            for site, selected_subs in per_site_selected.items():
+                for new_index, chosen_sub in enumerate(selected_subs, start=1):
+                    sub_renaming[(site, chosen_sub)] = new_index
+            
+            # Copy all non-site-specific files from prep directory
+            # Site-specific files will be handled separately with renaming
             for prep_file in prep_src.iterdir():
                 if not prep_file.is_file():
                     continue
                 
+                # Check if this is a site/sub specific file (RTF or PDB)
+                # Pattern: site{N}_sub{M}_{label}.{ext}
+                match = re.match(r'site(\d+)_sub(\d+)_(.+)', prep_file.name)
+                if match:
+                    # Skip all site-specific files - they'll be handled with renaming below
+                    continue
+                
+                # Copy non-site-specific files (full_ligand.*, par_all36_msld.prm, etc.)
                 dest_file = prep_dest / prep_file.name
-                
-                # Check if this is a renamed RTF or PDB file that should be replaced
-                should_skip = False
-                for site, selected_subs in per_site_selected.items():
-                    for new_index, chosen_sub in enumerate(selected_subs, start=1):
-                        # Check if this prep file corresponds to a renamed file
-                        if prep_file.name.startswith(f"site{site}_sub{new_index}_"):
-                            # This file will be replaced by the renamed version, skip copying
-                            should_skip = True
-                            break
-                    if should_skip:
-                        break
-                
-                if not should_skip:
-                    if dry_run:
-                        print(f"DRY: would copy prep file {prep_file} -> {dest_file}")
-                    else:
-                        copy2(prep_file, dest_file)
-                        mapping.append({
-                            'site': None,
-                            'original_sub': None,
-                            'original_path': str(prep_file.resolve()),
-                            'new_name': f"prep/{prep_file.name}",
-                            'dest_path': str(dest_file),
-                            'note': 'prep_directory',
-                        })
+                if dry_run:
+                    print(f"DRY: would copy prep file {prep_file} -> {dest_file}")
+                else:
+                    copy2(prep_file, dest_file)
+                    mapping.append({
+                        'site': None,
+                        'original_sub': None,
+                        'original_path': str(prep_file.resolve()),
+                        'new_name': f"prep/{prep_file.name}",
+                        'dest_path': str(dest_file),
+                        'note': 'prep_directory',
+                    })
             
-            # Now copy the renamed RTF/PDB files into prep directory
+            # Now rename and copy the selected RTF/PDB files into prep directory
             for site, selected_subs in per_site_selected.items():
+                # Use renumbered site ID
+                renumbered_site = site_renumber_map[site]
                 for new_index, chosen_sub in enumerate(selected_subs, start=1):
                     files_for_sub = found[site].get(chosen_sub, {})
                     for (label, ext), src_path in files_for_sub.items():
-                        new_name = f"site{site}_sub{new_index}_{label}.{ext}"
-                        # Copy from combo root to prep directory
-                        src_in_combo = combo_path / new_name
+                        new_name = f"site{renumbered_site}_sub{new_index}_{label}.{ext}"
                         dest_in_prep = prep_dest / new_name
                         
                         if dry_run:
-                            print(f"DRY: would copy {src_in_combo} -> {dest_in_prep}")
+                            print(f"DRY: would copy and rename {src_path} -> {dest_in_prep}")
                         else:
-                            if src_in_combo.exists():
-                                copy2(src_in_combo, dest_in_prep)
-                                mapping.append({
-                                    'site': site,
-                                    'original_sub': chosen_sub,
-                                    'original_path': str(src_path),
-                                    'new_name': f"prep/{new_name}",
-                                    'dest_path': str(dest_in_prep),
-                                    'note': 'prep_renamed',
-                                })
+                            # Copy directly from source to prep with new name
+                            copy2(src_path, dest_in_prep)
+                            
+                            # If this is an RTF file, update PRES token inside
+                            if ext.lower() == "rtf":
+                                try:
+                                    txt = dest_in_prep.read_text()
+                                    old_token = f"p{site}_{chosen_sub}"
+                                    new_token = f"p{renumbered_site}_{new_index}"
+                                    
+                                    def _replace_pres_line(m: re.Match) -> str:
+                                        line = m.group(0)
+                                        if old_token in line:
+                                            return line.replace(old_token, new_token)
+                                        return line
+                                    
+                                    new_txt, nsub = re.subn(r"(?m)^PRES.*$", _replace_pres_line, txt, count=1)
+                                    if nsub:
+                                        dest_in_prep.write_text(new_txt)
+                                except Exception:
+                                    pass
+                            
+                            mapping.append({
+                                'site': site,
+                                'original_sub': chosen_sub,
+                                'original_path': str(src_path),
+                                'new_name': f"prep/{new_name}",
+                                'dest_path': str(dest_in_prep),
+                                'note': 'prep_renamed',
+                            })
 
         # optionally copy additional files matching include_patterns into each combo dir
         if include_patterns:
@@ -386,8 +383,10 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
             # write info.py file
             info_path = combo_path / 'info.py'
             # Count number of substituents per site for this combination
+            # Use renumbered site order (sorted by renumbered site ID)
             nsubs_per_site = []
-            for site in sorted(per_site_selected.keys()):
+            sorted_sites = sorted(per_site_selected.keys(), key=lambda s: site_renumber_map[s])
+            for site in sorted_sites:
                 nsubs_per_site.append(len(per_site_selected[site]))
             
             # Generate info.py configuration file
@@ -417,8 +416,7 @@ info['temp'] = 298.15
 #SBATCH --export=ALL
 #SBATCH --time=01:00:00
 
-module load charmm
-export CHARMMEXEC='/home/dave/bin/charmm_6123706'
+module load charmm/charmm/c51a1
 
 # Run msld_flat.py with variables.py from this directory
 python3 msld_flat.py --vars-file variables.py --out-dir . > output.out
