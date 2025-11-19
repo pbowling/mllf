@@ -1,10 +1,51 @@
-manifest: examples/manifest_example.txt
+# Combination generation (comment out after first run to reuse existing combos)
+create_combos:
+  input_dir: /home/pbowling/mllf/examples/cb/14benz_solv_5.5
+  out_dir: /home/pbowling/mllf/examples/cb/generated_combos
+  include_patterns:
+    - msld_flat.py
+
+# Train/val/test split
 split:
-  train_frac: 0.8
-  seed: 0
-base_bias: quadratic
-run_sims: false
-sim_cmd: null
-max_workers: 4
-compress_after:
-  out_tar: examples/combos_archive
+  train_frac: 0.03  # Just 1 combo for testing (1/35 ≈ 0.03)
+  val_frac: 0.03
+  seed: 42
+
+# Training configuration
+training:
+  num_epochs: 1  # Just 1 epoch for testing
+  encoder:
+    hidden_dims: [64, 64]
+    out_dim: 32
+  policy:
+    mlp_hidden: 64
+  optimizer:
+    lr: 0.001
+  
+# Simulation configuration
+run_sims: true
+sim_cmd: ./run.sh
+max_workers: 2
+timeout: 3600  # 1 hour per simulation
+
+# Reward configuration (scalarized reward function)
+reward:
+  # Weights for normalized terms (should sum to 1.0)
+  w_P: 0.5              # Weight for population term
+  w_T: 0.5              # Weight for transition term
+  
+  # Non-zero constraint enforcement
+  gamma: 10.0           # Bonus coefficient for non-zero populations
+  
+  # Baseline normalization values
+  P_baseline: 1000.0    # Expected maximum total population
+  T_baseline: 100.0     # Expected maximum total transitions
+  
+  # REINFORCE entropy regularization
+  lambda_entropy: 0.01  # Entropy coefficient for exploration
+
+# Output organization
+output:
+  base_dir: /home/pbowling/mllf/examples/cb/training_output
+  save_checkpoints: true
+  checkpoint_freq: 1  # Save every epoch

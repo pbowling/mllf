@@ -130,16 +130,24 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
         RuntimeError: If verify_graph=True and graph verification fails.
     """
     bias: Dict[str, Any] = {}
+    combo_path = Path(combo_dir)
+    
+    # Check for RTF files in both combo_dir and combo_dir/prep
     rtf_results = parse_rtf_dir(combo_dir)
+    if not rtf_results:
+        prep_dir = combo_path / 'prep'
+        if prep_dir.exists() and prep_dir.is_dir():
+            rtf_results = parse_rtf_dir(str(prep_dir))
+    
     if rtf_results:
         g = Graph.from_rtf_results(rtf_results)
     else:
-        vpy = Path(combo_dir) / 'variables.py'
+        vpy = combo_path / 'variables.py'
         if vpy.exists():
             bias = load_bias_from_variables(str(vpy))
             g = graph_from_bias(bias)
         else:
-            raise FileNotFoundError(f'No RTF fragments and no variables.py found in {combo_dir}')
+            raise FileNotFoundError(f'No RTF fragments and no variables.py found in {combo_dir} or {combo_dir}/prep')
 
     data, extras = graph_utils.build_pyg_graph_from_mllf_graph(g)
 
@@ -369,16 +377,46 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             else:
                 b_vec[idx] = 0.0
 
-    bias_dict = {
-        'b': b_vec,
-        'c': c_mat,
-        'x': x_mat,
-        's': s_mat,
-    }
-    yaml_block = yaml.safe_dump(bias_dict, sort_keys=False)
+    # Format bias_string manually to match expected YAML structure
+    # b: single row with first element using '- -' then rest using just '-'
+    # c, x, s: NxN matrices with each row starting '- -' for first element, then '-' for rest
+    lines = []
+    
+    # Format b vector: [- - val1, - val2, - val3, ...]
+    lines.append('b:')
+    if b_vec:
+        lines.append(f'- - {b_vec[0]}')
+        for val in b_vec[1:]:
+            lines.append(f'  - {val}')
+    else:
+        lines.append('- - 0.0')
+    
+    # Format c matrix
+    lines.append('c:')
+    for row in c_mat:
+        lines.append(f'- - {row[0]}')
+        for val in row[1:]:
+            lines.append(f'  - {val}')
+    
+    # Format x matrix
+    lines.append('x:')
+    for row in x_mat:
+        lines.append(f'- - {row[0]}')
+        for val in row[1:]:
+            lines.append(f'  - {val}')
+    
+    # Format s matrix
+    lines.append('s:')
+    for row in s_mat:
+        lines.append(f'- - {row[0]}')
+        for val in row[1:]:
+            lines.append(f'  - {val}')
+    
+    yaml_block = '\n'.join(lines)
     content = f"""# Auto-generated variables.py — bias_string contains YAML for bias matrices
-bias_string = '''\
+bias_string = '''
 {yaml_block}
+
 '''
 """
     (combo_dir / out_name).write_text(content, encoding='utf-8')

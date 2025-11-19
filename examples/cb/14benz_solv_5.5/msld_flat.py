@@ -179,7 +179,8 @@ def _load_variables_module():
 
 # Initialize default values before loading variables
 if 'minimizeflag' not in globals():
-    minimizeflag = True
+    # Only minimize if minimized.pdb doesn't exist in prep
+    minimizeflag = not os.path.exists('prep/minimized.pdb')
 
 # perform the load (this may inspect CLI args or env vars)
 _vars_file_used = _load_variables_module()
