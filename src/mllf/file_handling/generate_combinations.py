@@ -6,7 +6,8 @@ and creates output subdirectories, one per combination. For each combination, it
 the relevant files, renaming them so sub-indices start at 1 within the new directory.
 
 Each generated combination directory contains:
-- Renamed RTF/PDB files with updated sub-indices
+- `prep/`: Copy of input prep directory with renamed RTF/PDB files
+- `msld_flat.py`: Simulation script (if included via --include pattern)
 - `mapping.json`: Records original file paths and new names
 - `info.py`: Configuration dict with nsubs, nblocks, temp, etc.
 - `run.sh`: Executable SLURM submission script for running simulations
@@ -25,10 +26,15 @@ Running:
 
 Will produce directories like:
   combos_out/comb_0001_site1_1__site1_2/
-    ├── site1_sub1_pres.rtf      (renamed from site1_sub1_pres.rtf)
-    ├── site1_sub1_frag.pdb
-    ├── site1_sub2_pres.rtf      (renamed from site1_sub2_pres.rtf)
-    ├── site1_sub2_frag.pdb
+    ├── prep/
+    │   ├── site1_sub1_pres.rtf    (renamed if necessary, see mapping.json)
+    │   ├── site1_sub1_frag.pdb
+    │   ├── site1_sub2_pres.rtf    (renamed if necessary, see mapping.json)
+    │   ├── site1_sub2_frag.pdb
+    │   ├── top_all36_msld.rtf     (unchanged from input prep/)
+    │   ├── par_all36_msld.prm     (unchanged from input prep/)
+    │   └── ... (other prep files)
+    ├── msld_flat.py               (if included via --include)
     ├── mapping.json
     ├── info.py
     └── run.sh
@@ -172,10 +178,11 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
     1. Create directory with name like 'comb_0001_site1_2__site1_3'
     2. Copy and rename RTF/PDB files (sub indices start at 1)
     3. Update PRES tokens in RTF files to match new indices
-    4. Generate mapping.json with file tracking info
-    5. Generate info.py with configuration dictionary
-    6. Generate run.sh executable script for job submission
-    7. Copy any additional files matching include_patterns
+    4. Copy prep/ directory with renamed files and unchanged support files
+    5. Generate mapping.json with file tracking info
+    6. Generate info.py with configuration dictionary
+    7. Generate run.sh executable script for job submission
+    8. Copy any additional files matching include_patterns (e.g., msld_flat.py)
 
     Args:
         input_dir: Directory containing site{n}_sub{m}_{label}.{ext} files.
@@ -281,6 +288,72 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                             # Best-effort: don't fail the whole generation if a single
                             # file can't be rewritten. Leave the copied file as-is.
                             pass
+
+        # Copy prep directory if it exists in input_dir
+        prep_src = input_dir / 'prep'
+        if prep_src.exists() and prep_src.is_dir():
+            prep_dest = combo_path / 'prep'
+            if dry_run:
+                print(f"DRY: would create prep directory {prep_dest}")
+            else:
+                prep_dest.mkdir(exist_ok=True)
+            
+            # Copy all files from prep directory
+            for prep_file in prep_src.iterdir():
+                if not prep_file.is_file():
+                    continue
+                
+                dest_file = prep_dest / prep_file.name
+                
+                # Check if this is a renamed RTF or PDB file that should be replaced
+                should_skip = False
+                for site, selected_subs in per_site_selected.items():
+                    for new_index, chosen_sub in enumerate(selected_subs, start=1):
+                        # Check if this prep file corresponds to a renamed file
+                        if prep_file.name.startswith(f"site{site}_sub{new_index}_"):
+                            # This file will be replaced by the renamed version, skip copying
+                            should_skip = True
+                            break
+                    if should_skip:
+                        break
+                
+                if not should_skip:
+                    if dry_run:
+                        print(f"DRY: would copy prep file {prep_file} -> {dest_file}")
+                    else:
+                        copy2(prep_file, dest_file)
+                        mapping.append({
+                            'site': None,
+                            'original_sub': None,
+                            'original_path': str(prep_file.resolve()),
+                            'new_name': f"prep/{prep_file.name}",
+                            'dest_path': str(dest_file),
+                            'note': 'prep_directory',
+                        })
+            
+            # Now copy the renamed RTF/PDB files into prep directory
+            for site, selected_subs in per_site_selected.items():
+                for new_index, chosen_sub in enumerate(selected_subs, start=1):
+                    files_for_sub = found[site].get(chosen_sub, {})
+                    for (label, ext), src_path in files_for_sub.items():
+                        new_name = f"site{site}_sub{new_index}_{label}.{ext}"
+                        # Copy from combo root to prep directory
+                        src_in_combo = combo_path / new_name
+                        dest_in_prep = prep_dest / new_name
+                        
+                        if dry_run:
+                            print(f"DRY: would copy {src_in_combo} -> {dest_in_prep}")
+                        else:
+                            if src_in_combo.exists():
+                                copy2(src_in_combo, dest_in_prep)
+                                mapping.append({
+                                    'site': site,
+                                    'original_sub': chosen_sub,
+                                    'original_path': str(src_path),
+                                    'new_name': f"prep/{new_name}",
+                                    'dest_path': str(dest_in_prep),
+                                    'note': 'prep_renamed',
+                                })
 
         # optionally copy additional files matching include_patterns into each combo dir
         if include_patterns:
