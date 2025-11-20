@@ -271,5 +271,7 @@ See Also
 --------
 
 * :doc:`workflow` - Complete workflow from combo generation to training
+* :doc:`examples` - Running the full training workflow
 * :doc:`api` - API reference for CB modules
-* ``examples/cb/14benz_solv_5.5/run_cb_training.py`` - Full training example
+* ``examples/run_workflow.py`` - Full training implementation
+* ``examples/workflow_sample.yaml`` - Configuration file template

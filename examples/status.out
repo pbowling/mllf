@@ -1,0 +1,3 @@
+/home/pbowling/miniconda3/envs/mllf/lib/python3.12/site-packages/torch/_compile.py:32: UserWarning: optimizer contains a parameter group with duplicate parameters; in future, this will cause an error; see github.com/pytorch/pytorch/issues/40967 for more information
+  return disable_fn(*args, **kwargs)
+slurmstepd: error: *** JOB 6170853 ON gollum006 CANCELLED AT 2025-11-19T16:32:25 DUE TO TIME LIMIT ***
