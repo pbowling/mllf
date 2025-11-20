@@ -203,7 +203,17 @@ For neural network training:
 
 Key properties of ``data``:
 
-* ``x``: Node features (typically one-hot or constant)
+* ``x``: Node features ``[num_nodes, 4 + vocab_size]`` containing:
+  
+  - ``total_charge``: Molecular charge (float)
+  - ``is_vacuum``: Binary indicator for vacuum/gas environment
+  - ``is_solvent``: Binary indicator for solvent/water environment
+  - ``is_protein``: Binary indicator for protein environment
+  - Multi-hot encoding of distinct atom types (e.g., CG2R61, HGR61, NG2R60)
+  
+  The atom type vocabulary is loaded from CHARMM toppar files (default: 333 types)
+  ensuring consistent feature dimensions across all training runs.
+
 * ``edge_index``: COO format edge indices ``[2, num_edges*2]``
 * ``edge_type``: Relation type per edge (int indices)
 * ``edge_attr``: Optional edge attributes

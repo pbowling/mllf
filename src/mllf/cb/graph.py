@@ -177,6 +177,14 @@ class Graph:
         'site' and 'sub'. The returned Graph will have nodes enumerated in
         deterministic order (sorted by site then sub) and node metadata containing
         'site', 'sub', 'total_charge', 'atom_types', 'unique_atom_types', 'solvent', and 'rtf'.
+        
+        Args:
+            rtf_results: Dictionary mapping keys to parsed RTF data
+            solvent_override: Optional environment type override. Allowed values:
+                - 'gas' or 'vacuum': Gas phase / vacuum environment
+                - 'solv' or 'solvent': Solvent / water environment
+                - 'protein': Protein environment
+                If not provided, environment is auto-detected from filenames.
         """
         # collect entries that have site and sub
         subs = []

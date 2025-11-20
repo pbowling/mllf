@@ -50,9 +50,17 @@ Graphs are built using one of two methods:
       
       rtf_results = parse_rtf_dir('combo_dir')
       graph = Graph.from_rtf_results(rtf_results)
+      
+      # Optional: Override environment type for all nodes
+      # graph = Graph.from_rtf_results(rtf_results, solvent_override='protein')
 
    This method reads ``site*_sub*_*_pres.rtf`` files and extracts connectivity
    information from the RTF topology fragments.
+   
+   **Environment Detection**: The environment type (vacuum, solvent, or protein) is 
+   automatically detected from filenames. You can override this behavior using the 
+   ``solvent_override`` parameter with values: ``'gas'``/``'vacuum'``, ``'solv'``/``'solvent'``, 
+   or ``'protein'``.
 
 2. **From variables.py** (fallback):
    
@@ -76,6 +84,28 @@ For neural network training, graphs are converted to PyTorch Geometric format:
    from mllf.cb import graph_utils
    
    data, extras = graph_utils.build_pyg_graph_from_mllf_graph(graph)
+
+**Node Features**: Each node is represented by a feature vector with:
+
+* Total molecular charge (float)
+* Binary indicators for environment type (one-hot encoded):
+  
+  - Vacuum/gas environment
+  - Solvent/water environment  
+  - Protein environment
+
+* Multi-hot encoding of distinct atom types present in the substituent
+  (e.g., CG2R61, HGR61, NG2R60 from CHARMM force field)
+
+**Atom Type Vocabulary**: The vocabulary is loaded from CHARMM toppar files
+in the ``toppar/`` directory, which contain MASS entries defining all possible
+atom types (default: 333 types). This ensures:
+
+* Consistent feature dimensions across all graphs
+* No vocabulary mismatch between training and inference
+* Support for unseen atom types during deployment
+
+The total feature dimension is ``4 + 333 = 337`` by default.
 
 **Important**: Each undirected edge is expanded into **two directed edges**:
 

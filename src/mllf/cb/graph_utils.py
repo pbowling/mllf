@@ -3,38 +3,79 @@
 This module is intentionally defensive: it will try to import the project's
 Graph class and fall back to handling networkx-like graph objects.
 """
-from typing import Tuple
+from typing import Tuple, Optional
 import torch
 from torch_geometric.data import Data
+from .atom_vocab import get_atom_type_vocab
 
 
 
-def _node_feature_from_meta(meta: dict):
-    """Create a small numeric vector from node metadata.
+def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None):
+    """Create a numeric vector from node metadata.
 
-    Expected keys in meta: 'total_charge', 'solvent' (bool), 'distinct_atom_types' (list or count)
-    The function returns a 1-D torch.float tensor.
+    Expected keys in meta: 
+    - 'total_charge' (float)
+    - 'solvent' (str: 'vacuum'/'gas', 'solvent'/'solv', or 'protein')
+    - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61'])
+    
+    The function returns a 1-D torch.float tensor with features:
+    [charge, is_vacuum, is_solvent, is_protein, <multi-hot atom types>]
+    
+    If atom_type_vocab is provided, distinct_atom_types are encoded as a multi-hot vector.
+    Otherwise, they are omitted from the feature vector.
     """
     charge = float(meta.get('total_charge', 0.0))
-    solvent = 1.0 if meta.get('solvent') else 0.0
-    dat = meta.get('distinct_atom_types')
-    if isinstance(dat, (list, tuple)):
-        nat = float(len(dat))
-    else:
-        try:
-            nat = float(dat)
-        except Exception:
-            nat = 0.0
-    return torch.tensor([charge, solvent, nat], dtype=torch.get_default_dtype())
+    
+    # Handle solvent as categorical: vacuum/gas, solvent/solv, or protein
+    solvent_str = (meta.get('solvent', '') or '').lower()
+    is_vacuum = 1.0 if solvent_str in ('vacuum', 'gas', 'vac') else 0.0
+    is_solvent = 1.0 if solvent_str in ('solvent', 'solv', 'water', 'aq', 'sol') else 0.0
+    is_protein = 1.0 if solvent_str in ('protein', 'prot') else 0.0
+    
+    base_features = [charge, is_vacuum, is_solvent, is_protein]
+    
+    # Encode distinct atom types as multi-hot if vocabulary provided
+    if atom_type_vocab is not None:
+        distinct_types = meta.get('distinct_atom_types', [])
+        if not isinstance(distinct_types, (list, tuple)):
+            distinct_types = []
+        
+        # Create multi-hot encoding
+        vocab_size = len(atom_type_vocab)
+        atom_encoding = [0.0] * vocab_size
+        for atom_type in distinct_types:
+            if atom_type in atom_type_vocab:
+                idx = atom_type_vocab[atom_type]
+                atom_encoding[idx] = 1.0
+        
+        base_features.extend(atom_encoding)
+    
+    return torch.tensor(base_features, dtype=torch.get_default_dtype())
 
 
-def build_pyg_graph_from_mllf_graph(g, relation_names: list = None) -> Tuple[object, dict]:
+def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: Optional[str] = None) -> Tuple[object, dict]:
     """Convert a Graph-like object `g` into a PyG Data object and metadata.
 
     We expand each undirected graph edge into up to four directed relation edges,
     one per bias type. The default `relation_names` is ['linear','quadratic','skew','end'].
+    
+    Node features are constructed from metadata and include:
+    - Charge, environment type (vacuum/solvent/protein)
+    - Multi-hot encoding of distinct atom types
+    
+    The atom type vocabulary is loaded from CHARMM toppar files (default: package toppar/ directory).
+    This ensures consistent feature dimensions across different graphs and training runs.
 
-    Returns (pyg_data, extras) where extras contain mappings helpful for training.
+    Args:
+        g: Graph object with node metadata
+        relation_names: List of base relation types (default: ['linear', 'quadratic', 'skew', 'end'])
+        toppar_dir: Path to toppar directory (None uses package default)
+
+    Returns (pyg_data, extras) where extras contain:
+        - relation_names: List of all relation type names
+        - relation_map: Dict mapping relation names to indices
+        - base_relation_map: Dict mapping base types to (fwd, bwd) relation names
+        - atom_type_vocab: Dict mapping atom type strings to feature indices
     """
 
     if relation_names is None:
@@ -54,11 +95,14 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None) -> Tuple[obj
 
     rel_to_idx = {r: i for i, r in enumerate(relation_names)}
 
-    # collect node features
+    # Load atom type vocabulary from toppar files
+    atom_type_vocab = get_atom_type_vocab(toppar_dir)
+    
+    # collect node features with atom type encoding
     node_feats = []
     for i in range(g.num_nodes):
         meta = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
-        node_feats.append(_node_feature_from_meta(meta))
+        node_feats.append(_node_feature_from_meta(meta, atom_type_vocab))
     x = torch.stack(node_feats, dim=0)
 
     # expand edges: for each undirected (i,j) and for each bias that is allowed.
@@ -114,5 +158,6 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None) -> Tuple[obj
         'relation_names': relation_names,
         'relation_map': rel_to_idx,
         'base_relation_map': base_relation_map,
+        'atom_type_vocab': atom_type_vocab,
     }
     return data, extras

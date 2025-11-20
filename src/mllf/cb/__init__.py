@@ -14,8 +14,9 @@ non-GNN code (for example, graph utilities and tests) can import
 """
 from importlib import import_module
 
-# Always export graph utilities and training helpers
+# Always export graph utilities, atom vocabulary, and training helpers
 from .graph_utils import build_pyg_graph_from_mllf_graph
+from .atom_vocab import get_atom_type_vocab
 from .policy import EdgePolicy
 from .train import reinforce_train_step
 
