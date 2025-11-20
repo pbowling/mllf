@@ -58,15 +58,6 @@ def compute_msld_reward(
     Returns:
         Scalar reward value (higher is better). Returns 0.0 if simulation
         did not complete successfully or if outputs cannot be parsed.
-    
-    Example:
-        >>> reward = compute_msld_reward(
-        ...     '/path/to/combo_001',
-        ...     w_P=0.6, w_T=0.4,
-        ...     gamma=15.0,
-        ...     P_baseline=1500.0,
-        ...     T_baseline=200.0
-        ... )
     """
     
     combo_path = Path(combo_dir)
@@ -184,6 +175,93 @@ def compute_msld_reward(
             penalty = -gamma * 2.0  # Double the gamma penalty
     
     # Final reward
+    R = R_normalized + R_non_zero + penalty
+    
+    return R
+
+
+def compute_reward_from_raw_metrics(
+    populations: list,
+    transitions: list,
+    w_P: float = 0.5,
+    w_T: float = 0.5,
+    gamma: float = 10.0,
+    P_baseline: float = 1000.0,
+    T_baseline: float = 100.0
+) -> float:
+    """Compute scalarized reward from raw simulation metrics.
+    
+    This function allows recomputing rewards with different hyperparameters
+    without re-running simulations. It uses the same reward logic as
+    `compute_msld_reward` but operates on pre-parsed metrics.
+    
+    This enables:
+    - Testing different reward configurations on existing simulation data
+    - Using simulations as "pretraining data" with flexible reward functions
+    - Hyperparameter tuning without expensive re-simulation
+    
+    Args:
+        populations: List of population counts per block/substituent.
+        transitions: List of transition counts per site.
+        w_P: Weight for population term (default: 0.5).
+        w_T: Weight for transition term (default: 0.5).
+        gamma: Bonus coefficient for non-zero populations (default: 10.0).
+        P_baseline: Normalization baseline for populations (default: 1000.0).
+        T_baseline: Normalization baseline for transitions (default: 100.0).
+    
+    Returns:
+        Scalar reward value (higher is better). Returns 0.0 if inputs are empty.
+    """
+    if not populations and not transitions:
+        return 0.0
+    
+    # Calculate normalized reward components
+    R_P = 0.0
+    if populations:
+        pop_array = np.array(populations)
+        nonzero_pops = pop_array[pop_array > 0]
+        
+        if len(nonzero_pops) > 1:
+            # Reward distributed populations (lower CV is better)
+            pop_mean = np.mean(nonzero_pops)
+            pop_std = np.std(nonzero_pops)
+            cv = pop_std / pop_mean if pop_mean > 0 else 1.0
+            
+            # Balance factor: exp(-cv)
+            balance_factor = np.exp(-cv)
+            
+            # Reward based on total population AND balance
+            total_pop_normalized = sum(P_i / P_baseline for P_i in populations)
+            R_P = w_P * total_pop_normalized * balance_factor
+        else:
+            # Only one non-zero population is bad
+            R_P = w_P * 0.1 * (populations[0] / P_baseline)
+    
+    R_T = 0.0
+    if transitions:
+        total_trans = sum(transitions)
+        R_T = w_T * (total_trans / T_baseline)
+        
+        # Penalize if transitions are too low (< 10)
+        if total_trans < 10:
+            R_T *= 0.1
+    
+    R_normalized = R_P + R_T
+    
+    # Non-zero constraint bonus
+    nonzero_count = sum(1 for P_i in populations if P_i > 0)
+    R_non_zero = gamma * nonzero_count
+    
+    # Worst-case penalty
+    penalty = 0.0
+    if populations and transitions:
+        total_trans = sum(transitions)
+        max_pop = max(populations)
+        total_pop = sum(populations)
+        
+        if total_pop > 0 and max_pop / total_pop > 0.9 and total_trans < 10:
+            penalty = -gamma * 2.0
+    
     R = R_normalized + R_non_zero + penalty
     
     return R

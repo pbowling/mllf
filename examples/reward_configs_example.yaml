@@ -1,0 +1,58 @@
+# Example reward configurations for testing
+# Use with: python test_reward_configs.py training_output/epoch_005 --configs reward_configs_example.yaml
+
+baseline:
+  w_P: 0.5
+  w_T: 0.5
+  gamma: 10.0
+  P_baseline: 1000.0
+  T_baseline: 100.0
+
+population_focused:
+  w_P: 0.7
+  w_T: 0.3
+  gamma: 10.0
+  P_baseline: 1000.0
+  T_baseline: 100.0
+
+transition_focused:
+  w_P: 0.3
+  w_T: 0.7
+  gamma: 10.0
+  P_baseline: 1000.0
+  T_baseline: 100.0
+
+strong_nonzero_constraint:
+  w_P: 0.5
+  w_T: 0.5
+  gamma: 20.0
+  P_baseline: 1000.0
+  T_baseline: 100.0
+
+weak_nonzero_constraint:
+  w_P: 0.5
+  w_T: 0.5
+  gamma: 5.0
+  P_baseline: 1000.0
+  T_baseline: 100.0
+
+balanced_high_baseline:
+  w_P: 0.5
+  w_T: 0.5
+  gamma: 10.0
+  P_baseline: 2000.0
+  T_baseline: 200.0
+
+balanced_low_baseline:
+  w_P: 0.5
+  w_T: 0.5
+  gamma: 10.0
+  P_baseline: 500.0
+  T_baseline: 50.0
+
+population_heavy_strong_constraint:
+  w_P: 0.8
+  w_T: 0.2
+  gamma: 25.0
+  P_baseline: 1000.0
+  T_baseline: 100.0

@@ -7,13 +7,13 @@ create_combos:
 
 # Train/val/test split
 split:
-  train_frac: 0.03  # Just 1 combo for testing (1/35 ≈ 0.03)
-  val_frac: 0.03
+  train_frac: 0.70  # 3% for training
+  val_frac: 0.15    # 3% for validation
   seed: 42
 
 # Training configuration
 training:
-  num_epochs: 1  # Just 1 epoch for testing
+  num_epochs: 50  # Full training cycle
   encoder:
     hidden_dims: [64, 64]
     out_dim: 32
@@ -24,11 +24,15 @@ training:
   
 # Simulation configuration
 run_sims: true
-sim_cmd: ./run.sh
-max_workers: 2
-timeout: 3600  # 1 hour per simulation
+wait_for_jobs: true  # Wait for jobs to complete before computing rewards
+max_concurrent_jobs: 30  # Maximum SLURM jobs running simultaneously
+timeout: 1200  # 20 minutes per simulation
 
 # Reward configuration (scalarized reward function)
+# Note: Raw simulation metrics (populations, transitions) are saved in checkpoints.
+# If you change reward parameters, cached results will be automatically recomputed
+# using the new configuration without re-running simulations. This allows testing
+# different reward functions on the same simulation data ("pretraining" mode).
 reward:
   # Weights for normalized terms (should sum to 1.0)
   w_P: 0.5              # Weight for population term
@@ -48,4 +52,12 @@ reward:
 output:
   base_dir: /home/pbowling/mllf/examples/cb/training_output
   save_checkpoints: true
-  checkpoint_freq: 1  # Save every epoch
+  checkpoint_freq: 5  # Save checkpoint every 5 epochs
+
+# Archive completed combinations (compress after training)
+archive:
+  enabled: false              # Set to true to archive combinations
+  pattern: 'comb_*'          # Glob pattern for directories to archive
+  remove_after: false        # Remove original directories after archiving
+  archive_dir: /home/pbowling/mllf/examples/cb/archives  # Where to store .tar.gz files
+
