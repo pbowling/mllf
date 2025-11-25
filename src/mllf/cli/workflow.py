@@ -483,6 +483,19 @@ def create_and_manifest(input_dir: str, out_dir: str, dry_run: bool = False) -> 
     return str(manifest_path)
 
 
+def load_manifest(manifest_path: str) -> List[str]:
+    """Load list of combo directories from manifest file.
+    
+    Args:
+        manifest_path: Path to manifest file with one combo directory per line.
+    
+    Returns:
+        List of combo directory paths as strings.
+    """
+    with open(manifest_path, 'r', encoding='utf-8') as fh:
+        return [ln.strip() for ln in fh if ln.strip()]
+
+
 def split_manifest(manifest: str, train_frac: float = 0.8, seed: int = 0) -> Tuple[str, str]:
     """Split a manifest file into training and validation sets.
 
@@ -495,8 +508,7 @@ def split_manifest(manifest: str, train_frac: float = 0.8, seed: int = 0) -> Tup
         Tuple of (train_manifest_path, val_manifest_path).
         Creates manifest.train.txt and manifest.val.txt in the same directory as manifest.
     """
-    with open(manifest, 'r', encoding='utf-8') as fh:
-        combos = [ln.strip() for ln in fh if ln.strip()]
+    combos = load_manifest(manifest)
     random.Random(seed).shuffle(combos)
     n = int(len(combos) * train_frac)
     train = combos[:n]
@@ -622,8 +634,7 @@ def run_from_config(config_path: str) -> Dict[str, Any]:
 
     # Step 3: pick example combo
     example_combo = None
-    with open(manifest, 'r', encoding='utf-8') as fh:
-        combos = [ln.strip() for ln in fh if ln.strip()]
+    combos = load_manifest(manifest)
     if combos:
         example_combo = combos[0]
         results['example_combo'] = example_combo

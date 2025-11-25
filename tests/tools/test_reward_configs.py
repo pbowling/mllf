@@ -47,7 +47,7 @@ def load_epoch_results(epoch_dir: Path) -> List[Dict]:
             continue
         
         try:
-            checkpoint = torch.load(results_file, map_location='cpu')
+            checkpoint = torch.load(results_file, map_location='cpu', weights_only=False)
             
             # Skip if raw metrics not available
             if 'populations' not in checkpoint or 'transitions' not in checkpoint:

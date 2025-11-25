@@ -155,8 +155,9 @@ def run_simulation_batch(manifest: str, sim_cmd: Optional[str] = None, max_worke
         `parse_simulation_results`). The function also prints a small progress
         summary to stdout.
     """
-    with open(manifest, 'r', encoding='utf-8') as fh:
-        combos = [ln.strip() for ln in fh if ln.strip()]
+    # Import here to avoid circular dependency with workflow.py
+    from mllf.cli.workflow import load_manifest
+    combos = load_manifest(manifest)
     results: Dict[str, Any] = {}
     if not combos:
         return results

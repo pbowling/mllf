@@ -26,8 +26,6 @@ import numpy as np
 from typing import Dict, List
 
 from mllf.file_handling.generate_combinations import create_combination_dirs
-import re
-import json
 from mllf.cli.workflow import (
     split_manifest,
     build_data_and_targets_from_combo,
@@ -36,13 +34,13 @@ from mllf.cli.workflow import (
 from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy
 from mllf.cb.train import compute_msld_reward
+from mllf.cb.workflow_utils import (
+    load_manifest,
+    fix_msld_flat_for_single_site,
+    check_simulation_success,
+    parse_simulation_metrics
+)
 from mllf.cli.sim import run_simulation_batch
-
-
-def load_manifest(manifest_path: str) -> List[str]:
-    """Load list of combo directories from manifest file."""
-    with open(manifest_path, 'r') as f:
-        return [line.strip() for line in f if line.strip()]
 
 
 def train_epoch(
@@ -290,17 +288,11 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             jcombo_path, jepoch_dir, jjob_id, jactions_old, jlogp_old, retry_count = job_queue.pop(i)
             
             # Check if simulation terminated normally
-            from mllf.file_handling.read_output import terminated_normally
-            
             output_file = jepoch_dir / 'output.out'
-            simulation_success = False
+            simulation_success = check_simulation_success(output_file)
             
-            try:
-                with open(output_file, 'r') as f:
-                    output_text = f.read()
-                simulation_success = terminated_normally(output_text)
-            except Exception as e:
-                print(f"  Warning: Could not read output from {output_file}: {e}")
+            if not simulation_success:
+                print(f"  Warning: Could not verify simulation success for {output_file}")
             
             # If simulation failed and we haven't exceeded max retries, resubmit
             if not simulation_success and retry_count < max_retries:
@@ -335,29 +327,7 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
                 continue
             
             # Simulation succeeded - parse outputs and update policy
-            from mllf.file_handling.read_output import (
-                parse_single_population,
-                parse_transitions_and_rates
-            )
-            
-            raw_metrics = {'populations': [], 'transitions': []}
-            
-            try:
-                population_data = parse_single_population(output_text)
-                transitions_data, _ = parse_transitions_and_rates(output_text)
-                
-                # Extract raw populations
-                for block_id, block_info in population_data.items():
-                    counts_dict = block_info.get('counts', {})
-                    total_count = sum(counts_dict.values())
-                    raw_metrics['populations'].append(total_count)
-                
-                # Extract raw transitions
-                for site_id, trans_dict in transitions_data.items():
-                    total_trans = sum(trans_dict.values())
-                    raw_metrics['transitions'].append(total_trans)
-            except Exception as e:
-                print(f"  Warning: Could not parse outputs from {output_file}: {e}")
+            raw_metrics = parse_simulation_metrics(output_file)
             
             # Compute reward with current config
             reward_config = config.get('reward', {})
@@ -441,72 +411,6 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
         'avg_reward': avg_reward,
         'num_combos': len(combos)
     }
-
-
-def fix_msld_flat_for_single_site(combo_path: Path):
-    """
-    Modify msld_flat.py in combo directory to only delete atoms that would
-    overlap with present sites. For this 14benz example:
-    - C4/H4 overlap with site1_sub1
-    - C5/H5 overlap with site2_sub1
-    
-    If only site1 is present: delete only C4/H4
-    If only site2 is present: delete only C5/H5
-    If both sites present: delete both C4/H4 and C5/H5 (original behavior)
-    """
-    msld_flat = combo_path / 'msld_flat.py'
-    if not msld_flat.exists():
-        return
-    
-    # Read mapping.json to determine ORIGINAL sites present
-    mapping_file = combo_path / 'mapping.json'
-    if not mapping_file.exists():
-        return
-    
-    with open(mapping_file, 'r') as f:
-        mapping = json.load(f)
-    
-    # Extract unique original site numbers from entries that have site info
-    original_sites = set()
-    for entry in mapping.get('entries', []):
-        site = entry.get('site')
-        if site is not None:
-            original_sites.add(site)
-    
-    # Determine what to delete based on original sites
-    # Only modify if exactly one site is present
-    if len(original_sites) != 1:
-        return  # Either no sites identified or multiple sites - leave unchanged
-    
-    original_site = list(original_sites)[0]
-    
-    # Determine which atoms to delete based on ORIGINAL site number
-    if original_site == 1:
-        # Original site1: delete C4/H4 (overlaps with site1_sub1)
-        atoms_to_delete = 'C4 H4'
-    elif original_site == 2:
-        # Original site2: delete C5/H5 (overlaps with site2_sub1)
-        atoms_to_delete = 'C5 H5'
-    else:
-        # Unknown site - leave as is
-        return
-    
-    # Read and modify the msld_flat.py content
-    content = msld_flat.read_text()
-    
-    # Replace the delete line - handle both original and already-modified versions
-    # Pattern matches any combination of C4, C5, H4, H5 atoms
-    old_pattern = r"select\.store_selection\('todelete',pycharmm\.SelectAtoms\(\)\.by_res_and_type\(ligseg,resnum,'[CH45 ]+'\)\)"
-    new_line = f"select.store_selection('todelete',pycharmm.SelectAtoms().by_res_and_type(ligseg,resnum,'{atoms_to_delete}'))"
-    
-    new_content = re.sub(old_pattern, new_line, content)
-    
-    # Only write if something changed
-    if new_content != content:
-        msld_flat.write_text(new_content)
-        #print(f"  Modified {combo_path.name}: delete {atoms_to_delete} (original site{original_site})")
-    else:
-        print(f"  Skipped {combo_path.name}: already correct or pattern not found")
 
 
 def main():
