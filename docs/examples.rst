@@ -87,8 +87,13 @@ The ``examples/cb/14benz_solv_5.5/`` directory contains:
 - ``msld_flat.py``: CHARMM/pyCHARMM simulation script
 - ``prep/``: Pre-equilibrated structures
 
-With 5 substituents at site 1 and 6 at site 2, the rotating anchor constraint
-generates 261 unique combinations.
+With 5 substituents at site 1 and 6 at site 2, the rotating anchor strategy
+generates:
+
+- 75 within-site combinations for site 1 (5 anchors × 15 each)
+- 186 within-site combinations for site 2 (6 anchors × 31 each)
+- 13,950 cross-site combinations (75 × 186)
+- **Total: 14,211 unique combinations**
 
 SLURM Job Submission
 --------------------

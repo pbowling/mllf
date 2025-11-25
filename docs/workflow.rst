@@ -42,11 +42,10 @@ A workflow config specifies which operations to run and their parameters:
 
    # Combination generation
    create_combos:
-     sites_file: examples/sites.txt
-     substituents_file: examples/substituents.txt
-     output_dir: examples/cb
-     r: 3  # Number of substituents per combination
-     base_dir: examples/14benz_solv_base
+     input_dir: examples/cb/14benz_solv_5.5  # Directory with site/sub fragment files
+     out_dir: examples/cb/generated_combos   # Output directory for combinations
+     include_patterns:
+       - msld_flat.py  # Additional files to copy to each combination
    
    # OR use existing combinations
    manifest: examples/manifest_example.txt
@@ -87,47 +86,77 @@ Combination Generation
 Principles
 ~~~~~~~~~~
 
-Combinations are generated from two input files:
+Combinations are generated from site/substituent fragment files:
 
-* **sites.txt**: Available λ-sites on the molecule (e.g., ``site1``, ``site2``)
-* **substituents.txt**: Available substituent groups (e.g., ``sub1``, ``sub2``)
+* **Input files**: ``site{N}_sub{M}_{label}.{rtf,pdb}`` files in the input directory
+* **Sites**: Identified by the site number (N)
+* **Substituents**: Identified by the sub number (M) within each site
 
-The generator creates all valid r-combinations with constraints:
+The generator creates two types of combinations:
 
-1. **First element fixed**: Permutations are ordered by the first site
-2. **Tail unordered**: Remaining (r-1) elements form an unordered set
+1. **Within-site combinations**: Multiple substituents from a single site
+2. **Cross-site combinations**: Substituents from multiple sites simultaneously
 
-This prevents duplicate combinations that differ only by tail permutation order.
+Rotating Anchor Strategy
+^^^^^^^^^^^^^^^^^^^^^^^^
 
-Example
-~~~~~~~
+For within-site combinations, each substituent can serve as the "anchor":
 
-For sites ``[1, 2, 3, 4]`` and ``r=3``:
+* **Anchor first**: The anchor substituent is always listed first
+* **Tail sorted**: Remaining substituents are sorted numerically
+* **Minimum size**: At least 2 substituents per combination
 
-* ✓ Generated: ``[1, 2, 3]``, ``[1, 2, 4]``, ``[1, 3, 4]``, ``[2, 3, 4]``
-* ✗ Not generated: ``[1, 3, 2]`` (same as ``[1, 2, 3]``), ``[1, 4, 2]`` (same as ``[1, 2, 4]``)
+This ensures unique, ordered combinations without duplicates.
 
-For 4 sites, 4 substituents per site, r=3, this generates 261 combinations
-instead of 2270 if all permutations were included.
+For a site with 5 substituents, each acting as anchor generates combinations:
+
+* Anchor 1: ``[1,2]``, ``[1,3]``, ``[1,4]``, ``[1,5]``, ``[1,2,3]``, ``[1,2,4]``, ..., ``[1,2,3,4,5]``
+* Anchor 2: ``[2,1]``, ``[2,3]``, ``[2,4]``, ...
+* Total: 5 anchors × 15 combinations each = **75 within-site combinations**
+
+Cross-Site Combinations
+^^^^^^^^^^^^^^^^^^^^^^^
+
+When multiple sites are available, the generator also creates cross-site combinations:
+
+* Takes the cartesian product of within-site selections across all sites
+* Each site must contribute at least 2 substituents
+* Results in a much larger combination space
+
+Example: With 5 subs at site1 (75 selections) and 6 subs at site2 (186 selections):
+
+* Site 1 within-site: 75 combinations
+* Site 2 within-site: 186 combinations  
+* Cross-site: 75 × 186 = **13,950 combinations**
+* Total: **14,211 combinations**
 
 Directory Structure
 ~~~~~~~~~~~~~~~~~~~
 
-Each combination creates a directory:
+Each combination creates a directory with a standardized name:
 
 .. code-block:: text
 
-   examples/cb/
-   ├── 14benz_solv_5.5/              # Example: site1_2 + site1_3 + site1_4
-   │   ├── site1_2_solv_pres.rtf
-   │   ├── site1_3_solv_pres.rtf
-   │   ├── site1_4_solv_pres.rtf
-   │   ├── variables.py               # CB training writes here
-   │   └── output/                    # Simulation outputs
-   │       ├── transitions.txt
-   │       └── populations.txt
-   └── 14benz_solv_6.6/              # Another combination
-       └── ...
+   generated_combos/
+   ├── comb_0001_site2_1__site2_2/          # Within-site: site2 with subs 1,2
+   │   └── prep/
+   │       ├── site2_sub1_label.rtf
+   │       ├── site2_sub1_label.pdb
+   │       ├── site2_sub2_label.rtf
+   │       ├── site2_sub2_label.pdb
+   │       └── support_files...
+   ├── comb_0075_site1_5__site1_1__site1_2/  # Within-site: site1 with subs 5,1,2
+   │   └── prep/
+   ├── comb_0262_site1_1__site1_2__site2_1__site2_2/  # Cross-site combination
+   │   ├── info.py                          # Configuration metadata
+   │   ├── mapping.json                     # File renumbering mapping
+   │   ├── run.sh                           # Job submission script
+   │   └── prep/
+   │       ├── site1_sub1_label.rtf         # Files from both sites
+   │       ├── site1_sub2_label.rtf
+   │       ├── site2_sub1_label.rtf
+   │       └── site2_sub2_label.rtf
+   └── ...
 
 Manifest Files
 ~~~~~~~~~~~~~~

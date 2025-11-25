@@ -22,12 +22,16 @@ Molecular systems are represented as undirected graphs where:
 
 Each edge can have multiple bias types:
 
-* ``linear`` (b): Per-node linear bias affecting individual sites
-* ``quadratic`` (c): Quadratic interaction between site pairs
-* ``skew`` (x): Skew bias controlling asymmetry
-* ``end`` (s): End-state bias affecting boundary behavior
+* ``linear`` (b): Per-node linear bias ensuring equal population of all perturbations 
+  at each site when correctly parameterized
+* ``quadratic`` (c): Pairwise interaction bias that removes barriers in alchemical space 
+  due to electrostatic interactions between sites
+* ``skew`` (x): Asymmetry correction bias that fits residuals beyond quadratic and end 
+  biases, particularly important after soft-core introduction
+* ``end`` (s): End-state bias compensating for the entropic and surface tension cost 
+  of displacing solvent and nearby molecules when substituents appear
 
-**Key Property**: All non-linear bias matrices are antisymmetric:
+**Key Property**: All bias matrices are antisymmetric:
 
 .. math::
 

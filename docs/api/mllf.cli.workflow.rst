@@ -14,6 +14,7 @@
       default_env_reward
       graph_from_bias
       load_bias_from_variables
+      load_manifest
       run_from_config
       run_quick_epoch_for_combo
       split_manifest

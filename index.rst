@@ -11,7 +11,6 @@ the ``docs/`` directory; see the sections below.
 
    docs/index
    docs/installation
-   docs/mlp_model
    docs/examples
    docs/api
 

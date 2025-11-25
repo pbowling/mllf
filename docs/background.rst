@@ -101,9 +101,3 @@ We set :math:`\sigma = 0.18` and :math:`\alpha = 0.017` in practice, and self-te
 where :math:`si = tj` are neglected. The coefficients :math:`\Psi, \chi, \omega`
 capture inter-site coupling and nonlinear bias effects; such coupling can
 substantially affect sampling and therefore free-energy estimates :cite:`HayVilBro18`.
-
-References
-----------
-
-.. bibliography:: references.bib
-   :style: unsrt
