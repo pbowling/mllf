@@ -26,6 +26,8 @@ import numpy as np
 from typing import Dict, List
 
 from mllf.file_handling.generate_combinations import create_combination_dirs
+import re
+import json
 from mllf.cli.workflow import (
     split_manifest,
     build_data_and_targets_from_combo,
@@ -93,7 +95,7 @@ def train_epoch(
         if epoch_results_file.exists():
             print(f"  Loading cached results from {epoch_results_file}")
             try:
-                cached = torch.load(epoch_results_file)
+                cached = torch.load(epoch_results_file, weights_only=False)
                 reward_config = config.get('reward', {})
                 
                 # Check if we need to recompute reward with new config
@@ -132,28 +134,39 @@ def train_epoch(
                 
                 epoch_rewards.append(reward)
                 
-                # REINFORCE update with (potentially recomputed) reward
-                baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
-                advantage = reward - baseline
-                lambda_entropy = reward_config.get('lambda_entropy', 0.01)
-                
-                policy_loss = -(cached['logp'].sum() * advantage)
-                
-                entropy_loss = 0.0
-                if lambda_entropy > 0:
-                    log_std = policy.log_std if hasattr(policy, 'log_std') else torch.zeros_like(cached['actions'])
-                    entropy = 0.5 * torch.log(2 * np.pi * np.e * torch.exp(2 * log_std)).sum()
-                    entropy_loss = -lambda_entropy * entropy
-                
-                loss = policy_loss + entropy_loss
-                
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                epoch_loss += loss.item()
-                print(f"  Using reward: {reward:.4f}")
-                continue
+                # REINFORCE update: Recompute forward pass to get fresh gradients
+                try:
+                    data, targets, extras = build_data_and_targets_from_combo(str(combo_path))
+                    data = data.to(device)
+                    
+                    # Recompute logp with gradients enabled
+                    _, logp_new, _, _ = policy.get_actions(
+                        data.x, data.edge_index, data.edge_type, data.edge_attr,
+                        deterministic=False
+                    )
+                    
+                    baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
+                    advantage = reward - baseline
+                    
+                    policy_loss = -(logp_new.sum() * advantage)
+                    
+                    # Entropy regularization
+                    lambda_entropy = reward_config.get('lambda_entropy', 0.01)
+                    entropy_loss = 0.0
+                    if lambda_entropy > 0:
+                        entropy_loss = -lambda_entropy * logp_new.var()
+                    
+                    loss = policy_loss + entropy_loss
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
+                    epoch_loss += loss.item()
+                    print(f"  Using cached reward: {reward:.4f}")
+                    continue
+                except Exception as e:
+                    print(f"  Error recomputing forward pass from cache: {e}, recomputing full simulation...")
             except Exception as e:
                 print(f"  Error loading cached results: {e}, recomputing...")
         
@@ -174,9 +187,12 @@ def train_epoch(
         # 3. Write variables.py with sampled biases
         variables_path = epoch_dir / 'variables.py'
         try:
+            train_config = config.get('training', {})
+            bias_clip = train_config.get('bias_clip', 1000.0)
             write_variables_from_actions(
                 str(combo_path), data, extras, actions,
-                out_name=str(variables_path.relative_to(combo_path))
+                out_name=str(variables_path.relative_to(combo_path)),
+                bias_clip=bias_clip
             )
             print(f"  Wrote variables to {variables_path}")
         except Exception as e:
@@ -206,13 +222,13 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             epoch_run_script.write_text(run_script_content)
             epoch_run_script.chmod(0o755)
             
-            print(f"  Submitting job via sbatch...")
+            #print(f"  Submitting job via sbatch...")
             try:
                 # Wait if we're at the concurrent job limit
                 while len(job_queue) >= max_concurrent:
                     # Check which jobs have completed
                     completed = []
-                    for i, (jcombo_path, jepoch_dir, jjob_id, jactions, jlogp) in enumerate(job_queue):
+                    for i, (jcombo_path, jepoch_dir, jjob_id, jactions, jlogp, retry_count) in enumerate(job_queue):
                         result = subprocess.run(
                             ['squeue', '--job', jjob_id, '--noheader'],
                             capture_output=True,
@@ -242,7 +258,9 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
                 print(f"  Submitted job {job_id}")
                 
                 # Add to queue for later processing
-                job_queue.append((combo_path, epoch_dir, job_id, actions, logp))
+                # Detach tensors to avoid gradient graph issues across iterations
+                # Include retry count (0 = first attempt)
+                job_queue.append((combo_path, epoch_dir, job_id, actions.detach(), logp.detach(), 0))
                     
             except subprocess.CalledProcessError as e:
                 print(f"  sbatch failed: {e.stderr}")
@@ -252,10 +270,11 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
                 continue
     
     # Wait for remaining jobs to complete
+    max_retries = 3  # Maximum number of retry attempts per simulation
     print(f"\nWaiting for {len(job_queue)} remaining jobs...")
     while job_queue:
         completed = []
-        for i, (jcombo_path, jepoch_dir, jjob_id, jactions, jlogp) in enumerate(job_queue):
+        for i, (jcombo_path, jepoch_dir, jjob_id, jactions, jlogp, retry_count) in enumerate(job_queue):
             result = subprocess.run(
                 ['squeue', '--job', jjob_id, '--noheader'],
                 capture_output=True,
@@ -268,36 +287,75 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
         
         # Remove completed jobs and process them
         for i in reversed(completed):
-            jcombo_path, jepoch_dir, jjob_id, jactions, jlogp = job_queue.pop(i)
+            jcombo_path, jepoch_dir, jjob_id, jactions_old, jlogp_old, retry_count = job_queue.pop(i)
             
-            # Parse raw simulation outputs for flexible reward computation
-            from mllf.file_handling.read_output import (
-                parse_single_population,
-                parse_transitions_and_rates,
-                terminated_normally
-            )
+            # Check if simulation terminated normally
+            from mllf.file_handling.read_output import terminated_normally
             
             output_file = jepoch_dir / 'output.out'
-            raw_metrics = {'populations': [], 'transitions': []}
+            simulation_success = False
             
             try:
                 with open(output_file, 'r') as f:
                     output_text = f.read()
+                simulation_success = terminated_normally(output_text)
+            except Exception as e:
+                print(f"  Warning: Could not read output from {output_file}: {e}")
+            
+            # If simulation failed and we haven't exceeded max retries, resubmit
+            if not simulation_success and retry_count < max_retries:
+                print(f"  Warning: Simulation failed for {jcombo_path.name} in {jepoch_dir.name}")
+                print(f"  Retrying (attempt {retry_count + 2}/{max_retries + 1})...")
                 
-                if terminated_normally(output_text):
-                    population_data = parse_single_population(output_text)
-                    transitions_data, _ = parse_transitions_and_rates(output_text)
+                try:
+                    # Resubmit the same job
+                    epoch_run_script = jepoch_dir / 'run.sh'
+                    result = subprocess.run(
+                        ['sbatch', str(epoch_run_script)],
+                        cwd=str(jepoch_dir),
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    new_job_id = result.stdout.strip().split()[-1]
+                    print(f"  Resubmitted job {new_job_id}")
                     
-                    # Extract raw populations
-                    for block_id, block_info in population_data.items():
-                        counts_dict = block_info.get('counts', {})
-                        total_count = sum(counts_dict.values())
-                        raw_metrics['populations'].append(total_count)
-                    
-                    # Extract raw transitions
-                    for site_id, trans_dict in transitions_data.items():
-                        total_trans = sum(trans_dict.values())
-                        raw_metrics['transitions'].append(total_trans)
+                    # Add back to queue with incremented retry count
+                    job_queue.append((jcombo_path, jepoch_dir, new_job_id, jactions_old, jlogp_old, retry_count + 1))
+                except Exception as e:
+                    print(f"  Error resubmitting job: {e}")
+                    print(f"  Skipping combo {jcombo_path.name} - manual intervention required")
+                
+                continue  # Skip processing this job for now
+            
+            # If simulation still failed after max retries, skip it
+            if not simulation_success:
+                print(f"  ERROR: Simulation failed after {max_retries + 1} attempts for {jcombo_path.name}")
+                print(f"  Skipping this combo - manual intervention required")
+                continue
+            
+            # Simulation succeeded - parse outputs and update policy
+            from mllf.file_handling.read_output import (
+                parse_single_population,
+                parse_transitions_and_rates
+            )
+            
+            raw_metrics = {'populations': [], 'transitions': []}
+            
+            try:
+                population_data = parse_single_population(output_text)
+                transitions_data, _ = parse_transitions_and_rates(output_text)
+                
+                # Extract raw populations
+                for block_id, block_info in population_data.items():
+                    counts_dict = block_info.get('counts', {})
+                    total_count = sum(counts_dict.values())
+                    raw_metrics['populations'].append(total_count)
+                
+                # Extract raw transitions
+                for site_id, trans_dict in transitions_data.items():
+                    total_trans = sum(trans_dict.values())
+                    raw_metrics['transitions'].append(total_trans)
             except Exception as e:
                 print(f"  Warning: Could not parse outputs from {output_file}: {e}")
             
@@ -318,8 +376,8 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             epoch_results_file = jepoch_dir / 'epoch_results.pt'
             torch.save({
                 'reward': reward,
-                'actions': jactions.detach().cpu(),
-                'logp': jlogp.detach().cpu(),
+                'actions': jactions_old.cpu(),
+                'logp': jlogp_old.cpu(),
                 'epoch': epoch,
                 'combo': str(jcombo_path.name),
                 # Raw simulation metrics for reward recomputation
@@ -328,27 +386,49 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
                 'reward_config': reward_config  # Save config used for this reward
             }, epoch_results_file)
             
-            # REINFORCE update
-            baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
-            advantage = reward - baseline
-            lambda_entropy = reward_config.get('lambda_entropy', 0.01)
-            
-            policy_loss = -(jlogp.sum() * advantage)
-            
-            # Entropy regularization
-            entropy_loss = 0.0
-            if lambda_entropy > 0:
-                log_std = policy.log_std if hasattr(policy, 'log_std') else torch.zeros_like(jactions)
-                entropy = 0.5 * torch.log(2 * np.pi * np.e * torch.exp(2 * log_std)).sum()
-                entropy_loss = -lambda_entropy * entropy
-            
-            loss = policy_loss + entropy_loss
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
+            # REINFORCE update: Recompute forward pass for this combo to get fresh gradients
+            try:
+                data, targets, extras = build_data_and_targets_from_combo(str(jcombo_path))
+                data = data.to(device)
+                
+                # Recompute actions and logp with gradients enabled
+                _, logp_new, _, _ = policy.get_actions(
+                    data.x, data.edge_index, data.edge_type, data.edge_attr,
+                    deterministic=False
+                )
+                
+                # REINFORCE loss with current policy
+                baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
+                advantage = reward - baseline
+                
+                policy_loss = -(logp_new.sum() * advantage)
+                
+                # Entropy regularization
+                lambda_entropy = reward_config.get('lambda_entropy', 0.01)
+                entropy_loss = 0.0
+                if lambda_entropy > 0:
+                    # Simple entropy approximation
+                    entropy_loss = -lambda_entropy * logp_new.var()
+                
+                loss = policy_loss + entropy_loss
+                
+                # Check for NaN or inf in loss before backprop
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"  Warning: NaN/inf loss detected for {jcombo_path.name}, skipping update")
+                    continue
+                
+                optimizer.zero_grad()
+                loss.backward()
+                
+                # Clip gradients to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                
+            except Exception as e:
+                print(f"  Warning: Could not recompute forward pass for {jcombo_path.name}: {e}")
         
         if job_queue:
             time.sleep(10)  # Wait before checking again
@@ -361,6 +441,72 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
         'avg_reward': avg_reward,
         'num_combos': len(combos)
     }
+
+
+def fix_msld_flat_for_single_site(combo_path: Path):
+    """
+    Modify msld_flat.py in combo directory to only delete atoms that would
+    overlap with present sites. For this 14benz example:
+    - C4/H4 overlap with site1_sub1
+    - C5/H5 overlap with site2_sub1
+    
+    If only site1 is present: delete only C4/H4
+    If only site2 is present: delete only C5/H5
+    If both sites present: delete both C4/H4 and C5/H5 (original behavior)
+    """
+    msld_flat = combo_path / 'msld_flat.py'
+    if not msld_flat.exists():
+        return
+    
+    # Read mapping.json to determine ORIGINAL sites present
+    mapping_file = combo_path / 'mapping.json'
+    if not mapping_file.exists():
+        return
+    
+    with open(mapping_file, 'r') as f:
+        mapping = json.load(f)
+    
+    # Extract unique original site numbers from entries that have site info
+    original_sites = set()
+    for entry in mapping.get('entries', []):
+        site = entry.get('site')
+        if site is not None:
+            original_sites.add(site)
+    
+    # Determine what to delete based on original sites
+    # Only modify if exactly one site is present
+    if len(original_sites) != 1:
+        return  # Either no sites identified or multiple sites - leave unchanged
+    
+    original_site = list(original_sites)[0]
+    
+    # Determine which atoms to delete based on ORIGINAL site number
+    if original_site == 1:
+        # Original site1: delete C4/H4 (overlaps with site1_sub1)
+        atoms_to_delete = 'C4 H4'
+    elif original_site == 2:
+        # Original site2: delete C5/H5 (overlaps with site2_sub1)
+        atoms_to_delete = 'C5 H5'
+    else:
+        # Unknown site - leave as is
+        return
+    
+    # Read and modify the msld_flat.py content
+    content = msld_flat.read_text()
+    
+    # Replace the delete line - handle both original and already-modified versions
+    # Pattern matches any combination of C4, C5, H4, H5 atoms
+    old_pattern = r"select\.store_selection\('todelete',pycharmm\.SelectAtoms\(\)\.by_res_and_type\(ligseg,resnum,'[CH45 ]+'\)\)"
+    new_line = f"select.store_selection('todelete',pycharmm.SelectAtoms().by_res_and_type(ligseg,resnum,'{atoms_to_delete}'))"
+    
+    new_content = re.sub(old_pattern, new_line, content)
+    
+    # Only write if something changed
+    if new_content != content:
+        msld_flat.write_text(new_content)
+        #print(f"  Modified {combo_path.name}: delete {atoms_to_delete} (original site{original_site})")
+    else:
+        print(f"  Skipped {combo_path.name}: already correct or pattern not found")
 
 
 def main():
@@ -386,6 +532,11 @@ def main():
         
         created = create_combination_dirs(input_dir, out_dir, include_patterns=include)
         print(f"Created {len(created)} combination directories")
+        
+        # Fix msld_flat.py for single-site combinations (14benz specific)
+        print("Fixing msld_flat.py for single-site combinations...")
+        for combo_path in created:
+            fix_msld_flat_for_single_site(combo_path)
         
         # Create manifest
         manifest_path = out_dir / 'manifest.txt'
@@ -479,7 +630,7 @@ def main():
         if checkpoints:
             latest_checkpoint = checkpoints[-1]
             print(f"\n=== Resuming from checkpoint: {latest_checkpoint} ===")
-            checkpoint = torch.load(latest_checkpoint, map_location=device)
+            checkpoint = torch.load(latest_checkpoint, map_location=device, weights_only=False)
             encoder.load_state_dict(checkpoint['encoder_state'])
             policy.load_state_dict(checkpoint['policy_state'])
             optimizer.load_state_dict(checkpoint['optimizer_state'])

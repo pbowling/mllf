@@ -245,7 +245,8 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
     return data, targets, extras
 
 
-def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: torch.Tensor, out_name: str = 'variables.py') -> None:
+def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: torch.Tensor, out_name: str = 'variables.py', 
+                                 bias_clip: float = 1000.0) -> None:
     """Write a variables.py file from per-directed-edge policy actions.
 
     This function maps directed relation actions back to base biases (quadratic, skew,
@@ -261,6 +262,8 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         actions: Tensor of per-directed-edge scalar actions (shape [E] where E = data.edge_index.shape[1]).
                  Each action corresponds to one directed edge in data.edge_index.
         out_name: Name of output file (default: 'variables.py').
+        bias_clip: Maximum absolute value for bias coefficients (default: 1000.0).
+                   All bias values will be clipped to [-bias_clip, bias_clip].
 
     Returns:
         None. Writes a Python file containing a triple-quoted YAML bias_string with keys:
@@ -325,6 +328,9 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 val = float(actions[k])
             except Exception:
                 val = 0.0
+        
+        # Clip to prevent extreme values
+        val = max(-bias_clip, min(bias_clip, val))
 
         # Store forward value if this is the forward relation and we haven't seen this pair yet
         if rel_name == fwd_name and (pair not in per_base_forward[base]):
@@ -343,6 +349,8 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 v = float(val)
             except Exception:
                 v = 0.0
+            # Clip to ensure antisymmetry doesn't create extreme values
+            v = max(-bias_clip, min(bias_clip, v))
             # Set forward (i,j) to value and backward (j,i) to negative
             mat[i][j] = v
             mat[j][i] = -v
@@ -366,16 +374,23 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 avg = float(val)
             except Exception:
                 avg = 0.0
+            # Clip before accumulating
+            avg = max(-bias_clip, min(bias_clip, avg))
             sums[i] += avg
             sums[j] += avg
             counts[i] += 1
             counts[j] += 1
-        # Average the accumulated values
+        # Average the accumulated values and clip the final result
         for idx in range(N):
             if counts[idx] > 0:
                 b_vec[idx] = sums[idx] / counts[idx]
+                b_vec[idx] = max(-bias_clip, min(bias_clip, b_vec[idx]))
             else:
                 b_vec[idx] = 0.0
+    
+    # Always set b[0] to 0.0 (first element of linear bias must be zero)
+    if b_vec:
+        b_vec[0] = 0.0
 
     # Format bias_string manually to match expected YAML structure
     # b: single row with first element using '- -' then rest using just '-'

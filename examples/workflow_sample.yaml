@@ -7,13 +7,13 @@ create_combos:
 
 # Train/val/test split
 split:
-  train_frac: 0.70  # 3% for training
-  val_frac: 0.15    # 3% for validation
+  train_frac: 0.70  # 70% for training
+  val_frac: 0.15    # 15% for validation
   seed: 42
 
 # Training configuration
 training:
-  num_epochs: 50  # Full training cycle
+  num_epochs: 50 
   encoder:
     hidden_dims: [64, 64]
     out_dim: 32
@@ -21,11 +21,12 @@ training:
     mlp_hidden: 64
   optimizer:
     lr: 0.001
+  bias_clip: 1000.0  # Maximum absolute value for bias coefficients
   
 # Simulation configuration
 run_sims: true
 wait_for_jobs: true  # Wait for jobs to complete before computing rewards
-max_concurrent_jobs: 30  # Maximum SLURM jobs running simultaneously
+max_concurrent_jobs: 60  # Maximum SLURM jobs running simultaneously
 timeout: 1200  # 20 minutes per simulation
 
 # Reward configuration (scalarized reward function)

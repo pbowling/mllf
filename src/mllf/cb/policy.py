@@ -70,6 +70,9 @@ class EdgePolicy(nn.Module):
             D = C // 2 if C >= 2 else 1
         mean = out[:, :D]
         log_std = out[:, D: D + D]
+        # Clamp log_std to prevent extreme standard deviations that can cause NaN
+        # exp(-20) ≈ 2e-9, exp(2) ≈ 7.4 — reasonable range for std deviation
+        log_std = torch.clamp(log_std, min=-20.0, max=2.0)
         return mean, log_std
 
     def get_actions(self, x, edge_index, edge_type, edge_feat: Optional[torch.Tensor] = None, deterministic: bool = False):
