@@ -21,8 +21,8 @@ def test_rotating_anchor_constraint():
     
     combos = all_site_sub_combinations(mock_found)
     
-    # Extract just the subs lists
-    subs_lists = [tuple(subs) for sites, subs in combos]
+    # Extract just the subs lists (handle 3-tuple format)
+    subs_lists = [tuple(subs) for sites, subs, _ in combos]
     
     # Expected count: 5 subs × 15 combinations each = 75
     expected_count = 75
@@ -65,16 +65,22 @@ def test_two_site_combinations():
     
     combos = all_site_sub_combinations(mock_found)
     
-    # Separate by site
-    site1_combos = [(sites, subs) for sites, subs in combos if sites == [1]]
-    site2_combos = [(sites, subs) for sites, subs in combos if sites == [2]]
+    # Separate by site (handle 3-tuple with None for within-site)
+    site1_combos = [(sites, subs) for sites, subs, _ in combos if sites == [1]]
+    site2_combos = [(sites, subs) for sites, subs, _ in combos if sites == [2]]
+    cross_site_combos = [(sites, subs) for sites, subs, counts in combos if len(sites) > 1]
     
     # Verify counts: each sub as anchor generates C(n-1,1) + C(n-1,2) + ... + C(n-1,n-1)
     # For n=5: C(4,1) + C(4,2) + C(4,3) + C(4,4) = 4 + 6 + 4 + 1 = 15 per anchor
     # For n=6: C(5,1) + C(5,2) + C(5,3) + C(5,4) + C(5,5) = 5 + 10 + 10 + 5 + 1 = 31 per anchor
     assert len(site1_combos) == 75, f"Expected 75 combinations for site1 (5×15), got {len(site1_combos)}"
     assert len(site2_combos) == 186, f"Expected 186 combinations for site2 (6×31), got {len(site2_combos)}"
-    assert len(combos) == 261, f"Expected 261 total combinations, got {len(combos)}"
+    
+    # Cross-site: 75 × 186 = 13,950
+    assert len(cross_site_combos) == 13950, f"Expected 13,950 cross-site combos, got {len(cross_site_combos)}"
+    
+    # Total: within-site + cross-site = 75 + 186 + 13,950 = 14,211
+    assert len(combos) == 14211, f"Expected 14,211 total combinations, got {len(combos)}"
     
     # Verify different anchors produce different ordered combinations
     site1_subs = [tuple(subs) for sites, subs in site1_combos]
@@ -86,9 +92,10 @@ def test_14benz_exact_count():
     """Test that 14benz_solv_5.5 generates correct number of combinations.
     
     With rotating anchor constraint:
-    - Site1: 5 subs × 15 combinations each = 75
-    - Site2: 6 subs × 31 combinations each = 186
-    - Total: 75 + 186 = 261 combinations
+    - Site1: 5 subs × 15 combinations each = 75 within-site
+    - Site2: 6 subs × 31 combinations each = 186 within-site
+    - Cross-site: 75 × 186 = 13,950 combinations
+    - Total: 75 + 186 + 13,950 = 14,211 combinations
     
     Note: site2_sub7 has been removed, so site2 now has 6 subs.
     """
@@ -103,19 +110,31 @@ def test_14benz_exact_count():
     eligible = {s: subs for s, subs in found.items() if len(subs) >= 2}
     combos = all_site_sub_combinations(eligible)
     
-    # Verify count matches formula: Σ(n_site × (2^(n_site-1) - 1))
-    expected_total = 0
+    # Separate within-site and cross-site
+    within_site = [(sites, subs) for sites, subs, _ in combos if len(sites) == 1]
+    cross_site = [(sites, subs) for sites, subs, _ in combos if len(sites) > 1]
+    
+    # Verify within-site count matches formula: Σ(n_site × (2^(n_site-1) - 1))
+    expected_within = 0
     for site in sorted(eligible.keys()):
-        site_combos = [c for c in combos if c[0] == [site]]
+        site_combos = [c for c in within_site if c[0] == [site]]
         nsubs = len(eligible[site])
         # Each sub as anchor generates 2^(n-1) - 1 combinations
         expected_per_site = nsubs * (2 ** (nsubs - 1) - 1)
-        expected_total += expected_per_site
+        expected_within += expected_per_site
         assert len(site_combos) == expected_per_site, \
-            f"Site {site}: expected {expected_per_site} combinations, got {len(site_combos)}"
+            f"Site {site}: expected {expected_per_site} within-site combinations, got {len(site_combos)}"
     
-    assert len(combos) == expected_total, \
-        f"Expected {expected_total} total combinations, got {len(combos)}"
+    assert len(within_site) == expected_within, \
+        f"Expected {expected_within} within-site combinations, got {len(within_site)}"
+    
+    # Verify cross-site count
+    # For 2 sites: site1 has 75 selections, site2 has 186 selections
+    # Cross-site = 75 × 186 = 13,950
+    assert len(cross_site) == 13950, f"Expected 13,950 cross-site combinations, got {len(cross_site)}"
+    
+    # Total
+    assert len(combos) == 14211, f"Expected 14,211 total combinations, got {len(combos)}"
     
     # Print for debugging
     print(f"\n14benz_solv_5.5 generated {len(combos)} combinations")
@@ -338,8 +357,8 @@ def test_combination_uniqueness():
     
     combos = all_site_sub_combinations(mock_found)
     
-    # Extract just the subs lists for easier checking
-    subs_lists = [tuple(subs) for sites, subs in combos]
+    # Extract just the subs lists for easier checking (handle 3-tuple format)
+    subs_lists = [tuple(subs) for sites, subs, _ in combos]
     
     # Check that [1,2,3] is present
     assert (1, 2, 3) in subs_lists, "Expected [1,2,3] to be generated"
@@ -365,6 +384,148 @@ def test_combination_uniqueness():
             seen.add(key)
 
 
+def test_cross_site_combinations():
+    """Test cross-site combination generation.
+    
+    With 2 sites (site1 has 3 subs, site2 has 3 subs):
+    - Within-site combos: site1 has 9, site2 has 9 (total 18)
+    - Cross-site combos: 9 × 9 = 81
+    - Total: 18 + 81 = 99 combinations
+    """
+    mock_found = {
+        1: {i: {} for i in [1, 2, 3]},
+        2: {i: {} for i in [1, 2, 3]},
+    }
+    
+    combos = all_site_sub_combinations(mock_found)
+    
+    # Separate within-site and cross-site
+    within_site = [(sites, subs) for sites, subs, _ in combos if len(sites) == 1]
+    cross_site = [(sites, subs, counts) for sites, subs, counts in combos if len(sites) > 1]
+    
+    # For n=3 subs: 3 anchors × (C(2,1) + C(2,2)) = 3 × 3 = 9 per site
+    assert len(within_site) == 18, f"Expected 18 within-site combos, got {len(within_site)}"
+    
+    # Cross-site: 9 selections for site1 × 9 selections for site2 = 81
+    assert len(cross_site) == 81, f"Expected 81 cross-site combos, got {len(cross_site)}"
+    
+    assert len(combos) == 99, f"Expected 99 total combinations, got {len(combos)}"
+    
+    # Verify structure of cross-site combos
+    sample_sites, sample_subs, sample_counts = cross_site[0]
+    assert len(sample_sites) == 2, "Cross-site should have 2 sites"
+    assert sample_sites == [1, 2], "Sites should be [1, 2]"
+    assert len(sample_subs) >= 4, "Cross-site should have at least 4 subs (2 from each site)"
+    assert sample_counts is not None, "Cross-site should have counts"
+    assert len(sample_counts) == 2, "Counts should match number of sites"
+
+
+def test_14benz_with_cross_site():
+    """Test that 14benz_solv_5.5 generates correct number including cross-site.
+    
+    With rotating anchor constraint:
+    - Site1: 5 subs × 15 combinations each = 75 within-site
+    - Site2: 6 subs × 31 combinations each = 186 within-site
+    - Cross-site: 75 × 186 = 13,950 combinations
+    - Total: 75 + 186 + 13,950 = 14,211 combinations
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    example_dir = repo_root / 'examples' / 'cb' / '14benz_solv_5.5'
+    
+    if not example_dir.exists():
+        # Skip if example not available
+        return
+    
+    found = find_site_sub_files(example_dir)
+    eligible = {s: subs for s, subs in found.items() if len(subs) >= 2}
+    combos = all_site_sub_combinations(eligible)
+    
+    # Separate within-site and cross-site (handle 3-tuple format)
+    within_site = [(sites, subs) for sites, subs, _ in combos if len(sites) == 1]
+    cross_site = [(sites, subs, counts) for sites, subs, counts in combos if len(sites) > 1]
+    
+    # Verify within-site counts
+    site1_within = [c for c in within_site if c[0] == [1]]
+    site2_within = [c for c in within_site if c[0] == [2]]
+    
+    print(f"\n14benz_solv_5.5 with cross-site:")
+    print(f"  Site 1 within-site: {len(site1_within)} combinations")
+    print(f"  Site 2 within-site: {len(site2_within)} combinations")
+    print(f"  Cross-site: {len(cross_site)} combinations")
+    print(f"  Total: {len(combos)} combinations")
+    
+    # Expected: site1 has 5 subs → 75, site2 has 6 subs → 186
+    assert len(site1_within) == 75, f"Expected 75 site1 within-site, got {len(site1_within)}"
+    assert len(site2_within) == 186, f"Expected 186 site2 within-site, got {len(site2_within)}"
+    
+    # Cross-site: 75 × 186 = 13,950
+    assert len(cross_site) == 13950, f"Expected 13,950 cross-site, got {len(cross_site)}"
+    
+    # Total
+    assert len(combos) == 14211, f"Expected 14,211 total, got {len(combos)}"
+
+
+def test_cross_site_file_structure():
+    """Test that cross-site combinations create correct file structure."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_dir = Path(tmpdir) / 'input'
+        prep_dir = input_dir / 'prep'
+        prep_dir.mkdir(parents=True)
+        
+        # Create files for site1 (2 subs) and site2 (2 subs)
+        for site in [1, 2]:
+            for sub in [1, 2]:
+                (prep_dir / f'site{site}_sub{sub}_pres.rtf').write_text(f'PRES p{site}_{sub} 0.0\n')
+                (prep_dir / f'site{site}_sub{sub}_frag.pdb').write_text(f'SITE{site}_SUB{sub}\n')
+        
+        # Create required support files
+        (prep_dir / 'full_ligand.rtf').write_text('RTF\n')
+        (prep_dir / 'full_ligand.pdb').write_text('ATOM 1\n')
+        
+        output_dir = Path(tmpdir) / 'output'
+        
+        # Generate combinations
+        created = create_combination_dirs(input_dir, output_dir, dry_run=False)
+        
+        # Should have: 2 site1-only + 2 site2-only + 4 cross-site = 8 total
+        # Actually with rotating anchor: site1: 1 combo, site2: 1 combo, cross: 1×1 = 1
+        # Wait, with 2 subs each: anchor 1 with [2], anchor 2 with [1] = 2 per site
+        # So: 2 + 2 + (2×2) = 8 combinations
+        
+        within_site = [d for d in created if len([s for s in d.name.split('__') if 'site1' in s]) + 
+                                            len([s for s in d.name.split('__') if 'site2' in s]) < 4]
+        
+        # Find a cross-site combination directory
+        cross_site_dirs = [d for d in created if 'site1' in d.name and 'site2' in d.name]
+        
+        assert len(cross_site_dirs) > 0, "Should have at least one cross-site combination"
+        
+        # Check first cross-site combo
+        cross_combo = cross_site_dirs[0]
+        prep_path = cross_combo / 'prep'
+        
+        # Should have files from both sites
+        site1_files = list(prep_path.glob('site1_sub*'))
+        site2_files = list(prep_path.glob('site2_sub*'))
+        
+        assert len(site1_files) >= 4, f"Should have at least 4 site1 files (2 RTF + 2 PDB), got {len(site1_files)}"
+        assert len(site2_files) >= 4, f"Should have at least 4 site2 files (2 RTF + 2 PDB), got {len(site2_files)}"
+        
+        # Verify info.py has nsubs as a list with 2 elements (one per site)
+        info_path = cross_combo / 'info.py'
+        info_content = info_path.read_text()
+        
+        # Should have nsubs = [2, 2] or similar
+        assert "info['nsubs']" in info_content
+        # Parse to verify it's a list with 2 elements
+        import re
+        match = re.search(r"info\['nsubs'\]\s*=\s*\[([^\]]+)\]", info_content)
+        assert match, "Should find nsubs list in info.py"
+        nsubs_values = [int(x.strip()) for x in match.group(1).split(',')]
+        assert len(nsubs_values) == 2, f"Should have 2 entries in nsubs for cross-site, got {len(nsubs_values)}"
+        assert all(n >= 2 for n in nsubs_values), "Each site should contribute at least 2 subs"
+
+
 def test_print_combinations_for_example():
     repo_root = Path(__file__).resolve().parents[1]
     example_dir = repo_root / 'examples' / 'cb' / '14benz_solv_5.5'
@@ -375,20 +536,40 @@ def test_print_combinations_for_example():
     eligible = {s: subs for s, subs in found.items() if len(subs) >= 2}
 
     combos = all_site_sub_combinations(eligible)
+    
+    # Separate within-site and cross-site for reporting (handle 3-tuple format)
+    within_site = [(sites, subs) for sites, subs, _ in combos if len(sites) == 1]
+    cross_site = [(sites, subs) for sites, subs, _ in combos if len(sites) > 1]
 
     # Print combinations directly to the controlling terminal (bypass pytest capture)
     import sys
     out = sys.__stdout__
-    out.write(f"Found {len(eligible)} eligible sites and {len(combos)} combinations\n")
-    for idx, (sites, subs) in enumerate(combos, start=1):
+    out.write(f"Found {len(eligible)} eligible sites\n")
+    out.write(f"  Within-site: {len(within_site)} combinations\n")
+    out.write(f"  Cross-site: {len(cross_site)} combinations\n")
+    out.write(f"  Total: {len(combos)} combinations\n")
+    
+    # Print first 10 of each type
+    out.write("\nFirst 10 within-site combinations:\n")
+    for idx, (sites, subs) in enumerate(within_site[:10], start=1):
         name = make_combo_dir_name(idx, sites, subs)
-        out.write(name + '\n')
+        out.write(f"  {name}\n")
+    
+    out.write("\nFirst 10 cross-site combinations:\n")
+    for idx, (sites, subs) in enumerate(cross_site[:10], start=len(within_site)+1):
+        name = make_combo_dir_name(idx, sites, subs)
+        out.write(f"  {name}\n")
+    
     out.flush()
+    
     # Also write combos to a file for easy inspection
     out_path = repo_root / 'combos_14benz_solv_5.5.txt'
     with out_path.open('w') as fh:
-        fh.write(f"Found {len(eligible)} eligible sites and {len(combos)} combinations\n")
-        for idx, (sites, subs) in enumerate(combos, start=1):
+        fh.write(f"Found {len(eligible)} eligible sites\n")
+        fh.write(f"  Within-site: {len(within_site)} combinations\n")
+        fh.write(f"  Cross-site: {len(cross_site)} combinations\n")
+        fh.write(f"  Total: {len(combos)} combinations\n\n")
+        for idx, (sites, subs, _) in enumerate(combos, start=1):
             name = make_combo_dir_name(idx, sites, subs)
             fh.write(name + '\n')
 

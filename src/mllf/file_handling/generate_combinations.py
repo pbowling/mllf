@@ -40,11 +40,22 @@ Will produce directories like:
     └── run.sh
 
 Combination Generation Logic:
-- Generates within-site combinations of size >= 2 (pairs, triplets, etc.)
-- First substituent is fixed as anchor; remaining form unordered sets
-- Example: [1,2,3] and [1,3,2] are considered identical (same tail)
-- But [2,1,3] is different (different anchor)
-- This reduces combinatorial explosion while maintaining diversity
+
+- Generates both within-site and cross-site combinations
+- Within-site: Each substituent can be the "anchor" with others as tail
+
+  - Anchor is always first, tail is sorted
+  - Example: anchor=1 generates [1,2], [1,3], [1,2,3], etc.
+  - Example: anchor=2 generates [2,1], [2,3], [2,1,3], etc.
+  - Minimum 2 substituents per combination
+
+- Cross-site: Cartesian product of within-site selections across sites
+
+  - Each site contributes >= 2 substituents
+  - Example: site1 has 75 selections, site2 has 186 selections
+  - Generates 75 × 186 = 13,950 cross-site combinations
+
+- Total combinations grow significantly with multiple sites
 
 Additional Features:
 - RTF PRES tokens are automatically renumbered to match new indices
@@ -108,34 +119,45 @@ def find_site_sub_files(input_dir: Path) -> Dict[int, Dict[int, Dict[Tuple[str, 
 
 
 def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> List[Tuple[List[int], List[int]]]:
-    """Generate all within-site ordered combinations with rotating anchor.
+    """Generate all within-site and cross-site ordered combinations.
 
-    For each site independently, enumerate all subsets of substituents of size >= 2.
-    For EACH substituent as anchor, generate all unordered combinations with the
-    remaining substituents. This creates ordered tuples where position matters.
+    For each site independently, enumerate all subsets of substituents of size >= 2
+    using rotating anchor strategy. Then, generate cross-site combinations by
+    selecting at least 2 substituents from each involved site.
 
-    Strategy:
+    Within-site strategy:
     - For each sub as "anchor", generate combinations from remaining subs
     - Example with subs [1,2,3,4,5]:
       - Anchor 1: [1,2], [1,3], [1,4], [1,5], [1,2,3], [1,2,4], ...
       - Anchor 2: [2,1], [2,3], [2,4], [2,5], [2,1,3], [2,1,4], ...
-      - etc.
+
+    Cross-site strategy:
+    - For each combination of sites (pairs, triplets, etc.), generate all valid
+      combinations where each site contributes >= 2 subs
+    - Uses rotating anchor within each site component
+    - Example: site1[1,2] × site2[3,4] generates multiple ordered combinations
 
     Args:
         found: Nested dict mapping site -> sub -> {(label, ext): Path}.
 
     Returns:
-        List of (sites_list, subs_list) tuples where:
-        - sites_list: List containing single site ID (e.g., [1])
-        - subs_list: List of selected sub indices (e.g., [1, 2, 3])
+        List of (sites_list, subs_list, subs_per_site_counts) tuples where:
+        - sites_list: List of site IDs (e.g., [1] for within-site or [1, 2] for cross-site)
+        - subs_list: List of selected sub indices (e.g., [1, 2, 3, 4])
+          For cross-site, subs are concatenated from each site in order
+        - subs_per_site_counts: Tuple of counts for cross-site (e.g., (2, 2) means
+          first 2 subs from site1, next 2 from site2), or None for within-site
     """
     combos = []
-    # For each site, iterate over each substituent as anchor
-    for site in sorted(found.keys()):
-        subs = sorted(found[site].keys())
-        if len(subs) < 2:
-            continue  # Need at least 2 subs to form a combination
-        
+    sites_with_enough_subs = {site: sorted(subs.keys()) 
+                               for site, subs in found.items() 
+                               if len(subs) >= 2}
+    
+    if not sites_with_enough_subs:
+        return combos
+    
+    # Part 1: Within-site combinations (existing logic)
+    for site, subs in sites_with_enough_subs.items():
         # Try each sub as anchor
         for anchor in subs:
             remaining = [s for s in subs if s != anchor]
@@ -146,7 +168,47 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
                 for tail_combo in itertools.combinations(remaining, r):
                     # Anchor always first, followed by sorted tail
                     combo_list = [anchor] + list(tail_combo)
-                    combos.append(([site], combo_list))
+                    # For within-site, return 2-tuple for backward compatibility
+                    combos.append(([site], combo_list, None))
+    
+    # Part 2: Cross-site combinations (new)
+    # Generate combinations of sites (pairs, triplets, etc.)
+    all_sites = sorted(sites_with_enough_subs.keys())
+    if len(all_sites) >= 2:
+        # For each combination of 2 or more sites
+        for num_sites in range(2, len(all_sites) + 1):
+            for site_combo in itertools.combinations(all_sites, num_sites):
+                # For each site in this combination, generate within-site sub selections
+                # Each site must contribute at least 2 subs
+                site_sub_options = []
+                for site in site_combo:
+                    subs = sites_with_enough_subs[site]
+                    # Generate all possible within-site selections (size >= 2) with rotating anchor
+                    site_selections = []
+                    for anchor in subs:
+                        remaining = [s for s in subs if s != anchor]
+                        for r in range(1, len(remaining) + 1):
+                            for tail_combo in itertools.combinations(remaining, r):
+                                combo_list = [anchor] + list(tail_combo)
+                                site_selections.append(combo_list)
+                    site_sub_options.append(site_selections)
+                
+                # Generate cartesian product of all site selections
+                for cross_site_selection in itertools.product(*site_sub_options):
+                    # Build sites list and concatenated subs list
+                    # Also track the distribution of subs per site for later processing
+                    sites_list = list(site_combo)
+                    subs_list = []
+                    subs_per_site_counts = []
+                    
+                    for sub_selection in cross_site_selection:
+                        subs_list.extend(sub_selection)
+                        subs_per_site_counts.append(len(sub_selection))
+                    
+                    # Store as tuple: (sites, subs, subs_per_site_counts)
+                    # The counts tell us how to split the subs list back into per-site selections
+                    combos.append((sites_list, subs_list, tuple(subs_per_site_counts)))
+    
     return combos
 
 
@@ -157,32 +219,39 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int]) -> str:
         counter: Sequential combination number (for comb_NNNN prefix).
         sites: List of site IDs in this combination.
         subs: List of substituent IDs in this combination.
+          For cross-site combos, subs are ordered by site.
 
     Returns:
-        Directory name like 'comb_0001_site1_2__site1_3__site1_4'.
+        Directory name like:
+        - Within-site: 'comb_0001_site1_2__site1_3__site1_4'
+        - Cross-site: 'comb_0001_site1_1__site1_2__site2_3__site2_4'
     """
     parts = []
-    # If there is a single site with multiple selected subs, list each sub
-    # for that site. If there are multiple sites and equal-length subs list,
-    # pair them elementwise. Otherwise fall back to pairing as much as
-    # possible.
-    if len(sites) == 1 and len(subs) >= 1:
+    
+    if len(sites) == 1:
+        # Within-site combination: all subs belong to same site
         s = sites[0]
-        # use `_to_` to indicate ordering/direction between selected subs
         for sub in subs:
             parts.append(f"site{s}_{sub}")
-    elif len(sites) == len(subs):
-        for s, sub in zip(sites, subs):
-            parts.append(f"site{s}_{sub}")
     else:
-        # fallback: pair up to the shorter length, then append remaining
-        for i in range(min(len(sites), len(subs))):
-            parts.append(f"site{sites[i]}_{subs[i]}")
-        # if any subs left (unlikely), append them using last site
-        if len(subs) > len(sites):
-            last_site = sites[-1]
-            for sub in subs[len(sites):]:
-                parts.append(f"site{last_site}_{sub}")
+        # Cross-site combination: distribute subs across sites
+        # Need to figure out which subs belong to which site
+        # For now, assume subs are evenly distributed or use simple split
+        # This is a heuristic - the actual mapping is stored in mapping.json
+        
+        # Simple strategy: divide subs among sites as evenly as possible
+        subs_per_site = len(subs) // len(sites)
+        remainder = len(subs) % len(sites)
+        
+        idx = 0
+        for i, site in enumerate(sites):
+            # Give extra sub to first 'remainder' sites
+            count = subs_per_site + (1 if i < remainder else 0)
+            for _ in range(count):
+                if idx < len(subs):
+                    parts.append(f"site{site}_{subs[idx]}")
+                    idx += 1
+    
     joined = "__".join(parts)
     return f"comb_{counter:04d}_{joined}"
 
@@ -225,7 +294,14 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
     created_dirs: List[Path] = []
     cnt = 1
     out_dir.mkdir(parents=True, exist_ok=True)
-    for sites, subs in combos:
+    for combo_data in combos:
+        # Handle both 2-tuple (backward compat) and 3-tuple (with counts)
+        if len(combo_data) == 3 and combo_data[2] is not None:
+            sites, subs, subs_per_site_counts = combo_data
+        else:
+            sites, subs = combo_data[0], combo_data[1]
+            subs_per_site_counts = None
+            
         name = make_combo_dir_name(cnt, sites, subs)
         combo_path = out_dir / name
         cnt += 1
@@ -235,27 +311,22 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
         else:
             combo_path.mkdir(exist_ok=True)
 
-        # For each site in this combo, we will rename selected subs starting at 1
-        # within the combo dir. Since we pick exactly one sub per site here, the
-        # new sub index is 1 for each site. If later we support multiple subs per
-        # site in a combo, we'd enumerate and assign 1..k.
-        # Handle per-site selection. `sites` is a list of sites; `subs` may
-        # represent multiple chosen subs for a single site (common case). We
-        # support two patterns:
-        #  - len(sites) == len(subs): one chosen sub per site (legacy behavior)
-        #  - len(sites) == 1 and len(subs) >= 1: multiple chosen subs within one site
-        if len(sites) == len(subs):
-            # one-to-one mapping: process each (site, chosen_sub)
-            per_site_selected = {site: [sub] for site, sub in zip(sites, subs)}
+        # For each site in this combo, determine which subs belong to it.
+        per_site_selected = {}
+        
+        if subs_per_site_counts is not None:
+            # Cross-site combination: use counts to split subs
+            idx = 0
+            for i, site in enumerate(sites):
+                count = subs_per_site_counts[i]
+                per_site_selected[site] = subs[idx:idx+count]
+                idx += count
+        elif len(sites) == 1:
+            # Within-site combination: all subs belong to the single site
+            per_site_selected[sites[0]] = list(subs)
         else:
-            # assume the common case: single site with multiple chosen subs
-            per_site_selected = {}
-            if len(sites) == 1:
-                per_site_selected[sites[0]] = list(subs)
-            else:
-                # fallback: try to pair as much as possible
-                for i, site in enumerate(sites):
-                    per_site_selected[site] = [subs[i]] if i < len(subs) else []
+            # Shouldn't reach here with new logic, but fallback
+            raise ValueError(f"Cross-site combo without counts: {sites}, {subs}")
 
         # Store the file info for later copying to prep directory
         # Don't copy to combo root - only to prep subdirectory

@@ -26,6 +26,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 examples/cb/generated_combos/
+examples/cb/epoch_049_results/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
