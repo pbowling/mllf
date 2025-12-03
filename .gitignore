@@ -27,6 +27,7 @@ share/python-wheels/
 MANIFEST
 examples/cb/generated_combos/
 examples/cb/epoch_049_results/
+pretraining/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
