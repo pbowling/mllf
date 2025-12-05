@@ -20,11 +20,26 @@ from .atom_vocab import get_atom_type_vocab
 from .policy import EdgePolicy
 from .train import reinforce_train_step
 
-# Try to import RGCNEncoder lazily; if PyG is not available, expose None
+# Try to import RGCNEncoder and pretraining modules lazily
 try:
 	_rgcn = import_module('.rgcn', __package__)
 	RGCNEncoder = getattr(_rgcn, 'RGCNEncoder')
+	_load_pretrained = import_module('.load_pretrained', __package__)
+	load_pretrained_encoder = getattr(_load_pretrained, 'load_pretrained_encoder')
+	freeze_encoder = getattr(_load_pretrained, 'freeze_encoder')
+	unfreeze_encoder = getattr(_load_pretrained, 'unfreeze_encoder')
 except Exception:
 	RGCNEncoder = None
+	load_pretrained_encoder = None
+	freeze_encoder = None
+	unfreeze_encoder = None
 
-__all__ = ["RGCNEncoder", "EdgePolicy", "build_pyg_graph_from_mllf_graph", "reinforce_train_step"]
+__all__ = [
+	"RGCNEncoder", 
+	"EdgePolicy", 
+	"build_pyg_graph_from_mllf_graph", 
+	"reinforce_train_step",
+	"load_pretrained_encoder",
+	"freeze_encoder",
+	"unfreeze_encoder",
+]

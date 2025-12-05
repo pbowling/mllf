@@ -7,9 +7,15 @@ create_combos:
 
 # Train/val/test split
 split:
-  train_frac: 0.70  # 70% for training
-  val_frac: 0.15    # 15% for validation
+  train_frac: 0.01  # 1% for training
+  val_frac: 0.01    # 1% for validation
   seed: 42
+
+# Pretraining (optional - load pretrained policy before training)
+# Run pretraining with: python -m mllf.cb.pretrain_policy
+pretrain:
+  model_path: /home/pbowling/mllf/examples/models/pretrained_combined/best_policy.pt
+  # Set to path of best_policy.pt after running pretrain_policy to use it
 
 # Training configuration
 training:
@@ -35,16 +41,23 @@ timeout: 1200  # 20 minutes per simulation
 # using the new configuration without re-running simulations. This allows testing
 # different reward functions on the same simulation data ("pretraining" mode).
 reward:
-  # Weights for normalized terms (should sum to 1.0)
+  # Weights for normalized terms (balanced_positive configuration)
   w_P: 0.5              # Weight for population term
   w_T: 0.5              # Weight for transition term
+  w_U: 0.3              # Weight for uniformity term
   
-  # Non-zero constraint enforcement
-  gamma: 10.0           # Bonus coefficient for non-zero populations
+  # Scaling and bonuses
+  gamma: 4.0            # Scaling factor for rewards
+  entropy_bonus: 8.0    # Bonus for uniform distributions
   
   # Baseline normalization values
-  P_baseline: 1000.0    # Expected maximum total population
-  T_baseline: 100.0     # Expected maximum total transitions
+  P_baseline: 500.0     # Expected maximum total population
+  T_baseline: 50.0      # Expected maximum total transitions
+  
+  # Hard constraints (violations result in negative rewards)
+  min_transitions_per_site: 10        # Minimum transitions required per site
+  min_coverage_ratio: 0.5             # Minimum ratio of substituents visited (0.5 = 50%)
+  concentration_penalty_threshold: 0.8  # Threshold for concentration penalty (0.8 = 80%)
   
   # REINFORCE entropy regularization
   lambda_entropy: 0.01  # Entropy coefficient for exploration

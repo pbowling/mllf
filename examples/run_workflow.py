@@ -23,17 +23,17 @@ import sys
 import yaml
 import torch
 import numpy as np
+import json
 from typing import Dict, List
 
-from mllf.file_handling.generate_combinations import create_combination_dirs
+from mllf.file_handling.generate_combinations import create_combination_dirs, create_single_combination_dir
 from mllf.cli.workflow import (
-    split_manifest,
     build_data_and_targets_from_combo,
     write_variables_from_actions,
 )
 from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy
-from mllf.cb.train import compute_msld_reward
+from mllf.cb.train_improved import compute_msld_reward_improved
 from mllf.cb.workflow_utils import (
     load_manifest,
     fix_msld_flat_for_single_site,
@@ -41,6 +41,63 @@ from mllf.cb.workflow_utils import (
     parse_simulation_metrics
 )
 from mllf.cli.sim import run_simulation_batch
+
+
+# ============================================================================
+# SYSTEM-SPECIFIC CONFIGURATION
+# ============================================================================
+# Atoms to delete for single-site combinations (prevents overlap with base structure)
+# Customize this mapping for your molecular system:
+SITE_ATOMS_MAPPING = {
+    1: 'C4 H4',  # Atoms overlapping with site 1 (14benz system)
+    2: 'C5 H5',  # Atoms overlapping with site 2 (14benz system)
+}
+# ============================================================================
+
+
+def ensure_combo_dir_exists(combo_path: Path, config: Dict) -> Path:
+    """Ensure a combination directory exists, creating it lazily if needed.
+    
+    Args:
+        combo_path: Path to the combination directory.
+        config: Config dict with 'create_combos' section containing input_dir and output_dir.
+    
+    Returns:
+        Path to the combo directory (guaranteed to exist).
+    """
+    if combo_path.exists():
+        return combo_path
+    
+    # Load combo metadata
+    combo_metadata_path = combo_path.parent / 'combo_metadata.json'
+    if not combo_metadata_path.exists():
+        raise FileNotFoundError(f"Combo metadata not found at {combo_metadata_path}")
+    
+    with open(combo_metadata_path, 'r') as f:
+        all_combo_info = json.load(f)
+    
+    # Find the matching combo info
+    combo_info = None
+    for info in all_combo_info:
+        if info['path'] == str(combo_path):
+            combo_info = info
+            break
+    
+    if combo_info is None:
+        raise ValueError(f"Combo info not found for {combo_path}")
+    
+    # Get input/output directories from config
+    create_config = config.get('create_combos', {})
+    input_dir = Path(create_config.get('input_dir', 'prep_files'))
+    # Support both 'out_dir' and 'output_dir' keys
+    output_dir = Path(create_config.get('out_dir', create_config.get('output_dir', 'generated_combos')))
+    include_patterns = create_config.get('include_patterns', [])
+    
+    # Create the directory
+    print(f"  Creating combo directory on-demand: {combo_path.name}")
+    created_path = create_single_combination_dir(input_dir, output_dir, combo_info, include_patterns=include_patterns)
+    
+    return created_path
 
 
 def train_epoch(
@@ -82,9 +139,15 @@ def train_epoch(
     for combo_idx, combo_dir in enumerate(combos):
         combo_path = Path(combo_dir)
         
+        # Lazily create combo directory if it doesn't exist yet
+        combo_path = ensure_combo_dir_exists(combo_path, config)
+        
+        # Fix msld_flat.py for single-site combinations if needed
+        fix_msld_flat_for_single_site(combo_path, SITE_ATOMS_MAPPING)
+        
         # Create epoch subdirectory for outputs
         epoch_dir = combo_path / f"run_{epoch:03d}"
-        epoch_dir.mkdir(exist_ok=True)
+        epoch_dir.mkdir(exist_ok=True, parents=True)
         
         print(f"Epoch {epoch}, Combo {combo_idx+1}/{len(combos)}: {combo_path.name}")
         
@@ -102,24 +165,30 @@ def train_epoch(
                 reward_changed = (
                     cached_reward_config.get('w_P') != reward_config.get('w_P', 0.5) or
                     cached_reward_config.get('w_T') != reward_config.get('w_T', 0.5) or
-                    cached_reward_config.get('gamma') != reward_config.get('gamma', 10.0) or
-                    cached_reward_config.get('P_baseline') != reward_config.get('P_baseline', 1000.0) or
-                    cached_reward_config.get('T_baseline') != reward_config.get('T_baseline', 100.0)
+                    cached_reward_config.get('w_U') != reward_config.get('w_U', 0.3) or
+                    cached_reward_config.get('gamma') != reward_config.get('gamma', 4.0) or
+                    cached_reward_config.get('P_baseline') != reward_config.get('P_baseline', 500.0) or
+                    cached_reward_config.get('T_baseline') != reward_config.get('T_baseline', 50.0) or
+                    cached_reward_config.get('min_transitions_per_site') != reward_config.get('min_transitions_per_site', 10) or
+                    cached_reward_config.get('min_coverage_ratio') != reward_config.get('min_coverage_ratio', 0.5) or
+                    cached_reward_config.get('entropy_bonus') != reward_config.get('entropy_bonus', 8.0)
                 )
                 
-                if reward_changed and 'populations' in cached and 'transitions' in cached:
-                    # Recompute reward with new configuration using raw metrics
-                    print(f"  Reward config changed - recomputing from raw metrics")
-                    from mllf.cb.train import compute_reward_from_raw_metrics
+                if reward_changed:
+                    # Recompute reward with new configuration using improved reward function
+                    print(f"  Reward config changed - recomputing with improved reward function")
                     
-                    reward = compute_reward_from_raw_metrics(
-                        populations=cached['populations'],
-                        transitions=cached['transitions'],
+                    reward = compute_msld_reward_improved(
+                        str(epoch_dir),
                         w_P=reward_config.get('w_P', 0.5),
                         w_T=reward_config.get('w_T', 0.5),
-                        gamma=reward_config.get('gamma', 10.0),
-                        P_baseline=reward_config.get('P_baseline', 1000.0),
-                        T_baseline=reward_config.get('T_baseline', 100.0)
+                        w_U=reward_config.get('w_U', 0.3),
+                        gamma=reward_config.get('gamma', 4.0),
+                        P_baseline=reward_config.get('P_baseline', 500.0),
+                        T_baseline=reward_config.get('T_baseline', 50.0),
+                        min_transitions_per_site=reward_config.get('min_transitions_per_site', 10),
+                        min_coverage_ratio=reward_config.get('min_coverage_ratio', 0.5),
+                        entropy_bonus=reward_config.get('entropy_bonus', 8.0)
                     )
                     print(f"  Old reward: {cached['reward']:.4f} -> New reward: {reward:.4f}")
                     
@@ -329,15 +398,19 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             # Simulation succeeded - parse outputs and update policy
             raw_metrics = parse_simulation_metrics(output_file)
             
-            # Compute reward with current config
+            # Compute reward with current config using IMPROVED reward function
             reward_config = config.get('reward', {})
-            reward = compute_msld_reward(
+            reward = compute_msld_reward_improved(
                 str(jepoch_dir),
                 w_P=reward_config.get('w_P', 0.5),
                 w_T=reward_config.get('w_T', 0.5),
-                gamma=reward_config.get('gamma', 10.0),
-                P_baseline=reward_config.get('P_baseline', 1000.0),
-                T_baseline=reward_config.get('T_baseline', 100.0)
+                w_U=reward_config.get('w_U', 0.3),
+                gamma=reward_config.get('gamma', 4.0),
+                P_baseline=reward_config.get('P_baseline', 500.0),
+                T_baseline=reward_config.get('T_baseline', 50.0),
+                min_transitions_per_site=reward_config.get('min_transitions_per_site', 10),
+                min_coverage_ratio=reward_config.get('min_coverage_ratio', 0.5),
+                entropy_bonus=reward_config.get('entropy_bonus', 8.0)
             )
             epoch_rewards.append(reward)
             print(f"  Combo {jcombo_path.name} reward: {reward:.4f}")
@@ -426,28 +499,36 @@ def main():
     
     print(f"Loaded config from {cfg_path}")
     
-    # Step 1: Generate combinations (if requested)
+    # Step 1: Generate combination metadata (if requested)
     if 'create_combos' in config:
-        print("\n=== Generating Combinations ===")
+        print("\n=== Generating Combination Metadata ===")
         cc = config['create_combos']
         input_dir = Path(cc['input_dir'])
         out_dir = Path(cc['out_dir'])
         include = cc.get('include_patterns', [])
         
-        created = create_combination_dirs(input_dir, out_dir, include_patterns=include)
-        print(f"Created {len(created)} combination directories")
+        # Import the new function
+        from mllf.file_handling.generate_combinations import list_possible_combinations
         
-        # Fix msld_flat.py for single-site combinations (14benz specific)
-        print("Fixing msld_flat.py for single-site combinations...")
-        for combo_path in created:
-            fix_msld_flat_for_single_site(combo_path)
+        # List all possible combinations without creating directories
+        all_combo_info = list_possible_combinations(input_dir, out_dir)
+        print(f"Found {len(all_combo_info)} possible combinations")
         
-        # Create manifest
+        # Create manifest with paths (directories don't exist yet)
         manifest_path = out_dir / 'manifest.txt'
+        out_dir.mkdir(parents=True, exist_ok=True)
         with manifest_path.open('w') as f:
-            for combo_path in created:
-                f.write(str(combo_path) + '\n')
+            for combo_info in all_combo_info:
+                f.write(combo_info['path'] + '\n')
         print(f"Wrote manifest to {manifest_path}")
+        
+        # Store combo_info for later lazy creation
+        # Save to a JSON file so we can recreate directories on demand
+        combo_metadata_path = out_dir / 'combo_metadata.json'
+        import json
+        with open(combo_metadata_path, 'w') as f:
+            json.dump(all_combo_info, f, indent=2)
+        print(f"Saved combination metadata to {combo_metadata_path}")
     else:
         manifest_path = Path(config.get('manifest', 'manifest.txt'))
     
@@ -493,7 +574,8 @@ def main():
     
     # Build sample graph to get dimensions
     sample_combo = train_combos[0]
-    sample_data, _, sample_extras = build_data_and_targets_from_combo(sample_combo)
+    sample_combo_path = ensure_combo_dir_exists(Path(sample_combo), config)
+    sample_data, _, sample_extras = build_data_and_targets_from_combo(str(sample_combo_path))
     
     train_config = config.get('training', {})
     encoder_config = train_config.get('encoder', {})
@@ -523,12 +605,24 @@ def main():
     print(f"Encoder: {sum(p.numel() for p in encoder.parameters())} params")
     print(f"Policy: {sum(p.numel() for p in policy.parameters())} params")
     
-    # Step 4: Check for existing checkpoint to resume training
+    # Step 4: Load pretrained policy or resume from checkpoint
     output_config = config.get('output', {})
     checkpoint_dir = Path(output_config.get('base_dir', 'checkpoints'))
     start_epoch = 0
     
-    if checkpoint_dir.exists():
+    # Check for pretrained policy
+    pretrain_config = config.get('pretrain', {})
+    pretrain_path = pretrain_config.get('model_path', None)
+    
+    if pretrain_path and Path(pretrain_path).exists():
+        print(f"\n=== Loading pretrained policy: {pretrain_path} ===")
+        pretrained = torch.load(pretrain_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(pretrained['encoder_state'])
+        policy.load_state_dict(pretrained['policy_state'])
+        print(f"Loaded pretrained policy from epoch {pretrained.get('epoch', 'unknown')}")
+        if 'avg_reward' in pretrained:
+            print(f"Pretraining avg reward: {pretrained['avg_reward']:.4f}")
+    elif checkpoint_dir.exists():
         # Find the latest checkpoint
         checkpoints = sorted(checkpoint_dir.glob('checkpoint_epoch_*.pt'))
         if checkpoints:

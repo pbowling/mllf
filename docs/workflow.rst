@@ -59,9 +59,16 @@ A workflow config specifies which operations to run and their parameters:
      train_fraction: 0.7
      val_fraction: 0.15
    
+   # Optional: Pretrain from existing simulations
+   pretrain:
+     data_dir: /path/to/pretraining_data     # Directory with completed runs
+     num_epochs: 1                            # Usually 1 epoch is sufficient
+     model_path: models/pretrained_policy.pt  # Save pretrained model here
+   
    # Training configuration
    training:
      num_epochs: 50
+     load_pretrained: models/pretrained_policy.pt  # Optional: load pretrained model
      encoder:
        hidden_dims: [64, 64]
        out_dim: 32
@@ -130,46 +137,166 @@ Example: With 5 subs at site1 (75 selections) and 6 subs at site2 (186 selection
 * Cross-site: 75 × 186 = **13,950 combinations**
 * Total: **14,211 combinations**
 
+Lazy Directory Creation
+^^^^^^^^^^^^^^^^^^^^^^^
+
+For systems with large combination spaces (e.g., 14,211 total combinations),
+creating all directories upfront is inefficient—most will never be used in
+training. The workflow implements **lazy (on-demand) directory creation**:
+
+**Metadata Generation**: During the combination generation phase, the system:
+
+1. Lists all possible combinations without creating directories
+2. Saves metadata to ``combo_metadata.json`` with:
+   
+   - Combination name (e.g., ``comb_0001_site2_1__site2_2``)
+   - Path where directory will be created
+   - Sites and substituents included
+   - Counter for ordering
+
+3. Writes manifest files listing all possible combinations
+
+**On-Demand Creation**: Directories are created only when needed:
+
+* During training/validation splits, combinations are selected but not created
+* When a combination is accessed for training, the workflow:
+  
+  1. Checks if the directory exists
+  2. If not, loads metadata from ``combo_metadata.json``
+  3. Creates the directory with all required files
+  4. Continues with training
+
+**Benefits**:
+
+* **Disk space efficiency**: Only create ~1-2% of possible combinations (e.g., 
+  142 training + 142 validation out of 14,211 total)
+* **Faster initialization**: Split generation completes in seconds instead of hours
+* **Filesystem efficiency**: Avoid creating thousands of unused directories
+* **Scalability**: Handle massive combination spaces (100K+ combinations)
+
+**Example**: For a 14,211-combination system with 1% train/1% val split:
+
+* Without lazy creation: ~14,211 directories created upfront
+* With lazy creation: ~284 directories created on-demand (only those used)
+* Space savings: ~98% fewer directories
+
 Directory Structure
 ~~~~~~~~~~~~~~~~~~~
 
-Each combination creates a directory with a standardized name:
+Each combination directory (created on-demand) has a standardized structure:
 
 .. code-block:: text
 
    generated_combos/
-   ├── comb_0001_site2_1__site2_2/          # Within-site: site2 with subs 1,2
-   │   └── prep/
-   │       ├── site2_sub1_label.rtf
-   │       ├── site2_sub1_label.pdb
-   │       ├── site2_sub2_label.rtf
-   │       ├── site2_sub2_label.pdb
-   │       └── support_files...
-   ├── comb_0075_site1_5__site1_1__site1_2/  # Within-site: site1 with subs 5,1,2
-   │   └── prep/
-   ├── comb_0262_site1_1__site1_2__site2_1__site2_2/  # Cross-site combination
-   │   ├── info.py                          # Configuration metadata
+   ├── combo_metadata.json                  # Metadata for all combinations
+   ├── manifest.txt                         # List of all combination names
+   ├── train_manifest.txt                   # Training combination names
+   ├── val_manifest.txt                     # Validation combination names
+   ├── test_manifest.txt                    # Test combination names
+   ├── comb_0001_site2_1__site2_2/          # Created on-demand
+   │   ├── info.py                          # System configuration
    │   ├── mapping.json                     # File renumbering mapping
-   │   ├── run.sh                           # Job submission script
+   │   ├── msld_flat.py                     # Simulation script (copied)
    │   └── prep/
-   │       ├── site1_sub1_label.rtf         # Files from both sites
-   │       ├── site1_sub2_label.rtf
-   │       ├── site2_sub1_label.rtf
-   │       └── site2_sub2_label.rtf
+   │       ├── site2_sub1_pres.rtf
+   │       ├── site2_sub1_frag.pdb
+   │       ├── site2_sub2_pres.rtf
+   │       ├── site2_sub2_frag.pdb
+   │       ├── full_ligand.rtf
+   │       ├── full_ligand.prm
+   │       ├── top_all36_msld.rtf
+   │       ├── par_all36_msld.prm
+   │       └── other_support_files...
+   ├── comb_0262_site1_1__site1_2__site2_1__site2_2/  # Cross-site
+   │   ├── info.py
+   │   ├── mapping.json
+   │   ├── msld_flat.py
+   │   └── prep/
+   │       ├── site1_sub1_pres.rtf          # Preserves site numbering
+   │       ├── site1_sub2_pres.rtf
+   │       ├── site2_sub1_pres.rtf          # Site 2 keeps site2_ prefix
+   │       ├── site2_sub2_pres.rtf
+   │       └── ...
    └── ...
+
+**File Naming Convention**: The renaming preserves site identity:
+
+* Files maintain their site number (``site1_*``, ``site2_*``, etc.)
+* Substituents are renumbered sequentially within each site
+* Original site/sub mapping is preserved in ``mapping.json``
+
+Combination Metadata Files
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each combination directory contains standardized metadata files:
+
+**info.py**: System configuration loaded by simulation scripts
+
+.. code-block:: python
+
+   import numpy as np
+   import os
+   
+   info = {}
+   info['name'] = 'comb_0262_site1_1__site1_2__site2_1__site2_2'
+   info['nsubs'] = [2, 2]              # Substituents per site [site1, site2]
+   info['nblocks'] = np.sum(info['nsubs'])  # Total substituents (4)
+   info['ncentral'] = 0                # Central replica for replica exchange
+   info['nreps'] = 1                   # Number of replicas
+   info['nnodes'] = 1                  # MPI nodes
+   info['enginepath'] = os.environ.get('CHARMMEXEC', '')
+   info['temp'] = 298.15               # Temperature in Kelvin
+
+**Key features**:
+
+* ``nsubs`` is a list showing substituent count per site (e.g., ``[3, 3]`` for 
+  3 subs at each of 2 sites)
+* ``nblocks`` is computed as the sum of ``nsubs`` (total substituents)
+* Used by ``msld_flat.py`` to determine site structure: ``nsites = len(info['nsubs'])``
+
+**mapping.json**: File renumbering information
+
+.. code-block:: json
+
+   [
+     {
+       "original": "/path/to/site1_sub2_pres.rtf",
+       "new_name": "site1_sub1_pres.rtf",
+       "original_site": 1,
+       "original_sub": 2,
+       "new_site": 1,
+       "new_sub": 1
+     },
+     {
+       "original": "/path/to/site2_sub5_pres.rtf",
+       "new_name": "site2_sub1_pres.rtf",
+       "original_site": 2,
+       "original_sub": 5,
+       "new_site": 2,
+       "new_sub": 1
+     }
+   ]
+
+This tracks how original fragment files were renumbered during combination
+creation, enabling traceability back to source files.
 
 Manifest Files
 ~~~~~~~~~~~~~~
 
-A manifest lists combination directories (one per line):
+Manifest files list combination names (one per line):
 
 .. code-block:: text
 
-   examples/cb/14benz_solv_5.5
-   examples/cb/14benz_solv_6.6
-   examples/cb/14benz_solv_5.6
+   comb_0001_site2_1__site2_2
+   comb_0002_site2_1__site2_3
+   comb_0003_site2_1__site2_4
+   comb_0075_site1_5__site1_1__site1_2
+   comb_0262_site1_1__site1_2__site2_1__site2_2
+   ...
 
-Manifests enable reproducible splits and batch operations.
+Manifest files enable reproducible splits and batch operations. The full paths
+are constructed by prepending the ``out_dir`` from the configuration:
+``{out_dir}/{combo_name}``.
 
 Graph Building
 --------------
@@ -190,20 +317,9 @@ The preferred method extracts connectivity from CHARMM topology fragments:
 RTF files (``site*_sub*_*_pres.rtf``) contain CHARMM topology patches
 defining atom connectivity for each substituent.
 
-Graph Structure
-^^^^^^^^^^^^^^^
-
-The ``Graph`` object stores:
-
-* ``nodes``: List of node labels (e.g., ``['site1_2', 'site1_3', 'site1_4']``)
-* ``edge_coeffs``: ``EdgeCoeffs`` object mapping edge types to node pairs
-
-Edge types include:
-
-* ``linear``: Per-node bias (actually stored per edge, aggregated to nodes)
-* ``quadratic``: Quadratic interaction
-* ``skew``: Skew bias
-* ``end``: End-state bias
+The ``Graph`` object stores nodes (λ-sites) and edges with associated bias
+coefficients. See :doc:`cb_setup` for detailed information on graph structure,
+edge types (linear, quadratic, skew, end), and their physical meanings.
 
 From Bias Matrices
 ~~~~~~~~~~~~~~~~~~
@@ -222,7 +338,7 @@ This parses the YAML ``bias_string`` to extract bias matrices.
 PyTorch Geometric Conversion
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For neural network training:
+For neural network training, convert graphs to PyTorch Geometric format:
 
 .. code-block:: python
 
@@ -230,28 +346,129 @@ For neural network training:
    
    data, extras = graph_utils.build_pyg_graph_from_mllf_graph(graph)
 
-Key properties of ``data``:
-
-* ``x``: Node features ``[num_nodes, 4 + vocab_size]`` containing:
-  
-  - ``total_charge``: Molecular charge (float)
-  - ``is_vacuum``: Binary indicator for vacuum/gas environment
-  - ``is_solvent``: Binary indicator for solvent/water environment
-  - ``is_protein``: Binary indicator for protein environment
-  - Multi-hot encoding of distinct atom types (e.g., CG2R61, HGR61, NG2R60)
-  
-  The atom type vocabulary is loaded from CHARMM toppar files (default: 333 types)
-  ensuring consistent feature dimensions across all training runs.
-
-* ``edge_index``: COO format edge indices ``[2, num_edges*2]``
-* ``edge_type``: Relation type per edge (int indices)
-* ``edge_attr``: Optional edge attributes
-
-**Directed Edge Expansion**: Each undirected edge becomes two directed edges
-with forward/backward relation types.
+This creates a ``Data`` object with node features, edge indices, and edge types
+suitable for GNN training. See :doc:`cb_setup` for details on node features,
+directed edge expansion, and the RGCN/policy architecture.
 
 Training Pipeline
 -----------------
+
+Pretraining from Existing Simulations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Before starting main training, you can pretrain the policy on existing MSLD
+simulation data. This provides a warm start with meaningful bias coefficients
+rather than random initialization.
+
+**Pretraining Data Sources**:
+
+Pretraining data consists of combination directories that have already been
+simulated with known bias coefficients. These can come from:
+
+* Previous training runs
+* Manual expert tuning
+* Systematic parameter sweeps
+* Multi-system datasets (different ligands, environments, etc.)
+
+**Benefits**:
+
+* **Faster convergence**: Start with reasonable bias values
+* **Improved sample efficiency**: Fewer epochs needed for good performance
+* **Transfer learning**: Leverage knowledge from related systems
+* **Robustness**: More stable early training with informed initialization
+
+**Data Collection**:
+
+Organize pretraining data by copying completed runs into a unified directory:
+
+.. code-block:: bash
+
+   pretraining/
+   ├── system1_run001/
+   │   ├── variables.py         # Bias coefficients used
+   │   ├── info.py              # System configuration
+   │   └── res/
+   │       └── *_flat.lmd       # Lambda trajectory
+   ├── system1_run002/
+   ├── system2_run001/
+   └── ...
+
+Each directory should contain:
+
+* ``variables.py``: Bias coefficients that were used for the simulation
+* ``info.py``: System metadata (nsubs, nblocks, temp)
+* ``res/*_flat.lmd``: Lambda dynamics trajectory file for computing rewards
+
+**Pretraining Configuration**:
+
+Enable pretraining in your workflow YAML:
+
+.. code-block:: yaml
+
+   pretrain:
+     data_dir: /path/to/pretraining       # Directory with existing runs
+     num_epochs: 1                         # Usually 1 epoch is sufficient
+     model_path: models/pretrained_policy.pt  # Where to save pretrained model
+   
+   training:
+     num_epochs: 50
+     load_pretrained: models/pretrained_policy.pt  # Load before training
+
+**Pretraining Process**:
+
+1. **Load existing data**: Read bias coefficients from ``variables.py`` and
+   compute rewards from lambda trajectories
+2. **Build graphs**: Construct graph representations from RTF files or info.py
+3. **Supervised learning**: Train policy to reproduce the bias coefficients
+   that led to good rewards
+4. **Save model**: Store pretrained encoder and policy weights
+
+**Running Pretraining**:
+
+.. code-block:: bash
+
+   # Step 1: Organize pretraining data
+   mkdir -p pretraining
+   cp -r previous_runs/good_combos/* pretraining/
+   
+   # Step 2: Run pretraining
+   python run_pretraining.py --config workflow_sample.yaml
+   
+   # Step 3: Use pretrained model in training
+   python run_workflow.py workflow_sample.yaml
+
+**Deterministic Rewards**:
+
+Since pretraining uses completed simulations, rewards are deterministic (not
+resampled). This means:
+
+* Multiple epochs don't improve training (data is fixed)
+* One epoch is typically sufficient to fit the pretraining data
+* The pretrained policy learns a mapping from graph structure to successful
+  bias coefficients
+
+**Multi-System Pretraining**:
+
+Pretraining can combine data from multiple systems to learn generalizable
+patterns:
+
+.. code-block:: bash
+
+   pretraining/
+   ├── 14benz_solv/      # Benzene derivatives in solvent
+   │   └── run_*/
+   ├── 14benz_vac/       # Same system in vacuum
+   │   └── run_*/
+   ├── indole_prot/      # Indole derivatives in protein
+   │   └── run_*/
+   └── indole_solv/      # Indole derivatives in solvent
+       └── run_*/
+
+The policy learns to adapt bias coefficients based on:
+
+* System size (number of sites, substituents)
+* Environment type (vacuum, solvent, protein)
+* Chemical properties (atom types, charge)
 
 Quick Epoch
 ~~~~~~~~~~~
@@ -804,9 +1021,16 @@ The ``workflow_sample.yaml`` file controls all aspects of the workflow:
      val_frac: 0.15
      seed: 42
    
+   # Optional: Pretrain from existing simulations
+   pretrain:
+     data_dir: /path/to/pretraining_data
+     num_epochs: 1
+     model_path: models/pretrained_policy.pt
+   
    # Model configuration
    training:
      num_epochs: 50
+     load_pretrained: models/pretrained_policy.pt  # Use pretrained model
      encoder:
        hidden_dims: [64, 64]
        out_dim: 32

@@ -72,10 +72,82 @@ Edit ``examples/workflow_sample.yaml`` to customize:
      save_checkpoints: true
      checkpoint_freq: 5
    
+   # Optional: Pretrain from existing simulations
+   pretrain:
+     data_dir: /path/to/pretraining_data
+     num_epochs: 1
+     model_path: models/pretrained_policy.pt
+   
+   # Load pretrained model before training
+   training:
+     load_pretrained: models/pretrained_policy.pt
+   
    # Archive combinations after training (optional)
    archive:
      enabled: true
      remove_after: false  # Keep originals for verification
+
+Pretraining Example
+-------------------
+
+Before running main training, you can pretrain the policy on existing
+simulation data to warm-start the model with meaningful bias coefficients.
+
+Setup Pretraining Data
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Collect completed simulation runs into a pretraining directory:
+
+.. code-block:: bash
+
+   mkdir -p pretraining
+   
+   # Copy runs from various sources
+   cp -r previous_training/epoch_*/comb_* pretraining/
+   cp -r manual_tuning/good_runs/* pretraining/
+   cp -r systematic_sweep/successful_configs/* pretraining/
+
+Each run directory should contain:
+
+- ``variables.py``: Bias coefficients used in the simulation
+- ``info.py``: System configuration (nsubs, nblocks, temp)
+- ``res/*_flat.lmd``: Lambda dynamics trajectory for reward computation
+
+Run Pretraining
+~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   # Run pretraining (1 epoch is usually sufficient)
+   python run_pretraining.py --config workflow_sample.yaml
+   
+   # This saves: models/pretrained_policy.pt
+
+Then update ``workflow_sample.yaml`` to use the pretrained model:
+
+.. code-block:: yaml
+
+   training:
+     load_pretrained: models/pretrained_policy.pt
+     num_epochs: 50  # Main training epochs
+
+Finally run main training:
+
+.. code-block:: bash
+
+   python run_workflow.py workflow_sample.yaml
+
+Benefits
+~~~~~~~~
+
+- **Faster convergence**: Start with reasonable bias values
+- **Better sample efficiency**: Fewer training epochs needed
+- **Transfer learning**: Leverage knowledge from related systems
+- **Multi-system learning**: Combine data from different ligands/environments
+
+The pretrained policy learns to map graph structure (system size, atom types,
+environment) to successful bias coefficients, providing a strong initialization
+for the main training phase.
 
 Example System: 14benz_solv_5.5
 --------------------------------

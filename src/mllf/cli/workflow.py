@@ -30,6 +30,19 @@ from mllf.cb.policy import EdgePolicy
 from mllf.cli.sim import run_simulation_batch, parse_simulation_results
 
 
+def load_manifest(manifest_path: str) -> List[str]:
+    """Load list of combo directories from manifest file.
+    
+    Args:
+        manifest_path: Path to manifest file with one combo directory per line.
+    
+    Returns:
+        List of combo directory paths as strings.
+    """
+    with open(manifest_path, 'r', encoding='utf-8') as fh:
+        return [ln.strip() for ln in fh if ln.strip()]
+
+
 def load_bias_from_variables(py_path: str) -> Dict[str, Any]:
     """Load the YAML bias mapping embedded inside a `variables.py` file.
 
@@ -103,6 +116,52 @@ def graph_from_bias(bias: Dict[str, Any]) -> Graph:
     return g
 
 
+def save_graph_info_from_rtf(combo_dir: str, g) -> None:
+    """Save graph_info.json from a Graph object built from RTF files.
+    
+    This is critical for the reward function to correctly handle asymmetric
+    molecules by extracting actual nsubs_per_site instead of estimating.
+    
+    Args:
+        combo_dir: Path to combination directory
+        g: Graph object with populated node metadata
+    """
+    import json
+    from collections import defaultdict
+    
+    combo_path = Path(combo_dir)
+    graph_info_path = combo_path / 'graph_info.json'
+    
+    # Extract site information from node metadata
+    sites_info = {}
+    solvent_state = None
+    
+    for node_idx, node_info in g.nodes.items():
+        if node_info:
+            site = node_info.get('site')
+            sub = node_info.get('sub')
+            if site is not None and sub is not None:
+                key = f"site{site}_sub{sub}"
+                sites_info[key] = {
+                    'site': site,
+                    'sub': sub,
+                    'total_charge': node_info.get('total_charge', 0.0),
+                    'atom_types': node_info.get('atom_types', []),
+                    'unique_atom_types': node_info.get('unique_atom_types', []),
+                }
+                # Extract solvent state (should be consistent across nodes)
+                if solvent_state is None:
+                    solvent_state = node_info.get('solvent', 'unknown')
+    
+    graph_info = {
+        'solvent_state': solvent_state or 'unknown',
+        'sites': sites_info
+    }
+    
+    with open(graph_info_path, 'w') as f:
+        json.dump(graph_info, f, indent=2)
+
+
 def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadratic', verify_graph: bool = False):
     """Build PyG Data object and per-edge targets from a combo directory.
 
@@ -141,6 +200,8 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
     
     if rtf_results:
         g = Graph.from_rtf_results(rtf_results)
+        # Save graph_info.json for reward function to extract actual nsubs_per_site
+        save_graph_info_from_rtf(combo_dir, g)
     else:
         vpy = combo_path / 'variables.py'
         if vpy.exists():
@@ -245,8 +306,7 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
     return data, targets, extras
 
 
-def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: torch.Tensor, out_name: str = 'variables.py', 
-                                 bias_clip: float = 1000.0) -> None:
+def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: torch.Tensor, out_name: str = 'variables.py', bias_clip: float = 1000.0) -> None:
     """Write a variables.py file from per-directed-edge policy actions.
 
     This function maps directed relation actions back to base biases (quadratic, skew,
@@ -328,9 +388,6 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 val = float(actions[k])
             except Exception:
                 val = 0.0
-        
-        # Clip to prevent extreme values
-        val = max(-bias_clip, min(bias_clip, val))
 
         # Store forward value if this is the forward relation and we haven't seen this pair yet
         if rel_name == fwd_name and (pair not in per_base_forward[base]):
@@ -374,8 +431,6 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 avg = float(val)
             except Exception:
                 avg = 0.0
-            # Clip before accumulating
-            avg = max(-bias_clip, min(bias_clip, avg))
             sums[i] += avg
             sums[j] += avg
             counts[i] += 1
@@ -388,9 +443,47 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             else:
                 b_vec[idx] = 0.0
     
-    # Always set b[0] to 0.0 (first element of linear bias must be zero)
-    if b_vec:
-        b_vec[0] = 0.0
+    # Enforce constraint: first substituent of each site must have b=0.0
+    # Load graph_info.json to determine site structure
+    graph_info_path = combo_dir / 'graph_info.json'
+    if graph_info_path.exists():
+        import json
+        try:
+            with open(graph_info_path, 'r') as f:
+                graph_info = json.load(f)
+            sites_info = graph_info.get('sites', {})
+            
+            # Group nodes by site to find first sub of each site
+            site_to_nodes = {}
+            for key, node_info in sites_info.items():
+                site = node_info.get('site')
+                sub = node_info.get('sub')
+                if site is not None and sub is not None:
+                    site_to_nodes.setdefault(site, []).append((sub, key))
+            
+            # For each site, find the node with sub==1 and set its b value to 0.0
+            # Nodes are ordered as sorted (site, sub), so we need to count how many
+            # nodes come before each site's first sub
+            all_nodes = []
+            for key, node_info in sites_info.items():
+                site = node_info.get('site')
+                sub = node_info.get('sub')
+                if site is not None and sub is not None:
+                    all_nodes.append((site, sub, key))
+            all_nodes.sort(key=lambda x: (x[0], x[1]))  # Sort by (site, sub)
+            
+            # Find indices where sub == 1
+            for idx, (site, sub, key) in enumerate(all_nodes):
+                if sub == 1 and idx < len(b_vec):
+                    b_vec[idx] = 0.0
+        except Exception:
+            # If we can't load graph_info, fall back to setting b[0] = 0.0 only
+            if b_vec:
+                b_vec[0] = 0.0
+    else:
+        # Fallback: always set b[0] to 0.0 (first element must be zero)
+        if b_vec:
+            b_vec[0] = 0.0
 
     # Format bias_string manually to match expected YAML structure
     # b: single row with first element using '- -' then rest using just '-'
@@ -483,19 +576,6 @@ def create_and_manifest(input_dir: str, out_dir: str, dry_run: bool = False) -> 
     return str(manifest_path)
 
 
-def load_manifest(manifest_path: str) -> List[str]:
-    """Load list of combo directories from manifest file.
-    
-    Args:
-        manifest_path: Path to manifest file with one combo directory per line.
-    
-    Returns:
-        List of combo directory paths as strings.
-    """
-    with open(manifest_path, 'r', encoding='utf-8') as fh:
-        return [ln.strip() for ln in fh if ln.strip()]
-
-
 def split_manifest(manifest: str, train_frac: float = 0.8, seed: int = 0) -> Tuple[str, str]:
     """Split a manifest file into training and validation sets.
 
@@ -508,7 +588,8 @@ def split_manifest(manifest: str, train_frac: float = 0.8, seed: int = 0) -> Tup
         Tuple of (train_manifest_path, val_manifest_path).
         Creates manifest.train.txt and manifest.val.txt in the same directory as manifest.
     """
-    combos = load_manifest(manifest)
+    with open(manifest, 'r', encoding='utf-8') as fh:
+        combos = [ln.strip() for ln in fh if ln.strip()]
     random.Random(seed).shuffle(combos)
     n = int(len(combos) * train_frac)
     train = combos[:n]
@@ -634,7 +715,8 @@ def run_from_config(config_path: str) -> Dict[str, Any]:
 
     # Step 3: pick example combo
     example_combo = None
-    combos = load_manifest(manifest)
+    with open(manifest, 'r', encoding='utf-8') as fh:
+        combos = [ln.strip() for ln in fh if ln.strip()]
     if combos:
         example_combo = combos[0]
         results['example_combo'] = example_combo

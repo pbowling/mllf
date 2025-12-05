@@ -94,13 +94,115 @@ def parse_bias_from_py(variables_file: Path) -> Dict[str, Any]:
 def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
     """Parse bias coefficients from variables*.inp file (old format).
     
+    Old format has individual coefficient entries like:
+      set lams1s1 = 0.00        # baseline bias for site1_sub1
+      set cs1s1s1s2 = -0.00     # quadratic coefficient
+      set xs1s1s2s3 = 1.50      # skew coefficient
+    
+    We need to convert these to matrix format for compatibility with the
+    graph building code that expects c, x, s matrices.
+    
     Args:
         variables_file: Path to variables*.inp file
         
     Returns:
-        Dict with bias coefficients (lams, cs, xs, ss keys)
+        Dict with bias coefficients in matrix format (c, x, s, b keys)
     """
-    return read_bias_coeff(str(variables_file))
+    # Read old format (returns {"lams": {...}, "cs": {...}, "xs": {...}, "ss": {...}})
+    old_data = read_bias_coeff(str(variables_file))
+    
+    # Determine dimensions from lams entries (baseline biases)
+    # lams format: lams1s1, lams1s2, ..., lams2s1, lams2s2, ...
+    site_sub_counts = {}
+    for lam_key in old_data.get("lams", {}).keys():
+        match = re.match(r'lams(\d+)s(\d+)', lam_key)
+        if match:
+            site_num = int(match.group(1))
+            sub_num = int(match.group(2))
+            if site_num not in site_sub_counts:
+                site_sub_counts[site_num] = set()
+            site_sub_counts[site_num].add(sub_num)
+    
+    if not site_sub_counts:
+        # Try to infer from cs entries: cs1s1s1s2 means site1_sub1 to site1_sub2
+        for cs_key in old_data.get("cs", {}).keys():
+            match = re.match(r'cs(\d+)s(\d+)s(\d+)s(\d+)', cs_key)
+            if match:
+                site1, sub1, site2, sub2 = map(int, match.groups())
+                for site, sub in [(site1, sub1), (site2, sub2)]:
+                    if site not in site_sub_counts:
+                        site_sub_counts[site] = set()
+                    site_sub_counts[site].add(sub)
+    
+    # Calculate total number of blocks (sum of substituents across all sites)
+    num_blocks = sum(len(subs) for subs in site_sub_counts.values())
+    
+    if num_blocks == 0:
+        raise ValueError(f"Could not determine number of blocks from {variables_file}")
+    
+    # Create mapping from site_sub to block index
+    block_idx = 0
+    site_sub_to_idx = {}
+    for site_num in sorted(site_sub_counts.keys()):
+        for sub_num in sorted(site_sub_counts[site_num]):
+            site_sub_to_idx[(site_num, sub_num)] = block_idx
+            block_idx += 1
+    
+    # Initialize matrices
+    c_matrix = [[0.0] * num_blocks for _ in range(num_blocks)]
+    x_matrix = [[0.0] * num_blocks for _ in range(num_blocks)]
+    s_matrix = [[0.0] * num_blocks for _ in range(num_blocks)]
+    b_vector = [0.0] * num_blocks
+    
+    # Fill b vector from lams entries (baseline biases)
+    for key, value in old_data.get("lams", {}).items():
+        match = re.match(r'lams(\d+)s(\d+)', key)
+        if match:
+            site_num = int(match.group(1))
+            sub_num = int(match.group(2))
+            idx = site_sub_to_idx.get((site_num, sub_num))
+            if idx is not None:
+                b_vector[idx] = float(value)
+    
+    # Fill c matrix from cs entries (quadratic coefficients)
+    for key, value in old_data.get("cs", {}).items():
+        match = re.match(r'cs(\d+)s(\d+)s(\d+)s(\d+)', key)
+        if match:
+            site1, sub1, site2, sub2 = map(int, match.groups())
+            i = site_sub_to_idx.get((site1, sub1))
+            j = site_sub_to_idx.get((site2, sub2))
+            if i is not None and j is not None:
+                c_matrix[i][j] = float(value)
+                c_matrix[j][i] = float(value)  # Symmetric
+    
+    # Fill x matrix from xs entries (skew coefficients)
+    for key, value in old_data.get("xs", {}).items():
+        match = re.match(r'xs(\d+)s(\d+)s(\d+)s(\d+)', key)
+        if match:
+            site1, sub1, site2, sub2 = map(int, match.groups())
+            i = site_sub_to_idx.get((site1, sub1))
+            j = site_sub_to_idx.get((site2, sub2))
+            if i is not None and j is not None:
+                x_matrix[i][j] = float(value)
+                # Note: x is typically asymmetric
+    
+    # Fill s matrix from ss entries (end-state coefficients)
+    for key, value in old_data.get("ss", {}).items():
+        match = re.match(r'ss(\d+)s(\d+)s(\d+)s(\d+)', key)
+        if match:
+            site1, sub1, site2, sub2 = map(int, match.groups())
+            i = site_sub_to_idx.get((site1, sub1))
+            j = site_sub_to_idx.get((site2, sub2))
+            if i is not None and j is not None:
+                s_matrix[i][j] = float(value)
+                s_matrix[j][i] = float(value)  # Symmetric
+    
+    return {
+        "b": b_vector,
+        "c": c_matrix,
+        "x": x_matrix,
+        "s": s_matrix,
+    }
 
 
 def convert_to_json_serializable(data: Any) -> Any:
@@ -341,13 +443,21 @@ bias = yaml.safe_load(bias_string)
             if sum(block_data['counts'].values()) > 0:
                 num_populated += 1
     
+    # Count unique sites (extract site number from site#_sub# keys)
+    unique_sites = set()
+    for site_key in graph_info['sites'].keys():
+        # site_key format: "site1_sub1", "site2_sub3", etc.
+        site_num = site_key.split('_')[0]  # Extract "site1", "site2", etc.
+        unique_sites.add(site_num)
+    
     metadata = {
         'source_run_dir': str(run_dir),
         'combo_name': combo_name,
         'terminated_normally': output_results['terminated_normally'],
         'total_transitions': total_trans,
         'num_populated_blocks': num_populated,
-        'num_sites': len(graph_info['sites']),
+        'num_sites': len(unique_sites),
+        'num_substituents': len(graph_info['sites']),
         'solvent_state': graph_info['solvent_state']
     }
     
@@ -451,7 +561,11 @@ Examples:
             run_num = int(match.group(1)) if match else i
             combo_name = args.name_pattern.format(run_num)
         else:
-            combo_name = run_dir.name
+            # For generated combo structure, include parent combo name
+            if run_dir.parent != base_path and run_dir.parent.name.startswith('comb_'):
+                combo_name = f"{run_dir.parent.name}_{run_dir.name}"
+            else:
+                combo_name = run_dir.name
         
         print(f"\n[{i}/{len(run_dirs)}] Processing {run_dir.name} -> {combo_name}")
         

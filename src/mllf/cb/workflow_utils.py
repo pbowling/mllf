@@ -8,7 +8,7 @@ This module contains reusable functions for:
 Note: For manifest loading, use mllf.cli.workflow.load_manifest()
 """
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 import json
 import re
 
@@ -17,8 +17,7 @@ from mllf.cli.workflow import load_manifest
 
 
 def fix_msld_flat_for_single_site(combo_path: Path, 
-                                   site1_atoms: str = 'C4 H4',
-                                   site2_atoms: str = 'C5 H5') -> bool:
+                                   site_atoms: Dict[int, str] = None) -> bool:
     """Modify msld_flat.py to delete only atoms that overlap with present sites.
     
     For multi-site λ-dynamics simulations, certain atoms in the base structure
@@ -29,23 +28,28 @@ def fix_msld_flat_for_single_site(combo_path: Path,
     This function reads mapping.json to determine which original sites are
     present, then modifies the atom deletion command in msld_flat.py accordingly.
     
-    Example (14benz system):
-    - C4/H4 overlap with site1_sub1
-    - C5/H5 overlap with site2_sub1
-    
-    If only site1 is present: delete only C4/H4
-    If only site2 is present: delete only C5/H5  
-    If both sites present: delete both (no change)
+    Example usage:
+        # 14benz system
+        site_atoms = {1: 'C4 H4', 2: 'C5 H5'}
+        fix_msld_flat_for_single_site(combo_path, site_atoms)
+        
+        # Indole system
+        site_atoms = {1: 'C2 H2', 2: 'C6 H6'}
+        fix_msld_flat_for_single_site(combo_path, site_atoms)
     
     Args:
         combo_path: Path to combination directory containing msld_flat.py
             and mapping.json.
-        site1_atoms: Atoms to delete when site1 is present (default: 'C4 H4').
-        site2_atoms: Atoms to delete when site2 is present (default: 'C5 H5').
+        site_atoms: Dictionary mapping site numbers to atom selection strings.
+            Example: {1: 'C4 H4', 2: 'C5 H5'} for 14benz system.
+            If None, defaults to 14benz atoms for backward compatibility.
     
     Returns:
         True if file was modified, False if skipped or unchanged.
     """
+    # Default to 14benz atoms for backward compatibility
+    if site_atoms is None:
+        site_atoms = {1: 'C4 H4', 2: 'C5 H5'}
     msld_flat = combo_path / 'msld_flat.py'
     if not msld_flat.exists():
         return False
@@ -60,8 +64,8 @@ def fix_msld_flat_for_single_site(combo_path: Path,
     
     # Extract unique original site numbers from entries that have site info
     original_sites = set()
-    for entry in mapping.get('entries', []):
-        site = entry.get('site')
+    for entry in mapping:
+        site = entry.get('original_site')
         if site is not None:
             original_sites.add(site)
     
@@ -73,12 +77,9 @@ def fix_msld_flat_for_single_site(combo_path: Path,
     original_site = list(original_sites)[0]
     
     # Determine which atoms to delete based on ORIGINAL site number
-    if original_site == 1:
-        atoms_to_delete = site1_atoms
-    elif original_site == 2:
-        atoms_to_delete = site2_atoms
-    else:
-        # Unknown site - leave as is
+    atoms_to_delete = site_atoms.get(original_site)
+    if atoms_to_delete is None:
+        # Site not in mapping - leave as is
         return False
     
     # Read and modify the msld_flat.py content

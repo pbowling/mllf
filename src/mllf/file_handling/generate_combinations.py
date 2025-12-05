@@ -256,6 +256,223 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int]) -> str:
     return f"comb_{counter:04d}_{joined}"
 
 
+def renumber_pres_tokens(content: str, old_site: int, old_sub: int, new_site: int, new_sub: int) -> str:
+    """Renumber PRES tokens in RTF file content.
+    
+    Args:
+        content: RTF file content as string.
+        old_site: Original site number.
+        old_sub: Original substituent number.
+        new_site: New site number.
+        new_sub: New substituent number.
+    
+    Returns:
+        Updated content with renumbered PRES tokens.
+    """
+    old_token = f"p{old_site}_{old_sub}"
+    new_token = f"p{new_site}_{new_sub}"
+    
+    def _replace_pres_line(m: re.Match) -> str:
+        line = m.group(0)
+        if old_token in line:
+            return line.replace(old_token, new_token)
+        return line
+    
+    new_content, nsub = re.subn(r"(?m)^PRES.*$", _replace_pres_line, content, count=1)
+    return new_content if nsub else content
+
+
+def list_possible_combinations(input_dir: Path, out_dir: Path) -> List[Dict]:
+    """List all possible combinations without creating directories.
+    
+    Args:
+        input_dir: Directory containing site{n}_sub{m}_{label}.{ext} files.
+        out_dir: Output directory where combination subdirs would be created.
+    
+    Returns:
+        List of dicts with keys: 'name', 'path', 'sites', 'subs', 'subs_per_site_counts'
+    """
+    found = find_site_sub_files(input_dir)
+    if not found:
+        raise RuntimeError(f"No site_sub files found in {input_dir}")
+    
+    eligible = {s: subs for s, subs in found.items() if len(subs) >= 2}
+    if not eligible:
+        raise RuntimeError(f"No eligible sites with >=2 substituents found in {input_dir}")
+    
+    combos = all_site_sub_combinations(eligible)
+    combo_list = []
+    
+    for cnt, combo_data in enumerate(combos, start=1):
+        if len(combo_data) == 3 and combo_data[2] is not None:
+            sites, subs, subs_per_site_counts = combo_data
+        else:
+            sites, subs = combo_data[0], combo_data[1]
+            subs_per_site_counts = None
+        
+        name = make_combo_dir_name(cnt, sites, subs)
+        combo_path = out_dir / name
+        
+        combo_list.append({
+            'name': name,
+            'path': str(combo_path),
+            'sites': sites,
+            'subs': subs,
+            'subs_per_site_counts': subs_per_site_counts,
+            'counter': cnt
+        })
+    
+    return combo_list
+
+
+def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Dict, include_patterns: List[str] | None = None) -> Path:
+    """Create a single combination directory with renamed files and support files.
+    
+    Args:
+        input_dir: Directory containing site{n}_sub{m}_{label}.{ext} files.
+        out_dir: Output directory where combination subdir will be created.
+        combo_info: Dict with 'name', 'sites', 'subs', 'subs_per_site_counts', 'counter'.
+        include_patterns: Glob patterns for extra files to copy (e.g., ['prep/*', '*.py']).
+    
+    Returns:
+        Path to created directory.
+    """
+    found = find_site_sub_files(input_dir)
+    
+    sites = combo_info['sites']
+    subs = combo_info['subs']
+    subs_per_site_counts = combo_info.get('subs_per_site_counts')
+    name = combo_info['name']
+    
+    combo_path = out_dir / name
+    combo_path.mkdir(parents=True, exist_ok=True)
+    
+    mapping = []
+    
+    # Determine which subs belong to which site
+    per_site_selected = {}
+    if subs_per_site_counts is not None:
+        idx = 0
+        for i, site in enumerate(sites):
+            count = subs_per_site_counts[i]
+            per_site_selected[site] = subs[idx:idx+count]
+            idx += count
+    elif len(sites) == 1:
+        per_site_selected[sites[0]] = list(subs)
+    else:
+        raise ValueError(f"Cross-site combo without counts: {sites}, {subs}")
+    
+    # Create prep directory and process files
+    prep_in = input_dir / 'prep'
+    prep_out = combo_path / 'prep'
+    prep_out.mkdir(exist_ok=True)
+    
+    # Build old->new index mapping for renumbering
+    # Map (original_site, original_sub) -> (new_site, new_sub_idx)
+    old_to_new = {}
+    
+    # Create site renumber map to handle site renumbering
+    site_renumber_map = {site: idx + 1 for idx, site in enumerate(sorted(sites))}
+    
+    # For each site, renumber substituents sequentially within that site
+    for site in sites:
+        selected_subs = per_site_selected[site]
+        new_site = site_renumber_map[site]
+        for new_sub_idx, sub in enumerate(selected_subs, start=1):
+            old_to_new[(site, sub)] = (new_site, new_sub_idx)
+    
+    # Copy and rename site/sub files
+    for site, selected_subs in per_site_selected.items():
+        for sub in selected_subs:
+            if site not in found or sub not in found[site]:
+                continue
+            
+            new_site, new_sub_idx = old_to_new[(site, sub)]
+            
+            for (label, ext), src_path in found[site][sub].items():
+                new_name = f"site{new_site}_sub{new_sub_idx}_{label}.{ext}"
+                dst_path = prep_out / new_name
+                
+                if ext.lower() == 'rtf':
+                    content = src_path.read_text()
+                    content = renumber_pres_tokens(content, site, sub, new_site, new_sub_idx)
+                    dst_path.write_text(content)
+                else:
+                    copy2(src_path, dst_path)
+                
+                mapping.append({
+                    'original': str(src_path),
+                    'new_name': new_name,
+                    'original_site': site,
+                    'original_sub': sub,
+                    'new_site': new_site,
+                    'new_sub': new_sub_idx,
+                })
+    
+    # Copy support files from prep directory
+    if prep_in.exists():
+        for item in prep_in.iterdir():
+            if item.is_file() and not SITE_SUB_RE.match(item.name):
+                dst = prep_out / item.name
+                if not dst.exists():
+                    copy2(item, dst)
+    
+    # Write mapping.json
+    (combo_path / 'mapping.json').write_text(json.dumps(mapping, indent=2))
+    
+    # Write info.py
+    # Calculate nsubs as list of counts per site
+    if subs_per_site_counts is not None:
+        nsubs_list = subs_per_site_counts
+    else:
+        # Single site case
+        nsubs_list = [len(subs)]
+    
+    info_content = f"""import numpy as np
+import os
+
+info = {{}}
+info['name'] = '{name}'
+info['nsubs'] = {nsubs_list}
+info['nblocks'] = np.sum(info['nsubs'])
+info['ncentral'] = 0
+info['nreps'] = 1
+info['nnodes'] = 1
+info['enginepath'] = os.environ.get('CHARMMEXEC', '')
+info['temp'] = 298.15
+"""
+    (combo_path / 'info.py').write_text(info_content)
+    
+    # Generate run.sh
+    run_sh = f"""#!/bin/bash
+#SBATCH --job-name={name}
+#SBATCH --output={name}.%j.out
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH -p gpu2080 --gres=gpu:1
+#SBATCH --export=ALL
+#SBATCH --time=01:00:00
+
+module load charmm/charmm/c51a1
+
+python3 msld_flat.py > output.out 2>&1
+"""
+    run_script = combo_path / 'run.sh'
+    run_script.write_text(run_sh)
+    run_script.chmod(0o755)
+    
+    # Copy additional files matching include patterns
+    if include_patterns:
+        for pattern in include_patterns:
+            if '/' in pattern:
+                continue
+            for src in input_dir.glob(pattern):
+                if src.is_file():
+                    copy2(src, combo_path / src.name)
+    
+    return combo_path
+
+
 def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = False, include_patterns: List[str] | None = None) -> List[Path]:
     """Create combination directories with renamed files and support files.
 
