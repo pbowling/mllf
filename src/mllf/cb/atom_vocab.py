@@ -37,12 +37,14 @@ def parse_toppar_file(filepath: str) -> Set[str]:
     return atom_types
 
 
-def build_atom_type_vocab_from_toppar(toppar_dir: str = None) -> Dict[str, int]:
+def build_atom_type_vocab_from_toppar(toppar_dir: str = None, toppar_files: List[str] = None) -> Dict[str, int]:
     """Build a complete atom type vocabulary from CHARMM toppar files.
     
     Args:
         toppar_dir: Path to directory containing toppar files (.rtf, .str).
                    If None, uses the package's bundled toppar directory.
+        toppar_files: List of specific filenames to include (e.g., ['top_all36_cgenff.rtf']).
+                     If None, includes all .rtf and .str files in toppar_dir.
                    
     Returns:
         Dictionary mapping atom type strings to indices (sorted alphabetically)
@@ -64,12 +66,27 @@ def build_atom_type_vocab_from_toppar(toppar_dir: str = None) -> Dict[str, int]:
     
     all_atom_types = set()
     
-    # Parse all .rtf and .str files
-    for filename in os.listdir(toppar_dir):
-        if filename.endswith('.rtf') or filename.endswith('.str'):
-            filepath = os.path.join(toppar_dir, filename)
-            atom_types = parse_toppar_file(filepath)
-            all_atom_types.update(atom_types)
+    # Determine which files to parse
+    if toppar_files is not None:
+        # Use specified files only
+        files_to_parse = toppar_files
+    else:
+        # Parse all .rtf and .str files
+        files_to_parse = [f for f in os.listdir(toppar_dir) 
+                         if f.endswith('.rtf') or f.endswith('.str')]
+    
+    # Parse files
+    for filename in files_to_parse:
+        filepath = os.path.join(toppar_dir, filename)
+        if not os.path.exists(filepath):
+            import warnings
+            warnings.warn(
+                f"Toppar file not found: {filepath}. Skipping.",
+                UserWarning
+            )
+            continue
+        atom_types = parse_toppar_file(filepath)
+        all_atom_types.update(atom_types)
     
     # Create sorted vocabulary
     sorted_types = sorted(all_atom_types)
@@ -80,22 +97,27 @@ def build_atom_type_vocab_from_toppar(toppar_dir: str = None) -> Dict[str, int]:
 
 # Cache the vocabulary to avoid re-parsing files
 _CACHED_VOCAB = None
+_CACHED_CONFIG = None
 
 
-def get_atom_type_vocab(toppar_dir: str = None, force_rebuild: bool = False) -> Dict[str, int]:
+def get_atom_type_vocab(toppar_dir: str = None, toppar_files: List[str] = None, force_rebuild: bool = False) -> Dict[str, int]:
     """Get the atom type vocabulary, using cached version if available.
     
     Args:
         toppar_dir: Path to toppar directory (None for default)
+        toppar_files: List of specific filenames to include (e.g., ['top_all36_cgenff.rtf'])
         force_rebuild: If True, rebuild vocabulary even if cached
         
     Returns:
         Dictionary mapping atom type strings to indices
     """
-    global _CACHED_VOCAB
+    global _CACHED_VOCAB, _CACHED_CONFIG
     
-    if _CACHED_VOCAB is None or force_rebuild:
-        _CACHED_VOCAB = build_atom_type_vocab_from_toppar(toppar_dir)
+    # Check if we need to rebuild (config changed or forced)
+    current_config = (toppar_dir, tuple(toppar_files) if toppar_files else None)
+    if _CACHED_VOCAB is None or force_rebuild or current_config != _CACHED_CONFIG:
+        _CACHED_VOCAB = build_atom_type_vocab_from_toppar(toppar_dir, toppar_files)
+        _CACHED_CONFIG = current_config
     
     return _CACHED_VOCAB
 

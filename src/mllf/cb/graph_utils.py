@@ -53,7 +53,7 @@ def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None):
     return torch.tensor(base_features, dtype=torch.get_default_dtype())
 
 
-def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: Optional[str] = None) -> Tuple[object, dict]:
+def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: Optional[str] = None, toppar_files: list = None, warn_missing_types: bool = True) -> Tuple[object, dict]:
     """Convert a Graph-like object `g` into a PyG Data object and metadata.
 
     We expand each undirected graph edge into up to four directed relation edges,
@@ -70,6 +70,8 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         g: Graph object with node metadata
         relation_names: List of base relation types (default: ['linear', 'quadratic', 'skew', 'end'])
         toppar_dir: Path to toppar directory (None uses package default)
+        toppar_files: List of specific toppar filenames to include (e.g., ['top_all36_cgenff.rtf'])
+        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
 
     Returns (pyg_data, extras) where extras contain:
         - relation_names: List of all relation type names
@@ -96,7 +98,27 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
     rel_to_idx = {r: i for i, r in enumerate(relation_names)}
 
     # Load atom type vocabulary from toppar files
-    atom_type_vocab = get_atom_type_vocab(toppar_dir)
+    atom_type_vocab = get_atom_type_vocab(toppar_dir, toppar_files)
+    
+    # Check for missing atom types in graph if requested
+    if warn_missing_types and atom_type_vocab:
+        missing_types = set()
+        for i in range(g.num_nodes):
+            meta = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
+            distinct_types = meta.get('distinct_atom_types', [])
+            for atom_type in distinct_types:
+                if atom_type not in atom_type_vocab:
+                    missing_types.add(atom_type)
+        
+        if missing_types:
+            import warnings
+            sorted_missing = sorted(missing_types)
+            warnings.warn(
+                f"Found {len(sorted_missing)} atom type(s) in substituent RTF files that are not in the vocabulary: "
+                f"{sorted_missing}. These atom types will not be encoded in node features. "
+                f"Consider adding the corresponding toppar file(s) to the vocabulary.",
+                UserWarning
+            )
     
     # collect node features with atom type encoding
     node_feats = []

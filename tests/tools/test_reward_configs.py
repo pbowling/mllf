@@ -62,7 +62,7 @@ def load_epoch_results(epoch_dir: Path) -> List[Dict]:
     return results
 
 
-def test_reward_config(
+def evaluate_reward_config(
     results: List[Dict],
     w_P: float = 0.5,
     w_T: float = 0.5,
@@ -71,7 +71,7 @@ def test_reward_config(
     T_baseline: float = 100.0,
     config_name: str = "default"
 ) -> Dict:
-    """Test a reward configuration on cached results.
+    """Evaluate a reward configuration on cached results.
     
     Args:
         results: List of checkpoint dicts with raw metrics
@@ -212,7 +212,7 @@ def main():
     
     stats = []
     for config in test_configs:
-        result_stats = test_reward_config(results, **config)
+        result_stats = evaluate_reward_config(results, **config)
         stats.append(result_stats)
         
         print(f"\nConfiguration: {result_stats['config_name']}")

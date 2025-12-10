@@ -17,6 +17,16 @@ pretrain:
   model_path: /home/pbowling/mllf/examples/models/pretrained_combined/best_policy.pt
   # Set to path of best_policy.pt after running pretrain_policy to use it
 
+# Atom type vocabulary configuration (for node feature encoding)
+vocabulary:
+  # Path to toppar directory (None uses package default: toppar/)
+  toppar_dir: null
+  # List of specific toppar files to include (None includes all .rtf and .str files)
+  # Example: ['top_all36_cgenff.rtf', 'top_all36_prot.rtf']
+  toppar_files: null
+  # Warn when substituent RTF files contain atom types not in vocabulary
+  warn_missing_types: true
+
 # Training configuration
 training:
   num_epochs: 50 

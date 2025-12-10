@@ -49,17 +49,25 @@ from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy
 
 
-def build_graph_from_saved_data(run_dir: Path):
+def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=None, warn_missing_types=True):
     """Build PyG graph from saved variables.py.
     
     Args:
         run_dir: Directory containing variables.py
+        toppar_dir: Path to toppar directory (None uses package default)
+        toppar_files: List of specific toppar filenames to include
+        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
     
     Returns:
         Tuple of (data, targets, extras)
     """
     # Use the existing workflow function to build graph from variables.py
-    return build_data_and_targets_from_combo(str(run_dir))
+    return build_data_and_targets_from_combo(
+        str(run_dir), 
+        toppar_dir=toppar_dir,
+        toppar_files=toppar_files,
+        warn_missing_types=warn_missing_types
+    )
 
 
 def filter_best_runs_per_system(runs: List[Dict]) -> List[Dict]:
@@ -380,6 +388,9 @@ def pretrain_epoch(
     runs: List[Dict],
     reward_config: Dict,
     device: torch.device,
+    toppar_dir=None,
+    toppar_files=None,
+    warn_missing_types=True,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -390,6 +401,9 @@ def pretrain_epoch(
         runs: List of pretraining run dicts (should be best runs only)
         reward_config: Reward function configuration (unused in BC)
         device: Device for computation
+        toppar_dir: Path to toppar directory (None uses package default)
+        toppar_files: List of specific toppar filenames to include
+        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
     
     Returns:
         Dict with epoch statistics
@@ -405,7 +419,12 @@ def pretrain_epoch(
         
         # Build graph from saved data AND get target coefficients
         try:
-            data, targets, extras = build_graph_from_saved_data(run_dir)
+            data, targets, extras = build_graph_from_saved_data(
+                run_dir, 
+                toppar_dir=toppar_dir,
+                toppar_files=toppar_files,
+                warn_missing_types=warn_missing_types
+            )
             data = data.to(device)
             
             # Targets contain the actual bias coefficients from successful run
@@ -527,12 +546,23 @@ def pretrain_with_runs(
     # Update runs to use filtered best runs
     runs = best_runs
     
+    # Extract toppar configuration
+    vocab_config = config.get('vocabulary', {})
+    toppar_dir = vocab_config.get('toppar_dir')
+    toppar_files = vocab_config.get('toppar_files')
+    warn_missing_types = vocab_config.get('warn_missing_types', True)
+    
     # Get a sample run to build model architecture (find one with edges)
     sample_data = None
     sample_extras = None
     for run in runs:
         try:
-            data, _, extras = build_data_and_targets_from_combo(str(run["run_dir"]))
+            data, _, extras = build_data_and_targets_from_combo(
+                str(run["run_dir"]),
+                toppar_dir=toppar_dir,
+                toppar_files=toppar_files,
+                warn_missing_types=warn_missing_types
+            )
             if data.edge_index.size(1) > 0:  # Has edges
                 sample_data = data
                 sample_extras = extras
@@ -586,7 +616,10 @@ def pretrain_with_runs(
         print(f"Epoch {epoch+1}/{epochs}")
         
         stats = pretrain_epoch(
-            encoder, policy, optimizer, runs, reward_config, device
+            encoder, policy, optimizer, runs, reward_config, device,
+            toppar_dir=toppar_dir,
+            toppar_files=toppar_files,
+            warn_missing_types=warn_missing_types
         )
         
         print(f"  MSE Loss: {stats['loss']:.4f}")

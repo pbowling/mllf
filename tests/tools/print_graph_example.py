@@ -9,7 +9,7 @@ import os
 from pprint import pprint
 
 from mllf.file_handling.read_rtf import parse_rtf_dir
-from mllf.rl.graph import Graph
+from mllf.cb.graph import Graph
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
         raise RuntimeError('Could not find repository root (pyproject.toml)')
 
     repo = _find_repo_root(Path(__file__))
-    examples_dir = repo / 'examples' / 'rl' / '14benz_solv_5.5'
+    examples_dir = repo / 'examples' / 'cb' / '14benz_solv_5.5'
     if not examples_dir.is_dir():
         print('Example directory not found:', examples_dir)
         return

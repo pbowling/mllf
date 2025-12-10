@@ -162,7 +162,8 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
         json.dump(graph_info, f, indent=2)
 
 
-def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadratic', verify_graph: bool = False):
+def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadratic', verify_graph: bool = False,
+                                      toppar_dir: str = None, toppar_files: list = None, warn_missing_types: bool = True):
     """Build PyG Data object and per-edge targets from a combo directory.
 
     This function prefers RTF fragments when available (Graph.from_rtf_results).
@@ -175,6 +176,9 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
         base_bias: Legacy parameter (currently unused, kept for compatibility).
         verify_graph: If True, verify that PyG edge expansion matches Graph.edge_mask.
                       Useful for debugging but adds runtime overhead.
+        toppar_dir: Path to toppar directory for vocabulary (None uses package default)
+        toppar_files: List of specific toppar filenames to include (e.g., ['top_all36_cgenff.rtf'])
+        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
 
     Returns:
         Tuple of (data, targets, extras) where:
@@ -210,7 +214,8 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
         else:
             raise FileNotFoundError(f'No RTF fragments and no variables.py found in {combo_dir} or {combo_dir}/prep')
 
-    data, extras = graph_utils.build_pyg_graph_from_mllf_graph(g)
+    data, extras = graph_utils.build_pyg_graph_from_mllf_graph(g, toppar_dir=toppar_dir, toppar_files=toppar_files, 
+                                                                 warn_missing_types=warn_missing_types)
 
     # Optional verification: ensure PyG edges correspond to Graph.edge_mask
     if verify_graph:

@@ -133,6 +133,94 @@ def test_atom_type_multihot_encoding():
     assert features3.shape == (expected_dim,), f"Expected {expected_dim} features, got {features3.shape}"
 
 
+def test_filtered_vocabulary_features():
+    """Test that node features work correctly with filtered vocabulary."""
+    # Use only CGenFF vocabulary
+    vocab_cgenff = get_atom_type_vocab(
+        toppar_files=['top_all36_cgenff.rtf'],
+        force_rebuild=True
+    )
+    
+    meta = {
+        'total_charge': 0.5,
+        'solvent': 'solv',
+        'distinct_atom_types': ['CG2R61', 'HGR61', 'NG2R60']
+    }
+    
+    features = _node_feature_from_meta(meta, vocab_cgenff)
+    
+    # Feature dimension should be 4 + filtered vocab size
+    expected_dim = 4 + len(vocab_cgenff)
+    assert features.shape == (expected_dim,), \
+        f"Expected {expected_dim} features with filtered vocab, got {features.shape}"
+    
+    # All specified atom types should be in CGenFF and present
+    for atom_type in ['CG2R61', 'HGR61', 'NG2R60']:
+        assert atom_type in vocab_cgenff, f"{atom_type} should be in CGenFF vocab"
+        assert features[4 + vocab_cgenff[atom_type]].item() == 1.0, \
+            f"{atom_type} should be present in features"
+
+
+def test_vocabulary_consistency():
+    """Test that same vocabulary produces consistent feature dimensions."""
+    # Get vocabulary with specific configuration
+    vocab = get_atom_type_vocab(
+        toppar_files=['top_all36_cgenff.rtf'],
+        force_rebuild=True
+    )
+    
+    # Create features for two different nodes
+    meta1 = {
+        'total_charge': 0.5,
+        'solvent': 'gas',
+        'distinct_atom_types': ['CG2R61']
+    }
+    
+    meta2 = {
+        'total_charge': -0.5,
+        'solvent': 'protein',
+        'distinct_atom_types': ['NG2R60', 'OG2D1']
+    }
+    
+    features1 = _node_feature_from_meta(meta1, vocab)
+    features2 = _node_feature_from_meta(meta2, vocab)
+    
+    # Both should have same dimension
+    assert features1.shape == features2.shape, \
+        "Features with same vocab should have same dimension"
+    
+    expected_dim = 4 + len(vocab)
+    assert features1.shape == (expected_dim,), \
+        f"Feature dimension should be {expected_dim}"
+
+
+def test_missing_atom_types_in_vocab():
+    """Test behavior when distinct_atom_types contains types not in vocabulary."""
+    # Create a very limited vocabulary (just a few types)
+    limited_vocab = {'CG2R61': 0, 'HGR61': 1}
+    
+    # Try to encode node with types not in limited vocab
+    meta = {
+        'total_charge': 0.0,
+        'solvent': 'solv',
+        'distinct_atom_types': ['CG2R61', 'NG2R60', 'UNKNOWN_TYPE']
+    }
+    
+    features = _node_feature_from_meta(meta, limited_vocab)
+    
+    # Should have 4 base + 2 vocab features
+    assert features.shape == (6,), f"Expected 6 features, got {features.shape}"
+    
+    # CG2R61 should be present
+    assert features[4 + limited_vocab['CG2R61']].item() == 1.0, \
+        "CG2R61 should be encoded"
+    
+    # NG2R60 and UNKNOWN_TYPE should be silently ignored (not in vocab)
+    # All other atom type positions should be 0
+    assert features[4 + limited_vocab['HGR61']].item() == 0.0, \
+        "HGR61 should not be present"
+
+
 if __name__ == '__main__':
     test_vacuum_environment()
     test_solvent_environment()
@@ -140,4 +228,7 @@ if __name__ == '__main__':
     test_alternative_names()
     test_missing_solvent()
     test_atom_type_multihot_encoding()
+    test_filtered_vocabulary_features()
+    test_vocabulary_consistency()
+    test_missing_atom_types_in_vocab()
     print("All tests passed!")
