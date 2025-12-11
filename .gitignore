@@ -25,8 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-examples/cb/generated_combos/
-examples/cb/epoch_049_results/
+generated_combos/
 pretraining/
 old_files/
 models/
