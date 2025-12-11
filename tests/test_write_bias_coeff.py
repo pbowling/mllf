@@ -1,8 +1,16 @@
 import os
+from pathlib import Path
 import yaml
 import numpy as np
 from mllf.cb.graph import Graph
 from mllf.file_handling.write_bias_coeff import write_bias_inp_from_graph, write_variables_py_from_inp
+
+
+def _get_example_path(filename):
+	"""Get absolute path to example file, relative to repository root."""
+	test_file = Path(__file__)
+	repo_root = test_file.parent.parent
+	return repo_root / "examples" / "cb" / filename
 
 
 def _read_set_names(path):
@@ -34,11 +42,16 @@ def test_write_matches_example(tmp_path):
 
     subs = [3, 4, 8, 8, 8]
     out = tmp_path / "generated.inp"
-    example = os.path.join('examples', 'cb', 'variables85.inp')
+    example = _get_example_path('variables85.inp')
+    
+    if not example.exists():
+        import pytest
+        pytest.skip(f"Example file not found: {example}")
+    
     # use the example file as the header source so non-bias lines are copied verbatim
-    write_bias_inp_from_graph(g, str(out), sub_counts=subs, header_source=example)
+    write_bias_inp_from_graph(g, str(out), sub_counts=subs, header_source=str(example))
     gen_names = set(_read_set_names(str(out)))
-    ex_names = set(_read_set_names(example))
+    ex_names = set(_read_set_names(str(example)))
 
     # assert generated parameter names equal the example's parameter names
     assert gen_names == ex_names
@@ -53,9 +66,14 @@ def test_variables_py_contains_bias(tmp_path):
     - no textual scalar lines (lams/cs/xs/ss) appear after the closing triple quotes
     """
 
-    inp = os.path.join('examples', 'cb', 'variables85.inp')
+    inp = _get_example_path('variables85.inp')
+    
+    if not inp.exists():
+        import pytest
+        pytest.skip(f"Example file not found: {inp}")
+    
     out = tmp_path / "variables.py"
-    write_variables_py_from_inp(inp, str(out))
+    write_variables_py_from_inp(str(inp), str(out))
 
     s = out.read_text(encoding='utf-8')
     assert 'bias_string="""' in s
