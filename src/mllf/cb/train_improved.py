@@ -27,7 +27,8 @@ def compute_msld_reward_improved(
     T_baseline: float = 50.0,
     min_transitions_per_site: int = 10,
     min_coverage_ratio: float = 0.5,
-    entropy_bonus: float = 8.0
+    entropy_bonus: float = 8.0,
+    concentration_penalty_threshold: float = 0.8
 ) -> float:
     """Compute improved scalarized reward that prevents degenerate solutions.
     
@@ -67,6 +68,7 @@ def compute_msld_reward_improved(
         min_transitions_per_site: Minimum transitions required per site (default: 10).
         min_coverage_ratio: Minimum fraction of substituents that must be visited (default: 0.5).
         entropy_bonus: Bonus coefficient for high-entropy distributions (default: 8.0).
+        concentration_penalty_threshold: Threshold for concentration penalty (default: 0.8).
     
     Returns:
         Scalar reward value (higher is better). Returns large negative value
@@ -112,18 +114,26 @@ def compute_msld_reward_improved(
         print(f"  Warning: No population or transition data in {output_file}")
         return -100.0 * gamma
     
-    # Extract populations (per block/substituent)
+    # Extract populations (per block/substituent) - use only HIGHEST lambda value
     populations = []
     for block_id, block_info in population_data.items():
         counts_dict = block_info.get('counts', {})
-        total_count = sum(counts_dict.values())
-        populations.append(total_count)
+        if counts_dict:
+            # Use only the highest lambda value
+            max_lambda = max(counts_dict.keys(), key=lambda x: float(x))
+            populations.append(counts_dict[max_lambda])
+        else:
+            populations.append(0)
     
-    # Extract transitions (per site)
+    # Extract transitions (per site) - use only HIGHEST lambda value
     site_transitions = {}
     for site_id, trans_dict in transitions_data.items():
-        total_trans = sum(trans_dict.values())
-        site_transitions[site_id] = total_trans
+        if trans_dict:
+            # Use only the highest lambda value
+            max_lambda = max(trans_dict.keys(), key=lambda x: float(x))
+            site_transitions[site_id] = trans_dict[max_lambda]
+        else:
+            site_transitions[site_id] = 0
     
     total_subs = len(populations)
     total_sites = len(site_transitions)
@@ -194,9 +204,9 @@ def compute_msld_reward_improved(
             total_pop = np.sum(site_pops)
             concentration_ratio = max_pop / total_pop
             
-            # If >80% of population in one substituent: penalty
-            if concentration_ratio > 0.8:
-                penalties -= gamma * 5.0 * (concentration_ratio - 0.8)
+            # If concentration exceeds threshold: penalty
+            if concentration_ratio > concentration_penalty_threshold:
+                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
                 print(f"  Warning: Site {site_idx} has {concentration_ratio:.2%} concentration")
         
         pop_idx += nsubs

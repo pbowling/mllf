@@ -175,13 +175,13 @@ fi
 # Pretrain on all datasets (behavior cloning with MSE loss)
 python -m mllf.cb.pretrain_policy \
     $pretrain_dirs \
-    --output-dir models/pretrained_combined \
+    --output-dir models/pretraining \
     --config $CONFIG_FILE \
     --epochs 50 \
     --learning-rate 0.001
 
 echo ""
-echo "Pretraining complete! Saved to models/pretrained_combined/"
+echo "Pretraining complete! Saved to models/pretraining/"
 echo ""
 
 echo "========================================="
@@ -194,7 +194,7 @@ echo "1. Edit your workflow config (e.g., examples/workflow_sample.yaml)"
 echo "   Update the pretrain section:"
 echo ""
 echo "   pretrain:"
-echo "     model_path: models/pretrained_combined/best_policy.pt"
+echo "     model_path: models/pretraining/best_policy.pt"
 echo ""
 echo "2. Make sure you have generated combinations ready"
 echo "   (or configure create_combos in your workflow config)"

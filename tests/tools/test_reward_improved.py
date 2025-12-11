@@ -30,6 +30,7 @@ def compute_improved_reward_from_json(
     min_transitions_per_site: int = 10,
     min_coverage_ratio: float = 0.5,
     entropy_bonus: float = 5.0,
+    concentration_penalty_threshold: float = 0.8,
     verbose: bool = False
 ) -> Tuple[float, Dict]:
     """Compute improved reward from pretraining JSON data.
@@ -43,6 +44,9 @@ def compute_improved_reward_from_json(
         P_baseline: Population normalization baseline (default: 1000.0)
         T_baseline: Transition normalization baseline (default: 100.0)
         min_transitions_per_site: Minimum transitions per site (default: 10)
+        min_coverage_ratio: Minimum coverage fraction (default: 0.5)
+        entropy_bonus: Entropy bonus coefficient (default: 5.0)
+        concentration_penalty_threshold: Threshold for concentration penalty (default: 0.8)
         min_coverage_ratio: Minimum coverage fraction (default: 0.5)
         entropy_bonus: Entropy bonus coefficient (default: 5.0)
         verbose: Print detailed breakdown
@@ -73,20 +77,30 @@ def compute_improved_reward_from_json(
         return -500.0, {'error': 'Missing population or transition data'}
     
     # Parse populations per block
+    # Parse populations per block - use only HIGHEST lambda value
     populations = []
     for block_id, block_info in population_data.items():
         if isinstance(block_info, dict) and 'counts' in block_info:
             counts_dict = block_info['counts']
-            total_count = sum(counts_dict.values())
-            populations.append(total_count)
+            if counts_dict:
+                # Use only the highest lambda value
+                max_lambda = max(counts_dict.keys(), key=lambda x: float(x))
+                populations.append(counts_dict[max_lambda])
+            else:
+                populations.append(0)
         else:
             populations.append(0)
     
-    # Parse transitions per site
+    # Parse transitions per site - use only HIGHEST lambda value
     site_transitions = {}
     for site_id, trans_dict in transitions_data.items():
         if isinstance(trans_dict, dict):
-            total_trans = sum(trans_dict.values())
+            if trans_dict:
+                # Use only the highest lambda value
+                max_lambda = max(trans_dict.keys(), key=lambda x: float(x))
+                total_trans = trans_dict[max_lambda]
+            else:
+                total_trans = 0
         else:
             total_trans = trans_dict if isinstance(trans_dict, (int, float)) else 0
         site_transitions[site_id] = total_trans
@@ -128,13 +142,34 @@ def compute_improved_reward_from_json(
         penalty_messages.append(f"Coverage {coverage_ratio:.2%} below minimum {min_coverage_ratio:.0%}")
     
     # Check 3: Detect single-dominant-population per site
-    subs_per_site = total_subs // total_sites if total_sites > 0 else total_subs
-    max_concentration = 0.0
+    # Extract actual substituents per site from graph_info.json
+    nsubs_per_site = None
+    graph_info_path = run_dir / 'graph_info.json'
+    if graph_info_path.exists():
+        try:
+            with open(graph_info_path, 'r') as f:
+                graph_info = json.load(f)
+            if 'sites' in graph_info:
+                from collections import defaultdict
+                site_counts = defaultdict(int)
+                for site_key in graph_info['sites']:
+                    site_num = int(site_key.split('_')[0].replace('site', ''))
+                    site_counts[site_num] += 1
+                nsubs_per_site = [site_counts[i] for i in sorted(site_counts.keys())]
+        except Exception:
+            pass
     
-    for site_idx in range(total_sites):
-        start_idx = site_idx * subs_per_site
-        end_idx = min(start_idx + subs_per_site, total_subs)
-        site_pops = pop_array[start_idx:end_idx]
+    # Fallback: uniform distribution (asymmetric-safe)
+    if nsubs_per_site is None:
+        subs_per_site = total_subs // total_sites if total_sites > 0 else total_subs
+        nsubs_per_site = [subs_per_site] * total_sites
+        for i in range(total_subs % total_sites):
+            nsubs_per_site[i] += 1
+    
+    max_concentration = 0.0
+    pop_idx = 0
+    for site_idx, nsubs in enumerate(nsubs_per_site):
+        site_pops = pop_array[pop_idx:pop_idx + nsubs]
         
         if len(site_pops) > 0 and np.sum(site_pops) > 0:
             max_pop = np.max(site_pops)
@@ -142,9 +177,11 @@ def compute_improved_reward_from_json(
             concentration_ratio = max_pop / total_pop
             max_concentration = max(max_concentration, concentration_ratio)
             
-            if concentration_ratio > 0.8:
-                penalties -= gamma * 5.0 * (concentration_ratio - 0.8)
+            if concentration_ratio > concentration_penalty_threshold:
+                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
                 penalty_messages.append(f"Site {site_idx} has {concentration_ratio:.0%} concentration")
+        
+        pop_idx += nsubs
     
     # ========== POSITIVE REWARD COMPONENTS ==========
     
@@ -154,16 +191,25 @@ def compute_improved_reward_from_json(
     if len(populations) > 1:
         nonzero_pops = pop_array[pop_array > 0]
         
-        if len(nonzero_pops) > 1:
+        # Require meaningful coverage: at least 2 subs per site on average
+        # If we have 8 subs total and only 2 are visited (one per site), that's degenerate
+        min_meaningful_coverage = max(2, total_sites * 1.5)  # At least 1.5 subs per site
+        
+        if len(nonzero_pops) > 1 and len(nonzero_pops) >= min_meaningful_coverage:
+            # Use coefficient of variation (std/mean) for balance
             pop_mean = np.mean(nonzero_pops)
             pop_std = np.std(nonzero_pops)
             cv = pop_std / pop_mean if pop_mean > 0 else 1.0
+            
+            # Balance factor: exp(-cv) ranges from ~0.37 (CV=1) to 1.0 (CV=0)
             balance_factor = np.exp(-cv)
             
-            total_pop_normalized = sum(p / P_baseline for p in populations)
+            # Normalized population reward (only count non-zero populations)
+            total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
             R_P = w_P * total_pop_normalized * balance_factor
         else:
-            R_P = w_P * 0.01
+            # Insufficient coverage: minimal reward proportional to coverage
+            R_P = w_P * 0.01 * coverage_ratio
             balance_factor = 0.01
     
     # R_T: Transition reward
@@ -190,6 +236,12 @@ def compute_improved_reward_from_json(
         max_entropy = np.log(len(prob_dist)) if len(prob_dist) > 0 else 1.0
         entropy_score = entropy / max_entropy if max_entropy > 0 else 0.0
         R_entropy = entropy_bonus * entropy_score
+    
+    # ========== PENALTY CLAMPING ==========
+    # Prevent gradient explosion by capping maximum negative penalty
+    max_penalty = 50.0
+    if penalties < -max_penalty:
+        penalties = -max_penalty
     
     # Final reward
     R = R_P + R_T + R_U + R_entropy + penalties

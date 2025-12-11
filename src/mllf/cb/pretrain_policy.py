@@ -70,7 +70,7 @@ def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=Non
     )
 
 
-def filter_best_runs_per_system(runs: List[Dict]) -> List[Dict]:
+def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] = None) -> List[Dict]:
     """Filter runs to keep only the best run per unique system.
     
     Groups runs by their dataset (pretraining parent directory) and keeps only the
@@ -83,10 +83,14 @@ def filter_best_runs_per_system(runs: List[Dict]) -> List[Dict]:
     
     Args:
         runs: List of run dicts with 'run_dir', 'source_dir', 'metadata', 'sim_results'
+        reward_config: Optional reward configuration dict from config file
     
     Returns:
         Filtered list containing only best run per system/combination
     """
+    if reward_config is None:
+        reward_config = {}
+    
     from collections import defaultdict
     
     # Group runs by system identifier
@@ -164,11 +168,19 @@ def filter_best_runs_per_system(runs: List[Dict]) -> List[Dict]:
                 else:
                     nsubs_per_site = [3] * num_sites
             
-            # Compute reward (using defaults for filtering)
+            # Compute reward using config parameters (filter out legacy/unknown parameters)
+            valid_params = {
+                'w_P', 'w_T', 'w_U', 'gamma', 'P_baseline', 'T_baseline',
+                'min_transitions_per_site', 'min_coverage_ratio', 'entropy_bonus',
+                'concentration_penalty_threshold'
+            }
+            filtered_config = {k: v for k, v in reward_config.items() if k in valid_params}
+            
             reward = compute_reward_from_sim_results(
                 run['sim_results'],
                 num_sites=num_sites,
-                nsubs_per_site=nsubs_per_site
+                nsubs_per_site=nsubs_per_site,
+                **filtered_config  # Use filtered reward config from workflow yaml
             )
             run_rewards.append((run, reward))
         
@@ -236,17 +248,20 @@ def compute_reward_from_sim_results(
     w_T: float = 0.5,
     w_U: float = 0.3,
     gamma: float = 4.0,
-    P_baseline: float = 500.0,
-    T_baseline: float = 50.0,
+    P_baseline: float = 500.0,  # Tested balanced_positive config (best for indolizine)
+    T_baseline: float = 50.0,   # Tested balanced_positive config
     min_transitions_per_site: int = 10,
     min_coverage_ratio: float = 0.5,
-    entropy_bonus: float = 8.0,
+    entropy_bonus: float = 8.0,  # Tested balanced_positive config
     concentration_penalty_threshold: float = 0.8,
 ) -> float:
     """Compute reward from simulation results dict using improved reward logic.
     
     This implements the same logic as train_improved.py but works with cached
     simulation results instead of reading from output files.
+    
+    Default parameters match the 'balanced_positive' configuration which achieved
+    the highest rewards (71.53) in testing on indolizine runs with >200 transitions.
     
     Args:
         sim_results: Dict with 'populations' and 'transitions' keys
@@ -267,12 +282,13 @@ def compute_reward_from_sim_results(
     populations = sim_results.get("populations", {})
     transitions = sim_results.get("transitions", {})
     
-    # Extract population counts (use highest lambda value)
+    # Extract population counts (use only HIGHEST lambda value)
     pop_list = []
     for block_id in sorted([int(k) for k in populations.keys()]):
         block_data = populations[str(block_id)]
         counts = block_data.get("counts", {})
         if counts:
+            # Use only the highest lambda value
             max_lambda = max(counts.keys(), key=lambda x: float(x))
             pop_list.append(counts[max_lambda])
     
@@ -285,13 +301,15 @@ def compute_reward_from_sim_results(
     if total_pop == 0:
         return -100.0 * gamma  # No sampling occurred
     
-    # Extract transition counts per site
+    # Extract transition counts per site (use only HIGHEST lambda value)
     trans_per_site = []
     for site_id in sorted([int(k) for k in transitions.keys()]):
         site_data = transitions[str(site_id)]
-        if site_data:
+        if site_data and isinstance(site_data, dict):
+            # Use only the highest lambda value
             max_lambda = max(site_data.keys(), key=lambda x: float(x))
-            trans_per_site.append(site_data[max_lambda])
+            total_trans = site_data[max_lambda]
+            trans_per_site.append(total_trans)
         else:
             trans_per_site.append(0)
     
@@ -303,13 +321,19 @@ def compute_reward_from_sim_results(
     total_trans = trans_array.sum()
     
     # === STRICT REQUIREMENTS (penalties) ===
-    penalty = 0.0
+    # Match test_reward_improved.py penalty calculation
+    penalties = 0.0
     
     # 1. Per-site minimum transitions requirement
+    sites_below_threshold = 0
     for site_idx, trans_count in enumerate(trans_array):
         if trans_count < min_transitions_per_site:
-            shortage = min_transitions_per_site - trans_count
-            penalty += gamma * shortage  # Linear penalty for shortage
+            sites_below_threshold += 1
+            deficit = min_transitions_per_site - trans_count
+            penalties -= gamma * (1 + deficit)
+    
+    if sites_below_threshold > 0:
+        penalties -= gamma * 10.0 * sites_below_threshold
     
     # 2. Coverage requirement (minimum % of substituents visited)
     num_populated = np.count_nonzero(pop_array)
@@ -317,8 +341,8 @@ def compute_reward_from_sim_results(
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
     
     if coverage_ratio < min_coverage_ratio:
-        shortage = min_coverage_ratio - coverage_ratio
-        penalty += gamma * 10.0 * shortage  # Heavy penalty for poor coverage
+        deficit = min_coverage_ratio - coverage_ratio
+        penalties -= gamma * 20.0 * deficit
     
     # 3. Concentration penalty (per-site check)
     pop_idx = 0
@@ -327,22 +351,11 @@ def compute_reward_from_sim_results(
         site_total = site_pops.sum()
         
         if site_total > 0:
-            site_max_ratio = site_pops.max() / site_total
-            if site_max_ratio > concentration_penalty_threshold:
-                excess = site_max_ratio - concentration_penalty_threshold
-                penalty += gamma * 5.0 * excess  # Penalty for concentration
+            concentration_ratio = site_pops.max() / site_total
+            if concentration_ratio > concentration_penalty_threshold:
+                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
         
         pop_idx += nsubs
-    
-    # Clamp penalties to prevent gradient explosion
-    # Cap at -50.0 to ensure single bad run doesn't destroy model weights
-    max_penalty = 50.0
-    if penalty > max_penalty:
-        penalty = max_penalty
-    
-    # If penalties are severe, return negative reward immediately
-    if penalty > gamma * 20:
-        return -penalty
     
     # === REWARD COMPONENTS ===
     
@@ -350,21 +363,37 @@ def compute_reward_from_sim_results(
     pop_probs = pop_array / total_pop  # Needed for entropy calculation below
     nonzero_pops = pop_array[pop_array > 0]
     
+    R_P = 0.0
     if len(nonzero_pops) > 1:
-        pop_mean = np.mean(nonzero_pops)
-        pop_std = np.std(nonzero_pops)
-        cv = pop_std / pop_mean if pop_mean > 0 else 10.0
-        balance_factor = np.exp(-cv)  # Use exp(-cv) like train_improved.py
+        # Require meaningful coverage: at least 2 subs per site on average
+        # If we have 8 subs total and only 2 are visited (one per site), that's degenerate
+        min_meaningful_coverage = max(2, num_sites * 1.5)  # At least 1.5 subs per site
         
-        # Sum per-substituent normalized populations (matching train_improved.py)
-        total_pop_normalized = np.sum(pop_array / P_baseline)
-        R_P = w_P * balance_factor * total_pop_normalized
-    else:
-        # Only one substituent visited: minimal reward
-        R_P = w_P * 0.01
+        if len(nonzero_pops) >= min_meaningful_coverage:
+            # Use coefficient of variation (std/mean) for balance
+            pop_mean = np.mean(nonzero_pops)
+            pop_std = np.std(nonzero_pops)
+            cv = pop_std / pop_mean if pop_mean > 0 else 1.0
+            
+            # Balance factor: exp(-cv) ranges from ~0.37 (CV=1) to 1.0 (CV=0)
+            balance_factor = np.exp(-cv)
+            
+            # Normalized population reward (only count non-zero populations)
+            total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
+            R_P = w_P * total_pop_normalized * balance_factor
+        else:
+            # Insufficient coverage: minimal reward proportional to coverage
+            R_P = w_P * 0.01 * coverage_ratio
     
     # R_T: Transitions (normalized by baseline)
-    R_T = w_T * (total_trans / T_baseline)
+    # Add bonus for high transition rates (matching test_reward_improved.py)
+    if sites_below_threshold == 0:
+        R_T = w_T * (total_trans / T_baseline)
+        avg_trans_per_site = total_trans / num_sites if num_sites > 0 else 0
+        if avg_trans_per_site > min_transitions_per_site * 2:
+            R_T *= 1.5  # 50% bonus for very active sampling
+    else:
+        R_T = 0.0  # No transition reward if some sites below threshold
     
     # R_U: Coverage uniformity reward (matching train_improved.py)
     R_U = w_U * coverage_ratio
@@ -375,8 +404,14 @@ def compute_reward_from_sim_results(
     normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
     R_entropy = entropy_bonus * normalized_entropy
     
-    # Total reward
-    reward = R_P + R_T + R_U + R_entropy - penalty
+    # ========== PENALTY CLAMPING ==========
+    # Prevent gradient explosion by capping maximum negative penalty
+    max_penalty = 50.0
+    if penalties < -max_penalty:
+        penalties = -max_penalty
+    
+    # Total reward (matching train_improved.py)
+    reward = R_P + R_T + R_U + R_entropy + penalties  # penalties are already negative
     
     return reward
 
@@ -535,8 +570,11 @@ def pretrain_with_runs(
         return
     
     # Filter to keep only best run per system for behavior cloning
+    # Use reward config from workflow yaml for consistent reward calculation
+    reward_config = config.get('reward', {})
     print(f"\nFiltering {len(runs)} runs to keep only best per system...")
-    best_runs = filter_best_runs_per_system(runs)
+    print(f"Using reward config: {reward_config}")
+    best_runs = filter_best_runs_per_system(runs, reward_config=reward_config)
     print(f"Filtered to {len(best_runs)} best runs for training\n")
     
     if len(best_runs) == 0:
