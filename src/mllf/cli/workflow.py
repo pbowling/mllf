@@ -315,10 +315,10 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     """Write a variables.py file from per-directed-edge policy actions.
 
     This function maps directed relation actions back to base biases (quadratic, skew,
-    end, linear) using a canonical forward-only representation. For each undirected
-    pair (i,j), we store a single forward value and set the backward value as its
-    negative (AB = v, BA = -v) to maintain antisymmetry. Per-edge linear values are
-    aggregated into per-node 'b' by averaging incident edges.
+    end, linear). For nonlinear biases (quadratic, skew, end), each undirected pair (i,j)
+    is represented by a SINGLE value stored in the upper triangle of the matrix (i < j).
+    The lower triangle remains zero to prevent cancellation issues. Linear biases are
+    aggregated into per-node 'b' vector by averaging incident edges.
 
     Args:
         combo_dir: Path to combo directory where variables.py will be written.
@@ -333,9 +333,9 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     Returns:
         None. Writes a Python file containing a triple-quoted YAML bias_string with keys:
         - 'b': per-node linear bias vector (length N)
-        - 'c': NxN antisymmetric quadratic bias matrix
-        - 'x': NxN antisymmetric skew bias matrix
-        - 's': NxN antisymmetric end bias matrix
+        - 'c': NxN quadratic bias matrix (upper triangular only)
+        - 'x': NxN skew bias matrix (upper triangular only)
+        - 's': NxN end bias matrix (upper triangular only)
     """
     combo_dir = Path(combo_dir)
     N = int(data.x.shape[0])
@@ -401,8 +401,11 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         elif rel_name == bwd_name and (pair not in per_base_forward[base]):
             per_base_forward[base][pair] = -val
 
-    # Assemble antisymmetric matrices (AB = v, BA = -v)
-    # This maintains the physical constraint that bias interactions are directional
+    # Assemble bias matrices for nonlinear terms
+    # IMPORTANT: For quadratic, skew, and end biases, we store ONLY the upper triangle
+    # (i.e., only for pairs where i < j). This prevents cancellation issues where
+    # mat[i][j] = v and mat[j][i] = -v would effectively cancel out in simulations.
+    # The lower triangle remains zero.
     def build_mat_for(base_name: str):
         mat = [[0.0 for _ in range(N)] for _ in range(N)]
         vals_map = per_base_forward.get(base_name, {})
@@ -411,11 +414,16 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 v = float(val)
             except Exception:
                 v = 0.0
-            # Clip to ensure antisymmetry doesn't create extreme values
+            # Clip to prevent extreme values
             v = max(-bias_clip, min(bias_clip, v))
-            # Set forward (i,j) to value and backward (j,i) to negative
-            mat[i][j] = v
-            mat[j][i] = -v
+            # Only set the canonical forward entry (i < j means store in upper triangle)
+            # This ensures each undirected pair has exactly ONE bias value, not two opposing values
+            if i < j:
+                mat[i][j] = v
+                # mat[j][i] remains 0.0 (not -v)
+            else:
+                mat[j][i] = v
+                # mat[i][j] remains 0.0 (not -v)
         return mat
 
     c_mat = build_mat_for('quadratic')

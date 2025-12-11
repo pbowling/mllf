@@ -1,13 +1,13 @@
 # Combination generation (comment out after first run to reuse existing combos)
 create_combos:
-  input_dir: /home/pbowling/mllf/examples/cb/14benz_solv_5.5
-  out_dir: /home/pbowling/mllf/examples/cb/generated_combos
+  input_dir: /home/pbowling/mllf/examples/14benz
+  out_dir: /home/pbowling/mllf/examples/14benz/generated_combos
   include_patterns:
     - msld_flat.py
 
 # Train/val/test split
 split:
-  train_frac: 0.01  # 1% for training
+  train_frac: 0.10  # 10% for training
   val_frac: 0.01    # 1% for validation
   seed: 42
 
@@ -27,9 +27,75 @@ vocabulary:
   # Warn when substituent RTF files contain atom types not in vocabulary
   warn_missing_types: true
 
+# Curriculum learning configuration (progressive training complexity)
+curriculum:
+  enabled: true  # Set to false to train on all combinations without curriculum
+  stages:
+    # Stage 1: Start with pairs (2 subs) at single site
+    - name: pairs_single_site
+      min_subs: 2
+      max_subs: 2
+      min_sites: 1
+      max_sites: 1
+      epochs: 25
+      
+    # Stage 2: Triplets at single site
+    - name: triplets_single_site
+      min_subs: 3
+      max_subs: 3
+      min_sites: 1
+      max_sites: 1
+      epochs: 20
+      
+    # Stage 3: Quadruplets at single site
+    - name: quadruplets_single_site
+      min_subs: 4
+      max_subs: 4
+      min_sites: 1
+      max_sites: 1
+      epochs: 10
+      
+    # Stage 4: 5 subs at single site
+    - name: quintuplets_single_site
+      min_subs: 5
+      max_subs: 5
+      min_sites: 1
+      max_sites: 1
+      epochs: 10
+      
+      
+    # Stage 5: Pairs across two sites (2 subs each)
+    - name: pairs_two_sites
+      min_subs: 4  # 2 from each site
+      max_subs: 4
+      min_sites: 2
+      max_sites: 2
+      epochs: 25
+      
+    # Stage 6: More complex two-site combinations
+    - name: complex_two_sites
+      min_subs: 5
+      max_subs: 8
+      min_sites: 2
+      max_sites: 2
+      epochs: 25
+      
+    # Stage 7: Full complexity
+    - name: full_complexity
+      min_subs: 2
+      max_subs: 20  # No practical limit
+      min_sites: 1
+      max_sites: 10
+      epochs: 25
+  
+  # Progression criteria (optional - when to advance to next stage)
+  progression:
+    type: epoch  # Options: 'epoch' (fixed epochs), 'reward' (reward threshold), 'both'
+    reward_threshold: 0.0  # Minimum avg reward to advance (if type='reward' or 'both')
+
 # Training configuration
 training:
-  num_epochs: 50 
+  num_epochs: 50  # Total epochs (ignored if curriculum is enabled)
   encoder:
     hidden_dims: [64, 64]
     out_dim: 32

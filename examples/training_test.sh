@@ -15,4 +15,4 @@ conda activate mllf
 
 cd $SLURM_SUBMIT_DIR
 # Run Python in unbuffered mode (-u) to see output in real-time
-python -u run_workflow.py workflow_sample.yaml
+python -u run_workflow.py workflow_14benz.yaml

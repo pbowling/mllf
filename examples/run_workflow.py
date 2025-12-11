@@ -25,6 +25,7 @@ import torch
 import numpy as np
 import json
 from typing import Dict, List
+import re
 
 from mllf.file_handling.generate_combinations import create_combination_dirs, create_single_combination_dir
 from mllf.cli.workflow import (
@@ -43,15 +44,71 @@ from mllf.cb.workflow_utils import (
 from mllf.cli.sim import run_simulation_batch
 
 
+def filter_combos_by_curriculum(combos: List[Path], 
+                                 min_subs: int, max_subs: int,
+                                 min_sites: int, max_sites: int) -> List[Path]:
+    """Filter combinations based on curriculum stage criteria.
+    
+    Parses combination directory names to extract number of sites and substituents,
+    then filters based on curriculum constraints.
+    
+    Args:
+        combos: List of combination directory paths
+        min_subs: Minimum number of substituents
+        max_subs: Maximum number of substituents
+        min_sites: Minimum number of sites
+        max_sites: Maximum number of sites
+    
+    Returns:
+        Filtered list of combinations matching curriculum criteria
+    """
+    filtered = []
+    
+    for combo_path in combos:
+        # Handle both string paths and Path objects
+        if isinstance(combo_path, str):
+            combo_name = Path(combo_path).name
+        else:
+            combo_name = combo_path.name
+        
+        # Parse combination name: comb_NNNN_site1_1__site1_2__site2_3...
+        # Count unique sites and total substituents
+        parts = combo_name.split('__')
+        
+        if len(parts) < 2:
+            continue  # Invalid format
+        
+        sites_seen = set()
+        num_subs = 0
+        
+        for part in parts:
+            # Each part is like 'site1_1' or from comb prefix 'comb_0001_site1_1'
+            if 'site' in part:
+                # Extract siteX_Y pattern
+                site_match = re.search(r'site(\d+)_(\d+)', part)
+                if site_match:
+                    site_id = int(site_match.group(1))
+                    sites_seen.add(site_id)
+                    num_subs += 1
+        
+        num_sites = len(sites_seen)
+        
+        # Check if this combo matches curriculum criteria
+        if (min_subs <= num_subs <= max_subs and 
+            min_sites <= num_sites <= max_sites):
+            filtered.append(combo_path)
+    
+    return filtered
+
+
 # ============================================================================
 # SYSTEM-SPECIFIC CONFIGURATION
 # ============================================================================
 # Atoms to delete for single-site combinations (prevents overlap with base structure)
 # Customize this mapping for your molecular system:
-SITE_ATOMS_MAPPING = {
-    1: 'C4 H4',  # Atoms overlapping with site 1 (14benz system)
-    2: 'C5 H5',  # Atoms overlapping with site 2 (14benz system)
-}
+# Example: {1: 'C4 H4', 2: 'C5 H5'} for old 14benz_solv_5.5 system
+# Leave empty {} if no atoms need to be deleted
+SITE_ATOMS_MAPPING = {}
 # ============================================================================
 
 
@@ -171,7 +228,8 @@ def train_epoch(
                     cached_reward_config.get('T_baseline') != reward_config.get('T_baseline', 50.0) or
                     cached_reward_config.get('min_transitions_per_site') != reward_config.get('min_transitions_per_site', 10) or
                     cached_reward_config.get('min_coverage_ratio') != reward_config.get('min_coverage_ratio', 0.5) or
-                    cached_reward_config.get('entropy_bonus') != reward_config.get('entropy_bonus', 8.0)
+                    cached_reward_config.get('entropy_bonus') != reward_config.get('entropy_bonus', 8.0) or
+                    cached_reward_config.get('concentration_penalty_threshold') != reward_config.get('concentration_penalty_threshold', 0.8)
                 )
                 
                 if reward_changed:
@@ -188,7 +246,8 @@ def train_epoch(
                         T_baseline=reward_config.get('T_baseline', 50.0),
                         min_transitions_per_site=reward_config.get('min_transitions_per_site', 10),
                         min_coverage_ratio=reward_config.get('min_coverage_ratio', 0.5),
-                        entropy_bonus=reward_config.get('entropy_bonus', 8.0)
+                        entropy_bonus=reward_config.get('entropy_bonus', 8.0),
+                        concentration_penalty_threshold=reward_config.get('concentration_penalty_threshold', 0.8)
                     )
                     print(f"  Old reward: {cached['reward']:.4f} -> New reward: {reward:.4f}")
                     
@@ -410,7 +469,8 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
                 T_baseline=reward_config.get('T_baseline', 50.0),
                 min_transitions_per_site=reward_config.get('min_transitions_per_site', 10),
                 min_coverage_ratio=reward_config.get('min_coverage_ratio', 0.5),
-                entropy_bonus=reward_config.get('entropy_bonus', 8.0)
+                entropy_bonus=reward_config.get('entropy_bonus', 8.0),
+                concentration_penalty_threshold=reward_config.get('concentration_penalty_threshold', 0.8)
             )
             epoch_rewards.append(reward)
             print(f"  Combo {jcombo_path.name} reward: {reward:.4f}")
@@ -548,6 +608,10 @@ def main():
     indices = np.arange(len(all_combos))
     rng.shuffle(indices)
     
+    # Check if curriculum learning is enabled
+    curriculum_config = config.get('curriculum', {})
+    curriculum_enabled = curriculum_config.get('enabled', False)
+    
     n_train = int(len(all_combos) * train_frac)
     n_val = int(len(all_combos) * val_frac)
     
@@ -560,6 +624,21 @@ def main():
     test_combos = [all_combos[i] for i in test_indices]
     
     print(f"Train: {len(train_combos)}, Val: {len(val_combos)}, Test: {len(test_combos)}")
+    
+    # If curriculum learning is enabled, prepare stage information
+    if curriculum_enabled:
+        stages = curriculum_config.get('stages', [])
+        if not stages:
+            print("Warning: Curriculum enabled but no stages defined. Disabling curriculum.")
+            curriculum_enabled = False
+        else:
+            print(f"\n=== Curriculum Learning Enabled ===")
+            print(f"Total stages: {len(stages)}")
+            for i, stage in enumerate(stages, 1):
+                print(f"  Stage {i}: {stage['name']} - "
+                      f"{stage['min_subs']}-{stage['max_subs']} subs, "
+                      f"{stage['min_sites']}-{stage['max_sites']} sites, "
+                      f"{stage['epochs']} epochs")
     
     # Save splits
     manifest_dir = manifest_path.parent
@@ -637,16 +716,133 @@ def main():
     
     # Step 5: Training loop
     print("\n=== Training ===")
-    num_epochs = train_config.get('num_epochs', 5)
+    train_config = config.get('training', {})
+    
+    # Determine total epochs based on curriculum or direct config
+    if curriculum_enabled:
+        stages = curriculum_config.get('stages', [])
+        num_epochs = sum(stage['epochs'] for stage in stages)
+        print(f"Total curriculum epochs: {num_epochs}")
+    else:
+        num_epochs = train_config.get('num_epochs', 5)
+        print(f"Training for {num_epochs} epochs")
+    
+    # Training loop with curriculum support
+    all_stats = []
+    current_stage_idx = 0
+    current_stage_epoch = 0
+    
+    # Determine active combinations for curriculum
+    if curriculum_enabled:
+        stages = curriculum_config.get('stages', [])
+        current_stage = stages[current_stage_idx]
+        print(f"\n=== Starting Stage 1/{len(stages)}: {current_stage['name']} ===")
+        
+        # Filter train combos for this stage
+        filtered_combos = filter_combos_by_curriculum(
+            train_combos,
+            min_subs=current_stage['min_subs'],
+            max_subs=current_stage['max_subs'],
+            min_sites=current_stage['min_sites'],
+            max_sites=current_stage['max_sites']
+        )
+        print(f"Filtered to {len(filtered_combos)} training combinations for this stage")
+        
+        # Apply max_train_combos limit if specified (stage-specific or global)
+        max_combos = current_stage.get('max_train_combos', curriculum_config.get('max_train_combos_per_stage'))
+        if max_combos is not None and len(filtered_combos) > max_combos:
+            print(f"Limiting to {max_combos} random training combos (from {len(filtered_combos)} available)")
+            # Use same RNG seed for reproducibility
+            stage_rng = np.random.RandomState(seed + current_stage_idx)
+            selected_indices = stage_rng.choice(len(filtered_combos), size=max_combos, replace=False)
+            active_train_combos = [filtered_combos[i] for i in selected_indices]
+        else:
+            active_train_combos = filtered_combos
+    else:
+        active_train_combos = train_combos
     
     for epoch in range(start_epoch, num_epochs):
-        print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
+        # Check if we need to advance to next curriculum stage
+        if curriculum_enabled and current_stage_idx < len(stages):
+            current_stage = stages[current_stage_idx]
+            current_stage_epoch += 1
+            
+            # Check if current stage is complete
+            if current_stage_epoch > current_stage['epochs']:
+                # Check progression criteria
+                progression_type = curriculum_config.get('progression', {}).get('type', 'epoch')
+                reward_threshold = curriculum_config.get('progression', {}).get('reward_threshold', 0.0)
+                
+                can_advance = False
+                if progression_type == 'epoch':
+                    can_advance = True
+                elif progression_type == 'reward':
+                    recent_rewards = [s['avg_reward'] for s in all_stats[-5:] if 'avg_reward' in s]
+                    avg_recent_reward = np.mean(recent_rewards) if recent_rewards else -999
+                    can_advance = avg_recent_reward >= reward_threshold
+                elif progression_type == 'both':
+                    recent_rewards = [s['avg_reward'] for s in all_stats[-5:] if 'avg_reward' in s]
+                    avg_recent_reward = np.mean(recent_rewards) if recent_rewards else -999
+                    can_advance = avg_recent_reward >= reward_threshold
+                else:
+                    can_advance = True
+                
+                if can_advance and current_stage_idx + 1 < len(stages):
+                    # Advance to next stage
+                    current_stage_idx += 1
+                    current_stage_epoch = 1
+                    current_stage = stages[current_stage_idx]
+                    
+                    print(f"\n{'='*60}")
+                    print(f"=== Advancing to Stage {current_stage_idx + 1}/{len(stages)}: {current_stage['name']} ===")
+                    print(f"{'='*60}")
+                    
+                    # Filter train combos for new stage
+                    filtered_combos = filter_combos_by_curriculum(
+                        train_combos,
+                        min_subs=current_stage['min_subs'],
+                        max_subs=current_stage['max_subs'],
+                        min_sites=current_stage['min_sites'],
+                        max_sites=current_stage['max_sites']
+                    )
+                    print(f"Filtered to {len(filtered_combos)} training combinations for this stage")
+                    
+                    # Apply max_train_combos limit if specified (stage-specific or global)
+                    max_combos = current_stage.get('max_train_combos', curriculum_config.get('max_train_combos_per_stage'))
+                    if max_combos is not None and len(filtered_combos) > max_combos:
+                        print(f"Limiting to {max_combos} random training combos (from {len(filtered_combos)} available)")
+                        # Use same RNG seed for reproducibility
+                        stage_rng = np.random.RandomState(seed + current_stage_idx)
+                        selected_indices = stage_rng.choice(len(filtered_combos), size=max_combos, replace=False)
+                        active_train_combos = [filtered_combos[i] for i in selected_indices]
+                    else:
+                        active_train_combos = filtered_combos
+                elif not can_advance:
+                    print(f"\nStage {current_stage_idx + 1} not meeting progression criteria, continuing...")
         
-        # Train on training set
+        if curriculum_enabled:
+            stage_name = stages[current_stage_idx]['name'] if current_stage_idx < len(stages) else 'final'
+            print(f"\n--- Epoch {epoch+1}/{num_epochs} - Stage {current_stage_idx + 1}/{len(stages)}: {stage_name} (epoch {current_stage_epoch}/{current_stage['epochs']}) ---")
+        else:
+            print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
+        
+        # Apply stage-specific reward overrides if defined
+        epoch_config = config.copy()
+        if curriculum_enabled and current_stage_idx < len(stages):
+            current_stage = stages[current_stage_idx]
+            if 'reward_override' in current_stage:
+                # Merge reward overrides into config for this epoch
+                base_reward = epoch_config.get('reward', {}).copy()
+                base_reward.update(current_stage['reward_override'])
+                epoch_config['reward'] = base_reward
+                print(f"  Applying reward overrides: {current_stage['reward_override']}")
+        
+        # Train on active training set
         stats = train_epoch(
             encoder, policy, optimizer,
-            train_combos, epoch, config, device
+            active_train_combos, epoch, epoch_config, device
         )
+        all_stats.append(stats)
         
         print(f"Epoch {epoch+1} Stats:")
         print(f"  Loss: {stats['loss']:.4f}")
