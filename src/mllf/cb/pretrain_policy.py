@@ -99,14 +99,20 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
         run_dir = run.get('run_dir')
         
         # Extract system identifier from the run directory path
-        # For directories like pretraining/14benz_solv/run1, we want "14benz_solv"
-        # For pretraining/14benz_combos_best/comb_0001_..._run_001, we want the combo name
+        # Supports both flat and nested structures:
+        # - Flat: pretraining/14benz_solv/run_001 → "14benz_solv"
+        # - Nested: pretraining/14benz_good_runs/comb_XXXX/run_001 → "14benz_good_runs/comb_XXXX"
         if run_dir:
-            parent_dir = run_dir.parent.name  # e.g., "14benz_solv" or "14benz_combos_best"
+            parent_dir = run_dir.parent.name  # e.g., "14benz_solv" or "comb_0063_site2_5__site2_3"
+            grandparent_dir = run_dir.parent.parent.name  # e.g., "pretraining" or "14benz_good_runs"
             
-            # Special handling for 14benz_combos_best: group by combination, not parent
-            if 'combo' in parent_dir.lower():
-                # Extract combination name (everything before _run_NNN)
+            # Check if parent looks like a combo directory (starts with "comb_")
+            if parent_dir.startswith('comb_'):
+                # Nested structure: use grandparent/combo as system ID
+                system_id = f"{grandparent_dir}/{parent_dir}"
+            # Check if dataset name contains 'combo' or 'best' (legacy flat structure)
+            elif 'combo' in grandparent_dir.lower() or 'best' in grandparent_dir.lower():
+                # Legacy flat structure with combo in dataset name
                 run_name = run_dir.name
                 if '_run_' in run_name:
                     combo_name = run_name.rsplit('_run_', 1)[0]
@@ -114,7 +120,7 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
                 else:
                     system_id = f"{parent_dir}/{run_name}"
             else:
-                # For other datasets, use parent directory as system ID
+                # Standard flat structure: use parent directory as system ID
                 system_id = parent_dir
         else:
             # Fallback to source_dir if run_dir not available
@@ -196,6 +202,10 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
 def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
     """Load all collected pretraining runs.
     
+    Supports both flat and nested directory structures:
+    - Flat: pretraining_dir/run_001/, pretraining_dir/run_002/, ...
+    - Nested: pretraining_dir/combo_XXX/run_001/, pretraining_dir/combo_XXX/run_002/, ...
+    
     Args:
         pretraining_dir: Directory with collected run data
     
@@ -204,14 +214,12 @@ def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
     """
     runs = []
     
-    for run_dir in sorted(pretraining_dir.iterdir()):
-        if not run_dir.is_dir():
-            continue
-        
+    def _load_run(run_dir: Path):
+        """Helper to load a single run directory."""
         # Load metadata
         metadata_file = run_dir / "metadata.json"
         if not metadata_file.exists():
-            continue
+            return None
         
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
@@ -219,23 +227,43 @@ def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
         # Skip if simulation didn't terminate normally
         if not metadata.get("terminated_normally", False):
             print(f"  Skipping {run_dir.name}: did not terminate normally")
-            continue
+            return None
         
         # Load simulation results
         results_file = run_dir / "simulation_results.json"
         if not results_file.exists():
             print(f"  Skipping {run_dir.name}: no simulation_results.json")
-            continue
+            return None
         
         with open(results_file, 'r') as f:
             sim_results = json.load(f)
         
-        runs.append({
+        return {
             "run_dir": run_dir,
             "source_dir": metadata.get("source_run_dir"),
             "metadata": metadata,
             "sim_results": sim_results,
-        })
+        }
+    
+    # Iterate through top-level directories
+    for entry in sorted(pretraining_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        
+        # Check if this is a run directory (has metadata.json)
+        if (entry / "metadata.json").exists():
+            # Flat structure: entry is a run directory
+            run_data = _load_run(entry)
+            if run_data:
+                runs.append(run_data)
+        else:
+            # Nested structure: entry might contain run subdirectories
+            # Look one level deeper for run directories
+            for subentry in sorted(entry.iterdir()):
+                if subentry.is_dir() and (subentry / "metadata.json").exists():
+                    run_data = _load_run(subentry)
+                    if run_data:
+                        runs.append(run_data)
     
     return runs
 
@@ -260,6 +288,11 @@ def compute_reward_from_sim_results(
     This implements the same logic as train_improved.py but works with cached
     simulation results instead of reading from output files.
     
+    Uses a **tiered transition penalty system** to provide continuous feedback:
+    - **Tier 1: "Death Floor" (0 transitions)**: -40.0 penalty per site
+    - **Tier 2: "Climbing Ramp" (1-9 transitions)**: Linear gradient ~-30 to -8
+    - **Tier 3: "Success Zone" (≥10 transitions)**: Unlocks R_T reward
+    
     Default parameters match the 'balanced_positive' configuration which achieved
     the highest rewards (71.53) in testing on indolizine runs with >200 transitions.
     
@@ -268,10 +301,10 @@ def compute_reward_from_sim_results(
         num_sites: Number of sites in the system
         nsubs_per_site: List of number of substituents per site
         w_P, w_T, w_U: Reward weights for populations, transitions, and uniformity
-        gamma: Scaling factor for rewards
+        gamma: Scaling factor for rewards (used in coverage/concentration penalties)
         P_baseline: Normalization baseline for populations
         T_baseline: Normalization baseline for transitions
-        min_transitions_per_site: Minimum transitions required per site
+        min_transitions_per_site: Minimum transitions required per site (default: 10)
         min_coverage_ratio: Minimum ratio of substituents that must be visited
         entropy_bonus: Bonus for uniform distributions
         concentration_penalty_threshold: Threshold for concentration penalty (e.g., 0.8 = 80%)
@@ -324,16 +357,22 @@ def compute_reward_from_sim_results(
     # Match test_reward_improved.py penalty calculation
     penalties = 0.0
     
-    # 1. Per-site minimum transitions requirement
+    # 1. Tiered transition penalty system
+    # Replaces binary threshold with continuous gradient feedback
     sites_below_threshold = 0
+    
     for site_idx, trans_count in enumerate(trans_array):
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-            deficit = min_transitions_per_site - trans_count
-            penalties -= gamma * (1 + deficit)
-    
-    if sites_below_threshold > 0:
-        penalties -= gamma * 10.0 * sites_below_threshold
+            
+            if trans_count == 0:
+                # Tier 1: "Death Floor" - worst possible state
+                penalties -= 40.0
+            elif trans_count < min_transitions_per_site:
+                # Tier 2: "Climbing Ramp" - linear gradient from ~-30 to -8
+                # Formula: -5.0 - (2.8 * deficit)
+                deficit = min_transitions_per_site - trans_count
+                penalties -= (5.0 + 2.8 * deficit)
     
     # 2. Coverage requirement (minimum % of substituents visited)
     num_populated = np.count_nonzero(pop_array)
@@ -385,15 +424,14 @@ def compute_reward_from_sim_results(
             # Insufficient coverage: minimal reward proportional to coverage
             R_P = w_P * 0.01 * coverage_ratio
     
-    # R_T: Transitions (normalized by baseline)
-    # Add bonus for high transition rates (matching test_reward_improved.py)
+    # R_T: Transitions (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
     if sites_below_threshold == 0:
         R_T = w_T * (total_trans / T_baseline)
         avg_trans_per_site = total_trans / num_sites if num_sites > 0 else 0
         if avg_trans_per_site > min_transitions_per_site * 2:
             R_T *= 1.5  # 50% bonus for very active sampling
     else:
-        R_T = 0.0  # No transition reward if some sites below threshold
+        R_T = 0.0  # No transition reward if some sites below threshold (Tier 1 or 2)
     
     # R_U: Coverage uniformity reward (matching train_improved.py)
     R_U = w_U * coverage_ratio

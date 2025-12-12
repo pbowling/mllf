@@ -33,29 +33,38 @@ def compute_msld_reward_improved(
     """Compute improved scalarized reward that prevents degenerate solutions.
     
     This reward function explicitly addresses the issue of the policy converging
-    to single-substituent solutions by:
+    to single-substituent solutions using a **tiered transition penalty system**:
     
-    1. **Requiring minimum transitions per site**: Heavy penalty if any site has
-       fewer than `min_transitions_per_site` transitions
+    **Tiered Transition Penalty System:**
+    - **Tier 1: "Death Floor" (0 transitions)**: Fixed penalty of -40.0
+      Worst possible state, signaling total inactivity is unacceptable
     
-    2. **Requiring minimum coverage**: Penalty if fewer than `min_coverage_ratio`
+    - **Tier 2: "Climbing Ramp" (1-9 transitions)**: Linear gradient from ~-30 to -8
+      Formula: -5.0 - (2.8 × deficit)
+      Provides continuous feedback where each additional transition reduces penalty
+    
+    - **Tier 3: "Success Zone" (≥10 transitions)**: Penalty = 0.0
+      Site is "unlocked" - earns positive R_T reward and potential 1.5× bonus
+    
+    **Additional Protections:**
+    1. **Minimum coverage requirement**: Penalty if fewer than `min_coverage_ratio`
        of substituents are visited (have non-zero population)
+    
+    2. **Concentration penalty**: Per-site penalty if any single substituent
+       exceeds `concentration_penalty_threshold` of that site's population
     
     3. **Entropy-based uniformity bonus**: Rewards more uniform population
        distributions using Shannon entropy
-    
-    4. **Per-site transition requirements**: Ensures all sites are actively
-       sampling, not just one
     
     The reward function is:
         R = R_P + R_T + R_U + R_entropy + R_penalties
     
     where:
         R_P: Population balance reward (weighted)
-        R_T: Transition reward (weighted, per-site minimum enforced)
+        R_T: Transition reward (Tier 3 only, weighted, with bonus for high counts)
         R_U: Coverage uniformity reward (weighted)
         R_entropy: Bonus for high-entropy (uniform) distributions
-        R_penalties: Strict penalties for degenerate behavior
+        R_penalties: Tiered transition penalties + coverage/concentration penalties
     
     Args:
         combo_dir: Path to combination directory with simulation outputs.
@@ -143,19 +152,29 @@ def compute_msld_reward_improved(
     
     # ========== STRICT DEGENERATE BEHAVIOR CHECKS ==========
     
-    # Check 1: Minimum transitions per site
+    # Check 1: Tiered transition penalty system
+    # Replaces binary threshold with continuous gradient feedback
     penalties = 0.0
     sites_below_threshold = 0
+    
     for site_id, trans_count in site_transitions.items():
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-            # Exponential penalty based on how far below threshold
-            deficit = min_transitions_per_site - trans_count
-            penalties -= gamma * (1 + deficit)  # Gets worse as deficit grows
+            
+            if trans_count == 0:
+                # Tier 1: "Death Floor" - worst possible state
+                penalties -= 40.0
+            elif trans_count < min_transitions_per_site:
+                # Tier 2: "Climbing Ramp" - linear gradient from ~-30 to -8
+                # Formula: -5.0 - (2.8 * deficit)
+                # At trans=1, deficit=9: -5.0 - 25.2 = -30.2
+                # At trans=9, deficit=1: -5.0 - 2.8 = -7.8
+                deficit = min_transitions_per_site - trans_count
+                penalties -= (5.0 + 2.8 * deficit)
     
-    # If ANY site is below threshold, apply heavy penalty
+    # Note: sites_below_threshold tracked but no additional penalty
+    # (tiered penalties already applied above)
     if sites_below_threshold > 0:
-        penalties -= gamma * 10.0 * sites_below_threshold
         print(f"  Warning: {sites_below_threshold} site(s) below {min_transitions_per_site} transitions")
     
     # Check 2: Minimum coverage (fraction of substituents visited)
@@ -238,9 +257,9 @@ def compute_msld_reward_improved(
             # Insufficient coverage: minimal reward proportional to coverage
             R_P = w_P * 0.01 * coverage_ratio
     
-    # R_T: Transition reward (only if all sites meet minimum)
+    # R_T: Transition reward (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
     R_T = 0.0
-    if sites_below_threshold == 0:  # Only reward if all sites are good
+    if sites_below_threshold == 0:  # All sites in Success Zone
         total_trans = sum(site_transitions.values())
         R_T = w_T * (total_trans / T_baseline)
         

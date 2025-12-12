@@ -118,18 +118,28 @@ def compute_improved_reward_from_json(
     penalties = 0.0
     penalty_messages = []
     
-    # Check 1: Minimum transitions per site
+    # Check 1: Tiered transition penalty system
+    # Replaces binary threshold with continuous gradient feedback
     sites_below_threshold = 0
     min_site_trans = min(site_transitions.values()) if site_transitions else 0
     
     for site_id, trans_count in site_transitions.items():
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-            deficit = min_transitions_per_site - trans_count
-            penalties -= gamma * (1 + deficit)
+            
+            if trans_count == 0:
+                # Tier 1: "Death Floor" - worst possible state
+                penalties -= 40.0
+                penalty_messages.append(f"Site {site_id}: 0 transitions (Death Floor: -40.0)")
+            elif trans_count < min_transitions_per_site:
+                # Tier 2: "Climbing Ramp" - linear gradient from ~-30 to -8
+                # Formula: -5.0 - (2.8 * deficit)
+                deficit = min_transitions_per_site - trans_count
+                tier2_penalty = 5.0 + 2.8 * deficit
+                penalties -= tier2_penalty
+                penalty_messages.append(f"Site {site_id}: {trans_count} transitions (Climbing Ramp: -{tier2_penalty:.1f})")
     
     if sites_below_threshold > 0:
-        penalties -= gamma * 10.0 * sites_below_threshold
         penalty_messages.append(f"{sites_below_threshold} site(s) below {min_transitions_per_site} transitions")
     
     # Check 2: Minimum coverage
@@ -212,15 +222,15 @@ def compute_improved_reward_from_json(
             R_P = w_P * 0.01 * coverage_ratio
             balance_factor = 0.01
     
-    # R_T: Transition reward
+    # R_T: Transition reward (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
     R_T = 0.0
-    if sites_below_threshold == 0:
+    if sites_below_threshold == 0:  # All sites in Success Zone
         total_trans = sum(site_transitions.values())
         R_T = w_T * (total_trans / T_baseline)
         
         avg_trans_per_site = total_trans / total_sites if total_sites > 0 else 0
         if avg_trans_per_site > min_transitions_per_site * 2:
-            R_T *= 1.5
+            R_T *= 1.5  # 50% bonus for high transition counts
     
     # R_U: Coverage uniformity reward
     R_U = w_U * coverage_ratio

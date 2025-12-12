@@ -1,5 +1,10 @@
-# Improved reward function configurations for testing
-# Use with: python test_reward_improved.py pretraining/indolizine_solv --configs reward_configs_improved.yaml
+# Improved reward function configurations with tiered transition penalties
+# Use with: python test_reward_improved.py pretraining/indole_solv --configs reward_configs_improved.yaml --good-threshold 200 --bad-threshold 30
+#
+# Tiered Transition Penalty System (per site):
+# - Tier 1 "Death Floor" (0 trans): -40.0 penalty
+# - Tier 2 "Climbing Ramp" (1-9 trans): -30.2 to -7.8 (linear gradient)
+# - Tier 3 "Success Zone" (≥10 trans): 0.0 penalty, unlocks R_T reward
 
 # Current default configuration
 current_default:
