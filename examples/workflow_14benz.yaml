@@ -11,7 +11,7 @@ create_combos:
 
 # Train/val/test split
 split:
-  train_frac: 0.8  # 80% for training
+  train_frac: 0.9  # 90% for training
   val_frac: 0.1    # 10% for validation
   seed: 42
 
@@ -33,47 +33,40 @@ curriculum:
       min_sites: 1
       max_sites: 1
       epochs: 50
-      reward_override:
-        min_transitions_per_site: 5  # Crucial for cold start
       # Optional: Override max_train_combos for this specific stage
       # max_train_combos: 50
 
     # 2. MASTERY: Perfecting the pairwise edge weights
-    - name: pairs_single_site_full
-      min_subs: 2
-      max_subs: 2
-      min_sites: 1
-      max_sites: 1
-      epochs: 50
-      # Standard threshold (10) applies here
+    #- name: pairs_single_site_full
+    #  min_subs: 2
+    #  max_subs: 2
+    #  min_sites: 1
+    #  max_sites: 1
+    #  epochs: 50
 
-    # 3. DENSITY (Uncommented): Learning crowding effects
-    - name: triplets_single_site
-      min_subs: 3
-      max_subs: 3
-      min_sites: 1
-      max_sites: 1
-      epochs: 75  # Increased: Density is harder than pairs
+    # 3. DENSITY: Learning crowding effects
+    #- name: triplets_single_site
+    #  min_subs: 3
+    #  max_subs: 3
+    #  min_sites: 1
+    #  max_sites: 1
+    #  epochs: 75  # Increased: Density is harder than pairs
 
     # 4. EXTRAPOLATION: The big jump to Multi-Site
-    # (Skip Quads if data is scarce, go straight to 2-site pairs)
-    - name: pairs_two_sites
-      min_subs: 4  # 2 per site
-      max_subs: 4
-      min_sites: 2
-      max_sites: 2
-      epochs: 100 # Increased: This is the hardest generalization step
-      reward_override:
-          # Optional: Relax threshold slightly for the first multi-site contact
-          min_transitions_per_site: 8 
+    #- name: pairs_two_sites
+    #  min_subs: 4  # 2 per site
+    #  max_subs: 4
+    #  min_sites: 2
+    #  max_sites: 2
+    #  epochs: 100 # Increased: This is the hardest generalization step
 
     # 5. COMPLEXITY: The "Endgame"
-    - name: complex_two_sites
-      min_subs: 5
-      max_subs: 8
-      min_sites: 2
-      max_sites: 2
-      epochs: 100
+    #- name: complex_two_sites
+    #  min_subs: 5
+    #  max_subs: 8
+    #  min_sites: 2
+    #  max_sites: 2
+    #  epochs: 100
   
   # Progression criteria (advance after fixed epochs)
   progression:

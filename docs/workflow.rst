@@ -353,6 +353,171 @@ directed edge expansion, and the RGCN/policy architecture.
 Training Pipeline
 -----------------
 
+Reward and Loss Functions
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The training system uses different objective functions for pretraining (behavior cloning) and reinforcement learning (policy gradients).
+
+**Pretraining Loss (Behavior Cloning)**
+
+Pretraining uses supervised learning with Mean Squared Error (MSE) loss:
+
+.. math::
+
+   \mathcal{L}_{\text{MSE}} = \frac{1}{N} \sum_{i=1}^{N} \|\mathbf{a}_i^{\text{pred}} - \mathbf{a}_i^{\text{target}}\|^2
+
+where:
+
+* :math:`\mathbf{a}_i^{\text{pred}}` is the policy's predicted bias coefficients for edge :math:`i`
+* :math:`\mathbf{a}_i^{\text{target}}` is the known successful bias coefficients from completed simulations
+* :math:`N` is the total number of edges in the graph
+
+The policy learns to **imitate successful bias coefficients** from existing simulation data.
+This provides a warm start before reinforcement learning begins.
+
+**Training Reward (Reinforcement Learning)**
+
+During training, the policy is optimized using REINFORCE with rewards computed from simulation trajectories.
+The reward function prevents degenerate solutions (e.g., convergence to single-substituent states)
+through multiple components:
+
+.. math::
+
+   R_{\text{total}} = R_P + R_T + R_U + R_{\text{entropy}} + R_{\text{penalties}}
+
+**Population Balance Reward** :math:`R_P`:
+
+Encourages equal sampling across all substituents:
+
+.. math::
+
+   R_P = w_P \cdot \frac{\sum_{k=1}^{N_{\text{subs}}} p_k}{P_{\text{baseline}}}
+
+where:
+
+* :math:`w_P` is the population weight (default: 0.5)
+* :math:`p_k` is the population count for substituent :math:`k`
+* :math:`P_{\text{baseline}}` is the normalization constant (default: 500.0)
+
+**Transition Reward** :math:`R_T`:
+
+Rewards frequent transitions between substituents, with bonus for high transition counts:
+
+.. math::
+
+   R_T = \begin{cases}
+   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} & \text{if all sites have } \geq 10 \text{ transitions} \\
+   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} \times 1.5 & \text{if avg. trans/site} > 20 \\
+   0 & \text{otherwise (sites below threshold)}
+   \end{cases}
+
+where:
+
+* :math:`w_T` is the transition weight (default: 0.5)
+* :math:`T_s` is the transition count for site :math:`s`
+* :math:`T_{\text{baseline}}` is the normalization constant (default: 50.0)
+* The 1.5× bonus applies when average transitions per site exceeds 20
+
+**Uniformity Reward** :math:`R_U`:
+
+Rewards visiting a minimum fraction of substituents:
+
+.. math::
+
+   R_U = w_U \cdot \frac{\text{coverage\_ratio}}{\text{min\_coverage\_ratio}}
+
+where coverage_ratio is the fraction of substituents with non-zero population.
+
+**Entropy Bonus** :math:`R_{\text{entropy}}`:
+
+Rewards uniform population distributions using Shannon entropy:
+
+.. math::
+
+   R_{\text{entropy}} = \beta_{\text{entropy}} \cdot H(\mathbf{p})
+
+where :math:`H(\mathbf{p}) = -\sum_k \frac{p_k}{P_{\text{total}}} \log \frac{p_k}{P_{\text{total}}}` is the normalized entropy.
+
+**Tiered Transition Penalties** :math:`R_{\text{penalties}}`:
+
+The system uses a three-tier penalty structure to provide continuous feedback:
+
+**Tier 1: "Death Floor"** (0 transitions):
+
+.. math::
+
+   \text{penalty} = -40.0 \quad \text{(per site with 0 transitions)}
+
+Worst possible state, signaling total inactivity is unacceptable.
+
+**Tier 2: "Climbing Ramp"** (1-9 transitions):
+
+.. math::
+
+   \text{penalty} = -\left(5.0 + 2.8 \times \text{deficit}\right)
+
+where :math:`\text{deficit} = 10 - T_s` for site :math:`s`. This creates a linear gradient:
+
+* 1 transition: :math:`-5.0 - 2.8 \times 9 = -30.2`
+* 5 transitions: :math:`-5.0 - 2.8 \times 5 = -19.0`
+* 9 transitions: :math:`-5.0 - 2.8 \times 1 = -7.8`
+
+Each additional transition improves the reward by ~2.8 points, providing continuous feedback.
+
+**Tier 3: "Success Zone"** (≥10 transitions):
+
+.. math::
+
+   \text{penalty} = 0.0
+
+Site is "unlocked" and eligible for positive :math:`R_T` rewards.
+
+**Additional Penalties**:
+
+* **Coverage penalty**: If fewer than :math:`\text{min\_coverage\_ratio}` of substituents are visited:
+
+  .. math::
+
+     \text{penalty} = -\gamma \times 20.0 \times \left(\text{min\_coverage\_ratio} - \text{coverage\_ratio}\right)
+
+* **Concentration penalty**: Per-site penalty if any substituent exceeds 80% of that site's population:
+
+  .. math::
+
+     \text{penalty} = -\gamma \times 15.0 \quad \text{(per concentrated site)}
+
+* **Simulation failure**: :math:`R = -100 \times \gamma` if simulation does not terminate normally
+
+**Default Hyperparameters**:
+
+.. code-block:: yaml
+
+   reward:
+     w_P: 0.5                                # Population weight
+     w_T: 0.5                                # Transition weight
+     w_U: 0.3                                # Uniformity weight
+     gamma: 4.0                              # Base penalty coefficient
+     P_baseline: 500.0                       # Population normalization
+     T_baseline: 50.0                        # Transition normalization
+     min_transitions_per_site: 10            # Tier 3 threshold
+     min_coverage_ratio: 0.5                 # Minimum fraction of substituents to visit
+     entropy_bonus: 8.0                      # Entropy bonus coefficient
+     concentration_penalty_threshold: 0.8    # Single-substituent dominance threshold
+
+**Policy Gradient Update**:
+
+The policy is updated using REINFORCE with the advantage function:
+
+.. math::
+
+   \nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=0}^{T} \nabla_\theta \log \pi_\theta(\mathbf{a}_t | \mathbf{s}_t) \cdot A_t \right]
+
+where:
+
+* :math:`\mathbf{a}_t` is the action (bias coefficients) at time :math:`t`
+* :math:`\mathbf{s}_t` is the state (graph representation) at time :math:`t`
+* :math:`A_t = R_{\text{total}} - b` is the advantage (with baseline :math:`b`)
+
 Pretraining from Existing Simulations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

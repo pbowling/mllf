@@ -17,6 +17,7 @@
       load_manifest
       run_from_config
       run_quick_epoch_for_combo
+      save_graph_info_from_rtf
       split_manifest
       write_variables_from_actions
    
