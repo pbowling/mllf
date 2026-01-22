@@ -65,6 +65,11 @@ Graphs are built using one of two methods:
    automatically detected from filenames. You can override this behavior using the 
    ``solvent_override`` parameter with values: ``'gas'``/``'vacuum'``, ``'solv'``/``'solvent'``, 
    or ``'protein'``.
+   
+   .. note::
+      While ``'gas'``/``'vacuum'`` is still accepted for compatibility, it has been 
+      deprecated as a distinct environment encoding in node features. Vacuum environments 
+      are now represented as neither solvent nor protein (both flags set to 0.0).
 
 2. **From variables.py** (fallback):
    
@@ -91,25 +96,35 @@ For neural network training, graphs are converted to PyTorch Geometric format:
 
 **Node Features**: Each node is represented by a feature vector with:
 
-* Total molecular charge (float)
-* Binary indicators for environment type (one-hot encoded):
+* Total molecular charge (float) - sum of partial charges in the substituent
+* Binary indicators for environment type:
   
-  - Vacuum/gas environment
-  - Solvent/water environment  
-  - Protein environment
+  - ``is_solvent``: 1.0 for solvent/water environment, 0.0 otherwise
+  - ``is_protein``: 1.0 for protein environment, 0.0 otherwise
+  - Note: Vacuum/gas environments have both flags set to 0.0 (deprecated as explicit encoding)
 
-* Multi-hot encoding of distinct atom types present in the substituent
-  (e.g., CG2R61, HGR61, NG2R60 from CHARMM force field)
+* Multi-hot encoding of chemical elements present in the substituent 
+  (e.g., C, H, N, O from the periodic table)
+* Multi-hot encoding of distinct CHARMM atom types present in the substituent
+  (e.g., CG2R61, HGR61, NG2R60)
 
-**Atom Type Vocabulary**: The vocabulary is loaded from CHARMM toppar files
-in the ``toppar/`` directory, which contain MASS entries defining all possible
-atom types (default: 333 types). This ensures:
+This two-level encoding provides both coarse-grained (element) and fine-grained 
+(atom type) chemical information while being more efficient than a single large 
+encoding.
+
+**Vocabularies**: The vocabularies are loaded from CHARMM toppar files
+in the ``toppar/`` directory, which contain MASS entries defining atom types 
+and their corresponding elements. By default, only CGenFF is loaded:
+
+* **Element vocabulary**: 14 elements (Al, B, Br, C, Cl, F, H, I, N, O, P, S, Se, X)
+* **Atom type vocabulary**: 161 CGenFF atom types
+* **Total feature dimensions**: ``3 + 14 + 161 = 178`` for CGenFF only
+
+This ensures:
 
 * Consistent feature dimensions across all graphs
 * No vocabulary mismatch between training and inference
-* Support for unseen atom types during deployment
-
-The total feature dimension is ``4 + 333 = 337`` by default.
+* Support for unseen atom types during deployment (with warnings)
 
 **Important**: Each undirected edge is expanded into **two directed edges**:
 
@@ -123,6 +138,9 @@ The ``extras`` dict contains:
 
 * ``relation_names``: List mapping relation indices to names
 * ``base_relation_map``: Dict mapping base types to (forward, backward) relation names
+* ``atom_type_vocab``: Dict mapping atom type strings to feature indices
+* ``element_vocab``: Dict mapping element symbols to feature indices
+* ``atom_to_element``: Dict mapping atom types to their elements
 
 Policy Network Architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -136,6 +154,8 @@ Node embeddings are computed using a Relational Graph Convolutional Network:
 
    from mllf.cb.rgcn import RGCNEncoder
    
+   # input_features = 3 + len(element_vocab) + len(atom_type_vocab)
+   # For CGenFF only: 3 + 14 + 161 = 178
    encoder = RGCNEncoder(
        in_dim=input_features,
        hidden_dims=[64, 64],
