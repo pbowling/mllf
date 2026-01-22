@@ -10,45 +10,67 @@ from .atom_vocab import get_atom_type_vocab
 
 
 
-def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None):
+def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vocab: dict = None, atom_to_element: dict = None):
     """Create a numeric vector from node metadata.
 
     Expected keys in meta: 
     - 'total_charge' (float)
-    - 'solvent' (str: 'vacuum'/'gas', 'solvent'/'solv', or 'protein')
+    - 'solvent' (str: 'solvent'/'solv' or 'protein')
     - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61'])
     
     The function returns a 1-D torch.float tensor with features:
-    [charge, is_vacuum, is_solvent, is_protein, <multi-hot atom types>]
+    [charge, is_solvent, is_protein, <element one-hot>, <atom type one-hot>]
     
-    If atom_type_vocab is provided, distinct_atom_types are encoded as a multi-hot vector.
-    Otherwise, they are omitted from the feature vector.
+    If atom_type_vocab, element_vocab, and atom_to_element mapping are provided, distinct_atom_types
+    are encoded as two separate one-hot vectors:
+    - Element one-hot: which elements are present in the substituent (e.g., C, H, N, O)
+    - Atom type one-hot: which specific atom types are present (e.g., CG2R61, HGR61)
+    
+    Elements are extracted from atom types using the atom_to_element mapping.
+    
+    This is more efficient than a single multi-hot encoding since:
+    - Element vocab is small (~14 elements in CGenFF)
+    - Provides both coarse (element) and fine (atom type) chemical information
     """
     charge = float(meta.get('total_charge', 0.0))
     
-    # Handle solvent as categorical: vacuum/gas, solvent/solv, or protein
+    # Handle solvent as categorical: solvent/solv or protein
     solvent_str = (meta.get('solvent', '') or '').lower()
-    is_vacuum = 1.0 if solvent_str in ('vacuum', 'gas', 'vac') else 0.0
     is_solvent = 1.0 if solvent_str in ('solvent', 'solv', 'water', 'aq', 'sol') else 0.0
     is_protein = 1.0 if solvent_str in ('protein', 'prot') else 0.0
     
-    base_features = [charge, is_vacuum, is_solvent, is_protein]
+    base_features = [charge, is_solvent, is_protein]
     
-    # Encode distinct atom types as multi-hot if vocabulary provided
-    if atom_type_vocab is not None:
+    # Encode elements and atom types as separate one-hot vectors if vocabularies provided
+    if element_vocab is not None and atom_type_vocab is not None and atom_to_element is not None:
         distinct_types = meta.get('distinct_atom_types', [])
         if not isinstance(distinct_types, (list, tuple)):
             distinct_types = []
         
-        # Create multi-hot encoding
-        vocab_size = len(atom_type_vocab)
-        atom_encoding = [0.0] * vocab_size
+        # Create element one-hot encoding (which elements are present)
+        element_encoding = [0.0] * len(element_vocab)
+        # Create atom type one-hot encoding (which specific types are present)
+        atom_type_encoding = [0.0] * len(atom_type_vocab)
+        
+        # Track which elements we've seen to avoid duplicates
+        seen_elements = set()
+        
         for atom_type in distinct_types:
+            # Mark atom type as present
             if atom_type in atom_type_vocab:
                 idx = atom_type_vocab[atom_type]
-                atom_encoding[idx] = 1.0
+                atom_type_encoding[idx] = 1.0
+                
+                # Extract element from atom type using the mapping
+                element = atom_to_element.get(atom_type)
+                if element and element not in seen_elements:
+                    seen_elements.add(element)
+                    if element in element_vocab:
+                        elem_idx = element_vocab[element]
+                        element_encoding[elem_idx] = 1.0
         
-        base_features.extend(atom_encoding)
+        base_features.extend(element_encoding)
+        base_features.extend(atom_type_encoding)
     
     return torch.tensor(base_features, dtype=torch.get_default_dtype())
 
@@ -60,17 +82,20 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
     one per bias type. The default `relation_names` is ['linear','quadratic','skew','end'].
     
     Node features are constructed from metadata and include:
-    - Charge, environment type (vacuum/solvent/protein)
-    - Multi-hot encoding of distinct atom types
+    - Charge, environment type (solvent/protein)
+    - Element one-hot encoding (which elements are present, e.g., C, H, N, O)
+    - Atom type one-hot encoding (which specific CHARMM types are present)
     
-    The atom type vocabulary is loaded from CHARMM toppar files (default: package toppar/ directory).
-    This ensures consistent feature dimensions across different graphs and training runs.
+    The vocabularies are loaded from CHARMM CGenFF toppar file by default.
+    This provides both coarse-grained (element) and fine-grained (atom type) chemical information
+    while being more efficient than a single large multi-hot encoding.
 
     Args:
         g: Graph object with node metadata
         relation_names: List of base relation types (default: ['linear', 'quadratic', 'skew', 'end'])
         toppar_dir: Path to toppar directory (None uses package default)
-        toppar_files: List of specific toppar filenames to include (e.g., ['top_all36_cgenff.rtf'])
+        toppar_files: List of specific toppar filenames to include.
+                     Default: ['top_all36_cgenff.rtf'] (CGenFF only)
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
 
     Returns (pyg_data, extras) where extras contain:
@@ -78,6 +103,7 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         - relation_map: Dict mapping relation names to indices
         - base_relation_map: Dict mapping base types to (fwd, bwd) relation names
         - atom_type_vocab: Dict mapping atom type strings to feature indices
+        - element_vocab: Dict mapping element symbols to feature indices
     """
 
     if relation_names is None:
@@ -97,8 +123,11 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
 
     rel_to_idx = {r: i for i, r in enumerate(relation_names)}
 
-    # Load atom type vocabulary from toppar files
-    atom_type_vocab = get_atom_type_vocab(toppar_dir, toppar_files)
+    # Load atom type and element vocabularies from toppar files
+    # Default to CGenFF only if no files specified
+    if toppar_files is None:
+        toppar_files = ['top_all36_cgenff.rtf']
+    atom_type_vocab, element_vocab, atom_to_element = get_atom_type_vocab(toppar_dir, toppar_files)
     
     # Check for missing atom types in graph if requested
     if warn_missing_types and atom_type_vocab:
@@ -120,11 +149,11 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
                 UserWarning
             )
     
-    # collect node features with atom type encoding
+    # collect node features with element and atom type encoding
     node_feats = []
     for i in range(g.num_nodes):
         meta = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
-        node_feats.append(_node_feature_from_meta(meta, atom_type_vocab))
+        node_feats.append(_node_feature_from_meta(meta, atom_type_vocab, element_vocab, atom_to_element))
     x = torch.stack(node_feats, dim=0)
 
     # expand edges: for each undirected (i,j) and for each bias that is allowed.
@@ -181,5 +210,7 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         'relation_map': rel_to_idx,
         'base_relation_map': base_relation_map,
         'atom_type_vocab': atom_type_vocab,
+        'element_vocab': element_vocab,
+        'atom_to_element': atom_to_element,
     }
     return data, extras

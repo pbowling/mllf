@@ -12,7 +12,7 @@ def test_atom_type_vocab_integration():
     # Set metadata for each node with different atom types
     g.set_node_info(0, {
         'total_charge': 0.5,
-        'solvent': 'gas',
+        'solvent': 'solv',  # Changed from 'gas' since vacuum is no longer supported
         'distinct_atom_types': ['CG2R61', 'HGR61']
     })
     
@@ -38,9 +38,11 @@ def test_atom_type_vocab_integration():
     
     # Check that vocab was built
     assert 'atom_type_vocab' in extras, "atom_type_vocab should be in extras"
+    assert 'element_vocab' in extras, "element_vocab should be in extras"
     vocab = extras['atom_type_vocab']
+    element_vocab = extras['element_vocab']
     
-    # Vocab should come from toppar files (default includes ~333 types)
+    # Vocab should come from toppar files (default includes ~277 types)
     assert len(vocab) > 100, f"Expected >100 atom types from toppar, got {len(vocab)}"
     
     # The atom types used in the graph should be in the vocab
@@ -54,37 +56,40 @@ def test_atom_type_vocab_integration():
     # Check indices are sequential
     assert set(vocab.values()) == set(range(len(vocab))), "Vocab indices should be sequential"
     
-    # Check node feature dimensions
+    # Check node feature dimensions: 3 base + element_vocab + atom_type_vocab
     num_nodes = 3
     vocab_size = len(vocab)
-    expected_dim = 4 + vocab_size  # charge + 3 environment flags + vocab_size atom types
+    element_vocab_size = len(element_vocab)
+    expected_dim = 3 + element_vocab_size + vocab_size  # charge, is_solvent, is_protein + elements + atom types
     assert data.x.shape == (num_nodes, expected_dim), f"Expected shape ({num_nodes}, {expected_dim}), got {data.x.shape}"
     
-    # Check that node 0 has correct atom type encoding
-    # Node 0 has CG2R61 and HGR61
+    # Check that node 0 has correct encoding
+    # Node 0 has CG2R61 and HGR61 (C and H elements)
     node0_features = data.x[0]
     assert node0_features[0].item() == 0.5, "Charge should be 0.5"
-    assert node0_features[1].item() == 1.0, "is_vacuum should be 1.0"
-    assert node0_features[2].item() == 0.0, "is_solvent should be 0.0"
-    assert node0_features[3].item() == 0.0, "is_protein should be 0.0"
+    assert node0_features[1].item() == 1.0, "is_solvent should be 1.0"
+    assert node0_features[2].item() == 0.0, "is_protein should be 0.0"
     
-    # Check atom type encoding (CG2R61=index 0, HGR61=index 1, NG2R60=index 2, OG2D1=index 3)
-    assert node0_features[4 + vocab['CG2R61']].item() == 1.0, "CG2R61 should be present"
-    assert node0_features[4 + vocab['HGR61']].item() == 1.0, "HGR61 should be present"
-    assert node0_features[4 + vocab['NG2R60']].item() == 0.0, "NG2R60 should not be present"
-    assert node0_features[4 + vocab['OG2D1']].item() == 0.0, "OG2D1 should not be present"
+    # Atom type features start after: 3 base features + element_vocab_size
+    atom_type_offset = 3 + element_vocab_size
+    
+    # Check atom type encoding (one-hot for each atom type present in node)
+    assert node0_features[atom_type_offset + vocab['CG2R61']].item() == 1.0, "CG2R61 should be present"
+    assert node0_features[atom_type_offset + vocab['HGR61']].item() == 1.0, "HGR61 should be present"
+    assert node0_features[atom_type_offset + vocab['NG2R60']].item() == 0.0, "NG2R60 should not be present"
+    assert node0_features[atom_type_offset + vocab['OG2D1']].item() == 0.0, "OG2D1 should not be present"
     
     # Check node 1
     node1_features = data.x[1]
-    assert node1_features[2].item() == 1.0, "is_solvent should be 1.0"
-    assert node1_features[4 + vocab['NG2R60']].item() == 1.0, "NG2R60 should be present"
-    assert node1_features[4 + vocab['HGR61']].item() == 1.0, "HGR61 should be present"
+    assert node1_features[1].item() == 1.0, "is_solvent should be 1.0"
+    assert node1_features[atom_type_offset + vocab['NG2R60']].item() == 1.0, "NG2R60 should be present"
+    assert node1_features[atom_type_offset + vocab['HGR61']].item() == 1.0, "HGR61 should be present"
     
     # Check node 2
     node2_features = data.x[2]
-    assert node2_features[3].item() == 1.0, "is_protein should be 1.0"
-    assert node2_features[4 + vocab['OG2D1']].item() == 1.0, "OG2D1 should be present"
-    assert node2_features[4 + vocab['CG2R61']].item() == 1.0, "CG2R61 should be present"
+    assert node2_features[2].item() == 1.0, "is_protein should be 1.0"
+    assert node2_features[atom_type_offset + vocab['OG2D1']].item() == 1.0, "OG2D1 should be present"
+    assert node2_features[atom_type_offset + vocab['CG2R61']].item() == 1.0, "CG2R61 should be present"
     
     print("Integration test passed!")
 
@@ -95,7 +100,7 @@ def test_custom_toppar_configuration():
     
     g.set_node_info(0, {
         'total_charge': 0.5,
-        'solvent': 'gas',
+        'solvent': 'solv',  # Changed from 'gas' since vacuum is no longer supported
         'distinct_atom_types': ['CG2R61', 'HGR61']
     })
     
@@ -106,7 +111,7 @@ def test_custom_toppar_configuration():
     })
     
     from mllf.cb.graph import EdgeCoeffs
-    g.set_edge(0, 1, EdgeCoeffs(linear=1.0, quadratic=0.5, skew=0.0, end=0.0))
+    g.set_edge(0, 1, EdgeCoeffs(linear=1.0, quadratic=0.0, skew=0.0, end=0.0))
     
     # Convert with specific toppar files
     data, extras = build_pyg_graph_from_mllf_graph(
@@ -115,12 +120,14 @@ def test_custom_toppar_configuration():
         warn_missing_types=False
     )
     
-    # Vocabulary should only include CGenFF types
+    # Vocabulary should only include CGenFF types (161 types)
     vocab = extras['atom_type_vocab']
-    assert len(vocab) < 200, "CGenFF-only vocab should be smaller than full vocab"
+    element_vocab = extras['element_vocab']
+    assert len(vocab) == 161, f"CGenFF should have 161 atom types, got {len(vocab)}"
+    assert len(element_vocab) == 14, f"CGenFF should have 14 elements, got {len(element_vocab)}"
     
-    # Feature dimension should reflect the filtered vocabulary
-    expected_dim = 4 + len(vocab)
+    # Feature dimension: 3 base + 14 elements + 161 atom types = 178
+    expected_dim = 3 + len(element_vocab) + len(vocab)
     assert data.x.shape[1] == expected_dim, \
         f"Feature dimension should be {expected_dim}, got {data.x.shape[1]}"
     
