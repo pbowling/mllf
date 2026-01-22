@@ -16,7 +16,8 @@ requires-python = ">=3.8"
 dependencies = [
     "numpy>=1.24",
     "torch>=2.0",
-    "torch_geometric>=2.7.0",
+    "torch_geometric>=2.6.0",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]
@@ -27,11 +28,6 @@ dev = [
     "pytest>=7.0",
     "pytest-cov",
     "flake8",
-]
-
-rl = [
-    "gym>=0.21.0",
-    "ray[rllib]>=2.4.0,<3.0.0",
 ]
 
 [tool.setuptools.packages.find]
