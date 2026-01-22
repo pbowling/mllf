@@ -1,6 +1,8 @@
 from pathlib import Path
 import tempfile
 import shutil
+import warnings
+import pytest
 
 from mllf.file_handling.generate_combinations import (
     find_site_sub_files,
@@ -575,3 +577,145 @@ def test_print_combinations_for_example():
 
     # sanity check so CI treats this as a test: ensure some combos exist
     assert len(combos) > 0
+
+
+def test_max_subs_per_site_limit():
+    """Test that max_subs_per_site correctly limits combination size while allowing all subs to participate.
+    
+    With 5 subs and max_subs_per_site=3:
+    - All 5 subs can participate in combinations
+    - But no single combination has more than 3 subs
+    - Sub 5 can still be in combinations like [5,1,2]
+    """
+    import warnings
+    
+    # Use small example for test speed: 5 subs with max_subs_per_site=3
+    small_found = {1: {i: {} for i in range(1, 6)}}  # subs 1-5
+    
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        combos = all_site_sub_combinations(small_found, max_subs_per_site=3)
+        
+        # Should warn about 5 subs exceeding max of 3
+        assert len(w) == 1, f"Expected 1 warning, got {len(w)}"
+        assert "has 5 substituents" in str(w[0].message)
+        assert "limited to at most 3" in str(w[0].message)
+    
+    subs_lists = [subs for sites, subs, _ in combos]
+    
+    # All combinations should have at most 3 subs
+    for subs in subs_lists:
+        assert len(subs) <= 3, f"Combination {subs} exceeds max_subs_per_site=3"
+    
+    # All 5 subs should still participate
+    all_participating = set()
+    for subs in subs_lists:
+        all_participating.update(subs)
+    assert all_participating == {1, 2, 3, 4, 5}, \
+        f"All 5 subs should participate, got {sorted(all_participating)}"
+    
+    # Verify sub 5 can be an anchor (first element in some combinations)
+    sub5_as_anchor = [subs for subs in subs_lists if subs[0] == 5]
+    assert len(sub5_as_anchor) > 0, "Sub 5 should be able to serve as anchor"
+    
+    # Should have combinations of size 2 and 3
+    sizes = sorted(set(len(subs) for subs in subs_lists))
+    assert sizes == [2, 3], f"Should have combinations of size 2 and 3, got {sizes}"
+    
+    # Verify a few specific expected combinations exist
+    assert [1, 2] in subs_lists, "Should have [1,2]"
+    assert [5, 1, 2] in subs_lists, "Should have [5,1,2] (sub 5 as anchor)"
+    assert [1, 2, 3] in subs_lists, "Should have [1,2,3] at max size"
+    
+    # But should NOT have any size-4 combinations
+    size_4_combos = [subs for subs in subs_lists if len(subs) == 4]
+    assert len(size_4_combos) == 0, f"Should not have size-4 combinations, found {len(size_4_combos)}"
+
+
+def test_max_subs_cross_site():
+    """Test that max_subs_per_site is applied per-site in cross-site combinations.
+    
+    With site1 having 4 subs and site2 having 3 subs, with max_subs_per_site=3:
+    - Site1 contributions are limited to 3 subs per combination
+    - Site2 can contribute all 3 subs
+    - Cross-site combo could have 3 from site1 + 3 from site2 = 6 total
+    """
+    import warnings
+    
+    # Use very small sites for test speed
+    mock_found = {
+        1: {i: {} for i in range(1, 5)},  # 4 subs (exceeds limit of 3)
+        2: {i: {} for i in range(1, 4)},  # 3 subs (at limit)
+    }
+    
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        combos = all_site_sub_combinations(mock_found, max_subs_per_site=3)
+        
+        # Should warn about site1 exceeding limit
+        warning_messages = [str(warning.message) for warning in w]
+        site1_warned = any("Site 1" in msg and "4 substituents" in msg for msg in warning_messages)
+        
+        assert site1_warned, f"Should warn about site1 exceeding limit, warnings: {warning_messages}"
+    
+    # Get cross-site combinations (limit check to avoid long iteration)
+    cross_site_combos = []
+    for sites, subs, counts in combos:
+        if len(sites) > 1:
+            cross_site_combos.append((sites, subs, counts))
+            # Check first 10 cross-site combinations for efficiency
+            if len(cross_site_combos) >= 10:
+                break
+    
+    assert len(cross_site_combos) > 0, "Should have cross-site combinations"
+    
+    # Verify per-site limits in sampled cross-site combinations
+    for sites, subs, counts in cross_site_combos:
+        if counts is not None:
+            # Extract per-site sub counts
+            for i, site in enumerate(sites):
+                site_sub_count = counts[i]
+                assert site_sub_count <= 3, \
+                    f"Site{site} should contribute at most 3 subs, got {site_sub_count} in combo {subs}"
+                assert site_sub_count >= 2, \
+                    f"Site{site} should contribute at least 2 subs, got {site_sub_count}"
+
+
+def test_single_sub_error():
+    """Test that an error is raised when a site has only 1 substituent.
+    
+    MSLD simulations require at least 2 substituents per site to run correctly.
+    Sites with only 1 sub should cause execution to stop with a helpful error message.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_dir = Path(tmpdir) / "input"
+        output_dir = Path(tmpdir) / "output"
+        input_dir.mkdir()
+        
+        # Create site1 with 2 subs (valid)
+        (input_dir / "site1_sub1_pres.rtf").write_text("PRES p1_1")
+        (input_dir / "site1_sub1_frag.pdb").write_text("ATOM 1")
+        (input_dir / "site1_sub2_pres.rtf").write_text("PRES p1_2")
+        (input_dir / "site1_sub2_frag.pdb").write_text("ATOM 2")
+        
+        # Create site2 with only 1 sub (should trigger error)
+        (input_dir / "site2_sub1_pres.rtf").write_text("PRES p2_1")
+        (input_dir / "site2_sub1_frag.pdb").write_text("ATOM 3")
+        
+        # Create site3 with 2 subs (valid)
+        (input_dir / "site3_sub1_pres.rtf").write_text("PRES p3_1")
+        (input_dir / "site3_sub1_frag.pdb").write_text("ATOM 4")
+        (input_dir / "site3_sub2_pres.rtf").write_text("PRES p3_2")
+        (input_dir / "site3_sub2_frag.pdb").write_text("ATOM 5")
+        
+        # Should raise RuntimeError for site2 having only 1 sub
+        with pytest.raises(RuntimeError) as exc_info:
+            create_combination_dirs(input_dir, output_dir, dry_run=False)
+        
+        error_msg = str(exc_info.value)
+        assert "site2" in error_msg, f"Error should mention site2: {error_msg}"
+        assert "only 1 substituent" in error_msg, f"Error should mention single substituent: {error_msg}"
+        assert "core" in error_msg.lower(), f"Error should mention core files: {error_msg}"
+        assert "MSLD simulations require at least 2 substituents" in error_msg, f"Error should explain requirement: {error_msg}"
+
+

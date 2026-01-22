@@ -99,6 +99,13 @@ Combinations are generated from site/substituent fragment files:
 * **Sites**: Identified by the site number (N)
 * **Substituents**: Identified by the sub number (M) within each site
 
+.. warning::
+   **Minimum Substituents Required**: Each site must have at least 2 substituents. MSLD simulations 
+   will not run correctly with only a single substituent at a site. If any site has only 1 substituent, 
+   combination generation will fail with an error. To resolve this, either add more substituents to the site or 
+   add the site information to your core structure files (e.g., ``core.pdb`` and ``core.rtf`` if using 
+   msld-py-prep).
+
 The generator creates two types of combinations:
 
 1. **Within-site combinations**: Multiple substituents from a single site
@@ -120,6 +127,14 @@ For a site with 5 substituents, each acting as anchor generates combinations:
 * Anchor 1: ``[1,2]``, ``[1,3]``, ``[1,4]``, ``[1,5]``, ``[1,2,3]``, ``[1,2,4]``, ..., ``[1,2,3,4,5]``
 * Anchor 2: ``[2,1]``, ``[2,3]``, ``[2,4]``, ...
 * Total: 5 anchors × 15 combinations each = **75 within-site combinations**
+
+.. note::
+   **Combination Size Limit**: By default, each combination is limited to at most 10 substituents 
+   per site (``max_subs_per_site=10``). This prevents combinatorial explosion while still allowing 
+   all substituents to participate across different combinations. For example, with 50 substituents 
+   at a site, the generator will create combinations like ``[1,2,...,10]``, ``[1,2,...,9,11]``, etc., 
+   but not ``[1,2,...,11]``. This limit can be increased via the ``--max-subs`` command-line option 
+   or the ``max_subs_per_site`` parameter in the API.
 
 Cross-Site Combinations
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -1368,8 +1383,14 @@ For custom workflows, the key components are:
    combos = create_combination_dirs(
        input_dir=Path('14benz_solv_5.5'),
        output_dir=Path('generated_combos'),
-       include_patterns=['msld_flat.py']
+       include_patterns=['msld_flat.py'],
+       max_subs_per_site=10  # Limit combination size (default: 10)
    )
+   
+   # Note: max_subs_per_site limits each combination to at most N substituents per site.
+   # All substituents can still participate, but individual combinations are capped.
+   # Increase this value if you need larger combinations (may significantly increase
+   # total number of combinations generated).
    
    # 2. Initialize model
    sample_data, _, sample_extras = build_data_and_targets_from_combo(combos[0])

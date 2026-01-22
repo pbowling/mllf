@@ -68,6 +68,7 @@ import argparse
 import json
 import re
 import itertools
+import warnings
 from pathlib import Path
 from shutil import copy2
 from shutil import make_archive
@@ -118,7 +119,7 @@ def find_site_sub_files(input_dir: Path) -> Dict[int, Dict[int, Dict[Tuple[str, 
     return found
 
 
-def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> List[Tuple[List[int], List[int]]]:
+def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]], max_subs_per_site: int = 10) -> List[Tuple[List[int], List[int]]]:
     """Generate all within-site and cross-site ordered combinations.
 
     For each site independently, enumerate all subsets of substituents of size >= 2
@@ -130,15 +131,20 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
     - Example with subs [1,2,3,4,5]:
       - Anchor 1: [1,2], [1,3], [1,4], [1,5], [1,2,3], [1,2,4], ...
       - Anchor 2: [2,1], [2,3], [2,4], [2,5], [2,1,3], [2,1,4], ...
+    - Combination size is limited to max_subs_per_site (no combinations larger than this)
 
     Cross-site strategy:
     - For each combination of sites (pairs, triplets, etc.), generate all valid
       combinations where each site contributes >= 2 subs
     - Uses rotating anchor within each site component
     - Example: site1[1,2] × site2[3,4] generates multiple ordered combinations
+    - Each site's contribution is limited to max_subs_per_site
 
     Args:
         found: Nested dict mapping site -> sub -> {(label, ext): Path}.
+        max_subs_per_site: Maximum number of substituents per site in any combination (default: 10).
+                          Combinations will include at most this many subs per site, but all
+                          available subs can participate in different combinations.
 
     Returns:
         List of (sites_list, subs_list, subs_per_site_counts) tuples where:
@@ -148,15 +154,31 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
         - subs_per_site_counts: Tuple of counts for cross-site (e.g., (2, 2) means
           first 2 subs from site1, next 2 from site2), or None for within-site
     """
+    import warnings
+    
     combos = []
-    sites_with_enough_subs = {site: sorted(subs.keys()) 
-                               for site, subs in found.items() 
-                               if len(subs) >= 2}
+    sites_with_enough_subs = {}
+    
+    for site, subs in found.items():
+        if len(subs) < 2:
+            continue
+        
+        sorted_subs = sorted(subs.keys())
+        sites_with_enough_subs[site] = sorted_subs
+        
+        # Warn if site has more subs than the limit
+        if len(sorted_subs) > max_subs_per_site:
+            warnings.warn(
+                f"Site {site} has {len(sorted_subs)} substituents. Individual combinations will be "
+                f"limited to at most {max_subs_per_site} substituents per site. "
+                f"To include larger combinations, increase max_subs_per_site parameter.",
+                UserWarning
+            )
     
     if not sites_with_enough_subs:
         return combos
     
-    # Part 1: Within-site combinations (existing logic)
+    # Part 1: Within-site combinations
     for site, subs in sites_with_enough_subs.items():
         # Try each sub as anchor
         for anchor in subs:
@@ -164,14 +186,16 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
             
             # Generate all combinations of size >= 1 from remaining subs
             # Combined with anchor, this gives combinations of size >= 2
-            for r in range(1, len(remaining) + 1):
+            # Limit to max_subs_per_site - 1 (since anchor takes 1 slot)
+            max_tail_size = min(len(remaining), max_subs_per_site - 1)
+            for r in range(1, max_tail_size + 1):
                 for tail_combo in itertools.combinations(remaining, r):
                     # Anchor always first, followed by sorted tail
                     combo_list = [anchor] + list(tail_combo)
-                    # For within-site, return 2-tuple for backward compatibility
+                    # For within-site, return 3-tuple with None as third element
                     combos.append(([site], combo_list, None))
     
-    # Part 2: Cross-site combinations (new)
+    # Part 2: Cross-site combinations
     # Generate combinations of sites (pairs, triplets, etc.)
     all_sites = sorted(sites_with_enough_subs.keys())
     if len(all_sites) >= 2:
@@ -179,15 +203,17 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
         for num_sites in range(2, len(all_sites) + 1):
             for site_combo in itertools.combinations(all_sites, num_sites):
                 # For each site in this combination, generate within-site sub selections
-                # Each site must contribute at least 2 subs
+                # Each site must contribute at least 2 subs, but no more than max_subs_per_site
                 site_sub_options = []
                 for site in site_combo:
                     subs = sites_with_enough_subs[site]
-                    # Generate all possible within-site selections (size >= 2) with rotating anchor
+                    # Generate all possible within-site selections (size >= 2, <= max_subs_per_site) with rotating anchor
                     site_selections = []
                     for anchor in subs:
                         remaining = [s for s in subs if s != anchor]
-                        for r in range(1, len(remaining) + 1):
+                        # Limit tail size to ensure total doesn't exceed max_subs_per_site
+                        max_tail_size = min(len(remaining), max_subs_per_site - 1)
+                        for r in range(1, max_tail_size + 1):
                             for tail_combo in itertools.combinations(remaining, r):
                                 combo_list = [anchor] + list(tail_combo)
                                 site_selections.append(combo_list)
@@ -282,12 +308,13 @@ def renumber_pres_tokens(content: str, old_site: int, old_sub: int, new_site: in
     return new_content if nsub else content
 
 
-def list_possible_combinations(input_dir: Path, out_dir: Path) -> List[Dict]:
+def list_possible_combinations(input_dir: Path, out_dir: Path, max_subs_per_site: int = 10) -> List[Dict]:
     """List all possible combinations without creating directories.
     
     Args:
         input_dir: Directory containing site{n}_sub{m}_{label}.{ext} files.
         out_dir: Output directory where combination subdirs would be created.
+        max_subs_per_site: Maximum number of substituents to consider per site (default: 10).
     
     Returns:
         List of dicts with keys: 'name', 'path', 'sites', 'subs', 'subs_per_site_counts'
@@ -296,11 +323,22 @@ def list_possible_combinations(input_dir: Path, out_dir: Path) -> List[Dict]:
     if not found:
         raise RuntimeError(f"No site_sub files found in {input_dir}")
     
+    # Check for sites with only 1 substituent and raise error
+    single_sub_sites = [site for site, subs in found.items() if len(subs) == 1]
+    if single_sub_sites:
+        site_list = ", ".join(f"site{s}" for s in sorted(single_sub_sites))
+        raise RuntimeError(
+            f"Sites with only 1 substituent detected: {site_list}. "
+            f"MSLD simulations require at least 2 substituents per site. "
+            f"Please add more substituents or add these sites from the core structure files "
+            f"(e.g., core.pdb and core.rtf if using msld-py-prep)."
+        )
+    
     eligible = {s: subs for s, subs in found.items() if len(subs) >= 2}
     if not eligible:
         raise RuntimeError(f"No eligible sites with >=2 substituents found in {input_dir}")
     
-    combos = all_site_sub_combinations(eligible)
+    combos = all_site_sub_combinations(eligible, max_subs_per_site=max_subs_per_site)
     combo_list = []
     
     for cnt, combo_data in enumerate(combos, start=1):
@@ -473,7 +511,7 @@ python3 msld_flat.py > output.out 2>&1
     return combo_path
 
 
-def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = False, include_patterns: List[str] | None = None) -> List[Path]:
+def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = False, include_patterns: List[str] | None = None, max_subs_per_site: int = 10) -> List[Path]:
     """Create combination directories with renamed files and support files.
 
     For each valid combination:
@@ -491,6 +529,8 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
         out_dir: Output directory where combination subdirs will be created.
         dry_run: If True, print actions without creating files.
         include_patterns: Glob patterns for extra files to copy (e.g., ['prep/*', '*.py']).
+        max_subs_per_site: Maximum number of substituents per site in any single combination (default: 10).
+                          All substituents can still participate, but each combination is limited to this size per site.
 
     Returns:
         List of created directory paths.
@@ -498,6 +538,17 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
     found = find_site_sub_files(input_dir)
     if not found:
         raise RuntimeError(f"No site_sub files found in {input_dir}")
+
+    # Check for sites with only 1 substituent and raise error
+    single_sub_sites = [site for site, subs in found.items() if len(subs) == 1]
+    if single_sub_sites:
+        site_list = ", ".join(f"site{s}" for s in sorted(single_sub_sites))
+        raise RuntimeError(
+            f"Sites with only 1 substituent detected: {site_list}. "
+            f"MSLD simulations require at least 2 substituents per site. "
+            f"Please add more substituents or remove these sites from the core structure files "
+            f"(e.g., core.pdb and core.rtf if using msld-py-prep)."
+        )
 
     # Only consider sites that have at least two substituents. Sites with a
     # single available substituent are not informative for generating
@@ -507,7 +558,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
         raise RuntimeError(f"No eligible sites with >=2 substituents found in {input_dir}")
     found = eligible
 
-    combos = all_site_sub_combinations(found)
+    combos = all_site_sub_combinations(found, max_subs_per_site=max_subs_per_site)
     created_dirs: List[Path] = []
     cnt = 1
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -764,6 +815,7 @@ def main():
     p.add_argument('--out', '-o', dest='out_dir', type=Path, default=Path('combos'), help='Output base directory')
     p.add_argument('--dry-run', action='store_true', help='Show actions without copying files')
     p.add_argument('--include', '-i', dest='include', action='append', default=[], help='Glob pattern(s) of additional files to copy into each combo dir (relative to input_dir). Can be provided multiple times.')
+    p.add_argument('--max-subs', type=int, default=10, help='Maximum number of substituents per site in any single combination (default: 10). All substituents can still participate, but each combination is limited to this size per site.')
     p.add_argument('--archive', dest='archive', action='store_true', help='Create .tar.gz archives of generated combo directories matching pattern comb_*')
     p.add_argument('--archive-remove', dest='archive_remove', action='store_true', help='Remove combo directories after successful archiving')
     args = p.parse_args()
@@ -773,7 +825,7 @@ def main():
         raise SystemExit(f"Input directory not found: {input_dir}")
 
     include_patterns = args.include if args.include else None
-    created = create_combination_dirs(input_dir, args.out_dir, dry_run=args.dry_run, include_patterns=include_patterns)
+    created = create_combination_dirs(input_dir, args.out_dir, dry_run=args.dry_run, include_patterns=include_patterns, max_subs_per_site=args.max_subs)
     print(f"Created {len(created)} combination dirs under {args.out_dir}")
 
     if args.archive:
