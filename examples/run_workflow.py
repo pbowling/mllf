@@ -335,7 +335,7 @@ def train_epoch(
 #SBATCH --output={slurm_output}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH -p gpu2080 --gres=gpu:1 
+#SBATCH -p ada6000 --gres=gpu:1 
 #SBATCH --export=ALL
 #SBATCH --time=01:00:00
 
@@ -448,11 +448,17 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
                 
                 continue  # Skip processing this job for now
             
-            # If simulation still failed after max retries, skip it
+            # If simulation still failed after max retries, stop the entire training
             if not simulation_success:
-                print(f"  ERROR: Simulation failed after {max_retries + 1} attempts for {jcombo_path.name}")
-                print(f"  Skipping this combo - manual intervention required")
-                continue
+                print("\n" + "=" * 70)
+                print(f"FATAL ERROR: Simulation failed after {max_retries + 1} attempts")
+                print(f"  Combo: {jcombo_path.name}")
+                print(f"  Epoch directory: {jepoch_dir}")
+                print(f"  Output file: {output_file}")
+                print("\nTraining cannot continue with failed simulations.")
+                print("Please check the simulation logs and fix the issue before restarting.")
+                print("=" * 70)
+                sys.exit(1)
             
             # Simulation succeeded - parse outputs and update policy
             raw_metrics = parse_simulation_metrics(output_file)
