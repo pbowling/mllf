@@ -39,20 +39,3 @@ flake8
 
 Please see full documentation at https://mllf.readthedocs.io/en/latest for more detailed information.
 
-## RLlib training (optional)
-
-To use Ray RLlib for scalable training, install the optional `rl` extras which include Ray/RLlib:
-
-```bash
-pip install -e '.[rl]'
-```
-
-A tiny example trainer is provided at `src/mllf/rl/rllib_trainer.py`. To run a short test training run:
-
-```python
-from mllf.rl.rllib_trainer import train
-train(num_iters=10)
-```
-
-Note: RLlib is a large dependency; if you only need the GNN prototype for quick experiments, you can run the `GNNPolicy` directly in a custom PyTorch loop instead.
-
