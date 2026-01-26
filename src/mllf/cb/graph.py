@@ -300,6 +300,94 @@ class Graph:
         g.apply_site_connectivity_rules()
         return g
 
+    @classmethod
+    def from_graph_info(cls, graph_info: Dict) -> "Graph":
+        """Create a Graph from graph_info.json data.
+        
+        This is used during pretraining when RTF files aren't available but
+        graph_info.json was saved during data collection.
+        
+        Args:
+            graph_info: Dictionary loaded from graph_info.json with keys:
+                - 'solvent_state': Environment type ('solvent', 'protein', 'gas')
+                - 'sites': Dict mapping 'site{N}_sub{M}' to metadata dicts containing:
+                    - 'site': Site number
+                    - 'sub': Substituent number
+                    - 'atom_types': List of atom type strings
+                    - 'total_charge': Total charge
+                    
+        Returns:
+            Graph with nodes populated from site/sub data
+        """
+        sites_data = graph_info.get('sites', {})
+        solvent_state = graph_info.get('solvent_state', 'solvent')
+        
+        # Parse and sort by (site, sub)
+        subs = []
+        for key, data in sites_data.items():
+            site = data.get('site')
+            sub = data.get('sub')
+            if site is not None and sub is not None:
+                subs.append((int(site), int(sub), key, data))
+        
+        if not subs:
+            # Fallback: single node
+            return cls(1)
+        
+        subs.sort(key=lambda x: (x[0], x[1]))
+        
+        # Compute atom type sets per site for distinct types calculation
+        per_site = {}
+        for site, sub, key, data in subs:
+            per_site.setdefault(site, {})
+            per_site[site][sub] = data
+        
+        # Compute distinct atom types (excluding atoms common to all subs at site)
+        unique_map = {}
+        site_intersection = {}
+        for site, subdict in per_site.items():
+            atom_sets = {s: set(subdict[s].get('atom_types', [])) for s in subdict}
+            if atom_sets:
+                intersection_all = set.intersection(*atom_sets.values()) if len(atom_sets) > 0 else set()
+            else:
+                intersection_all = set()
+            site_intersection[site] = intersection_all
+            for s, aset in atom_sets.items():
+                others = set().union(*(atom_sets[o] for o in atom_sets if o != s)) if len(atom_sets) > 1 else set()
+                unique_map[(site, s)] = sorted(list(aset - others))
+        
+        # Create graph with one node per substituent
+        nsubs = len(subs)
+        g = cls(nsubs)
+        
+        # Populate node metadata
+        for idx, (site, sub, key, data) in enumerate(subs):
+            atom_types = list(data.get('atom_types', []))
+            total_charge = float(data.get('total_charge', 0.0))
+            
+            # Compute distinct atom types (excluding site intersection)
+            intersection_all = site_intersection.get(site, set())
+            distinct_list = [a for a in atom_types if a not in intersection_all]
+            
+            # Per-site unique atom types
+            per_site_unique = set(unique_map.get((site, sub), []))
+            merged_unique = sorted(list(per_site_unique))
+            
+            node_meta = {
+                'site': site,
+                'sub': sub,
+                'total_charge': total_charge,
+                'atom_types': atom_types,
+                'distinct_atom_types': distinct_list,
+                'unique_atom_types': merged_unique,
+                'solvent': solvent_state,
+            }
+            g.set_node_info(idx, node_meta)
+        
+        # Apply connectivity rules
+        g.apply_site_connectivity_rules()
+        return g
+
     def apply_site_connectivity_rules(self):
         """Apply default connectivity rules per-site.
 

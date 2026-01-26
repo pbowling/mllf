@@ -207,12 +207,21 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
         # Save graph_info.json for reward function to extract actual nsubs_per_site
         save_graph_info_from_rtf(combo_dir, g)
     else:
-        vpy = combo_path / 'variables.py'
-        if vpy.exists():
-            bias = load_bias_from_variables(str(vpy))
-            g = graph_from_bias(bias)
+        # Try loading from graph_info.json (saved during pretraining data collection)
+        graph_info_path = combo_path / 'graph_info.json'
+        if graph_info_path.exists():
+            import json
+            with open(graph_info_path, 'r') as f:
+                graph_info = json.load(f)
+            g = Graph.from_graph_info(graph_info)
         else:
-            raise FileNotFoundError(f'No RTF fragments and no variables.py found in {combo_dir} or {combo_dir}/prep')
+            # Fall back to creating graph from bias matrices (no node metadata)
+            vpy = combo_path / 'variables.py'
+            if vpy.exists():
+                bias = load_bias_from_variables(str(vpy))
+                g = graph_from_bias(bias)
+            else:
+                raise FileNotFoundError(f'No RTF fragments, graph_info.json, or variables.py found in {combo_dir} or {combo_dir}/prep')
 
     data, extras = graph_utils.build_pyg_graph_from_mllf_graph(g, toppar_dir=toppar_dir, toppar_files=toppar_files, 
                                                                  warn_missing_types=warn_missing_types)

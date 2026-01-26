@@ -76,11 +76,173 @@ for dataset_dir in $PRETRAIN_DIR/*/; do
 done
 
 echo ""
-echo "Total: $total_systems systems, $total_runs_available runs available, $total_runs_used runs will be used for training"
+echo "Total: $total_systems systems, $total_runs_available runs available"
 echo ""
 
 echo "========================================="
-echo "Step 2: Policy Pretraining"
+echo "Step 2: Filter Systems by Reward Quality"
+echo "========================================="
+echo ""
+echo "Computing rewards for each system to filter out poor performers..."
+echo ""
+
+# Filter systems to only include those with positive rewards
+python3 << 'FILTER_EOF'
+import sys
+import json
+from pathlib import Path
+
+# Import the actual reward calculation function from the codebase
+from mllf.cb.pretrain_policy import compute_reward_from_sim_results
+
+# Find pretraining directory
+pretrain_dir = Path("pretraining") if Path("pretraining").exists() else Path("../pretraining")
+
+good_systems = []
+bad_systems = []
+
+for dataset_dir in sorted(pretrain_dir.glob("*/")):
+    if not dataset_dir.is_dir():
+        continue
+    
+    dataset_name = dataset_dir.name
+    
+    # Special case: 14benz_pair_combos has nested combo directories
+    if dataset_name == "14benz_pair_combos":
+        for combo_dir in sorted(dataset_dir.glob("comb_*")):
+            if not combo_dir.is_dir():
+                continue
+            
+            combo_name = f"{dataset_name}/{combo_dir.name}"
+            max_reward = -float('inf')
+            best_run = None
+            
+            for run_dir in combo_dir.glob("run_*"):
+                metadata_file = run_dir / "metadata.json"
+                sim_file = run_dir / "simulation_results.json"
+                
+                if not metadata_file.exists() or not sim_file.exists():
+                    continue
+                
+                try:
+                    with open(metadata_file) as f:
+                        metadata = json.load(f)
+                    
+                    if not metadata.get("terminated_normally", False):
+                        continue
+                    
+                    with open(sim_file) as f:
+                        sim_results = json.load(f)
+                    
+                    num_sites = metadata.get("num_sites", 2)
+                    num_subs = metadata.get("num_substituents", 2)
+                    # For pair combos, each site has 1 substituent
+                    nsubs_per_site = [1, 1] if num_sites == 2 else [num_subs]
+                    
+                    reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
+                    
+                    if reward > max_reward:
+                        max_reward = reward
+                        best_run = run_dir.name
+                
+                except Exception as e:
+                    continue
+            
+            if max_reward > 0:
+                good_systems.append((combo_name, max_reward, best_run))
+                print(f"  ✓ {combo_name}: best reward = {max_reward:.2f} (run {best_run})")
+            elif max_reward > -float('inf'):
+                bad_systems.append((combo_name, max_reward, best_run))
+                print(f"  ✗ {combo_name}: best reward = {max_reward:.2f} (run {best_run}) - EXCLUDED")
+        continue
+    
+    # Standard case: run directories directly under dataset directory
+    run_dirs = [d for d in dataset_dir.iterdir() if d.is_dir()]
+    if not run_dirs:
+        continue
+    
+    max_reward = -float('inf')
+    best_run = None
+    
+    for run_dir in run_dirs:
+        metadata_file = run_dir / "metadata.json"
+        sim_file = run_dir / "simulation_results.json"
+        
+        if not metadata_file.exists() or not sim_file.exists():
+            continue
+        
+        try:
+            with open(metadata_file) as f:
+                metadata = json.load(f)
+            
+            # Skip runs that didn't terminate normally
+            if not metadata.get("terminated_normally", False):
+                continue
+            
+            with open(sim_file) as f:
+                sim_results = json.load(f)
+            
+            num_sites = metadata.get("num_sites", 1)
+            num_subs = metadata.get("num_substituents", 1)
+            nsubs_per_site = [num_subs] if num_sites == 1 else [num_subs // 2, num_subs - num_subs // 2]
+            
+            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
+            
+            if reward > max_reward:
+                max_reward = reward
+                best_run = run_dir.name
+        
+        except Exception as e:
+            continue
+    
+    if max_reward > 0:
+        good_systems.append((dataset_name, max_reward, best_run))
+        print(f"  ✓ {dataset_name}: best reward = {max_reward:.2f} (run {best_run})")
+    else:
+        bad_systems.append((dataset_name, max_reward, best_run))
+        print(f"  ✗ {dataset_name}: best reward = {max_reward:.2f} (run {best_run}) - EXCLUDED")
+
+print()
+print(f"Summary: {len(good_systems)} systems with positive rewards, {len(bad_systems)} systems excluded")
+
+# Write good systems to temp file for shell script
+with open("/tmp/pretrain_good_systems.txt", "w") as f:
+    for system_name, _, _ in good_systems:
+        f.write(f"{system_name}\n")
+
+sys.exit(0 if good_systems else 1)
+FILTER_EOF
+
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "Error: No systems with positive rewards found!"
+    echo "Cannot proceed with pretraining."
+    exit 1
+fi
+
+# Read filtered systems
+total_runs_used=0
+pretrain_dirs=""
+while IFS= read -r system_name; do
+    dataset_dir="$PRETRAIN_DIR/$system_name"
+    if [ -d "$dataset_dir" ]; then
+        pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
+        # Count runs for this system
+        if [[ "$system_name" == *"best"* ]] || [[ "$system_name" == *"combos"* ]]; then
+            count=$(find "$dataset_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+            total_runs_used=$((total_runs_used + count))
+        else
+            total_runs_used=$((total_runs_used + 1))
+        fi
+    fi
+done < /tmp/pretrain_good_systems.txt
+
+echo ""
+echo "Will use $total_runs_used runs for pretraining"
+echo ""
+
+echo "========================================="
+echo "Step 3: Policy Pretraining"
 echo "========================================="
 echo ""
 
@@ -132,27 +294,15 @@ fi
 echo "Pretraining policy via Behavior Cloning (supervised learning)..."
 echo "This learns to predict bias coefficients from successful runs"
 echo ""
-echo "Approach: Filters to best run per system, trains with MSE loss"
+echo "Approach: Filters to best run per system (with positive reward), trains with MSE loss"
 echo "Using 50 epochs for convergence"
 echo ""
 
-# Auto-detect all non-empty subdirectories in pretraining/
-pretrain_dirs=""
-for dataset_dir in $PRETRAIN_DIR/*/; do
-    if [ -d "$dataset_dir" ] && [ "$(ls -A "$dataset_dir" 2>/dev/null)" ]; then
-        # Remove trailing slash for cleaner path
-        clean_path="${dataset_dir%/}"
-        pretrain_dirs="$pretrain_dirs --pretraining-dir $clean_path"
-    fi
-done
-
 if [ -z "$pretrain_dirs" ]; then
-    echo "Error: No pretraining data found in $PRETRAIN_DIR subdirectories"
+    echo "Error: No systems with positive rewards found"
     echo ""
-    echo "Each subdirectory should contain run directories with:"
-    echo "  - variables.py (bias coefficients)"
-    echo "  - metadata.json (optional)"
-    echo "  - simulation_results.json (optional)"
+    echo "All systems were filtered out due to poor performance."
+    echo "Check your pretraining data quality."
     exit 1
 fi
 
