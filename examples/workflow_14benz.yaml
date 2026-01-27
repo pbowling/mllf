@@ -110,7 +110,7 @@ reward:
   gamma: 4.0            # Scaling factor for coverage/concentration penalties
   entropy_bonus: 8.0    # Bonus for uniform distributions
   
-  # Baseline normalization values
+  # Baseline normalization values (lower = higher normalized rewards)
   P_baseline: 500.0     # Expected maximum total population
   T_baseline: 50.0      # Expected maximum total transitions
   

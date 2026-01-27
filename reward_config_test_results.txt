@@ -1,0 +1,790 @@
+Testing improved reward function on: pretraining/indolizine_solv
+Good runs: >= run215
+Bad runs: < run15
+================================================================================
+
+Found 17 good runs, 14 bad runs
+
+Loading configurations from tests/tools/reward_configs_improved.yaml...
+Loaded 15 configurations
+
+================================================================================
+TESTING CONFIGURATION: current_default
+================================================================================
+Parameters: {'w_P': 0.4, 'w_T': 0.4, 'w_U': 0.2, 'gamma': 5.0, 'P_baseline': 1000.0, 'T_baseline': 100.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 5.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  14.50, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  15.64, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  16.05, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  15.42, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  15.59, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  15.67, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  15.53, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  15.14, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  15.66, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  15.44, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  15.55, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  15.88, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  15.52, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  16.24, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  14.93, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  15.53, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  15.02, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -44.98, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -45.00, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -44.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -45.31, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -46.56, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -46.37, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -19.13, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -46.98, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -46.59, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -17.33, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -18.36, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -14.55, coverage=42%, trans= 36, max_conc=69%
+  run13: reward= -11.68, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -23.43, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   15.49 ±   0.40
+    Range: [  14.50,   16.24]
+  Bad Runs (n=14):
+    Mean:  -33.66 ±  14.29
+    Range: [ -46.98,  -11.68]
+  Difference (good - bad):   49.15
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: higher_rewards_v1
+================================================================================
+Parameters: {'w_P': 0.5, 'w_T': 0.5, 'w_U': 0.3, 'gamma': 4.0, 'P_baseline': 500.0, 'T_baseline': 50.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 8.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  31.69, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  34.46, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  35.49, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  33.94, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  34.36, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  34.58, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  34.18, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  33.25, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  34.55, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  33.98, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  34.27, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  35.07, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  34.17, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  35.94, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  32.76, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  34.22, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  32.95, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -41.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -42.00, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -41.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -42.49, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -44.46, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -44.16, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -11.44, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -45.13, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -44.52, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -11.48, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -12.83, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -10.10, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -7.16, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -20.14, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   34.11 ±   0.99
+    Range: [  31.69,   35.94]
+  Bad Runs (n=14):
+    Mean:  -29.99 ±  15.66
+    Range: [ -45.13,   -7.16]
+  Difference (good - bad):   64.10
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: higher_rewards_v2
+================================================================================
+Parameters: {'w_P': 0.5, 'w_T': 0.5, 'w_U': 0.3, 'gamma': 4.0, 'P_baseline': 750.0, 'T_baseline': 75.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 6.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  21.87, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  23.73, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  24.42, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  23.38, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  23.66, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  23.80, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  23.54, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  22.92, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  23.79, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  23.41, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  23.60, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  24.13, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  23.53, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  24.72, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  22.59, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  23.56, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  22.72, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -43.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -43.99, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -43.97, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -44.36, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -45.84, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -45.61, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -13.35, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -46.33, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -45.87, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -13.42, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -14.79, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -11.90, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -9.00, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -21.31, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   23.49 ±   0.66
+    Range: [  21.87,   24.72]
+  Bad Runs (n=14):
+    Mean:  -31.69 ±  15.57
+    Range: [ -46.33,   -9.00]
+  Difference (good - bad):   55.19
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: entropy_focused_v1
+================================================================================
+Parameters: {'w_P': 0.4, 'w_T': 0.4, 'w_U': 0.2, 'gamma': 4.0, 'P_baseline': 1000.0, 'T_baseline': 100.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 10.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  19.36, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  20.59, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  20.98, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  20.32, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  20.49, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  20.54, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  20.46, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  20.02, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  20.55, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  20.36, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  20.46, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  20.80, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  20.44, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  21.19, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  19.79, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  20.42, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  19.90, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -39.98, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -40.02, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -39.99, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -40.64, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -43.19, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -42.81, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -10.41, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -44.06, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -43.28, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -10.17, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -11.41, coverage=38%, trans= 38, max_conc=67%
+  run12: reward=  -8.77, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -5.86, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -19.15, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   20.39 ±   0.43
+    Range: [  19.36,   21.19]
+  Bad Runs (n=14):
+    Mean:  -28.55 ±  15.51
+    Range: [ -44.06,   -5.86]
+  Difference (good - bad):   48.95
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: entropy_focused_v2
+================================================================================
+Parameters: {'w_P': 0.4, 'w_T': 0.4, 'w_U': 0.3, 'gamma': 4.0, 'P_baseline': 1000.0, 'T_baseline': 100.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 12.0, 'concentration_penalty_threshold': 0.7}
+
+Good Runs:
+  run215: reward=  21.40, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  22.66, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  23.05, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  22.38, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  22.55, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  22.59, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  22.53, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  22.07, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  22.61, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  22.43, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  22.52, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  22.87, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  22.51, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  23.28, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  21.84, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  22.48, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  21.95, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -37.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -38.01, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -37.99, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -38.76, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -41.82, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -41.36, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -10.77, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -42.87, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -41.92, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -10.41, coverage=38%, trans= 30, max_conc=87%
+  run11: reward=  -9.60, coverage=38%, trans= 38, max_conc=67%
+  run12: reward=  -7.08, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -5.07, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -19.99, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   22.46 ±   0.44
+    Range: [  21.40,   23.28]
+  Bad Runs (n=14):
+    Mean:  -27.40 ±  15.04
+    Range: [ -42.87,   -5.07]
+  Difference (good - bad):   49.86
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: softer_penalties_v1
+================================================================================
+Parameters: {'w_P': 0.4, 'w_T': 0.4, 'w_U': 0.2, 'gamma': 3.0, 'P_baseline': 1000.0, 'T_baseline': 100.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.4, 'entropy_bonus': 5.0, 'concentration_penalty_threshold': 0.85}
+
+Good Runs:
+  run215: reward=  14.50, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  15.64, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  16.05, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  15.42, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  15.59, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  15.67, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  15.53, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  15.14, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  15.66, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  15.44, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  15.55, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  15.88, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  15.52, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  16.24, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  14.93, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  15.53, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  15.02, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -44.98, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -45.00, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -44.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -45.31, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -46.56, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -46.37, coverage=21%, trans= 23, max_conc=100%
+  run7: reward=  -2.96, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -37.98, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -43.64, coverage=33%, trans= 19, max_conc=100%
+  run10: reward=  -4.91, coverage=38%, trans= 30, max_conc=87%
+  run11: reward=  -7.36, coverage=38%, trans= 38, max_conc=67%
+  run12: reward=  -6.22, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -3.35, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -17.23, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   15.49 ±   0.40
+    Range: [  14.50,   16.24]
+  Bad Runs (n=14):
+    Mean:  -28.34 ±  18.85
+    Range: [ -46.56,   -2.96]
+  Difference (good - bad):   43.83
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: softer_penalties_v2
+================================================================================
+Parameters: {'w_P': 0.5, 'w_T': 0.5, 'w_U': 0.3, 'gamma': 3.5, 'P_baseline': 750.0, 'T_baseline': 75.0, 'min_transitions_per_site': 8, 'min_coverage_ratio': 0.4, 'entropy_bonus': 7.0, 'concentration_penalty_threshold': 0.85}
+
+Good Runs:
+  run215: reward=  22.84, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  24.72, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  25.40, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  24.36, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  24.64, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  24.78, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  24.53, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  23.89, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  24.76, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  24.39, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  24.58, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  25.12, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  24.52, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  25.71, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  23.56, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  24.54, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  23.69, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -42.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -42.99, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -42.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -43.43, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -45.15, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -35.53, coverage=21%, trans= 23, max_conc=100%
+  run7: reward=  -2.22, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -24.76, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -27.09, coverage=33%, trans= 19, max_conc=100%
+  run10: reward=   4.84, coverage=38%, trans= 30, max_conc=87%
+  run11: reward=   5.30, coverage=38%, trans= 38, max_conc=67%
+  run12: reward=   6.51, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=   6.65, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -10.60, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   24.47 ±   0.67
+    Range: [  22.84,   25.71]
+  Bad Runs (n=14):
+    Mean:  -21.03 ±  20.94
+    Range: [ -45.15,    6.65]
+  Difference (good - bad):   45.50
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: balanced_v1
+================================================================================
+Parameters: {'w_P': 0.5, 'w_T': 0.5, 'w_U': 0.3, 'gamma': 4.0, 'P_baseline': 600.0, 'T_baseline': 60.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 8.0, 'concentration_penalty_threshold': 0.75}
+
+Good Runs:
+  run215: reward=  27.75, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  30.08, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  30.94, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  29.64, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  29.99, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  30.16, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  29.85, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  29.06, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  30.15, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  29.68, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  29.92, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  30.58, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  29.84, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  31.32, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  28.65, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  29.87, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  28.81, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -41.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -42.00, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -41.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -42.49, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -44.48, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -44.18, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -12.59, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -45.15, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -44.54, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -12.59, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -12.92, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -10.18, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -7.25, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -21.17, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   29.78 ±   0.83
+    Range: [  27.75,   31.32]
+  Bad Runs (n=14):
+    Mean:  -30.25 ±  15.41
+    Range: [ -45.15,   -7.25]
+  Difference (good - bad):   60.03
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: balanced_v2
+================================================================================
+Parameters: {'w_P': 0.45, 'w_T': 0.45, 'w_U': 0.25, 'gamma': 4.5, 'P_baseline': 800.0, 'T_baseline': 80.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 6.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  19.36, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  20.95, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  21.52, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  20.64, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  20.88, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  20.99, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  20.79, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  20.25, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  20.98, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  20.67, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  20.83, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  21.28, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  20.78, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  21.79, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  19.97, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  20.80, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  20.08, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -43.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -43.99, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -43.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -44.37, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -45.86, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -45.63, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -15.81, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -46.36, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -45.90, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -14.92, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -16.11, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -12.80, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -9.91, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -22.09, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   20.74 ±   0.56
+    Range: [  19.36,   21.79]
+  Bad Runs (n=14):
+    Mean:  -32.26 ±  14.93
+    Range: [ -46.36,   -9.91]
+  Difference (good - bad):   53.00
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: transition_focused_v1
+================================================================================
+Parameters: {'w_P': 0.3, 'w_T': 0.6, 'w_U': 0.2, 'gamma': 4.0, 'P_baseline': 1000.0, 'T_baseline': 50.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 5.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  20.13, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  20.96, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  21.41, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  21.46, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  21.07, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  20.65, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  20.87, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  19.95, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  20.80, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  21.06, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  21.01, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  21.34, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  20.49, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  21.16, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  20.85, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  21.12, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  19.51, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -44.98, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -45.00, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -44.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -45.31, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -46.56, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -46.37, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -14.21, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -46.99, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -46.60, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -14.56, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -15.91, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -12.93, coverage=42%, trans= 36, max_conc=69%
+  run13: reward= -10.07, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -21.97, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   20.81 ±   0.51
+    Range: [  19.51,   21.46]
+  Bad Runs (n=14):
+    Mean:  -32.60 ±  15.49
+    Range: [ -46.99,  -10.07]
+  Difference (good - bad):   53.42
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: transition_focused_v2
+================================================================================
+Parameters: {'w_P': 0.35, 'w_T': 0.55, 'w_U': 0.25, 'gamma': 4.0, 'P_baseline': 800.0, 'T_baseline': 60.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 6.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  20.66, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  21.89, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  22.42, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  22.01, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  21.92, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  21.74, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  21.76, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  21.01, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  21.82, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  21.81, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  21.86, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  22.26, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  21.56, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  22.42, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  21.34, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  21.90, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  20.69, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -43.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -43.99, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -43.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -44.37, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -45.87, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -45.64, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -13.41, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -46.37, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -45.91, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -13.59, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -14.93, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -12.02, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -9.15, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -21.37, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   21.71 ±   0.50
+    Range: [  20.66,   22.42]
+  Bad Runs (n=14):
+    Mean:  -31.76 ±  15.52
+    Range: [ -46.37,   -9.15]
+  Difference (good - bad):   53.47
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: population_focused_v1
+================================================================================
+Parameters: {'w_P': 0.6, 'w_T': 0.3, 'w_U': 0.3, 'gamma': 4.0, 'P_baseline': 600.0, 'T_baseline': 100.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 7.0, 'concentration_penalty_threshold': 0.75}
+
+Good Runs:
+  run215: reward=  24.50, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  27.29, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  28.22, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  26.25, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  27.08, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  27.67, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  27.02, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  26.57, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  27.52, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  26.63, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  27.01, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  27.74, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  27.29, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  28.97, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  25.27, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  26.86, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  26.55, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -42.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -42.99, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -42.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -43.43, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -45.13, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -44.87, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -13.48, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -45.71, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -45.19, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -13.34, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -13.72, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -10.92, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -7.99, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -21.70, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   26.97 ±   1.00
+    Range: [  24.50,   28.97]
+  Bad Runs (n=14):
+    Mean:  -31.03 ±  15.43
+    Range: [ -45.71,   -7.99]
+  Difference (good - bad):   58.00
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: population_focused_v2
+================================================================================
+Parameters: {'w_P': 0.55, 'w_T': 0.35, 'w_U': 0.25, 'gamma': 4.0, 'P_baseline': 750.0, 'T_baseline': 100.0, 'min_transitions_per_site': 10, 'min_coverage_ratio': 0.5, 'entropy_bonus': 6.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  19.99, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  22.05, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  22.74, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  21.37, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  21.91, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  22.27, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  21.85, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  21.42, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  22.18, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  21.59, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  21.85, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  22.40, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  21.99, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  23.24, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  20.61, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  21.76, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  21.35, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -43.97, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -43.99, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -43.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -44.37, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -45.84, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -45.62, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -13.43, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -46.34, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -45.89, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -13.40, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -14.77, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -11.89, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  -8.99, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -21.32, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   21.80 ±   0.73
+    Range: [  19.99,   23.24]
+  Bad Runs (n=14):
+    Mean:  -31.70 ±  15.57
+    Range: [ -46.34,   -8.99]
+  Difference (good - bad):   53.50
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: aggressive_positive
+================================================================================
+Parameters: {'w_P': 0.6, 'w_T': 0.6, 'w_U': 0.4, 'gamma': 3.0, 'P_baseline': 400.0, 'T_baseline': 40.0, 'min_transitions_per_site': 8, 'min_coverage_ratio': 0.4, 'entropy_bonus': 12.0, 'concentration_penalty_threshold': 0.8}
+
+Good Runs:
+  run215: reward=  47.48, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  51.63, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  53.19, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  50.86, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  51.49, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  51.81, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  51.22, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  49.82, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  51.77, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  50.92, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  51.35, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  52.55, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  51.20, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  53.86, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  49.09, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  51.27, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  49.38, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -37.96, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -38.00, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -37.97, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -38.75, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -41.67, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -30.32, coverage=21%, trans= 23, max_conc=100%
+  run7: reward=   3.17, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -21.01, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -23.37, coverage=33%, trans= 19, max_conc=100%
+  run10: reward=   9.66, coverage=38%, trans= 30, max_conc=87%
+  run11: reward=  10.91, coverage=38%, trans= 38, max_conc=67%
+  run12: reward=  11.44, coverage=42%, trans= 36, max_conc=69%
+  run13: reward=  11.74, coverage=42%, trans= 40, max_conc=75%
+  run14: reward=  -8.15, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   51.11 ±   1.48
+    Range: [  47.48,   53.86]
+  Bad Runs (n=14):
+    Mean:  -16.45 ±  21.11
+    Range: [ -41.67,   11.74]
+  Difference (good - bad):   67.56
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+TESTING CONFIGURATION: conservative
+================================================================================
+Parameters: {'w_P': 0.4, 'w_T': 0.4, 'w_U': 0.2, 'gamma': 5.0, 'P_baseline': 1200.0, 'T_baseline': 120.0, 'min_transitions_per_site': 12, 'min_coverage_ratio': 0.6, 'entropy_bonus': 4.0, 'concentration_penalty_threshold': 0.75}
+
+Good Runs:
+  run215: reward=  11.96, coverage=100%, trans=592, max_conc=33%
+  run216: reward=  12.90, coverage=100%, trans=588, max_conc=21%
+  run217: reward=  13.24, coverage=100%, trans=599, max_conc=21%
+  run218: reward=  12.72, coverage=100%, trans=639, max_conc=19%
+  run219: reward=  12.86, coverage=100%, trans=600, max_conc=24%
+  run220: reward=  12.93, coverage=100%, trans=565, max_conc=21%
+  run221: reward=  12.81, coverage=100%, trans=588, max_conc=19%
+  run222: reward=  12.49, coverage=100%, trans=543, max_conc=22%
+  run223: reward=  12.92, coverage=100%, trans=576, max_conc=21%
+  run224: reward=  12.74, coverage=100%, trans=607, max_conc=21%
+  run225: reward=  12.83, coverage=100%, trans=598, max_conc=21%
+  run226: reward=  13.10, coverage=100%, trans=604, max_conc=20%
+  run227: reward=  12.80, coverage=100%, trans=561, max_conc=22%
+  run228: reward=  13.40, coverage=100%, trans=570, max_conc=18%
+  run229: reward=  12.32, coverage=100%, trans=621, max_conc=26%
+  run230: reward=  12.81, coverage=100%, trans=607, max_conc=22%
+  run231: reward=  12.39, coverage=100%, trans=517, max_conc=26%
+
+Bad Runs:
+  run1: reward= -45.98, coverage=12%, trans=  3, max_conc=100%
+  run2: reward= -45.99, coverage=12%, trans=  3, max_conc=100%
+  run3: reward= -45.98, coverage=12%, trans=  3, max_conc=100%
+  run4: reward= -46.24, coverage=12%, trans=  3, max_conc=100%
+  run5: reward= -47.24, coverage=21%, trans=  6, max_conc=100%
+  run6: reward= -47.09, coverage=21%, trans= 23, max_conc=100%
+  run7: reward= -46.57, coverage=29%, trans= 33, max_conc=91%
+  run8: reward= -47.58, coverage=29%, trans= 22, max_conc=99%
+  run9: reward= -47.26, coverage=33%, trans= 19, max_conc=100%
+  run10: reward= -46.29, coverage=38%, trans= 30, max_conc=87%
+  run11: reward= -45.52, coverage=38%, trans= 38, max_conc=67%
+  run12: reward= -38.83, coverage=42%, trans= 36, max_conc=69%
+  run13: reward= -28.18, coverage=42%, trans= 40, max_conc=75%
+  run14: reward= -47.63, coverage=46%, trans= 34, max_conc=93%
+
+Summary:
+  Good Runs (n=17):
+    Mean:   12.78 ±   0.34
+    Range: [  11.96,   13.40]
+  Bad Runs (n=14):
+    Mean:  -44.74 ±   5.05
+    Range: [ -47.63,  -28.18]
+  Difference (good - bad):   57.52
+  ✅ Correctly distinguishes good from bad
+
+================================================================================
+CONFIGURATION COMPARISON
+================================================================================
+
+Config                     Good Mean   Bad Mean   Difference   Status
+--------------------------------------------------------------------------------
+aggressive_positive            51.11     -16.45        67.56        ✅
+higher_rewards_v1              34.11     -29.99        64.10        ✅
+balanced_v1                    29.78     -30.25        60.03        ✅
+population_focused_v1          26.97     -31.03        58.00        ✅
+softer_penalties_v2            24.47     -21.03        45.50        ✅
+higher_rewards_v2              23.49     -31.69        55.19        ✅
+entropy_focused_v2             22.46     -27.40        49.86        ✅
+population_focused_v2          21.80     -31.70        53.50        ✅
+transition_focused_v2          21.71     -31.76        53.47        ✅
+transition_focused_v1          20.81     -32.60        53.42        ✅
+balanced_v2                    20.74     -32.26        53.00        ✅
+entropy_focused_v1             20.39     -28.55        48.95        ✅
+current_default                15.49     -33.66        49.15        ✅
+softer_penalties_v1            15.49     -28.34        43.83        ✅
+conservative                   12.78     -44.74        57.52        ✅
+
+================================================================================
+BEST CONFIGURATIONS
+================================================================================
+
+Highest Good Reward: aggressive_positive
+  Good mean: 51.11
+  Bad mean: -16.45
+  Difference: 67.56

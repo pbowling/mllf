@@ -32,39 +32,34 @@ def compute_msld_reward_improved(
 ) -> float:
     """Compute improved scalarized reward that prevents degenerate solutions.
     
-    This reward function explicitly addresses the issue of the policy converging
-    to single-substituent solutions using a **tiered transition penalty system**:
+    This reward function uses two key mechanisms to prevent degenerate behavior:
+    
+    **1. Penalty Shield (I_dead)**
+    Prevents "double jeopardy" by disabling secondary penalties when any site
+    has zero transitions:
+        I_dead = 1 if min_transitions = 0, else 0
+        Coverage & concentration penalties only apply when I_dead = 0
+    
+    **2. Confidence Factor (C_F)**
+    Scales population rewards based on data reliability:
+        C_F = min(1.0, min_transitions / (2 * N_req))
+        R_P is multiplied by C_F, reducing false rewards from low-transition runs
     
     **Tiered Transition Penalty System:**
     - **Tier 1: "Death Floor" (0 transitions)**: Fixed penalty of -40.0
-      Worst possible state, signaling total inactivity is unacceptable
-    
     - **Tier 2: "Climbing Ramp" (1-9 transitions)**: Linear gradient from ~-30 to -8
       Formula: -5.0 - (2.8 × deficit)
-      Provides continuous feedback where each additional transition reduces penalty
+    - **Tier 3: "Success Zone" (≥10 transitions)**: Penalty = 0.0, unlocks R_T
     
-    - **Tier 3: "Success Zone" (≥10 transitions)**: Penalty = 0.0
-      Site is "unlocked" - earns positive R_T reward and potential 1.5× bonus
-    
-    **Additional Protections:**
-    1. **Minimum coverage requirement**: Penalty if fewer than `min_coverage_ratio`
-       of substituents are visited (have non-zero population)
-    
-    2. **Concentration penalty**: Per-site penalty if any single substituent
-       exceeds `concentration_penalty_threshold` of that site's population
-    
-    3. **Entropy-based uniformity bonus**: Rewards more uniform population
-       distributions using Shannon entropy
-    
-    The reward function is:
+    **Reward Components:**
         R = R_P + R_T + R_U + R_entropy + R_penalties
     
     where:
-        R_P: Population balance reward (weighted)
-        R_T: Transition reward (Tier 3 only, weighted, with bonus for high counts)
-        R_U: Coverage uniformity reward (weighted)
+        R_P: Population balance reward × C_F (confidence-scaled)
+        R_T: Transition reward (gated: only if all sites ≥ min_transitions)
+        R_U: Coverage uniformity reward
         R_entropy: Bonus for high-entropy (uniform) distributions
-        R_penalties: Tiered transition penalties + coverage/concentration penalties
+        R_penalties: Tiered transition penalties + shielded secondary penalties
     
     Args:
         combo_dir: Path to combination directory with simulation outputs.
@@ -156,8 +151,11 @@ def compute_msld_reward_improved(
     # Replaces binary threshold with continuous gradient feedback
     penalties = 0.0
     sites_below_threshold = 0
+    min_transitions_across_sites = float('inf')
     
     for site_id, trans_count in site_transitions.items():
+        min_transitions_across_sites = min(min_transitions_across_sites, trans_count)
+        
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
             
@@ -177,18 +175,24 @@ def compute_msld_reward_improved(
     if sites_below_threshold > 0:
         print(f"  Warning: {sites_below_threshold} site(s) below {min_transitions_per_site} transitions")
     
+    # Penalty Shield: I_dead indicator (1 if any site has 0 transitions)
+    # This prevents "double jeopardy" by disabling secondary penalties for frozen simulations
+    I_dead = 1 if min_transitions_across_sites == 0 else 0
+    
     # Check 2: Minimum coverage (fraction of substituents visited)
+    # ONLY APPLIED IF SHIELD IS INACTIVE (I_dead = 0)
     pop_array = np.array(populations)
     nonzero_count = np.sum(pop_array > 0)
     coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
     
-    if coverage_ratio < min_coverage_ratio:
-        # Heavy penalty for low coverage
+    if (1 - I_dead) and coverage_ratio < min_coverage_ratio:
+        # Heavy penalty for low coverage (only if simulation is active)
         deficit = min_coverage_ratio - coverage_ratio
         penalties -= gamma * 20.0 * deficit
         print(f"  Warning: Coverage {coverage_ratio:.2f} below minimum {min_coverage_ratio}")
     
     # Check 3: Detect single-dominant-population per site
+    # ONLY APPLIED IF SHIELD IS INACTIVE (I_dead = 0)
     # Extract actual substituents per site from graph_info.json
     nsubs_per_site = None
     graph_info_path = combo_path / 'graph_info.json'
@@ -223,8 +227,8 @@ def compute_msld_reward_improved(
             total_pop = np.sum(site_pops)
             concentration_ratio = max_pop / total_pop
             
-            # If concentration exceeds threshold: penalty
-            if concentration_ratio > concentration_penalty_threshold:
+            # If concentration exceeds threshold: penalty (only if shield is inactive)
+            if (1 - I_dead) and concentration_ratio > concentration_penalty_threshold:
                 penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
                 print(f"  Warning: Site {site_idx} has {concentration_ratio:.2%} concentration")
         
@@ -232,7 +236,12 @@ def compute_msld_reward_improved(
     
     # ========== POSITIVE REWARD COMPONENTS ==========
     
-    # R_P: Population balance reward
+    # Confidence Factor: Scale population reward based on minimum transitions
+    # C_F = min(1.0, min_transitions / (2 * N_req))
+    # This prevents rewarding low-transition runs with misleading population data
+    confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
+    
+    # R_P: Population balance reward (scaled by confidence factor)
     R_P = 0.0
     if len(populations) > 1:
         nonzero_pops = pop_array[pop_array > 0]
@@ -252,10 +261,12 @@ def compute_msld_reward_improved(
             
             # Normalized population reward (only count non-zero populations)
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-            R_P = w_P * total_pop_normalized * balance_factor
+            
+            # Apply confidence factor to prevent rewarding low-transition runs
+            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
         else:
             # Insufficient coverage: minimal reward proportional to coverage
-            R_P = w_P * 0.01 * coverage_ratio
+            R_P = w_P * 0.01 * coverage_ratio * confidence_factor
     
     # R_T: Transition reward (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
     R_T = 0.0
@@ -301,7 +312,8 @@ def compute_msld_reward_improved(
     print(f"  Reward breakdown: R_P={R_P:.2f}, R_T={R_T:.2f}, R_U={R_U:.2f}, "
           f"R_entropy={R_entropy:.2f}, penalties={penalties:.2f}, total={R:.2f}")
     print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.2%}), "
-          f"Transitions: {list(site_transitions.values())}")
+          f"Transitions: {list(site_transitions.values())}, "
+          f"Confidence: {confidence_factor:.2f}, Shield: {'ACTIVE' if I_dead else 'INACTIVE'}")
     
     return R
 

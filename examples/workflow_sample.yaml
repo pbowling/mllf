@@ -117,7 +117,7 @@ timeout: 1200  # 20 minutes per simulation
 # using the new configuration without re-running simulations. This allows testing
 # different reward functions on the same simulation data ("pretraining" mode).
 reward:
-  # Weights for normalized terms (balanced_positive configuration)
+  # Weights for normalized terms (higher_rewards_v1 configuration)
   w_P: 0.5              # Weight for population term
   w_T: 0.5              # Weight for transition term
   w_U: 0.3              # Weight for uniformity term
@@ -126,7 +126,7 @@ reward:
   gamma: 4.0            # Scaling factor for coverage/concentration penalties
   entropy_bonus: 8.0    # Bonus for uniform distributions
   
-  # Baseline normalization values
+  # Baseline normalization values (lower = higher normalized rewards)
   P_baseline: 500.0     # Expected maximum total population
   T_baseline: 50.0      # Expected maximum total transitions
   

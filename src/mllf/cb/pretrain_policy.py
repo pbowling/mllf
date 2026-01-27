@@ -276,11 +276,11 @@ def compute_reward_from_sim_results(
     w_T: float = 0.5,
     w_U: float = 0.3,
     gamma: float = 4.0,
-    P_baseline: float = 500.0,  # Tested balanced_positive config (best for indolizine)
-    T_baseline: float = 50.0,   # Tested balanced_positive config
+    P_baseline: float = 500.0,  # Updated to higher_rewards_v1 config
+    T_baseline: float = 50.0,   # Updated to higher_rewards_v1 config
     min_transitions_per_site: int = 10,
     min_coverage_ratio: float = 0.5,
-    entropy_bonus: float = 8.0,  # Tested balanced_positive config
+    entropy_bonus: float = 8.0,  # Updated to higher_rewards_v1 config
     concentration_penalty_threshold: float = 0.8,
 ) -> float:
     """Compute reward from simulation results dict using improved reward logic.
@@ -288,13 +288,17 @@ def compute_reward_from_sim_results(
     This implements the same logic as train_improved.py but works with cached
     simulation results instead of reading from output files.
     
+    **New Mechanisms (matches train_improved.py):**
+    - **Penalty Shield (I_dead)**: Disables coverage/concentration penalties when min_transitions = 0
+    - **Confidence Factor (C_F)**: Scales population reward by data reliability
+    
     Uses a **tiered transition penalty system** to provide continuous feedback:
     - **Tier 1: "Death Floor" (0 transitions)**: -40.0 penalty per site
     - **Tier 2: "Climbing Ramp" (1-9 transitions)**: Linear gradient ~-30 to -8
     - **Tier 3: "Success Zone" (≥10 transitions)**: Unlocks R_T reward
     
-    Default parameters match the 'balanced_positive' configuration which achieved
-    the highest rewards (71.53) in testing on indolizine runs with >200 transitions.
+    Default parameters match the 'higher_rewards_v1' configuration which achieved
+    64.10 point separation in testing on indolizine runs (good: 34.11, bad: -29.99).
     
     Args:
         sim_results: Dict with 'populations' and 'transitions' keys
@@ -353,8 +357,15 @@ def compute_reward_from_sim_results(
     trans_array = np.array(trans_per_site[:num_sites], dtype=float)
     total_trans = trans_array.sum()
     
+    # Track minimum transitions across all sites for Penalty Shield and Confidence Factor
+    min_transitions_across_sites = int(trans_array.min())
+    
+    # === PENALTY SHIELD (I_dead) ===
+    # Prevents "double jeopardy" by disabling secondary penalties when sim is frozen
+    I_dead = 1 if min_transitions_across_sites == 0 else 0
+    
     # === STRICT REQUIREMENTS (penalties) ===
-    # Match test_reward_improved.py penalty calculation
+    # Match train_improved.py penalty calculation
     penalties = 0.0
     
     # 1. Tiered transition penalty system
@@ -375,21 +386,23 @@ def compute_reward_from_sim_results(
                 penalties -= (5.0 + 2.8 * deficit)
     
     # 2. Coverage requirement (minimum % of substituents visited)
+    # ONLY applied when shield is INACTIVE (I_dead = 0)
     num_populated = np.count_nonzero(pop_array)
     total_subs = sum(nsubs_per_site)
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
     
-    if coverage_ratio < min_coverage_ratio:
+    if (1 - I_dead) and coverage_ratio < min_coverage_ratio:
         deficit = min_coverage_ratio - coverage_ratio
         penalties -= gamma * 20.0 * deficit
     
     # 3. Concentration penalty (per-site check)
+    # ONLY applied when shield is INACTIVE (I_dead = 0)
     pop_idx = 0
     for site_idx, nsubs in enumerate(nsubs_per_site):
         site_pops = pop_array[pop_idx:pop_idx + nsubs]
         site_total = site_pops.sum()
         
-        if site_total > 0:
+        if (1 - I_dead) and site_total > 0:
             concentration_ratio = site_pops.max() / site_total
             if concentration_ratio > concentration_penalty_threshold:
                 penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
@@ -397,6 +410,10 @@ def compute_reward_from_sim_results(
         pop_idx += nsubs
     
     # === REWARD COMPONENTS ===
+    
+    # Confidence Factor (C_F): Scale population reward by data reliability
+    # Low-transition runs have unreliable population distributions
+    confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
     
     # R_P: Population balance (coefficient of variation - lower is better/more uniform)
     pop_probs = pop_array / total_pop  # Needed for entropy calculation below
@@ -419,10 +436,12 @@ def compute_reward_from_sim_results(
             
             # Normalized population reward (only count non-zero populations)
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-            R_P = w_P * total_pop_normalized * balance_factor
+            
+            # Apply Confidence Factor to scale R_P by data reliability
+            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
         else:
             # Insufficient coverage: minimal reward proportional to coverage
-            R_P = w_P * 0.01 * coverage_ratio
+            R_P = w_P * 0.01 * coverage_ratio * confidence_factor
     
     # R_T: Transitions (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
     if sites_below_threshold == 0:

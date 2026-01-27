@@ -427,20 +427,35 @@ def augment_core_with_excluded_sub1(
     core_rtf_content = core_rtf_path.read_text()
     core_rtf_lines = core_rtf_content.split('\n')
     
-    # Add comment at the top (after existing header comments)
+    # Process the RTF file line by line
     final_rtf_lines = []
     header_done = False
-    atoms_inserted = False
-    bonds_inserted = False
+    last_atom_idx = -1
+    last_bond_idx = -1
+    found_blank_comment = False
     
-    for line in core_rtf_lines:
+    # First pass: find where to insert atoms and bonds
+    for i, line in enumerate(core_rtf_lines):
+        stripped = line.strip()
+        if stripped.startswith('ATOM'):
+            last_atom_idx = i
+        elif stripped.startswith('BOND'):
+            if last_bond_idx == -1:
+                last_bond_idx = i
+            # Keep updating to find the last BOND line
+            elif i == last_bond_idx + 1 or (i > last_bond_idx and not any(core_rtf_lines[j].strip().startswith(('BOND', 'IMPR', 'IC', 'END', 'DELE', 'PATC')) for j in range(last_bond_idx + 1, i))):
+                last_bond_idx = i
+    
+    # Second pass: build the output
+    for i, line in enumerate(core_rtf_lines):
         stripped = line.strip()
         
-        # Add augmentation comment after the header comments (lines starting with *)
-        if not header_done and stripped and not stripped.startswith('*'):
+        # Replace the first blank comment line (* followed by nothing/whitespace) with augmentation comment
+        if not header_done and line.strip() == '*':
             final_rtf_lines.append('* Core augmented with atoms from excluded site\'s first substituent for single-site combination')
-            final_rtf_lines.append('* ')
+            final_rtf_lines.append('* ')  # Add blank comment line after augmentation comment
             header_done = True
+            continue  # Skip the original blank comment line
         
         # Update RESI charge
         if stripped.startswith('RESI'):
@@ -453,21 +468,15 @@ def augment_core_with_excluded_sub1(
         
         final_rtf_lines.append(line)
         
-        # Insert atoms after the last original ATOM line (before BOND section)
-        if not atoms_inserted and sub1_atoms and stripped.startswith('BOND'):
-            # Insert atoms before the first BOND line
-            final_rtf_lines.insert(-1, '')
-            for atom_line in reversed(sub1_atoms):
-                final_rtf_lines.insert(-1, atom_line)
-            atoms_inserted = True
+        # Insert sub1 atoms after the last original ATOM line
+        if i == last_atom_idx and sub1_atoms:
+            for atom_line in sub1_atoms:
+                final_rtf_lines.append(atom_line)
         
-        # Insert bonds after the last original BOND line (before PATCH/IMPR/IC/END)
-        if not bonds_inserted and sub1_bonds and atoms_inserted and stripped.startswith(('PATCH', 'IMPR', 'IC', 'END', 'DELE')):
-            # Insert bonds before PATCH/END line
-            final_rtf_lines.insert(-1, '')
-            for bond_line in reversed(sub1_bonds):
-                final_rtf_lines.insert(-1, bond_line)
-            bonds_inserted = True
+        # Insert sub1 bonds after the last original BOND line
+        if i == last_bond_idx and sub1_bonds:
+            for bond_line in sub1_bonds:
+                final_rtf_lines.append(bond_line)
     
     core_rtf_path.write_text('\n'.join(final_rtf_lines))
     
