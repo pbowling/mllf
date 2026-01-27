@@ -152,6 +152,49 @@ Example: With 5 subs at site1 (75 selections) and 6 subs at site2 (186 selection
 * Cross-site: 75 × 186 = **13,950 combinations**
 * Total: **14,211 combinations**
 
+Single-Site Core Augmentation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When generating **single-site pair combinations** (e.g., testing only site1 pairs while
+site2 is excluded), the core structure must include atoms from the excluded site's first
+substituent to maintain the complete molecular structure.
+
+The combination generator automatically augments ``core.rtf`` and ``core.pdb`` for
+single-site combinations:
+
+.. code-block:: text
+
+   # Example: comb_0001_site1_1__site1_2 (site2 excluded)
+   
+   # Original core.rtf:
+   RESI  LIG    -0.012
+   ATOM C001 CG2R61  -0.120335 
+   ATOM H002 HGR61    0.114301
+   BOND C001 H002
+   
+   # Augmented core.rtf (adds site2_sub1 atoms):
+   * Core augmented with atoms from excluded site's first substituent for single-site combination
+   * 
+   RESI  LIG    -0.002000   # Charge updated: -0.012 + 0.010 from site2_sub1
+   ATOM C001 CG2R61  -0.120335 
+   ATOM H002 HGR61    0.114301
+   ATOM C062 CG2R61  -0.110800  # From site2_sub1
+   ATOM H063 HGR61    0.121200   # From site2_sub1
+   BOND C001 H002
+   BOND C001 C062  # From site2_sub1
+   BOND C003 C062  # From site2_sub1
+   BOND C062 H063  # From site2_sub1
+
+This ensures that:
+
+* CHARMM simulations run successfully with proper energy landscapes
+* Single-site combinations have the correct molecular topology
+* Core structure includes all necessary atoms for simulation
+
+The augmentation is performed automatically during combination directory creation and
+only applies to single-site combinations. Cross-site combinations (involving multiple
+sites) already have complete core structures and are not modified.
+
 Lazy Directory Creation
 ^^^^^^^^^^^^^^^^^^^^^^^
 

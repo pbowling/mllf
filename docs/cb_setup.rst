@@ -253,22 +253,123 @@ Training Loop Example
 Reward Function
 ^^^^^^^^^^^^^^^
 
-The reward is computed from simulation outputs:
+The reward function balances multiple simulation objectives using a tiered system with
+protections against double jeopardy and unreliable data.
+
+**Improved Reward Structure** (``compute_msld_reward_improved``):
 
 .. code-block:: python
 
-   def compute_reward(sim_results):
-       # Transition counts (more is better)
-       total_transitions = sum(sim_results['transitions'].values())
+   def compute_msld_reward_improved(
+       run_dir,
+       w_P=0.5,           # Population balance weight
+       w_T=0.5,           # Transition count weight  
+       w_U=0.3,           # Coverage uniformity weight
+       gamma=4.0,         # Penalty scaling factor
+       P_baseline=500.0,  # Population normalization (lower = higher rewards)
+       T_baseline=50.0,   # Transition normalization (lower = higher rewards)
+       min_transitions_per_site=10,  # Threshold for "Success Zone"
+       min_coverage_ratio=0.5,       # Minimum % of substituents visited
+       entropy_bonus=8.0,            # Bonus for uniform distributions
+       concentration_penalty_threshold=0.8  # Max concentration ratio
+   ):
+       # Parse simulation outputs
+       populations = parse_populations(run_dir)
+       transitions = parse_transitions(run_dir)
        
-       # Population coverage (more blocks visited is better)
-       total_blocks = len(sim_results['population'])
-       nonzero_blocks = sum(1 for p in sim_results['population'].values() 
-                           if p['counts'])
-       coverage = nonzero_blocks / total_blocks if total_blocks > 0 else 0
+       # Track minimum transitions across all sites
+       min_transitions_across_sites = min(transitions.values())
        
-       # Combined reward
-       return w_trans * total_transitions + w_pop * coverage
+       # === PENALTY SHIELD (I_dead) ===
+       # Prevents "double jeopardy" for frozen simulations
+       I_dead = 1 if min_transitions_across_sites == 0 else 0
+       
+       # === TIERED TRANSITION PENALTIES ===
+       penalties = 0.0
+       for site, trans in transitions.items():
+           if trans == 0:
+               penalties -= 40.0  # Tier 1: "Death Floor"
+           elif trans < min_transitions_per_site:
+               deficit = min_transitions_per_site - trans
+               penalties -= (5.0 + 2.8 * deficit)  # Tier 2: "Climbing Ramp"
+           # Tier 3: "Success Zone" (>=10) gets no penalty
+       
+       # === CONFIDENCE FACTOR (C_F) ===
+       # Scale population rewards by data reliability
+       confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
+       
+       # === REWARD COMPONENTS ===
+       
+       # R_P: Population balance (scaled by confidence)
+       pop_array = np.array(list(populations.values()))
+       nonzero_pops = pop_array[pop_array > 0]
+       if len(nonzero_pops) > 1:
+           cv = np.std(nonzero_pops) / np.mean(nonzero_pops)
+           balance_factor = np.exp(-cv)
+           total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
+           R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
+       else:
+           R_P = 0.0
+       
+       # R_T: Transitions (only if all sites meet threshold)
+       sites_below_threshold = sum(1 for t in transitions.values() 
+                                  if t < min_transitions_per_site)
+       if sites_below_threshold == 0:
+           total_trans = sum(transitions.values())
+           R_T = w_T * (total_trans / T_baseline)
+       else:
+           R_T = 0.0
+       
+       # R_U: Coverage uniformity
+       coverage_ratio = len(nonzero_pops) / len(populations)
+       R_U = w_U * coverage_ratio
+       
+       # R_entropy: Shannon entropy bonus
+       pop_probs = pop_array / pop_array.sum()
+       entropy = -np.sum(pop_probs * np.log(pop_probs + 1e-10))
+       max_entropy = np.log(len(pop_probs))
+       R_entropy = entropy_bonus * (entropy / max_entropy)
+       
+       # === SECONDARY PENALTIES (only when shield inactive) ===
+       if (1 - I_dead):
+           # Coverage penalty
+           if coverage_ratio < min_coverage_ratio:
+               deficit = min_coverage_ratio - coverage_ratio
+               penalties -= gamma * 20.0 * deficit
+           
+           # Concentration penalty (per-site check)
+           for site_pops in get_site_populations(populations):
+               concentration = max(site_pops) / sum(site_pops)
+               if concentration > concentration_penalty_threshold:
+                   penalties -= gamma * 5.0 * (concentration - concentration_penalty_threshold)
+       
+       # Total reward
+       reward = R_P + R_T + R_U + R_entropy + penalties
+       return reward
+
+**Key Mechanisms**:
+
+* **Penalty Shield (I_dead)**: When ``min_transitions_across_sites = 0``, disables secondary
+  penalties (coverage, concentration) to prevent "double jeopardy" on frozen simulations.
+
+* **Confidence Factor (C_F)**: Scales population rewards by ``min(1.0, min_transitions / (2*N_req))``.
+  Low-transition runs (1-5 transitions) have unreliable population distributions and receive
+  reduced ``R_P`` accordingly.
+
+* **Tiered Transition Penalties**: Provides continuous gradient feedback instead of binary
+  thresholds:
+  
+  - Tier 1 "Death Floor" (0 trans): -40.0 penalty per site
+  - Tier 2 "Climbing Ramp" (1-9 trans): -30.2 to -7.8 (linear gradient)
+  - Tier 3 "Success Zone" (≥10 trans): 0.0 penalty, unlocks ``R_T`` reward
+
+**Default Configuration** (higher_rewards_v1):
+
+Tested on indolizine pretraining data with 64.10 point separation between good and bad runs:
+
+* ``w_P=0.5, w_T=0.5, w_U=0.3``
+* ``gamma=4.0, P_baseline=500, T_baseline=50``
+* ``entropy_bonus=8.0, min_transitions_per_site=10``
 
 Higher rewards indicate better bias coefficients that improve sampling efficiency.
 
