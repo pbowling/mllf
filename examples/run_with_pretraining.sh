@@ -10,6 +10,13 @@
 # - Collected pretraining data in pretraining/* subdirectories
 # - workflow_pretrain.yaml with matching model architecture
 # - mllf conda environment activated
+#
+# IMPORTANT: Policy architecture updated (Jan 2026)
+# - New: Separate heads per bias type (4 heads: quadratic, skew, end, linear)
+# - New: Output scaling to [-20, 20] range via tanh
+# - New: Increased exploration (log_std max = 3.5, std up to ~33)
+# - Action: Old pretrained models are NOT compatible - must retrain
+# - Benefit: Better bias magnitude predictions and faster learning
 
 set -e  # Exit on error
 
@@ -50,7 +57,7 @@ echo ""
 
 # Auto-detect all subdirectories in pretraining/
 # Note: Pretraining selects BEST run per system (highest reward)
-# Exception: Systems with 'best' or 'combos' in name use all runs
+# Exception: Systems with 'combos' in name use all runs (already filtered to best per combo)
 total_systems=0
 total_runs_available=0
 total_runs_used=0
@@ -64,8 +71,8 @@ for dataset_dir in $PRETRAIN_DIR/*/; do
             total_runs_available=$((total_runs_available + count))
             
             # Check if this system uses all runs or just best run
-            if [[ "$dataset_name" == *"best"* ]] || [[ "$dataset_name" == *"combos"* ]]; then
-                echo "  - $dataset_name: $count runs (all used)"
+            if [[ "$dataset_name" == *"combos"* ]]; then
+                echo "  - $dataset_name: $count combos (all used, already best per combo)"
                 total_runs_used=$((total_runs_used + count))
             else
                 echo "  - $dataset_name: $count runs (best 1 used)"
@@ -107,7 +114,8 @@ for dataset_dir in sorted(pretrain_dir.glob("*/")):
     
     dataset_name = dataset_dir.name
     
-    # Special case: 14benz_pair_combos has nested combo directories
+    # Special case: 14benz_pair_combos has nested comb_*/run_* structure
+    # These are already the best runs from training, so we include all of them
     if dataset_name == "14benz_pair_combos":
         for combo_dir in sorted(dataset_dir.glob("comb_*")):
             if not combo_dir.is_dir():
@@ -134,10 +142,10 @@ for dataset_dir in sorted(pretrain_dir.glob("*/")):
                     with open(sim_file) as f:
                         sim_results = json.load(f)
                     
-                    num_sites = metadata.get("num_sites", 2)
+                    num_sites = metadata.get("num_sites", 1)
                     num_subs = metadata.get("num_substituents", 2)
-                    # For pair combos, each site has 1 substituent
-                    nsubs_per_site = [1, 1] if num_sites == 2 else [num_subs]
+                    # For pair combos, typically single site with 2 substituents
+                    nsubs_per_site = [num_subs]
                     
                     reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
                     
@@ -227,13 +235,7 @@ while IFS= read -r system_name; do
     dataset_dir="$PRETRAIN_DIR/$system_name"
     if [ -d "$dataset_dir" ]; then
         pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
-        # Count runs for this system
-        if [[ "$system_name" == *"best"* ]] || [[ "$system_name" == *"combos"* ]]; then
-            count=$(find "$dataset_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-            total_runs_used=$((total_runs_used + count))
-        else
-            total_runs_used=$((total_runs_used + 1))
-        fi
+        total_runs_used=$((total_runs_used + 1))
     fi
 done < /tmp/pretrain_good_systems.txt
 

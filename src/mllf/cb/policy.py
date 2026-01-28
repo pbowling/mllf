@@ -15,32 +15,69 @@ import torch.nn.functional as F
 
 
 class EdgeValueMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 64, out_dim: int = 1):
-        """Simple MLP producing `out_dim` outputs per input.
-
-        Note: callers may request `out_dim = D*2` so the output can be split
-        into means and log-stds for D predicted coefficients.
+    def __init__(self, in_dim: int, hidden: int = 64, num_bias_types: int = 4):
+        """MLP with shared trunk and separate heads per bias type.
+        
+        Architecture:
+        - Shared trunk: processes concatenated node embeddings
+        - Separate heads: one per bias type (quadratic, skew, end, linear)
+        - Each head outputs (mean, log_std) for its bias type
+        
+        Args:
+            in_dim: Input dimension (typically 2*emb_dim + edge_feat_dim)
+            hidden: Hidden layer size
+            num_bias_types: Number of bias types (default: 4)
         """
         super().__init__()
-        self.net = nn.Sequential(
+        self.num_bias_types = num_bias_types
+        
+        # Shared trunk - deeper network for better representation learning
+        self.trunk = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, out_dim)
+            nn.Linear(hidden, hidden),
+            nn.ReLU()
         )
+        
+        # Separate heads for each bias type
+        # Each head outputs 2 values: mean and log_std
+        self.heads = nn.ModuleList([
+            nn.Linear(hidden, 2) for _ in range(num_bias_types)
+        ])
 
     def forward(self, x):
-        return self.net(x)
+        """Forward pass with separate heads.
+        
+        Returns:
+            Tensor [E, 2*num_bias_types] with means and log_stds concatenated:
+            [mean_1, mean_2, ..., mean_D, logstd_1, logstd_2, ..., logstd_D]
+        """
+        # Shared representation
+        h = self.trunk(x)  # [E, hidden]
+        
+        # Apply each head
+        head_outputs = [head(h) for head in self.heads]  # List of [E, 2] tensors
+        
+        # Stack and split into means and log_stds
+        stacked = torch.stack(head_outputs, dim=1)  # [E, num_bias_types, 2]
+        means = stacked[:, :, 0]  # [E, num_bias_types]
+        log_stds = stacked[:, :, 1]  # [E, num_bias_types]
+        
+        # Concatenate to match expected output format [mean_1...mean_D, logstd_1...logstd_D]
+        out = torch.cat([means, log_stds], dim=-1)  # [E, 2*num_bias_types]
+        
+        return out
 
 
 class EdgePolicy(nn.Module):
-    def __init__(self, encoder: nn.Module, emb_dim: int, edge_feat_dim: int = 0, mlp_hidden: int = 64, mlp_out_dim: int = 1):
+    def __init__(self, encoder: nn.Module, emb_dim: int, edge_feat_dim: int = 0, mlp_hidden: int = 64, mlp_out_dim: int = 4):
         super().__init__()
         self.encoder = encoder
         # input to edge-mlp is concat([emb_u, emb_v, edge_feat])
-        # mlp_out_dim controls how many coefficients per directed edge
-        # The MLP produces D means and D log-stds concatenated -> 2*D outputs
+        # mlp_out_dim controls how many coefficients per directed edge (bias types)
+        # The MLP uses separate heads for each bias type
         self.mlp_out_dim = int(mlp_out_dim)
-        self.edge_mlp = EdgeValueMLP(2 * emb_dim + edge_feat_dim, mlp_hidden, self.mlp_out_dim * 2)
+        self.edge_mlp = EdgeValueMLP(2 * emb_dim + edge_feat_dim, mlp_hidden, num_bias_types=self.mlp_out_dim)
 
     def forward_node_embeddings(self, x, edge_index, edge_type):
         return self.encoder(x, edge_index, edge_type)
@@ -70,9 +107,14 @@ class EdgePolicy(nn.Module):
             D = C // 2 if C >= 2 else 1
         mean = out[:, :D]
         log_std = out[:, D: D + D]
+        
+        # Scale mean outputs to expected bias coefficient range using tanh
+        # This constrains outputs to [-20, 20] which covers typical MSLD bias magnitudes
+        mean = torch.tanh(mean) * 20.0
+        
         # Clamp log_std to prevent extreme standard deviations that can cause NaN
-        # exp(-20) ≈ 2e-9, exp(2) ≈ 7.4 — reasonable range for std deviation
-        log_std = torch.clamp(log_std, min=-20.0, max=2.0)
+        # exp(-20) ≈ 2e-9, exp(3.5) ≈ 33 — allows wider exploration than previous max=2.0
+        log_std = torch.clamp(log_std, min=-20.0, max=3.5)
         return mean, log_std
 
     def get_actions(self, x, edge_index, edge_type, edge_feat: Optional[torch.Tensor] = None, deterministic: bool = False):

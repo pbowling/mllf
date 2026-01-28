@@ -4,15 +4,18 @@
 # After pretraining, use workflow_sample.yaml with pretrain.model_path set
 
 # Training configuration (must match your main workflow config)
+# Note: Policy uses separate heads architecture (one per bias type)
+# mlp_out_dim is automatically computed from relation_names (typically 4: quadratic, skew, end, linear)
 training:
   encoder:
-    hidden_dims: [64, 64]
-    out_dim: 32
+    hidden_dims: [64, 64]  # RGCN hidden layers
+    out_dim: 32             # Node embedding dimension
   policy:
-    mlp_hidden: 64
+    mlp_hidden: 64          # Hidden units in shared trunk (before separate heads)
+    # mlp_out_dim: 4        # Auto-computed: number of bias types (quadratic, skew, end, linear)
   optimizer:
     lr: 0.001
-  bias_clip: 1000.0
+  bias_clip: 1000.0         # Clip bias coefficients to [-1000, 1000] (policy outputs scaled to [-20, 20])
 
 # Reward configuration (improved reward function with tiered transition penalties)
 # Using higher_rewards_v1 configuration

@@ -5,7 +5,7 @@
 # Combination generation
 create_combos:
   input_dir: /home/pbowling/mllf/examples/14benz
-  out_dir: /home/pbowling/mllf/examples/14benz/generated_combos
+  out_dir: /home/pbowling/mllf/examples/14benz/generated_combos_no_pretraining
   include_patterns:
     - msld_flat.py
 
@@ -16,7 +16,7 @@ split:
   seed: 42
 
 pretrain:
-  model_path: /home/pbowling/mllf/examples/models/pretraining/best_policy.pt
+  model_path: null  # No pretraining; train from scratch
 
 # Curriculum learning configuration (progressive training complexity)
 curriculum:
@@ -83,21 +83,15 @@ vocabulary:
   warn_missing_types: true
 
 # Training configuration
-# Policy architecture: Separate heads per bias type with output scaling
-# - Shared trunk: 2 layers with ReLU (deeper than previous 1 layer)
-# - Separate heads: One per bias type (quadratic, skew, end, linear)
-# - Output scaling: Mean values scaled to [-20, 20] via tanh
-# - Exploration: log_std clamped to [-20, 3.5] (std up to ~33)
 training:
   encoder:
-    hidden_dims: [64, 64]  # RGCN hidden layers for node embeddings
-    out_dim: 32             # Node embedding dimension
+    hidden_dims: [64, 64]
+    out_dim: 32
   policy:
-    mlp_hidden: 64          # Hidden units in shared trunk (before separate heads)
-    # mlp_out_dim: 4        # Auto-computed: number of bias types (typically 4)
+    mlp_hidden: 64
   optimizer:
-    lr: 0.001               # Learning rate for Adam optimizer
-  bias_clip: 1000.0         # Clip final bias values (policy outputs scaled to [-20, 20])
+    lr: 0.001
+  bias_clip: 1000.0  # Maximum absolute value for bias coefficients
   
 # Simulation configuration
 run_sims: true
@@ -135,7 +129,7 @@ reward:
 
 # Output organization
 output:
-  base_dir: /home/pbowling/mllf/examples/14benz/training_output
+  base_dir: /home/pbowling/mllf/examples/14benz/training_output_no_pretraining
   save_checkpoints: true
   checkpoint_freq: 5  # Save checkpoint every 5 epochs
 

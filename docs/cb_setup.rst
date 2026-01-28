@@ -171,7 +171,48 @@ separate transformation matrices for each interaction type.
 Edge Policy
 ^^^^^^^^^^^
 
-Per-edge coefficients are predicted by an edge-level MLP:
+Per-edge coefficients are predicted by an edge-level policy network with **separate heads**
+architecture. This design allows specialized predictions for each bias type while sharing
+common feature representations.
+
+**Architecture Overview**:
+
+The ``EdgeValueMLP`` uses a two-stage design:
+
+1. **Shared Trunk**: Two-layer MLP that processes concatenated node embeddings
+   
+   * Input: Concatenated node features [h_i, h_j] from encoder
+   * Layer 1: Linear(in_dim → 64) + ReLU
+   * Layer 2: Linear(64 → 64) + ReLU
+   * Output: 64-dimensional shared representation
+
+2. **Separate Heads**: Independent linear layers per bias type
+   
+   * 4 heads (one per bias type: linear, quadratic, skew, end)
+   * Each head: Linear(64 → 2) outputting [mean, log_std]
+   * Total output: 8 values per edge (4 means + 4 log_stds)
+
+**Key Features**:
+
+* **Output Scaling**: Mean predictions are scaled to [-20, 20] via ``tanh(mean) * 20.0``
+  
+  - Ensures bias magnitudes are in physically meaningful ranges
+  - Provides smooth gradients during training
+  - Eliminates need to learn scale from scratch
+
+* **Enhanced Exploration**: Log standard deviation clamped to [-20, 3.5]
+  
+  - Standard deviation range: [~0, 33]
+  - 4.5× larger than previous architecture (std ~7.4)
+  - Enables discovery of larger bias magnitudes during early training
+
+* **Specialized Predictions**: Each bias type gets its own predictor head
+  
+  - Reduces interference between different bias types
+  - Allows learning type-specific patterns
+  - Improves sample efficiency
+
+**Usage Example**:
 
 .. code-block:: python
 
@@ -193,17 +234,32 @@ Per-edge coefficients are predicted by an edge-level MLP:
 
 The policy outputs:
 
-* ``actions``: Sampled coefficient values (one per directed edge)
+* ``actions``: Sampled coefficient values (shape: [num_edges, 4])
 * ``logp``: Log-probabilities for REINFORCE updates
-* ``mean``: Mean of the Gaussian distribution per edge
-* ``log_std``: Log standard deviation per edge
+* ``mean``: Mean of the Gaussian distribution per edge per bias type (scaled to [-20, 20])
+* ``log_std``: Log standard deviation per edge per bias type (clamped to [-20, 3.5])
 
-Each directed edge receives its own Gaussian distribution, and actions are sampled
-independently per edge:
+Each directed edge receives 4 independent Gaussian distributions (one per bias type),
+and actions are sampled independently:
 
 .. math::
 
-   v_{ij} \\sim \\mathcal{N}(\\mu_{ij}, \\sigma_{ij}^2)
+   v_{ij}^{(k)} \\sim \\mathcal{N}(\\mu_{ij}^{(k)}, (\\sigma_{ij}^{(k)})^2)
+
+where :math:`k \\in \\{\\text{linear, quadratic, skew, end}\\}`.
+
+**Architecture Update (January 2026)**:
+
+The separate heads architecture replaced the previous single-head design. Key improvements:
+
+* Bias magnitudes now correctly scaled (e.g., -16 instead of -3)
+* Wider exploration range allows discovering optimal large-magnitude biases
+* Specialized heads reduce learning interference between bias types
+* ~4k additional parameters (167k total vs 163k) for improved expressiveness
+
+.. note::
+   Models trained with the old architecture are **not compatible** with the new separate 
+   heads design. Pretrained models must be retrained using the updated architecture.
 
 Training with REINFORCE
 ~~~~~~~~~~~~~~~~~~~~~~~
