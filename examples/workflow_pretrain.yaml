@@ -4,7 +4,13 @@
 # After pretraining, use workflow_sample.yaml with pretrain.model_path set
 
 # Training configuration (must match your main workflow config)
-# Note: Policy uses separate heads architecture (one per bias type)
+# Architecture: Bias-type embeddings + separate heads for forced specialization
+# - Shared trunk: 1 layer (lightweight)
+# - Bias-type embeddings: Learnable 16-dim vectors providing unique context per head
+# - Separate heads: Deep 3-layer networks receiving [trunk_out, bias_embedding]
+# - Output scaling: [Linear ±79, Quadratic ±163, Skew ±11, End ±7]
+# - Exploration: log_std max = 2.0 (std up to ~7.4)  
+# - Action clipping: Enforces scaling limits × 1.05
 # mlp_out_dim is automatically computed from relation_names (typically 4: quadratic, skew, end, linear)
 training:
   encoder:
@@ -15,7 +21,7 @@ training:
     # mlp_out_dim: 4        # Auto-computed: number of bias types (quadratic, skew, end, linear)
   optimizer:
     lr: 0.001
-  bias_clip: 1000.0         # Clip bias coefficients to [-1000, 1000] (policy outputs scaled to [-20, 20])
+  bias_clip: 1000.0         # Safety net (policy clips to [±83, ±171, ±11.6, ±7.4] per bias type)
 
 # Reward configuration (improved reward function with tiered transition penalties)
 # Using higher_rewards_v1 configuration
