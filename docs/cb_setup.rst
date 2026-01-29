@@ -65,6 +65,11 @@ Graphs are built using one of two methods:
    automatically detected from filenames. You can override this behavior using the 
    ``solvent_override`` parameter with values: ``'gas'``/``'vacuum'``, ``'solv'``/``'solvent'``, 
    or ``'protein'``.
+   
+   .. note::
+      While ``'gas'``/``'vacuum'`` is still accepted for compatibility, it has been 
+      deprecated as a distinct environment encoding in node features. Vacuum environments 
+      are now represented as neither solvent nor protein (both flags set to 0.0).
 
 2. **From variables.py** (fallback):
    
@@ -91,25 +96,35 @@ For neural network training, graphs are converted to PyTorch Geometric format:
 
 **Node Features**: Each node is represented by a feature vector with:
 
-* Total molecular charge (float)
-* Binary indicators for environment type (one-hot encoded):
+* Total molecular charge (float) - sum of partial charges in the substituent
+* Binary indicators for environment type:
   
-  - Vacuum/gas environment
-  - Solvent/water environment  
-  - Protein environment
+  - ``is_solvent``: 1.0 for solvent/water environment, 0.0 otherwise
+  - ``is_protein``: 1.0 for protein environment, 0.0 otherwise
+  - Note: Vacuum/gas environments have both flags set to 0.0 (deprecated as explicit encoding)
 
-* Multi-hot encoding of distinct atom types present in the substituent
-  (e.g., CG2R61, HGR61, NG2R60 from CHARMM force field)
+* Multi-hot encoding of chemical elements present in the substituent 
+  (e.g., C, H, N, O from the periodic table)
+* Multi-hot encoding of distinct CHARMM atom types present in the substituent
+  (e.g., CG2R61, HGR61, NG2R60)
 
-**Atom Type Vocabulary**: The vocabulary is loaded from CHARMM toppar files
-in the ``toppar/`` directory, which contain MASS entries defining all possible
-atom types (default: 333 types). This ensures:
+This two-level encoding provides both coarse-grained (element) and fine-grained 
+(atom type) chemical information while being more efficient than a single large 
+encoding.
+
+**Vocabularies**: The vocabularies are loaded from CHARMM toppar files
+in the ``toppar/`` directory, which contain MASS entries defining atom types 
+and their corresponding elements. By default, only CGenFF is loaded:
+
+* **Element vocabulary**: 14 elements (Al, B, Br, C, Cl, F, H, I, N, O, P, S, Se, X)
+* **Atom type vocabulary**: 161 CGenFF atom types
+* **Total feature dimensions**: ``3 + 14 + 161 = 178`` for CGenFF only
+
+This ensures:
 
 * Consistent feature dimensions across all graphs
 * No vocabulary mismatch between training and inference
-* Support for unseen atom types during deployment
-
-The total feature dimension is ``4 + 333 = 337`` by default.
+* Support for unseen atom types during deployment (with warnings)
 
 **Important**: Each undirected edge is expanded into **two directed edges**:
 
@@ -123,6 +138,9 @@ The ``extras`` dict contains:
 
 * ``relation_names``: List mapping relation indices to names
 * ``base_relation_map``: Dict mapping base types to (forward, backward) relation names
+* ``atom_type_vocab``: Dict mapping atom type strings to feature indices
+* ``element_vocab``: Dict mapping element symbols to feature indices
+* ``atom_to_element``: Dict mapping atom types to their elements
 
 Policy Network Architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -136,6 +154,8 @@ Node embeddings are computed using a Relational Graph Convolutional Network:
 
    from mllf.cb.rgcn import RGCNEncoder
    
+   # input_features = 3 + len(element_vocab) + len(atom_type_vocab)
+   # For CGenFF only: 3 + 14 + 161 = 178
    encoder = RGCNEncoder(
        in_dim=input_features,
        hidden_dims=[64, 64],
@@ -151,7 +171,48 @@ separate transformation matrices for each interaction type.
 Edge Policy
 ^^^^^^^^^^^
 
-Per-edge coefficients are predicted by an edge-level MLP:
+Per-edge coefficients are predicted by an edge-level policy network with **separate heads**
+architecture. This design allows specialized predictions for each bias type while sharing
+common feature representations.
+
+**Architecture Overview**:
+
+The ``EdgeValueMLP`` uses a two-stage design:
+
+1. **Shared Trunk**: Two-layer MLP that processes concatenated node embeddings
+   
+   * Input: Concatenated node features [h_i, h_j] from encoder
+   * Layer 1: Linear(in_dim → 64) + ReLU
+   * Layer 2: Linear(64 → 64) + ReLU
+   * Output: 64-dimensional shared representation
+
+2. **Separate Heads**: Independent linear layers per bias type
+   
+   * 4 heads (one per bias type: linear, quadratic, skew, end)
+   * Each head: Linear(64 → 2) outputting [mean, log_std]
+   * Total output: 8 values per edge (4 means + 4 log_stds)
+
+**Key Features**:
+
+* **Output Scaling**: Mean predictions are scaled to [-20, 20] via ``tanh(mean) * 20.0``
+  
+  - Ensures bias magnitudes are in physically meaningful ranges
+  - Provides smooth gradients during training
+  - Eliminates need to learn scale from scratch
+
+* **Enhanced Exploration**: Log standard deviation clamped to [-20, 3.5]
+  
+  - Standard deviation range: [~0, 33]
+  - 4.5× larger than previous architecture (std ~7.4)
+  - Enables discovery of larger bias magnitudes during early training
+
+* **Specialized Predictions**: Each bias type gets its own predictor head
+  
+  - Reduces interference between different bias types
+  - Allows learning type-specific patterns
+  - Improves sample efficiency
+
+**Usage Example**:
 
 .. code-block:: python
 
@@ -173,17 +234,32 @@ Per-edge coefficients are predicted by an edge-level MLP:
 
 The policy outputs:
 
-* ``actions``: Sampled coefficient values (one per directed edge)
+* ``actions``: Sampled coefficient values (shape: [num_edges, 4])
 * ``logp``: Log-probabilities for REINFORCE updates
-* ``mean``: Mean of the Gaussian distribution per edge
-* ``log_std``: Log standard deviation per edge
+* ``mean``: Mean of the Gaussian distribution per edge per bias type (scaled to [-20, 20])
+* ``log_std``: Log standard deviation per edge per bias type (clamped to [-20, 3.5])
 
-Each directed edge receives its own Gaussian distribution, and actions are sampled
-independently per edge:
+Each directed edge receives 4 independent Gaussian distributions (one per bias type),
+and actions are sampled independently:
 
 .. math::
 
-   v_{ij} \\sim \\mathcal{N}(\\mu_{ij}, \\sigma_{ij}^2)
+   v_{ij}^{(k)} \\sim \\mathcal{N}(\\mu_{ij}^{(k)}, (\\sigma_{ij}^{(k)})^2)
+
+where :math:`k \\in \\{\\text{linear, quadratic, skew, end}\\}`.
+
+**Architecture Update (January 2026)**:
+
+The separate heads architecture replaced the previous single-head design. Key improvements:
+
+* Bias magnitudes now correctly scaled (e.g., -16 instead of -3)
+* Wider exploration range allows discovering optimal large-magnitude biases
+* Specialized heads reduce learning interference between bias types
+* ~4k additional parameters (167k total vs 163k) for improved expressiveness
+
+.. note::
+   Models trained with the old architecture are **not compatible** with the new separate 
+   heads design. Pretrained models must be retrained using the updated architecture.
 
 Training with REINFORCE
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -233,22 +309,123 @@ Training Loop Example
 Reward Function
 ^^^^^^^^^^^^^^^
 
-The reward is computed from simulation outputs:
+The reward function balances multiple simulation objectives using a tiered system with
+protections against double jeopardy and unreliable data.
+
+**Improved Reward Structure** (``compute_msld_reward_improved``):
 
 .. code-block:: python
 
-   def compute_reward(sim_results):
-       # Transition counts (more is better)
-       total_transitions = sum(sim_results['transitions'].values())
+   def compute_msld_reward_improved(
+       run_dir,
+       w_P=0.5,           # Population balance weight
+       w_T=0.5,           # Transition count weight  
+       w_U=0.3,           # Coverage uniformity weight
+       gamma=4.0,         # Penalty scaling factor
+       P_baseline=500.0,  # Population normalization (lower = higher rewards)
+       T_baseline=50.0,   # Transition normalization (lower = higher rewards)
+       min_transitions_per_site=10,  # Threshold for "Success Zone"
+       min_coverage_ratio=0.5,       # Minimum % of substituents visited
+       entropy_bonus=8.0,            # Bonus for uniform distributions
+       concentration_penalty_threshold=0.8  # Max concentration ratio
+   ):
+       # Parse simulation outputs
+       populations = parse_populations(run_dir)
+       transitions = parse_transitions(run_dir)
        
-       # Population coverage (more blocks visited is better)
-       total_blocks = len(sim_results['population'])
-       nonzero_blocks = sum(1 for p in sim_results['population'].values() 
-                           if p['counts'])
-       coverage = nonzero_blocks / total_blocks if total_blocks > 0 else 0
+       # Track minimum transitions across all sites
+       min_transitions_across_sites = min(transitions.values())
        
-       # Combined reward
-       return w_trans * total_transitions + w_pop * coverage
+       # === PENALTY SHIELD (I_dead) ===
+       # Prevents "double jeopardy" for frozen simulations
+       I_dead = 1 if min_transitions_across_sites == 0 else 0
+       
+       # === TIERED TRANSITION PENALTIES ===
+       penalties = 0.0
+       for site, trans in transitions.items():
+           if trans == 0:
+               penalties -= 40.0  # Tier 1: "Death Floor"
+           elif trans < min_transitions_per_site:
+               deficit = min_transitions_per_site - trans
+               penalties -= (5.0 + 2.8 * deficit)  # Tier 2: "Climbing Ramp"
+           # Tier 3: "Success Zone" (>=10) gets no penalty
+       
+       # === CONFIDENCE FACTOR (C_F) ===
+       # Scale population rewards by data reliability
+       confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
+       
+       # === REWARD COMPONENTS ===
+       
+       # R_P: Population balance (scaled by confidence)
+       pop_array = np.array(list(populations.values()))
+       nonzero_pops = pop_array[pop_array > 0]
+       if len(nonzero_pops) > 1:
+           cv = np.std(nonzero_pops) / np.mean(nonzero_pops)
+           balance_factor = np.exp(-cv)
+           total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
+           R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
+       else:
+           R_P = 0.0
+       
+       # R_T: Transitions (only if all sites meet threshold)
+       sites_below_threshold = sum(1 for t in transitions.values() 
+                                  if t < min_transitions_per_site)
+       if sites_below_threshold == 0:
+           total_trans = sum(transitions.values())
+           R_T = w_T * (total_trans / T_baseline)
+       else:
+           R_T = 0.0
+       
+       # R_U: Coverage uniformity
+       coverage_ratio = len(nonzero_pops) / len(populations)
+       R_U = w_U * coverage_ratio
+       
+       # R_entropy: Shannon entropy bonus
+       pop_probs = pop_array / pop_array.sum()
+       entropy = -np.sum(pop_probs * np.log(pop_probs + 1e-10))
+       max_entropy = np.log(len(pop_probs))
+       R_entropy = entropy_bonus * (entropy / max_entropy)
+       
+       # === SECONDARY PENALTIES (only when shield inactive) ===
+       if (1 - I_dead):
+           # Coverage penalty
+           if coverage_ratio < min_coverage_ratio:
+               deficit = min_coverage_ratio - coverage_ratio
+               penalties -= gamma * 20.0 * deficit
+           
+           # Concentration penalty (per-site check)
+           for site_pops in get_site_populations(populations):
+               concentration = max(site_pops) / sum(site_pops)
+               if concentration > concentration_penalty_threshold:
+                   penalties -= gamma * 5.0 * (concentration - concentration_penalty_threshold)
+       
+       # Total reward
+       reward = R_P + R_T + R_U + R_entropy + penalties
+       return reward
+
+**Key Mechanisms**:
+
+* **Penalty Shield (I_dead)**: When ``min_transitions_across_sites = 0``, disables secondary
+  penalties (coverage, concentration) to prevent "double jeopardy" on frozen simulations.
+
+* **Confidence Factor (C_F)**: Scales population rewards by ``min(1.0, min_transitions / (2*N_req))``.
+  Low-transition runs (1-5 transitions) have unreliable population distributions and receive
+  reduced ``R_P`` accordingly.
+
+* **Tiered Transition Penalties**: Provides continuous gradient feedback instead of binary
+  thresholds:
+  
+  - Tier 1 "Death Floor" (0 trans): -40.0 penalty per site
+  - Tier 2 "Climbing Ramp" (1-9 trans): -30.2 to -7.8 (linear gradient)
+  - Tier 3 "Success Zone" (≥10 trans): 0.0 penalty, unlocks ``R_T`` reward
+
+**Default Configuration** (higher_rewards_v1):
+
+Tested on indolizine pretraining data with 64.10 point separation between good and bad runs:
+
+* ``w_P=0.5, w_T=0.5, w_U=0.3``
+* ``gamma=4.0, P_baseline=500, T_baseline=50``
+* ``entropy_bonus=8.0, min_transitions_per_site=10``
 
 Higher rewards indicate better bias coefficients that improve sampling efficiency.
 

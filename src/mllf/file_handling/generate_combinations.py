@@ -68,6 +68,7 @@ import argparse
 import json
 import re
 import itertools
+import warnings
 from pathlib import Path
 from shutil import copy2
 from shutil import make_archive
@@ -118,7 +119,7 @@ def find_site_sub_files(input_dir: Path) -> Dict[int, Dict[int, Dict[Tuple[str, 
     return found
 
 
-def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> List[Tuple[List[int], List[int]]]:
+def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]], max_subs_per_site: int = 10) -> List[Tuple[List[int], List[int]]]:
     """Generate all within-site and cross-site ordered combinations.
 
     For each site independently, enumerate all subsets of substituents of size >= 2
@@ -130,15 +131,20 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
     - Example with subs [1,2,3,4,5]:
       - Anchor 1: [1,2], [1,3], [1,4], [1,5], [1,2,3], [1,2,4], ...
       - Anchor 2: [2,1], [2,3], [2,4], [2,5], [2,1,3], [2,1,4], ...
+    - Combination size is limited to max_subs_per_site (no combinations larger than this)
 
     Cross-site strategy:
     - For each combination of sites (pairs, triplets, etc.), generate all valid
       combinations where each site contributes >= 2 subs
     - Uses rotating anchor within each site component
     - Example: site1[1,2] × site2[3,4] generates multiple ordered combinations
+    - Each site's contribution is limited to max_subs_per_site
 
     Args:
         found: Nested dict mapping site -> sub -> {(label, ext): Path}.
+        max_subs_per_site: Maximum number of substituents per site in any combination (default: 10).
+                          Combinations will include at most this many subs per site, but all
+                          available subs can participate in different combinations.
 
     Returns:
         List of (sites_list, subs_list, subs_per_site_counts) tuples where:
@@ -148,15 +154,31 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
         - subs_per_site_counts: Tuple of counts for cross-site (e.g., (2, 2) means
           first 2 subs from site1, next 2 from site2), or None for within-site
     """
+    import warnings
+    
     combos = []
-    sites_with_enough_subs = {site: sorted(subs.keys()) 
-                               for site, subs in found.items() 
-                               if len(subs) >= 2}
+    sites_with_enough_subs = {}
+    
+    for site, subs in found.items():
+        if len(subs) < 2:
+            continue
+        
+        sorted_subs = sorted(subs.keys())
+        sites_with_enough_subs[site] = sorted_subs
+        
+        # Warn if site has more subs than the limit
+        if len(sorted_subs) > max_subs_per_site:
+            warnings.warn(
+                f"Site {site} has {len(sorted_subs)} substituents. Individual combinations will be "
+                f"limited to at most {max_subs_per_site} substituents per site. "
+                f"To include larger combinations, increase max_subs_per_site parameter.",
+                UserWarning
+            )
     
     if not sites_with_enough_subs:
         return combos
     
-    # Part 1: Within-site combinations (existing logic)
+    # Part 1: Within-site combinations
     for site, subs in sites_with_enough_subs.items():
         # Try each sub as anchor
         for anchor in subs:
@@ -164,14 +186,16 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
             
             # Generate all combinations of size >= 1 from remaining subs
             # Combined with anchor, this gives combinations of size >= 2
-            for r in range(1, len(remaining) + 1):
+            # Limit to max_subs_per_site - 1 (since anchor takes 1 slot)
+            max_tail_size = min(len(remaining), max_subs_per_site - 1)
+            for r in range(1, max_tail_size + 1):
                 for tail_combo in itertools.combinations(remaining, r):
                     # Anchor always first, followed by sorted tail
                     combo_list = [anchor] + list(tail_combo)
-                    # For within-site, return 2-tuple for backward compatibility
+                    # For within-site, return 3-tuple with None as third element
                     combos.append(([site], combo_list, None))
     
-    # Part 2: Cross-site combinations (new)
+    # Part 2: Cross-site combinations
     # Generate combinations of sites (pairs, triplets, etc.)
     all_sites = sorted(sites_with_enough_subs.keys())
     if len(all_sites) >= 2:
@@ -179,15 +203,17 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]]) -> L
         for num_sites in range(2, len(all_sites) + 1):
             for site_combo in itertools.combinations(all_sites, num_sites):
                 # For each site in this combination, generate within-site sub selections
-                # Each site must contribute at least 2 subs
+                # Each site must contribute at least 2 subs, but no more than max_subs_per_site
                 site_sub_options = []
                 for site in site_combo:
                     subs = sites_with_enough_subs[site]
-                    # Generate all possible within-site selections (size >= 2) with rotating anchor
+                    # Generate all possible within-site selections (size >= 2, <= max_subs_per_site) with rotating anchor
                     site_selections = []
                     for anchor in subs:
                         remaining = [s for s in subs if s != anchor]
-                        for r in range(1, len(remaining) + 1):
+                        # Limit tail size to ensure total doesn't exceed max_subs_per_site
+                        max_tail_size = min(len(remaining), max_subs_per_site - 1)
+                        for r in range(1, max_tail_size + 1):
                             for tail_combo in itertools.combinations(remaining, r):
                                 combo_list = [anchor] + list(tail_combo)
                                 site_selections.append(combo_list)
@@ -282,12 +308,13 @@ def renumber_pres_tokens(content: str, old_site: int, old_sub: int, new_site: in
     return new_content if nsub else content
 
 
-def list_possible_combinations(input_dir: Path, out_dir: Path) -> List[Dict]:
+def list_possible_combinations(input_dir: Path, out_dir: Path, max_subs_per_site: int = 10) -> List[Dict]:
     """List all possible combinations without creating directories.
     
     Args:
         input_dir: Directory containing site{n}_sub{m}_{label}.{ext} files.
         out_dir: Output directory where combination subdirs would be created.
+        max_subs_per_site: Maximum number of substituents to consider per site (default: 10).
     
     Returns:
         List of dicts with keys: 'name', 'path', 'sites', 'subs', 'subs_per_site_counts'
@@ -296,11 +323,22 @@ def list_possible_combinations(input_dir: Path, out_dir: Path) -> List[Dict]:
     if not found:
         raise RuntimeError(f"No site_sub files found in {input_dir}")
     
+    # Check for sites with only 1 substituent and raise error
+    single_sub_sites = [site for site, subs in found.items() if len(subs) == 1]
+    if single_sub_sites:
+        site_list = ", ".join(f"site{s}" for s in sorted(single_sub_sites))
+        raise RuntimeError(
+            f"Sites with only 1 substituent detected: {site_list}. "
+            f"MSLD simulations require at least 2 substituents per site. "
+            f"Please add more substituents or add these sites from the core structure files "
+            f"(e.g., core.pdb and core.rtf if using msld-py-prep)."
+        )
+    
     eligible = {s: subs for s, subs in found.items() if len(subs) >= 2}
     if not eligible:
         raise RuntimeError(f"No eligible sites with >=2 substituents found in {input_dir}")
     
-    combos = all_site_sub_combinations(eligible)
+    combos = all_site_sub_combinations(eligible, max_subs_per_site=max_subs_per_site)
     combo_list = []
     
     for cnt, combo_data in enumerate(combos, start=1):
@@ -323,6 +361,149 @@ def list_possible_combinations(input_dir: Path, out_dir: Path) -> List[Dict]:
         })
     
     return combo_list
+
+
+def augment_core_with_excluded_sub1(
+    core_rtf_path: Path,
+    core_pdb_path: Path,
+    sub1_rtf_path: Path,
+    sub1_pdb_path: Path
+) -> None:
+    """Augment core.rtf and core.pdb with atoms from an excluded site's sub1.
+    
+    When generating single-site pair combinations (e.g., testing only site1 pairs),
+    the core structure needs to include the first substituent from any excluded sites
+    to maintain the complete molecular structure.
+    
+    Args:
+        core_rtf_path: Path to the core.rtf file to be augmented (modified in place)
+        core_pdb_path: Path to the core.pdb file to be augmented (modified in place)
+        sub1_rtf_path: Path to the excluded site's sub1 _pres.rtf file
+        sub1_pdb_path: Path to the excluded site's sub1 _frag.pdb file
+    """
+    # Parse sub1 RTF file to extract charge, atoms, and bonds
+    sub1_rtf_content = sub1_rtf_path.read_text()
+    
+    # Extract charge from PRES line (format: PRES siteName charge)
+    sub1_charge = 0.0
+    pres_match = re.search(r'PRES\s+\S+\s+([-+]?\d+\.?\d*)', sub1_rtf_content)
+    if pres_match:
+        sub1_charge = float(pres_match.group(1))
+    
+    # Extract ATOM lines from sub1 RTF (between GROUP and BOND/IMPR/IC/END)
+    sub1_atoms = []
+    in_atom_section = False
+    for line in sub1_rtf_content.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('GROUP'):
+            in_atom_section = True
+            continue
+        if stripped.startswith(('BOND', 'IMPR', 'IC', 'END', 'DELE', 'PATC')):
+            in_atom_section = False
+        if in_atom_section and stripped.startswith('ATOM'):
+            sub1_atoms.append(line)
+    
+    # Extract BOND lines from sub1 RTF
+    sub1_bonds = []
+    in_bond_section = False
+    for line in sub1_rtf_content.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('BOND'):
+            in_bond_section = True
+        if in_bond_section:
+            if stripped.startswith(('IMPR', 'IC', 'END', 'DELE', 'PATC')):
+                break
+            if stripped:  # Non-empty line in bond section
+                sub1_bonds.append(line)
+    
+    # Parse sub1 PDB file to extract ATOM lines
+    sub1_pdb_content = sub1_pdb_path.read_text()
+    sub1_pdb_atoms = []
+    for line in sub1_pdb_content.split('\n'):
+        if line.startswith('ATOM'):
+            sub1_pdb_atoms.append(line)
+    
+    # Augment core.rtf
+    core_rtf_content = core_rtf_path.read_text()
+    core_rtf_lines = core_rtf_content.split('\n')
+    
+    # Process the RTF file line by line
+    final_rtf_lines = []
+    header_done = False
+    last_atom_idx = -1
+    last_bond_idx = -1
+    found_blank_comment = False
+    
+    # First pass: find where to insert atoms and bonds
+    for i, line in enumerate(core_rtf_lines):
+        stripped = line.strip()
+        if stripped.startswith('ATOM'):
+            last_atom_idx = i
+        elif stripped.startswith('BOND'):
+            if last_bond_idx == -1:
+                last_bond_idx = i
+            # Keep updating to find the last BOND line
+            elif i == last_bond_idx + 1 or (i > last_bond_idx and not any(core_rtf_lines[j].strip().startswith(('BOND', 'IMPR', 'IC', 'END', 'DELE', 'PATC')) for j in range(last_bond_idx + 1, i))):
+                last_bond_idx = i
+    
+    # Second pass: build the output
+    for i, line in enumerate(core_rtf_lines):
+        stripped = line.strip()
+        
+        # Replace the first blank comment line (* followed by nothing/whitespace) with augmentation comment
+        if not header_done and line.strip() == '*':
+            final_rtf_lines.append('* Core augmented with atoms from excluded site\'s first substituent for single-site combination')
+            final_rtf_lines.append('* ')  # Add blank comment line after augmentation comment
+            header_done = True
+            continue  # Skip the original blank comment line
+        
+        # Update RESI charge
+        if stripped.startswith('RESI'):
+            resi_match = re.search(r'(RESI\s+\S+\s+)([-+]?\d+\.?\d*)', line)
+            if resi_match:
+                prefix = resi_match.group(1)
+                current_charge = float(resi_match.group(2))
+                new_charge = current_charge + sub1_charge
+                line = f"{prefix}{new_charge:.6f}"
+        
+        final_rtf_lines.append(line)
+        
+        # Insert sub1 atoms after the last original ATOM line
+        if i == last_atom_idx and sub1_atoms:
+            for atom_line in sub1_atoms:
+                final_rtf_lines.append(atom_line)
+        
+        # Insert sub1 bonds after the last original BOND line
+        if i == last_bond_idx and sub1_bonds:
+            for bond_line in sub1_bonds:
+                final_rtf_lines.append(bond_line)
+    
+    core_rtf_path.write_text('\n'.join(final_rtf_lines))
+    
+    # Augment core.pdb
+    core_pdb_content = core_pdb_path.read_text()
+    core_pdb_lines = core_pdb_content.split('\n')
+    
+    # Add REMARK at the top, then insert atoms before TER/END
+    final_pdb_lines = []
+    remark_added = False
+    inserted = False
+    
+    for line in core_pdb_lines:
+        # Add REMARK at the very beginning (before any ATOM lines)
+        if not remark_added and (line.startswith('ATOM') or line.startswith('HETATM')):
+            final_pdb_lines.append('REMARK Core augmented with atoms from excluded site\'s first substituent')
+            remark_added = True
+        
+        if not inserted and (line.startswith('TER') or line.startswith('END')):
+            # Insert sub1 atoms before TER/END
+            if sub1_pdb_atoms:
+                final_pdb_lines.extend(sub1_pdb_atoms)
+            inserted = True
+        
+        final_pdb_lines.append(line)
+    
+    core_pdb_path.write_text('\n'.join(final_pdb_lines))
 
 
 def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Dict, include_patterns: List[str] | None = None) -> Path:
@@ -417,6 +598,35 @@ def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Di
                 if not dst.exists():
                     copy2(item, dst)
     
+    # Augment core files for single-site combinations
+    # When testing only one site's pairs, we need to include sub1 from excluded sites
+    if len(sites) == 1 and len(found) > 1:
+        # Find all sites that are NOT in the current combination
+        excluded_sites = [s for s in found.keys() if s not in sites]
+        
+        for excluded_site in excluded_sites:
+            # Get the sub1 files for this excluded site
+            if excluded_site in found and 1 in found[excluded_site]:
+                sub1_files = found[excluded_site][1]
+                
+                # Find the RTF and PDB files for sub1
+                sub1_rtf = None
+                sub1_pdb = None
+                for (label, ext), path in sub1_files.items():
+                    if ext.lower() == 'rtf' and 'pres' in label.lower():
+                        sub1_rtf = path
+                    elif ext.lower() == 'pdb' and 'frag' in label.lower():
+                        sub1_pdb = path
+                
+                # If we found both files, augment the core
+                if sub1_rtf and sub1_pdb:
+                    core_rtf = prep_out / 'core.rtf'
+                    core_pdb = prep_out / 'core.pdb'
+                    
+                    if core_rtf.exists() and core_pdb.exists():
+                        print(f"  Augmenting core with site{excluded_site}_sub1 for single-site combo")
+                        augment_core_with_excluded_sub1(core_rtf, core_pdb, sub1_rtf, sub1_pdb)
+    
     # Write mapping.json
     (combo_path / 'mapping.json').write_text(json.dumps(mapping, indent=2))
     
@@ -462,8 +672,12 @@ python3 msld_flat.py > output.out 2>&1
     run_script.chmod(0o755)
     
     # Copy additional files matching include patterns
+    # Skip 'prep/*' patterns since prep files are already handled above
     if include_patterns:
         for pattern in include_patterns:
+            # Skip prep/* patterns to avoid duplication
+            if pattern.startswith('prep/') or pattern == 'prep/*':
+                continue
             if '/' in pattern:
                 continue
             for src in input_dir.glob(pattern):
@@ -473,7 +687,7 @@ python3 msld_flat.py > output.out 2>&1
     return combo_path
 
 
-def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = False, include_patterns: List[str] | None = None) -> List[Path]:
+def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = False, include_patterns: List[str] | None = None, max_subs_per_site: int = 10) -> List[Path]:
     """Create combination directories with renamed files and support files.
 
     For each valid combination:
@@ -491,6 +705,8 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
         out_dir: Output directory where combination subdirs will be created.
         dry_run: If True, print actions without creating files.
         include_patterns: Glob patterns for extra files to copy (e.g., ['prep/*', '*.py']).
+        max_subs_per_site: Maximum number of substituents per site in any single combination (default: 10).
+                          All substituents can still participate, but each combination is limited to this size per site.
 
     Returns:
         List of created directory paths.
@@ -498,6 +714,17 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
     found = find_site_sub_files(input_dir)
     if not found:
         raise RuntimeError(f"No site_sub files found in {input_dir}")
+
+    # Check for sites with only 1 substituent and raise error
+    single_sub_sites = [site for site, subs in found.items() if len(subs) == 1]
+    if single_sub_sites:
+        site_list = ", ".join(f"site{s}" for s in sorted(single_sub_sites))
+        raise RuntimeError(
+            f"Sites with only 1 substituent detected: {site_list}. "
+            f"MSLD simulations require at least 2 substituents per site. "
+            f"Please add more substituents or remove these sites from the core structure files "
+            f"(e.g., core.pdb and core.rtf if using msld-py-prep)."
+        )
 
     # Only consider sites that have at least two substituents. Sites with a
     # single available substituent are not informative for generating
@@ -507,7 +734,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
         raise RuntimeError(f"No eligible sites with >=2 substituents found in {input_dir}")
     found = eligible
 
-    combos = all_site_sub_combinations(found)
+    combos = all_site_sub_combinations(found, max_subs_per_site=max_subs_per_site)
     created_dirs: List[Path] = []
     cnt = 1
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -641,8 +868,12 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                             })
 
         # optionally copy additional files matching include_patterns into each combo dir
+        # Skip 'prep/*' patterns since prep files are already handled above
         if include_patterns:
             for pat in include_patterns:
+                # Skip prep/* patterns to avoid duplication
+                if pat.startswith('prep/') or pat == 'prep/*':
+                    continue
                 for extra in input_dir.glob(pat):
                     if not extra.is_file():
                         continue
@@ -659,6 +890,35 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                         print(f"DRY: would copy extra {extra} -> {dest}")
                     else:
                         copy2(extra, dest)
+
+        # Augment core files for single-site combinations
+        # When testing only one site's pairs, we need to include sub1 from excluded sites
+        if not dry_run and len(sites) == 1 and len(found) > 1:
+            # Find all sites that are NOT in the current combination
+            excluded_sites = [s for s in found.keys() if s not in sites]
+            
+            for excluded_site in excluded_sites:
+                # Get the sub1 files for this excluded site
+                if excluded_site in found and 1 in found[excluded_site]:
+                    sub1_files = found[excluded_site][1]
+                    
+                    # Find the RTF and PDB files for sub1
+                    sub1_rtf = None
+                    sub1_pdb = None
+                    for (label, ext), path in sub1_files.items():
+                        if ext.lower() == 'rtf' and 'pres' in label.lower():
+                            sub1_rtf = path
+                        elif ext.lower() == 'pdb' and 'frag' in label.lower():
+                            sub1_pdb = path
+                    
+                    # If we found both files, augment the core
+                    if sub1_rtf and sub1_pdb:
+                        core_rtf = prep_dest / 'core.rtf'
+                        core_pdb = prep_dest / 'core.pdb'
+                        
+                        if core_rtf.exists() and core_pdb.exists():
+                            print(f"  Augmenting {name} core with site{excluded_site}_sub1 for single-site combo")
+                            augment_core_with_excluded_sub1(core_rtf, core_pdb, sub1_rtf, sub1_pdb)
 
         # write mapping file
         if dry_run:
@@ -764,6 +1024,7 @@ def main():
     p.add_argument('--out', '-o', dest='out_dir', type=Path, default=Path('combos'), help='Output base directory')
     p.add_argument('--dry-run', action='store_true', help='Show actions without copying files')
     p.add_argument('--include', '-i', dest='include', action='append', default=[], help='Glob pattern(s) of additional files to copy into each combo dir (relative to input_dir). Can be provided multiple times.')
+    p.add_argument('--max-subs', type=int, default=10, help='Maximum number of substituents per site in any single combination (default: 10). All substituents can still participate, but each combination is limited to this size per site.')
     p.add_argument('--archive', dest='archive', action='store_true', help='Create .tar.gz archives of generated combo directories matching pattern comb_*')
     p.add_argument('--archive-remove', dest='archive_remove', action='store_true', help='Remove combo directories after successful archiving')
     args = p.parse_args()
@@ -773,7 +1034,7 @@ def main():
         raise SystemExit(f"Input directory not found: {input_dir}")
 
     include_patterns = args.include if args.include else None
-    created = create_combination_dirs(input_dir, args.out_dir, dry_run=args.dry_run, include_patterns=include_patterns)
+    created = create_combination_dirs(input_dir, args.out_dir, dry_run=args.dry_run, include_patterns=include_patterns, max_subs_per_site=args.max_subs)
     print(f"Created {len(created)} combination dirs under {args.out_dir}")
 
     if args.archive:

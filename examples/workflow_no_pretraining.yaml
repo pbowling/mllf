@@ -5,7 +5,7 @@
 # Combination generation
 create_combos:
   input_dir: /home/pbowling/mllf/examples/14benz
-  out_dir: /home/pbowling/mllf/examples/14benz/generated_combos
+  out_dir: /home/pbowling/mllf/examples/14benz/generated_combos_no_pretraining
   include_patterns:
     - msld_flat.py
 
@@ -16,7 +16,7 @@ split:
   seed: 42
 
 pretrain:
-  model_path: /home/pbowling/mllf/examples/models/pretraining/best_policy.pt
+  model_path: null  # No pretraining; train from scratch
 
 # Curriculum learning configuration (progressive training complexity)
 curriculum:
@@ -83,28 +83,15 @@ vocabulary:
   warn_missing_types: true
 
 # Training configuration
-# Policy architecture: Separate heads with bias-type embeddings for forced specialization
-# - Shared trunk: 1 layer with ReLU (lightweight, extracts basic edge features)
-# - Bias-type embeddings: Learnable 16-dim vectors (one per bias type)
-#   Provides unique context to each head, forcing independent specialization
-# - Separate heads: Deep 3-layer networks per bias type (quadratic, skew, end, linear)
-#   Input: [trunk_output (64-dim), bias_type_embedding (16-dim)] = 80-dim
-#   Architecture: Linear(80,64) -> ReLU -> Linear(64,32) -> ReLU -> Linear(32,2)
-#   Each head receives DIFFERENT input due to unique bias embedding
-# - Output scaling: Per-bias ranges via tanh - [Linear ±79, Quadratic ±163, Skew ±11, End ±7]
-#   Based on analysis of 5,332 coefficients from 52 pretraining systems (95th percentile + 20%)
-# - Exploration: log_std clamped to [-20, 2.0] (std up to ~7.4)
-# - Action clipping: Sampled actions clipped to scaling limits × 1.05 to prevent extreme outliers
 training:
   encoder:
-    hidden_dims: [64, 64]  # RGCN hidden layers for node embeddings
-    out_dim: 32             # Node embedding dimension
+    hidden_dims: [64, 64]
+    out_dim: 32
   policy:
-    mlp_hidden: 64          # Hidden units in shared trunk (before separate heads)
-    # mlp_out_dim: 4        # Auto-computed: number of bias types (typically 4)
+    mlp_hidden: 64
   optimizer:
-    lr: 0.001               # Learning rate for Adam optimizer
-  bias_clip: 1000.0         # Safety net for write_variables (policy clips to [±83, ±171, ±11.6, ±7.4])
+    lr: 0.001
+  bias_clip: 1000.0  # Maximum absolute value for bias coefficients
   
 # Simulation configuration
 run_sims: true
@@ -142,7 +129,7 @@ reward:
 
 # Output organization
 output:
-  base_dir: /home/pbowling/mllf/examples/14benz/training_output
+  base_dir: /home/pbowling/mllf/examples/14benz/training_output_no_pretraining
   save_checkpoints: true
   checkpoint_freq: 5  # Save checkpoint every 5 epochs
 

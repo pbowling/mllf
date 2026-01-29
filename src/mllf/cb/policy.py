@@ -15,32 +15,96 @@ import torch.nn.functional as F
 
 
 class EdgeValueMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 64, out_dim: int = 1):
-        """Simple MLP producing `out_dim` outputs per input.
-
-        Note: callers may request `out_dim = D*2` so the output can be split
-        into means and log-stds for D predicted coefficients.
+    def __init__(self, in_dim: int, hidden: int = 64, num_bias_types: int = 4, bias_embed_dim: int = 16):
+        """MLP with shared trunk and separate heads per bias type.
+        
+        Architecture:
+        - Shared trunk: processes concatenated node embeddings
+        - Bias-type embeddings: learnable vectors identifying each bias type
+        - Separate heads: one per bias type, receives [trunk_output, bias_embedding]
+        - Each head outputs (mean, log_std) for its bias type
+        
+        Key innovation: Bias-type embeddings provide unique context to each head,
+        forcing specialization by giving heads different input signals.
+        
+        Args:
+            in_dim: Input dimension (typically 2*emb_dim + edge_feat_dim)
+            hidden: Hidden layer size
+            num_bias_types: Number of bias types (default: 4)
+            bias_embed_dim: Dimension of bias-type embeddings (default: 16)
         """
         super().__init__()
-        self.net = nn.Sequential(
+        self.num_bias_types = num_bias_types
+        self.bias_embed_dim = bias_embed_dim
+        
+        # Shared trunk - lightweight for basic edge representation
+        self.trunk = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, out_dim)
+            nn.ReLU()
         )
+        
+        # Learnable bias-type embeddings
+        # Each bias type gets a unique embedding that will be learned during training
+        # This provides bias-specific context to force head specialization
+        self.bias_type_embeddings = nn.Embedding(num_bias_types, bias_embed_dim)
+        
+        # Separate heads - deep and specialized for each bias type
+        # Input: [trunk_output (hidden), bias_type_embedding (bias_embed_dim)]
+        # This concatenated input ensures each head receives unique information
+        head_input_dim = hidden + bias_embed_dim
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(head_input_dim, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden // 2),
+                nn.ReLU(),
+                nn.Linear(hidden // 2, 2)
+            ) for _ in range(num_bias_types)
+        ])
 
     def forward(self, x):
-        return self.net(x)
+        """Forward pass with bias-type embeddings.
+        
+        Returns:
+            Tensor [E, 2*num_bias_types] with means and log_stds concatenated:
+            [mean_1, mean_2, ..., mean_D, logstd_1, logstd_2, ..., logstd_D]
+        """
+        # Shared representation (lightweight)
+        h = self.trunk(x)  # [E, hidden]
+        E = h.shape[0]
+        
+        # Get bias-type embeddings for all types
+        bias_type_ids = torch.arange(self.num_bias_types, device=h.device)  # [num_bias_types]
+        bias_embeddings = self.bias_type_embeddings(bias_type_ids)  # [num_bias_types, bias_embed_dim]
+        
+        # Apply each head with its specific bias-type embedding
+        head_outputs = []
+        for i, head in enumerate(self.heads):
+            # Expand bias embedding to match batch size and concatenate with trunk output
+            bias_emb = bias_embeddings[i:i+1].expand(E, -1)  # [E, bias_embed_dim]
+            head_input = torch.cat([h, bias_emb], dim=-1)  # [E, hidden + bias_embed_dim]
+            head_outputs.append(head(head_input))  # [E, 2]
+        
+        # Stack and split into means and log_stds
+        stacked = torch.stack(head_outputs, dim=1)  # [E, num_bias_types, 2]
+        means = stacked[:, :, 0]  # [E, num_bias_types]
+        log_stds = stacked[:, :, 1]  # [E, num_bias_types]
+        
+        # Concatenate to match expected output format [mean_1...mean_D, logstd_1...logstd_D]
+        out = torch.cat([means, log_stds], dim=-1)  # [E, 2*num_bias_types]
+        
+        return out
 
 
 class EdgePolicy(nn.Module):
-    def __init__(self, encoder: nn.Module, emb_dim: int, edge_feat_dim: int = 0, mlp_hidden: int = 64, mlp_out_dim: int = 1):
+    def __init__(self, encoder: nn.Module, emb_dim: int, edge_feat_dim: int = 0, mlp_hidden: int = 64, mlp_out_dim: int = 4):
         super().__init__()
         self.encoder = encoder
         # input to edge-mlp is concat([emb_u, emb_v, edge_feat])
-        # mlp_out_dim controls how many coefficients per directed edge
-        # The MLP produces D means and D log-stds concatenated -> 2*D outputs
+        # mlp_out_dim controls how many coefficients per directed edge (bias types)
+        # The MLP uses separate heads for each bias type
         self.mlp_out_dim = int(mlp_out_dim)
-        self.edge_mlp = EdgeValueMLP(2 * emb_dim + edge_feat_dim, mlp_hidden, self.mlp_out_dim * 2)
+        self.edge_mlp = EdgeValueMLP(2 * emb_dim + edge_feat_dim, mlp_hidden, num_bias_types=self.mlp_out_dim)
 
     def forward_node_embeddings(self, x, edge_index, edge_type):
         return self.encoder(x, edge_index, edge_type)
@@ -70,8 +134,19 @@ class EdgePolicy(nn.Module):
             D = C // 2 if C >= 2 else 1
         mean = out[:, :D]
         log_std = out[:, D: D + D]
+        
+        # Scale mean outputs to expected bias coefficient range using tanh
+        # Different scaling factors per bias type: [linear, quadratic, skew, end]
+        # Based on analysis of 5,332 coefficients from 52 pretraining systems:
+        # Linear: ±79 (95th percentile=65.74), Quadratic: ±163 (95th=135.15)
+        # Skew: ±11 (95th=8.74), End: ±7 (95th=5.69)
+        # Each factor provides 95th percentile + 20% headroom for safety
+        scale_factors = torch.tensor([79.0, 163.0, 11.0, 7.0], device=mean.device)
+        mean = torch.tanh(mean) * scale_factors.unsqueeze(0)
+        
         # Clamp log_std to prevent extreme standard deviations that can cause NaN
-        # exp(-20) ≈ 2e-9, exp(2) ≈ 7.4 — reasonable range for std deviation
+        # exp(-20) ≈ 2e-9, exp(2.0) ≈ 7.4 — provides exploration while preventing extreme outliers
+        # Note: Higher values (e.g., 3.5 → std≈33) can produce samples far beyond intended ranges
         log_std = torch.clamp(log_std, min=-20.0, max=2.0)
         return mean, log_std
 
@@ -100,6 +175,14 @@ class EdgePolicy(nn.Module):
             dist = torch.distributions.Normal(mean, std)
             actions = dist.rsample()
             logp_per = dist.log_prob(actions)
+            
+            # CRITICAL: Clip sampled actions to intended ranges per bias type
+            # Without this, exploration noise (std up to ~7.4) can produce extreme outliers
+            # Scale factors: [linear=79, quadratic=163, skew=11, end=7]
+            scale_factors = torch.tensor([79.0, 163.0, 11.0, 7.0], device=actions.device)
+            # Add small margin (5%) to allow slight overshoot during exploration
+            clip_limits = scale_factors * 1.05
+            actions = torch.clamp(actions, -clip_limits.unsqueeze(0), clip_limits.unsqueeze(0))
 
         # sum logp across output dims to get per-edge scalar logp
         logp = logp_per.sum(dim=-1)

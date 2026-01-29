@@ -12,77 +12,98 @@ from mllf.cb.graph_utils import build_pyg_graph_from_mllf_graph
 
 def test_default_vocabulary():
     """Test that default vocabulary loads all toppar files."""
-    vocab = get_atom_type_vocab(force_rebuild=True)
+    atom_type_vocab, element_vocab, atom_to_element = get_atom_type_vocab(force_rebuild=True)
     
-    # Should have many atom types (default toppar has ~333)
-    assert len(vocab) > 100, f"Expected >100 atom types, got {len(vocab)}"
+    # Should have many atom types (default toppar has ~277)
+    assert len(atom_type_vocab) > 100, f"Expected >100 atom types, got {len(atom_type_vocab)}"
     
     # Should be alphabetically sorted
-    keys = list(vocab.keys())
+    keys = list(atom_type_vocab.keys())
     assert keys == sorted(keys), "Vocabulary should be sorted alphabetically"
     
     # Indices should be sequential
-    assert set(vocab.values()) == set(range(len(vocab))), "Indices should be sequential"
+    assert set(atom_type_vocab.values()) == set(range(len(atom_type_vocab))), "Indices should be sequential"
     
     # Should contain common CHARMM atom types
-    common_types = ['CG2R61', 'HGR61', 'NG2R60', 'OG2D1', 'CT1', 'CT2', 'NH1']
+    common_types = ['CG2R61', 'HGR61', 'NG2R60', 'NG2D1', 'OG2D1', 'CT1', 'CT2', 'NH1']
     for atom_type in common_types:
-        assert atom_type in vocab, f"{atom_type} should be in default vocabulary"
+        assert atom_type in atom_type_vocab, f"{atom_type} should be in default vocabulary"
+    
+    # Test element vocabulary
+    assert len(element_vocab) > 10, f"Expected >10 elements, got {len(element_vocab)}"
+    common_elements = ['C', 'H', 'N', 'O', 'S', 'P']
+    for element in common_elements:
+        assert element in element_vocab, f"Element {element} should be in vocabulary"
+    
+    # Test atom_to_element mapping
+    assert len(atom_to_element) == len(atom_type_vocab), "Mapping should have entry for each atom type"
+    assert atom_to_element['CG2R61'] == 'C', "CG2R61 should map to C"
+    assert atom_to_element['HGR61'] == 'H', "HGR61 should map to H"
+    assert atom_to_element['NG2D1'] == 'N', "NG2D1 should map to N"
 
 
 def test_filtered_vocabulary_single_file():
     """Test vocabulary with single toppar file specified."""
     # Use only CGenFF file
-    vocab = get_atom_type_vocab(
+    atom_type_vocab, element_vocab, atom_to_element = get_atom_type_vocab(
         toppar_files=['top_all36_cgenff.rtf'],
         force_rebuild=True
     )
     
+    # Should have 161 atom types for CGenFF
+    assert len(atom_type_vocab) == 161, f"Expected 161 CGenFF atom types, got {len(atom_type_vocab)}"
+    
     # Should have fewer types than default
-    default_vocab = get_atom_type_vocab(toppar_files=None, force_rebuild=True)
-    assert len(vocab) < len(default_vocab), "Filtered vocab should be smaller"
+    default_vocab, _, _ = get_atom_type_vocab(toppar_files=None, force_rebuild=True)
+    assert len(atom_type_vocab) < len(default_vocab), "Filtered vocab should be smaller"
     
     # Should still be sorted
-    keys = list(vocab.keys())
+    keys = list(atom_type_vocab.keys())
     assert keys == sorted(keys), "Filtered vocabulary should be sorted"
     
-    # CGenFF types should be present
-    assert 'CG2R61' in vocab, "CG2R61 from CGenFF should be present"
-    assert 'HGR61' in vocab, "HGR61 from CGenFF should be present"
+    # CGenFF types should be present (including NG2D1 which was missing before)
+    assert 'CG2R61' in atom_type_vocab, "CG2R61 from CGenFF should be present"
+    assert 'HGR61' in atom_type_vocab, "HGR61 from CGenFF should be present"
+    assert 'NG2D1' in atom_type_vocab, "NG2D1 from CGenFF should be present"
+    
+    # Check NG2D1 specifically (was the problematic one)
+    assert atom_to_element['NG2D1'] == 'N', "NG2D1 should map to element N"
 
 
 def test_filtered_vocabulary_multiple_files():
     """Test vocabulary with multiple toppar files specified."""
-    vocab = get_atom_type_vocab(
+    atom_type_vocab, element_vocab, atom_to_element = get_atom_type_vocab(
         toppar_files=['top_all36_cgenff.rtf', 'top_all36_prot.rtf'],
         force_rebuild=True
     )
     
     # Should have types from both files
     # CGenFF type
-    assert 'CG2R61' in vocab or 'CG251O' in vocab, "Should have CGenFF types"
+    assert 'CG2R61' in atom_type_vocab or 'CG251O' in atom_type_vocab, "Should have CGenFF types"
     # Protein type
-    assert 'CT1' in vocab or 'NH1' in vocab or 'C' in vocab, "Should have protein types"
+    assert 'CT1' in atom_type_vocab or 'NH1' in atom_type_vocab or 'C' in atom_type_vocab, "Should have protein types"
     
     # Should still be sorted
-    keys = list(vocab.keys())
+    keys = list(atom_type_vocab.keys())
     assert keys == sorted(keys), "Multi-file vocabulary should be sorted"
 
 
 def test_vocabulary_caching():
     """Test that vocabulary is cached and reused."""
     # First call builds vocabulary
-    vocab1 = get_atom_type_vocab(
+    vocab1, el1, map1 = get_atom_type_vocab(
         toppar_files=['top_all36_cgenff.rtf'],
         force_rebuild=True
     )
     
     # Second call should return cached version (same object)
-    vocab2 = get_atom_type_vocab(toppar_files=['top_all36_cgenff.rtf'])
+    vocab2, el2, map2 = get_atom_type_vocab(toppar_files=['top_all36_cgenff.rtf'])
     assert vocab1 is vocab2, "Should return cached vocabulary"
+    assert el1 is el2, "Should return cached element vocab"
+    assert map1 is map2, "Should return cached mapping"
     
     # Different config should rebuild
-    vocab3 = get_atom_type_vocab(
+    vocab3, el3, map3 = get_atom_type_vocab(
         toppar_files=['top_all36_prot.rtf'],
         force_rebuild=True
     )
@@ -92,14 +113,14 @@ def test_vocabulary_caching():
 def test_vocabulary_invalidation():
     """Test that cache is invalidated when config changes."""
     # Build with one config
-    vocab1 = get_atom_type_vocab(
+    vocab1, _, _ = get_atom_type_vocab(
         toppar_files=['top_all36_cgenff.rtf'],
         force_rebuild=True
     )
     size1 = len(vocab1)
     
     # Change config - should rebuild automatically
-    vocab2 = get_atom_type_vocab(
+    vocab2, _, _ = get_atom_type_vocab(
         toppar_files=['top_all36_prot.rtf'],
         force_rebuild=False  # Even without force_rebuild
     )
@@ -114,7 +135,7 @@ def test_missing_toppar_file_warning():
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         
-        vocab = build_atom_type_vocab_from_toppar(
+        vocab, _, _ = build_atom_type_vocab_from_toppar(
             toppar_files=['nonexistent_file.rtf', 'top_all36_cgenff.rtf']
         )
         
@@ -250,22 +271,33 @@ def test_parse_toppar_file():
         cgenff_path = os.path.join(toppar_dir, 'top_all36_cgenff.rtf')
         
         if os.path.exists(cgenff_path):
-            atom_types = parse_toppar_file(cgenff_path)
+            atom_types, elements, atom_to_element = parse_toppar_file(cgenff_path)
             
             # Should have found atom types
             assert len(atom_types) > 0, "Should parse atom types from file"
             assert isinstance(atom_types, set), "Should return a set"
             
-            # Should contain expected CGenFF types
-            expected = {'CG2R61', 'HGR61', 'NG2R60'}
-            # At least some of these should be present
-            assert len(expected.intersection(atom_types)) > 0, \
-                "Should contain expected CGenFF atom types"
+            # Should contain expected CGenFF types (including NG2D1)
+            expected = {'CG2R61', 'HGR61', 'NG2R60', 'NG2D1'}
+            # All of these should be present
+            assert expected.issubset(atom_types), \
+                f"Should contain expected CGenFF atom types. Missing: {expected - atom_types}"
+            
+            # Should have parsed elements
+            assert len(elements) > 0, "Should parse elements from file"
+            assert isinstance(elements, set), "Elements should be a set"
+            
+            # Should have atom_to_element mapping
+            assert len(atom_to_element) == len(atom_types), "Mapping should have entry for each atom type"
+            assert atom_to_element['NG2D1'] == 'N', "NG2D1 should map to N"
 
 
 def test_vocabulary_with_empty_distinct_types():
     """Test that nodes with no distinct_atom_types don't cause errors."""
-    vocab = get_atom_type_vocab(toppar_files=['top_all36_cgenff.rtf'], force_rebuild=True)
+    atom_type_vocab, element_vocab, atom_to_element = get_atom_type_vocab(
+        toppar_files=['top_all36_cgenff.rtf'], 
+        force_rebuild=True
+    )
     
     g = Graph(2)
     
@@ -291,11 +323,19 @@ def test_vocabulary_with_empty_distinct_types():
         g, toppar_files=['top_all36_cgenff.rtf'], warn_missing_types=False
     )
     
-    # Node 0 should have all zeros in atom type encoding
+    # Node 0 should have all zeros in element and atom type encoding
     vocab = extras['atom_type_vocab']
-    node0_atom_features = data.x[0, 4:]  # Skip first 4 base features
-    assert node0_atom_features.sum().item() == 0.0, \
-        "Node with no atom types should have all zeros"
+    element_vocab = extras['element_vocab']
+    # Skip first 3 base features, then check element and atom type encodings
+    base_dims = 3
+    element_dims = len(element_vocab)
+    atom_type_start = base_dims + element_dims
+    atom_type_features = data.x[0, atom_type_start:]
+    assert atom_type_features.sum().item() == 0.0, \
+        "Node with no atom types should have all zeros in atom type encoding"
+    element_features = data.x[0, base_dims:atom_type_start]
+    assert element_features.sum().item() == 0.0, \
+        "Node with no atom types should have all zeros in element encoding"
 
 
 if __name__ == '__main__':

@@ -222,8 +222,8 @@ To adapt the workflow for your system:
 3. **Modify simulation script**: Adapt ``msld_flat.py`` for your system
    (force field, topology, equilibration protocol)
 
-4. **Adjust reward function**: Edit ``src/mllf/cb/train.py::compute_msld_reward``
-   to weight different simulation metrics
+4. **Adjust reward function**: Edit ``src/mllf/cb/train_improved.py::compute_msld_reward_improved``
+   to weight different simulation metrics (uses Penalty Shield and Confidence Factor)
 
 5. **Run training**: Execute ``python run_workflow.py your_config.yaml``
 
@@ -244,15 +244,24 @@ experimentation without re-running simulations:
 
 .. code-block:: bash
 
-   # Test different reward configurations on epoch 5 data
-   cd examples
-   python test_reward_configs.py training_output/epoch_005 \\
-       --configs reward_configs_example.yaml
+   # Test different reward configurations on pretraining data
+   cd tests/tools
+   python test_reward_improved.py ../../pretraining/indolizine_solv \
+       --good-threshold 215 \
+       --bad-threshold 15 \
+       --configs reward_configs_improved.yaml
 
 This compares multiple reward configurations and identifies which yields
-the highest mean reward. You can then update ``workflow_sample.yaml``
-and resume training with the best configuration—cached results will be
-automatically recomputed.
+the best separation between good and bad runs. The improved reward function
+includes:
+
+* **Penalty Shield**: Prevents double jeopardy on frozen simulations (0 transitions)
+* **Confidence Factor**: Scales population rewards by data reliability
+* **Tiered Penalties**: Continuous gradient feedback instead of binary thresholds
+
+You can then update ``workflow_sample.yaml`` with the best configuration
+(e.g., ``higher_rewards_v1``) and resume training—cached results will be
+automatically recomputed with the new reward parameters.
 
 **Example workflow**:
 

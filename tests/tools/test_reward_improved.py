@@ -122,6 +122,7 @@ def compute_improved_reward_from_json(
     # Replaces binary threshold with continuous gradient feedback
     sites_below_threshold = 0
     min_site_trans = min(site_transitions.values()) if site_transitions else 0
+    min_transitions_across_sites = min_site_trans
     
     for site_id, trans_count in site_transitions.items():
         if trans_count < min_transitions_per_site:
@@ -142,16 +143,20 @@ def compute_improved_reward_from_json(
     if sites_below_threshold > 0:
         penalty_messages.append(f"{sites_below_threshold} site(s) below {min_transitions_per_site} transitions")
     
-    # Check 2: Minimum coverage
+    # Penalty Shield: I_dead indicator (1 if any site has 0 transitions)
+    # This prevents "double jeopardy" by disabling secondary penalties for frozen simulations
+    I_dead = 1 if min_transitions_across_sites == 0 else 0
+    
+    # Check 2: Minimum coverage (ONLY APPLIED IF SHIELD IS INACTIVE) (ONLY APPLIED IF SHIELD IS INACTIVE)
     nonzero_count = np.sum(pop_array > 0)
     coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
     
-    if coverage_ratio < min_coverage_ratio:
+    if (1 - I_dead) and coverage_ratio < min_coverage_ratio:
         deficit = min_coverage_ratio - coverage_ratio
         penalties -= gamma * 20.0 * deficit
         penalty_messages.append(f"Coverage {coverage_ratio:.2%} below minimum {min_coverage_ratio:.0%}")
     
-    # Check 3: Detect single-dominant-population per site
+    # Check 3: Detect single-dominant-population per site (ONLY APPLIED IF SHIELD IS INACTIVE)
     # Extract actual substituents per site from graph_info.json
     nsubs_per_site = None
     graph_info_path = run_dir / 'graph_info.json'
@@ -187,7 +192,7 @@ def compute_improved_reward_from_json(
             concentration_ratio = max_pop / total_pop
             max_concentration = max(max_concentration, concentration_ratio)
             
-            if concentration_ratio > concentration_penalty_threshold:
+            if (1 - I_dead) and concentration_ratio > concentration_penalty_threshold:
                 penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
                 penalty_messages.append(f"Site {site_idx} has {concentration_ratio:.0%} concentration")
         
@@ -195,7 +200,12 @@ def compute_improved_reward_from_json(
     
     # ========== POSITIVE REWARD COMPONENTS ==========
     
-    # R_P: Population balance reward
+    # Confidence Factor: Scale population reward based on minimum transitions
+    # C_F = min(1.0, min_transitions / (2 * N_req))
+    # This prevents rewarding low-transition runs with misleading population data
+    confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
+    
+    # R_P: Population balance reward (scaled by confidence factor)
     R_P = 0.0
     balance_factor = 0.0
     if len(populations) > 1:
@@ -216,10 +226,12 @@ def compute_improved_reward_from_json(
             
             # Normalized population reward (only count non-zero populations)
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-            R_P = w_P * total_pop_normalized * balance_factor
+            
+            # Apply confidence factor to prevent rewarding low-transition runs
+            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
         else:
             # Insufficient coverage: minimal reward proportional to coverage
-            R_P = w_P * 0.01 * coverage_ratio
+            R_P = w_P * 0.01 * coverage_ratio * confidence_factor
             balance_factor = 0.01
     
     # R_T: Transition reward (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
@@ -273,6 +285,8 @@ def compute_improved_reward_from_json(
         'balance_factor': balance_factor,
         'entropy_score': entropy_score,
         'sites_below_threshold': sites_below_threshold,
+        'confidence_factor': confidence_factor,
+        'shield_active': bool(I_dead),
         'penalty_messages': penalty_messages
     }
     
@@ -280,6 +294,7 @@ def compute_improved_reward_from_json(
         print(f"  R_P={R_P:.2f} R_T={R_T:.2f} R_U={R_U:.2f} R_entropy={R_entropy:.2f} penalties={penalties:.2f}")
         print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.0%}), "
               f"Transitions: {list(site_transitions.values())}, Max conc: {max_concentration:.0%}")
+        print(f"  Confidence: {confidence_factor:.2f}, Shield: {'ACTIVE' if I_dead else 'INACTIVE'}")
         if penalty_messages:
             for msg in penalty_messages:
                 print(f"  ⚠️  {msg}")

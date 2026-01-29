@@ -99,6 +99,13 @@ Combinations are generated from site/substituent fragment files:
 * **Sites**: Identified by the site number (N)
 * **Substituents**: Identified by the sub number (M) within each site
 
+.. warning::
+   **Minimum Substituents Required**: Each site must have at least 2 substituents. MSLD simulations 
+   will not run correctly with only a single substituent at a site. If any site has only 1 substituent, 
+   combination generation will fail with an error. To resolve this, either add more substituents to the site or 
+   add the site information to your core structure files (e.g., ``core.pdb`` and ``core.rtf`` if using 
+   msld-py-prep).
+
 The generator creates two types of combinations:
 
 1. **Within-site combinations**: Multiple substituents from a single site
@@ -121,6 +128,14 @@ For a site with 5 substituents, each acting as anchor generates combinations:
 * Anchor 2: ``[2,1]``, ``[2,3]``, ``[2,4]``, ...
 * Total: 5 anchors × 15 combinations each = **75 within-site combinations**
 
+.. note::
+   **Combination Size Limit**: By default, each combination is limited to at most 10 substituents 
+   per site (``max_subs_per_site=10``). This prevents combinatorial explosion while still allowing 
+   all substituents to participate across different combinations. For example, with 50 substituents 
+   at a site, the generator will create combinations like ``[1,2,...,10]``, ``[1,2,...,9,11]``, etc., 
+   but not ``[1,2,...,11]``. This limit can be increased via the ``--max-subs`` command-line option 
+   or the ``max_subs_per_site`` parameter in the API.
+
 Cross-Site Combinations
 ^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -136,6 +151,49 @@ Example: With 5 subs at site1 (75 selections) and 6 subs at site2 (186 selection
 * Site 2 within-site: 186 combinations  
 * Cross-site: 75 × 186 = **13,950 combinations**
 * Total: **14,211 combinations**
+
+Single-Site Core Augmentation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When generating **single-site pair combinations** (e.g., testing only site1 pairs while
+site2 is excluded), the core structure must include atoms from the excluded site's first
+substituent to maintain the complete molecular structure.
+
+The combination generator automatically augments ``core.rtf`` and ``core.pdb`` for
+single-site combinations:
+
+.. code-block:: text
+
+   # Example: comb_0001_site1_1__site1_2 (site2 excluded)
+   
+   # Original core.rtf:
+   RESI  LIG    -0.012
+   ATOM C001 CG2R61  -0.120335 
+   ATOM H002 HGR61    0.114301
+   BOND C001 H002
+   
+   # Augmented core.rtf (adds site2_sub1 atoms):
+   * Core augmented with atoms from excluded site's first substituent for single-site combination
+   * 
+   RESI  LIG    -0.002000   # Charge updated: -0.012 + 0.010 from site2_sub1
+   ATOM C001 CG2R61  -0.120335 
+   ATOM H002 HGR61    0.114301
+   ATOM C062 CG2R61  -0.110800  # From site2_sub1
+   ATOM H063 HGR61    0.121200   # From site2_sub1
+   BOND C001 H002
+   BOND C001 C062  # From site2_sub1
+   BOND C003 C062  # From site2_sub1
+   BOND C062 H063  # From site2_sub1
+
+This ensures that:
+
+* CHARMM simulations run successfully with proper energy landscapes
+* Single-site combinations have the correct molecular topology
+* Core structure includes all necessary atoms for simulation
+
+The augmentation is performed automatically during combination directory creation and
+only applies to single-site combinations. Cross-site combinations (involving multiple
+sites) already have complete core structures and are not modified.
 
 Lazy Directory Creation
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -1368,8 +1426,14 @@ For custom workflows, the key components are:
    combos = create_combination_dirs(
        input_dir=Path('14benz_solv_5.5'),
        output_dir=Path('generated_combos'),
-       include_patterns=['msld_flat.py']
+       include_patterns=['msld_flat.py'],
+       max_subs_per_site=10  # Limit combination size (default: 10)
    )
+   
+   # Note: max_subs_per_site limits each combination to at most N substituents per site.
+   # All substituents can still participate, but individual combinations are capped.
+   # Increase this value if you need larger combinations (may significantly increase
+   # total number of combinations generated).
    
    # 2. Initialize model
    sample_data, _, sample_extras = build_data_and_targets_from_combo(combos[0])
