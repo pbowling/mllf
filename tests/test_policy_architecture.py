@@ -7,6 +7,7 @@ This test suite verifies the new EdgePolicy architecture with:
 - Deeper MLP with shared trunk
 """
 import torch
+import torch.nn as nn
 import pytest
 from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy, EdgeValueMLP
@@ -25,15 +26,19 @@ class TestEdgeValueMLP:
         
         # Check trunk architecture
         assert hasattr(mlp, 'trunk'), "MLP should have shared trunk"
-        assert len(mlp.trunk) == 4, "Trunk should have 4 layers (Linear, ReLU, Linear, ReLU)"
+        assert len(mlp.trunk) == 2, "Trunk should have 2 layers (Linear, ReLU)"
         
         # Check separate heads
         assert hasattr(mlp, 'heads'), "MLP should have separate heads"
         assert len(mlp.heads) == num_bias_types, f"Should have {num_bias_types} heads"
         
-        # Each head should output 2 values (mean, log_std)
+        # Each head should be a Sequential module that outputs 2 values (mean, log_std)
         for i, head in enumerate(mlp.heads):
-            assert head.out_features == 2, f"Head {i} should output 2 values"
+            assert isinstance(head, nn.Sequential), f"Head {i} should be Sequential"
+            # Check final layer output dimension
+            final_layer = list(head.children())[-1]
+            assert isinstance(final_layer, nn.Linear), f"Head {i} final layer should be Linear"
+            assert final_layer.out_features == 2, f"Head {i} should output 2 values"
     
     def test_output_shape(self):
         """Test that output has correct shape."""
@@ -74,7 +79,14 @@ class TestEdgePolicyArchitecture:
     """Tests for EdgePolicy with new architecture."""
     
     def test_output_scaling_to_bias_range(self):
-        """Test that mean outputs are scaled to [-20, 20] range."""
+        """Test that mean outputs are scaled to expected bias coefficient ranges.
+        
+        Scale factors based on 95th percentile + 20% headroom from pretraining data:
+        - Linear: ±79
+        - Quadratic: ±163
+        - Skew: ±11
+        - End: ±7
+        """
         N, E = 5, 10
         encoder = RGCNEncoder(in_dim=10, hidden_dims=[16], out_dim=8, num_relations=2)
         policy = EdgePolicy(encoder=encoder, emb_dim=8, edge_feat_dim=0, mlp_hidden=32, mlp_out_dim=4)
@@ -85,9 +97,13 @@ class TestEdgePolicyArchitecture:
         
         _, _, mean, _ = policy.get_actions(x, edge_index, edge_type, deterministic=True)
         
-        # Mean should be in [-20, 20] due to tanh scaling
-        assert mean.min() >= -20.0, f"Mean min {mean.min()} should be >= -20"
-        assert mean.max() <= 20.0, f"Mean max {mean.max()} should be <= 20"
+        # Mean should be within expected ranges per bias type
+        # [linear, quadratic, skew, end]
+        expected_max = torch.tensor([79.0, 163.0, 11.0, 7.0])
+        
+        for i, max_val in enumerate(expected_max):
+            assert mean[:, i].min() >= -max_val, f"Bias type {i} min {mean[:, i].min()} should be >= -{max_val}"
+            assert mean[:, i].max() <= max_val, f"Bias type {i} max {mean[:, i].max()} should be <= {max_val}"
     
     def test_increased_exploration_range(self):
         """Test that log_std can reach 3.5 (std up to ~33)."""
