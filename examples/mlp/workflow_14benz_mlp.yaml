@@ -1,0 +1,110 @@
+# Pairwise MLP Training Configuration for 14benz System
+# Uses direct feature-to-bias prediction without graph construction
+# 2 sites: site1 (6 subs) and site2 (5 subs)
+
+# Combination generation settings
+# Note: This generates METADATA for all possible combinations (14,211 total)
+# but directories are created lazily on-demand during training.
+# The curriculum stages below filter which combos are actually used for training.
+create_combos:
+  input_dir: /home/pbowling/mllf/examples/14benz
+  output_dir: /home/pbowling/mllf/examples/mlp/14benz/generated_combos
+  include_patterns:
+    - msld_flat.py
+
+# Train/val/test split
+split:
+  train_frac: 0.9
+  val_frac: 0.1
+  seed: 42
+
+# Curriculum learning (optional)
+curriculum:
+  enabled: true
+  stages:
+    # Stage 1: Single-site pairs (easiest)
+    - name: "Stage 1: Single-Site Pairs"
+      epochs: 20
+      min_subs: 2
+      max_subs: 2
+      min_sites: 1
+      max_sites: 1
+      max_train_combos: 100
+    
+    # Stage 2: Single-site triplets
+    #- name: "Stage 2: Single-Site Triplets"
+    #  epochs: 30
+    #  min_subs: 3
+    #  max_subs: 3
+    #  min_sites: 1
+    #  max_sites: 1
+    #  max_train_combos: 100
+    
+    # Stage 3: Two-site systems (hardest)
+    #- name: "Stage 3: Two-Site Systems"
+    #  epochs: 50
+    #  min_subs: 4
+    #  max_subs: 11
+    #  min_sites: 2
+    #  max_sites: 2
+    #  max_train_combos: 150
+    
+# Training configuration for Pairwise MLP
+training:
+  num_epochs: 100
+  policy:
+    # feature_dim: auto-detected from data (typically 364 for CGenFF vocab)
+    hidden_dims: [256, 128]  # Shared trunk hidden layers
+    num_bias_types: 4        # Linear, quadratic, skew, end
+    bias_embed_dim: 16       # Bias-type embedding dimension
+    dropout: 0.1             # Dropout probability
+  optimizer:
+    lr: 0.0005  # Lower learning rate for fine-tuning pretrained model
+  bias_clip: 1000.0  # Safety net for action clipping
+
+# Pretrained policy (load from pretraining)
+pretrain:
+  model_path: /home/pbowling/mllf/examples/mlp/models/pretrained_pairwise/best_pairwise_policy.pt
+
+# Reward configuration
+reward:
+  # Reward component weights
+  w_P: 0.5
+  w_T: 0.5
+  w_U: 0.3
+  
+  # Scaling and bonuses
+  gamma: 4.0
+  entropy_bonus: 8.0
+  
+  # Baseline normalization
+  P_baseline: 500.0
+  T_baseline: 50.0
+  
+  # Transition requirements
+  min_transitions_per_site: 10
+  
+  # Coverage requirements
+  min_coverage_ratio: 0.5
+  concentration_penalty_threshold: 0.8
+  
+  # Legacy
+  lambda_entropy: 0.01
+
+# Simulation settings
+run_sims: true
+max_concurrent_jobs: 60
+timeout: 1200  # 20 minutes per simulation
+
+# Output settings
+output:
+  base_dir: /home/pbowling/mllf/examples/mlp/14benz/epochs
+  save_checkpoints: true
+  checkpoint_freq: 5  # Save every 5 epochs
+
+# Archive settings (optional)
+archive:
+  enabled: false
+  pattern: 'comb_*'
+  remove_after: false
+  archive_dir: /home/pbowling/mllf/examples/mlp/14benz/archives
