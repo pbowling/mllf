@@ -42,8 +42,24 @@ def test_read_bias_coeff_parses_new_file():
 
 	data = read_bias_coeff(fn)
 
-	# top-level groups should exist
-	assert set(data.keys()) == {'lams', 'cs', 'xs', 'ss'}
+	# top-level groups should exist (scalar entries)
+	assert set(data.keys()) >= {'lams', 'cs', 'xs', 'ss'}
+	
+	# matrices should also be present
+	assert 'b' in data and 'c' in data and 'x' in data and 's' in data
+	
+	# b should be a nested list (single row vector)
+	b = data['b']
+	assert isinstance(b, list), "b should be a list"
+	assert len(b) == 1, "b should be a single row (nested list)"
+	assert isinstance(b[0], list), "b[0] should be a list of values"
+	assert len(b[0]) == 31, "b should have 31 values for this example"
+	assert b[0][0] == 0.0 and b[0][1] == 0.13, "b vector values should match"
+	
+	# c should be a 31x31 matrix
+	c = data['c']
+	assert isinstance(c, list) and len(c) == 31
+	assert all(isinstance(row, list) and len(row) == 31 for row in c)
 
 	assert 'lams1s2' in data['lams']
 	assert math.isclose(data['lams']['lams1s2'], 0.13, rel_tol=1e-6)

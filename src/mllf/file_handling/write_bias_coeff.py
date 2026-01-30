@@ -175,9 +175,8 @@ def write_variables_py_from_inp(inp_path: str, out_path: str):
 
     data = parse_old(inp_path)
 
-    # Prepare header (imports + empty bias_string to mimic variablesNN.py layout)
-    # Header: imports only; bias_string block will be inserted below
-    header = "import yaml\nimport numpy as np\n\n"
+    # Prepare header (imports + docstring to match pretraining file format)
+    header = '"""Auto-generated variables file for pretraining data."""\nimport yaml\n\n'
 
     lines = [header]
 
@@ -292,7 +291,10 @@ def write_variables_py_from_inp(inp_path: str, out_path: str):
                 bias_lines.append(f"{k}: {repr(float(grp[k]))}\n")
 
     # close bias_string block
-    bias_lines.append('\"\"\"\n\n')
+    bias_lines.append('"""\n\n')
+    
+    # Add the yaml.safe_load line to make the bias dict available
+    bias_lines.append('bias = yaml.safe_load(bias_string)\n')
 
     # write header + bias_string
     lines = [header] + bias_lines
