@@ -102,3 +102,6 @@ def test_variables_py_contains_bias(tmp_path):
     after = s[end + 3 :]
     dup_lines = [ln for ln in after.splitlines() if ln.strip().startswith(('lams', 'cs', 'xs', 'ss'))]
     assert dup_lines == []
+    
+    # ensure bias = yaml.safe_load(bias_string) line is present
+    assert 'bias = yaml.safe_load(bias_string)' in s, "Missing yaml.safe_load line"
