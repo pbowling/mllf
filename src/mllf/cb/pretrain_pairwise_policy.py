@@ -338,6 +338,7 @@ def pretrain_pairwise(
         num_bias_types=4,
         bias_embed_dim=pairwise_config.get('bias_embed_dim', 16),
         dropout=pairwise_config.get('dropout', 0.1),
+        feature_mode=pairwise_config.get('feature_mode', 'difference')  # Default: difference features
     ).to(device)
     
     optimizer = optim.Adam(
@@ -347,6 +348,7 @@ def pretrain_pairwise(
     
     print(f"\nModel architecture:")
     print(f"  Feature dimension: {feature_dim}")
+    print(f"  Feature mode: {policy.feature_mode}")
     print(f"  Total parameters: {sum(p.numel() for p in policy.parameters()):,}")
     
     # Training loop

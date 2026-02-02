@@ -13,8 +13,8 @@
 # Differences from Graph-Based Policy:
 # - No graph construction: Uses substituent features directly
 # - Pairwise predictions: Predicts for each directed pair
-# - Simpler architecture: MLP on concatenated features
-# - Faster training: No RGCN message passing
+# - Simpler architecture: MLP on difference features (feat_i - feat_j)
+# - Faster training: No RGCN message passing, smaller input dimension
 
 set -e  # Exit on error
 
@@ -250,10 +250,12 @@ echo "Training pairwise MLP policy via Behavior Cloning..."
 echo "This learns to predict bias coefficients from successful runs"
 echo ""
 echo "Architecture:"
-echo "  - Input: Concatenated substituent features (2*178 = 356 dims)"
+echo "  - Input: Difference features (feat_i - feat_j) = 178 dims"
+echo "  - Features: Count-based encoding (CGenFF vocab: 161 types, 14 elements)"
 echo "  - Shared trunk: [256, 128] with ReLU and dropout"
 echo "  - Bias-type embeddings: 16-dim per bias type"
 echo "  - Separate heads: 3-layer networks per bias type"
+echo "  - Directionality: i→j preserved by difference (opposite of j→i)"
 echo ""
 echo "Training with MSE loss for 50 epochs"
 echo ""

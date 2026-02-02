@@ -53,7 +53,9 @@ curriculum:
 training:
   num_epochs: 100
   policy:
-    # feature_dim: auto-detected from data (typically 364 for CGenFF vocab)
+    # feature_dim: auto-detected from data (178 for CGenFF vocab with count encoding)
+    # feature_mode: 'difference' (default) - uses feat_i - feat_j for directionality
+    #   Can override to 'concat' ([feat_i, feat_j]) or 'both' if needed
     hidden_dims: [256, 128]  # Shared trunk hidden layers
     num_bias_types: 4        # Linear, quadratic, skew, end
     bias_embed_dim: 16       # Bias-type embedding dimension

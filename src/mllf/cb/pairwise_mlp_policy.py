@@ -29,13 +29,21 @@ class PairwiseBiasMLP(nn.Module):
     substituent features (atom types, elements, charge, environment) and
     predicts the 4 bias coefficients for the directed edge (sub_i -> sub_j).
     
-    Features are concatenated: [feat_i, feat_j] where each feature vector contains:
+    Feature modes:
+    - 'difference' (default): feat_i - feat_j (preserves directionality i->j)
+      Input dimension: (3 + 14 + 161) = 178 dims for CGenFF
+      Note: Environment flags are preserved (not differenced) since both subs in same env
+      Structure: [charge_diff, is_solvent, is_protein, element_diffs, atom_type_diffs]
+    - 'concat': [feat_i, feat_j] (absolute features)
+      Input dimension: 2 * 178 = 356 dims
+    - 'both': [feat_i, feat_j, feat_i - feat_j] (absolute + difference)
+      Input dimension: 3 * 178 = 534 dims
+    
+    Each feature vector contains:
     - charge (1 dim)
     - environment (2 dims: is_solvent, is_protein)
-    - elements (multi-hot, ~14 dims)
-    - atom types (multi-hot, ~161 dims for CGenFF)
-    
-    Total input dimension: 2 * (3 + 14 + 161) = 356 dims for CGenFF
+    - element counts (~14 dims)
+    - atom type counts (~161 dims for CGenFF)
     """
     
     def __init__(
@@ -44,7 +52,8 @@ class PairwiseBiasMLP(nn.Module):
         hidden_dims: List[int] = [256, 128],
         num_bias_types: int = 4,
         bias_embed_dim: int = 16,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        feature_mode: str = 'difference'
     ):
         """Initialize pairwise bias MLP.
         
@@ -54,14 +63,23 @@ class PairwiseBiasMLP(nn.Module):
             num_bias_types: Number of bias coefficients to predict (default: 4)
             bias_embed_dim: Dimension of bias-type embeddings
             dropout: Dropout probability for regularization
+            feature_mode: How to combine pair features ('difference', 'concat', or 'both')
         """
         super().__init__()
         self.feature_dim = feature_dim
         self.num_bias_types = num_bias_types
         self.bias_embed_dim = bias_embed_dim
+        self.feature_mode = feature_mode
         
-        # Input is concatenated pair features: [feat_i, feat_j]
-        pair_input_dim = 2 * feature_dim
+        # Determine input dimension based on feature mode
+        if feature_mode == 'difference':
+            pair_input_dim = feature_dim  # feat_i - feat_j
+        elif feature_mode == 'concat':
+            pair_input_dim = 2 * feature_dim  # [feat_i, feat_j]
+        elif feature_mode == 'both':
+            pair_input_dim = 3 * feature_dim  # [feat_i, feat_j, feat_i - feat_j]
+        else:
+            raise ValueError(f"Invalid feature_mode: {feature_mode}. Must be 'difference', 'concat', or 'both'")
         
         # Shared trunk to process pair features
         layers = []
@@ -92,7 +110,10 @@ class PairwiseBiasMLP(nn.Module):
         """Forward pass to predict bias coefficients.
         
         Args:
-            pair_features: [N_pairs, 2*feature_dim] concatenated substituent features
+            pair_features: [N_pairs, pair_input_dim] pair features based on feature_mode:
+                - 'difference': feat_i - feat_j
+                - 'concat': [feat_i, feat_j]
+                - 'both': [feat_i, feat_j, feat_i - feat_j]
         
         Returns:
             Tuple of (means, log_stds):
@@ -145,13 +166,18 @@ class PairwiseMLPPolicy(nn.Module):
     
     We directly:
     1. Extract substituent features (atom types, elements, etc.)
-    2. For each directed pair, concatenate features
+    2. For each directed pair, compute difference features (i->j)
     3. Predict bias coefficients via MLP
+    
+    By default, uses difference features (feat_i - feat_j) which:
+    - Preserves directionality (i->j has opposite sign from j->i)
+    - Focuses on relative properties (key for interactions)
+    - Reduces input dimension (178 vs 356)
     
     This approach is conceptually simpler and may work better when:
     - Graph structure doesn't provide much signal
     - Pairwise interactions dominate
-    - Feature-based similarity is more important than topology
+    - Feature-based similarity/difference is more important than topology
     """
     
     def __init__(
@@ -160,7 +186,8 @@ class PairwiseMLPPolicy(nn.Module):
         hidden_dims: List[int] = [256, 128],
         num_bias_types: int = 4,
         bias_embed_dim: int = 16,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        feature_mode: str = 'difference'
     ):
         """Initialize pairwise MLP policy.
         
@@ -170,15 +197,18 @@ class PairwiseMLPPolicy(nn.Module):
             num_bias_types: Number of bias types (default: 4)
             bias_embed_dim: Bias-type embedding dimension
             dropout: Dropout probability
+            feature_mode: How to combine pair features ('difference', 'concat', or 'both')
         """
         super().__init__()
         self.feature_dim = feature_dim
+        self.feature_mode = feature_mode
         self.mlp = PairwiseBiasMLP(
             feature_dim=feature_dim,
             hidden_dims=hidden_dims,
             num_bias_types=num_bias_types,
             bias_embed_dim=bias_embed_dim,
-            dropout=dropout
+            dropout=dropout,
+            feature_mode=feature_mode
         )
     
     def get_actions(
@@ -204,7 +234,35 @@ class PairwiseMLPPolicy(nn.Module):
         # Extract features for each pair
         feat_i = substituent_features[pairs[:, 0]]  # [N_pairs, feature_dim]
         feat_j = substituent_features[pairs[:, 1]]  # [N_pairs, feature_dim]
-        pair_features = torch.cat([feat_i, feat_j], dim=-1)  # [N_pairs, 2*feature_dim]
+        
+        # Check for environment mismatches (should never happen in practice)
+        if (feat_i[:, 1:3] != feat_j[:, 1:3]).any():
+            import warnings
+            warnings.warn(
+                "Environment mismatch detected between paired substituents! "
+                "All substituents in a combination should be in the same environment. "
+                "This may indicate a data loading error.",
+                UserWarning
+            )
+        
+        # Compute pair features based on mode
+        if self.feature_mode == 'difference':
+            # Compute difference features but preserve environment flags
+            # Feature structure: [charge, is_solvent, is_protein, element_counts..., atom_type_counts...]
+            # We want: [charge_diff, is_solvent_i, is_protein_i, element_diffs..., atom_type_diffs...]
+            feat_diff = feat_i - feat_j  # [N_pairs, feature_dim]
+            # Replace environment flags (indices 1-2) with feat_i's values (actual environment)
+            feat_diff[:, 1] = feat_i[:, 1]  # is_solvent from substituent i
+            feat_diff[:, 2] = feat_i[:, 2]  # is_protein from substituent i
+            pair_features = feat_diff
+        elif self.feature_mode == 'concat':
+            pair_features = torch.cat([feat_i, feat_j], dim=-1)  # [N_pairs, 2*feature_dim]
+        elif self.feature_mode == 'both':
+            feat_diff = feat_i - feat_j
+            # Also preserve environment flags in difference features for 'both' mode
+            feat_diff[:, 1] = feat_i[:, 1]
+            feat_diff[:, 2] = feat_i[:, 2]
+            pair_features = torch.cat([feat_i, feat_j, feat_diff], dim=-1)  # [N_pairs, 3*feature_dim]
         
         # Forward pass
         means, log_stds = self.mlp(pair_features)  # Each [N_pairs, num_bias_types]
@@ -241,5 +299,29 @@ class PairwiseMLPPolicy(nn.Module):
         """
         feat_i = substituent_features[pairs[:, 0]]
         feat_j = substituent_features[pairs[:, 1]]
-        pair_features = torch.cat([feat_i, feat_j], dim=-1)
+        
+        # Check for environment mismatches
+        if (feat_i[:, 1:3] != feat_j[:, 1:3]).any():
+            import warnings
+            warnings.warn(
+                "Environment mismatch detected between paired substituents! "
+                "All substituents in a combination should be in the same environment.",
+                UserWarning
+            )
+        
+        # Compute pair features based on mode
+        if self.feature_mode == 'difference':
+            # Compute difference features but preserve environment flags
+            feat_diff = feat_i - feat_j
+            feat_diff[:, 1] = feat_i[:, 1]  # is_solvent from substituent i
+            feat_diff[:, 2] = feat_i[:, 2]  # is_protein from substituent i
+            pair_features = feat_diff
+        elif self.feature_mode == 'concat':
+            pair_features = torch.cat([feat_i, feat_j], dim=-1)
+        elif self.feature_mode == 'both':
+            feat_diff = feat_i - feat_j
+            feat_diff[:, 1] = feat_i[:, 1]
+            feat_diff[:, 2] = feat_i[:, 2]
+            pair_features = torch.cat([feat_i, feat_j, feat_diff], dim=-1)
+        
         return self.mlp(pair_features)

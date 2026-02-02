@@ -5,17 +5,18 @@
 
 # Training configuration for Pairwise MLP
 # Architecture: Direct feature-to-bias prediction without graph structure
-# - Input: Concatenated substituent features [feat_i, feat_j] (2*feature_dim)
+# - Input: Difference features (feat_i - feat_j) preserving directionality (feature_dim)
 # - Shared trunk: 2 layers [256, 128] with ReLU and dropout
 # - Bias-type embeddings: Learnable 16-dim vectors for specialization
 # - Separate heads: 3-layer networks per bias type [hidden//2 → 2]
 # - Output: [mean, log_std] for each of 4 bias types
 # - Output clipping: [Linear ±79, Quadratic ±163, Skew ±11, End ±7]
 # - Exploration: log_std max = 2.0 (std up to ~7.4)
-# Note: feature_dim is auto-detected from data (typically 364 for CGenFF vocab)
+# Note: feature_dim is auto-detected from data (178 for CGenFF vocab with count encoding)
 training:
   policy:
-    # feature_dim: auto-detected from pretraining data
+    # feature_dim: auto-detected from pretraining data (178 with CGenFF count encoding)
+    # feature_mode: 'difference' (default) - uses feat_i - feat_j
     hidden_dims: [256, 128] # Shared trunk hidden layers
     num_bias_types: 4       # Linear, quadratic, skew, end
     bias_embed_dim: 16      # Bias-type embedding dimension

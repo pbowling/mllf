@@ -16,21 +16,22 @@ def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vo
     Expected keys in meta: 
     - 'total_charge' (float)
     - 'solvent' (str: 'solvent'/'solv' or 'protein')
-    - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61'])
+    - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61', 'CG2R61'])
     
     The function returns a 1-D torch.float tensor with features:
-    [charge, is_solvent, is_protein, <element one-hot>, <atom type one-hot>]
+    [charge, is_solvent, is_protein, <element counts>, <atom type counts>]
     
     If atom_type_vocab, element_vocab, and atom_to_element mapping are provided, distinct_atom_types
-    are encoded as two separate one-hot vectors:
-    - Element one-hot: which elements are present in the substituent (e.g., C, H, N, O)
-    - Atom type one-hot: which specific atom types are present (e.g., CG2R61, HGR61)
+    are encoded as two separate count vectors:
+    - Element counts: how many atoms of each element (e.g., 6 C, 4 H, 1 O)
+    - Atom type counts: how many of each specific atom type (e.g., 3 CG2R61, 2 HGR61)
     
     Elements are extracted from atom types using the atom_to_element mapping.
     
-    This is more efficient than a single multi-hot encoding since:
-    - Element vocab is small (~14 elements in CGenFF)
-    - Provides both coarse (element) and fine (atom type) chemical information
+    This encoding captures both composition (counts) and chemical diversity:
+    - Coarse counts: total atoms per element
+    - Fine counts: atoms per specific CHARMM type
+    - More informative than binary presence/absence
     """
     charge = float(meta.get('total_charge', 0.0))
     
@@ -41,33 +42,29 @@ def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vo
     
     base_features = [charge, is_solvent, is_protein]
     
-    # Encode elements and atom types as separate one-hot vectors if vocabularies provided
+    # Encode elements and atom types with counts if vocabularies provided
     if element_vocab is not None and atom_type_vocab is not None and atom_to_element is not None:
         distinct_types = meta.get('distinct_atom_types', [])
         if not isinstance(distinct_types, (list, tuple)):
             distinct_types = []
         
-        # Create element one-hot encoding (which elements are present)
+        # Create element count encoding (how many atoms of each element)
         element_encoding = [0.0] * len(element_vocab)
-        # Create atom type one-hot encoding (which specific types are present)
+        # Create atom type count encoding (how many of each specific type)
         atom_type_encoding = [0.0] * len(atom_type_vocab)
         
-        # Track which elements we've seen to avoid duplicates
-        seen_elements = set()
-        
+        # Count occurrences of each atom type and element
         for atom_type in distinct_types:
-            # Mark atom type as present
+            # Increment atom type count
             if atom_type in atom_type_vocab:
                 idx = atom_type_vocab[atom_type]
-                atom_type_encoding[idx] = 1.0
+                atom_type_encoding[idx] += 1.0
                 
-                # Extract element from atom type using the mapping
+                # Increment element count using the mapping
                 element = atom_to_element.get(atom_type)
-                if element and element not in seen_elements:
-                    seen_elements.add(element)
-                    if element in element_vocab:
-                        elem_idx = element_vocab[element]
-                        element_encoding[elem_idx] = 1.0
+                if element and element in element_vocab:
+                    elem_idx = element_vocab[element]
+                    element_encoding[elem_idx] += 1.0
         
         base_features.extend(element_encoding)
         base_features.extend(atom_type_encoding)

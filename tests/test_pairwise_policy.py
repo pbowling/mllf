@@ -296,10 +296,11 @@ class TestPairwiseMLPPolicy:
         nsubs_per_site = [3, 2]
         pairs = build_directed_pairs(nsubs_per_site)
         
-        # Create dummy pair features [N_pairs, 2*178] (concatenated features)
-        pair_features = torch.randn(len(pairs), 2 * 178)
+        # Create dummy pair features [N_pairs, 178] (difference features - default mode)
+        pair_features = torch.randn(len(pairs), 178)
         
         # Create policy - note feature_dim is for a SINGLE substituent
+        # Default feature_mode='difference' expects input of size feature_dim
         policy = PairwiseBiasMLP(
             feature_dim=178,
             num_bias_types=4,
@@ -323,8 +324,9 @@ class TestPairwiseMLPPolicy:
         
         total_params = sum(p.numel() for p in policy.parameters())
         
-        # Should be around 162K parameters (much less than graph-based ~500K)
-        assert 150_000 < total_params < 200_000, \
+        # With difference mode (178 input), should be around 116K parameters
+        # (less than concat mode ~162K, much less than graph-based ~500K)
+        assert 100_000 < total_params < 150_000, \
             f"Parameter count {total_params} outside expected range"
     
     def test_output_clipping(self):

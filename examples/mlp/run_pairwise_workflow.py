@@ -583,16 +583,18 @@ def main():
         hidden_dims=policy_config.get('hidden_dims', [256, 128]),
         num_bias_types=policy_config.get('num_bias_types', 4),
         bias_embed_dim=policy_config.get('bias_embed_dim', 16),
-        dropout=policy_config.get('dropout', 0.1)
+        dropout=policy_config.get('dropout', 0.1),
+        feature_mode=policy_config.get('feature_mode', 'difference')  # Default: difference features
     ).to(device)
+    
+    print(f"Feature mode: {policy.feature_mode}")
+    print(f"Policy: {sum(p.numel() for p in policy.parameters()):,} parameters")
     
     optimizer_config = train_config.get('optimizer', {})
     optimizer = torch.optim.Adam(
         policy.parameters(),
         lr=optimizer_config.get('lr', 0.001)
     )
-    
-    print(f"Policy: {sum(p.numel() for p in policy.parameters()):,} parameters")
     
     # Step 4: Load pretrained policy or resume from checkpoint
     output_config = config.get('output', {})

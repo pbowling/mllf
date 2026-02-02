@@ -170,10 +170,14 @@ def extract_substituent_features(
             solvent = detect_solvent_state(filename)
         
         # Build metadata for feature extraction
+        # RTF parser returns 'atom_types' (list with duplicates)
+        # Pass full list to _node_feature_from_meta for count-based encoding
+        atom_types_list = parsed.get('atom_types', [])
+        
         meta = {
             'total_charge': parsed.get('total_charge', 0.0),
             'solvent': solvent,
-            'distinct_atom_types': parsed.get('distinct_atom_types', [])
+            'distinct_atom_types': atom_types_list  # Full list with duplicates for counts
         }
         
         # Extract features using existing infrastructure
