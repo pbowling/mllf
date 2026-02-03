@@ -30,7 +30,7 @@ training:
 reward:
   # Reward component weights
   w_P: 0.5              # Weight for population distribution
-  w_T: 0.5              # Weight for transition counts
+  w_T: 0.75             # Weight for transition counts
   w_U: 0.3              # Weight for uniformity/entropy
   
   # Scaling and bonuses

@@ -273,7 +273,7 @@ def compute_reward_from_sim_results(
     num_sites: int,
     nsubs_per_site: List[int],
     w_P: float = 0.5,
-    w_T: float = 0.5,
+    w_T: float = 0.75,
     w_U: float = 0.3,
     gamma: float = 4.0,
     P_baseline: float = 500.0,  # Updated to higher_rewards_v1 config
@@ -288,13 +288,11 @@ def compute_reward_from_sim_results(
     This implements the same logic as train_improved.py but works with cached
     simulation results instead of reading from output files.
     
-    **New Mechanisms (matches train_improved.py):**
-    - **Penalty Shield (I_dead)**: Disables coverage/concentration penalties when min_transitions = 0
-    - **Confidence Factor (C_F)**: Scales population reward by data reliability
+    **Confidence Factor (C_F)**: Scales population reward by data reliability
     
     Uses a **tiered transition penalty system** to provide continuous feedback:
-    - **Tier 1: "Death Floor" (0 transitions)**: -40.0 penalty per site
-    - **Tier 2: "Climbing Ramp" (1-9 transitions)**: Linear gradient ~-30 to -8
+    - **Tier 1: "Death Floor" (0-2 transitions)**: -40.0 penalty per site
+    - **Tier 2: "Climbing Ramp" (3-9 transitions)**: Linear gradient ~-16 to -4
     - **Tier 3: "Success Zone" (≥10 transitions)**: Unlocks R_T reward
     
     Default parameters match the 'higher_rewards_v1' configuration which achieved
@@ -357,12 +355,8 @@ def compute_reward_from_sim_results(
     trans_array = np.array(trans_per_site[:num_sites], dtype=float)
     total_trans = trans_array.sum()
     
-    # Track minimum transitions across all sites for Penalty Shield and Confidence Factor
+    # Track minimum transitions across all sites for Confidence Factor
     min_transitions_across_sites = int(trans_array.min())
-    
-    # === PENALTY SHIELD (I_dead) ===
-    # Prevents "double jeopardy" by disabling secondary penalties when sim is frozen
-    I_dead = 1 if min_transitions_across_sites == 0 else 0
     
     # === STRICT REQUIREMENTS (penalties) ===
     # Match train_improved.py penalty calculation
@@ -377,32 +371,36 @@ def compute_reward_from_sim_results(
             sites_below_threshold += 1
             
             if trans_count == 0:
-                # Tier 1: "Death Floor" - worst possible state
+                # Tier 1: "Death Floor" - zero activity (max penalty)
                 penalties -= 40.0
+            elif trans_count == 1:
+                # Tier 1: "Death Floor" - very low activity
+                penalties -= 32.0
+            elif trans_count == 2:
+                # Tier 1: "Death Floor" - very low activity
+                penalties -= 24.0
             elif trans_count < min_transitions_per_site:
-                # Tier 2: "Climbing Ramp" - linear gradient from ~-30 to -8
-                # Formula: -5.0 - (2.8 * deficit)
+                # Tier 2: "Climbing Ramp" - softened gradient from ~-16 to -4
+                # Formula: -2.0 - (2.0 * deficit)
                 deficit = min_transitions_per_site - trans_count
-                penalties -= (5.0 + 2.8 * deficit)
+                penalties -= (2.0 + 2.0 * deficit)
     
     # 2. Coverage requirement (minimum % of substituents visited)
-    # ONLY applied when shield is INACTIVE (I_dead = 0)
     num_populated = np.count_nonzero(pop_array)
     total_subs = sum(nsubs_per_site)
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
     
-    if (1 - I_dead) and coverage_ratio < min_coverage_ratio:
+    if coverage_ratio < min_coverage_ratio:
         deficit = min_coverage_ratio - coverage_ratio
         penalties -= gamma * 20.0 * deficit
     
     # 3. Concentration penalty (per-site check)
-    # ONLY applied when shield is INACTIVE (I_dead = 0)
     pop_idx = 0
     for site_idx, nsubs in enumerate(nsubs_per_site):
         site_pops = pop_array[pop_idx:pop_idx + nsubs]
         site_total = site_pops.sum()
         
-        if (1 - I_dead) and site_total > 0:
+        if site_total > 0:
             concentration_ratio = site_pops.max() / site_total
             if concentration_ratio > concentration_penalty_threshold:
                 penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)

@@ -72,7 +72,7 @@ pretrain:
 reward:
   # Reward component weights
   w_P: 0.5
-  w_T: 0.5
+  w_T: 0.75
   w_U: 0.3
   
   # Scaling and bonuses

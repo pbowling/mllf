@@ -20,7 +20,7 @@ from mllf.file_handling.read_output import (
 def compute_msld_reward_improved(
     combo_dir: str,
     w_P: float = 0.5,
-    w_T: float = 0.5,
+    w_T: float = 0.75,
     w_U: float = 0.3,
     gamma: float = 4.0,
     P_baseline: float = 500.0,
@@ -32,23 +32,17 @@ def compute_msld_reward_improved(
 ) -> float:
     """Compute improved scalarized reward that prevents degenerate solutions.
     
-    This reward function uses two key mechanisms to prevent degenerate behavior:
+    This reward function uses a Confidence Factor to prevent degenerate behavior:
     
-    **1. Penalty Shield (I_dead)**
-    Prevents "double jeopardy" by disabling secondary penalties when any site
-    has zero transitions:
-        I_dead = 1 if min_transitions = 0, else 0
-        Coverage & concentration penalties only apply when I_dead = 0
-    
-    **2. Confidence Factor (C_F)**
+    **Confidence Factor (C_F)**
     Scales population rewards based on data reliability:
         C_F = min(1.0, min_transitions / (2 * N_req))
         R_P is multiplied by C_F, reducing false rewards from low-transition runs
     
     **Tiered Transition Penalty System:**
-    - **Tier 1: "Death Floor" (0 transitions)**: Fixed penalty of -40.0
-    - **Tier 2: "Climbing Ramp" (1-9 transitions)**: Linear gradient from ~-30 to -8
-      Formula: -5.0 - (2.8 × deficit)
+    - **Tier 1: "Death Floor" (0-2 transitions)**: Fixed penalty of -40.0
+    - **Tier 2: "Climbing Ramp" (3-9 transitions)**: Linear gradient from ~-16 to -4
+      Formula: -2.0 - (2.0 × deficit)
     - **Tier 3: "Success Zone" (≥10 transitions)**: Penalty = 0.0, unlocks R_T
     
     **Reward Components:**
@@ -59,7 +53,7 @@ def compute_msld_reward_improved(
         R_T: Transition reward (gated: only if all sites ≥ min_transitions)
         R_U: Coverage uniformity reward
         R_entropy: Bonus for high-entropy (uniform) distributions
-        R_penalties: Tiered transition penalties + shielded secondary penalties
+        R_penalties: Tiered transition penalties + coverage/concentration penalties
     
     Args:
         combo_dir: Path to combination directory with simulation outputs.
@@ -160,39 +154,39 @@ def compute_msld_reward_improved(
             sites_below_threshold += 1
             
             if trans_count == 0:
-                # Tier 1: "Death Floor" - worst possible state
+                # Tier 1: "Death Floor" - zero activity (max penalty)
                 penalties -= 40.0
+            elif trans_count == 1:
+                # Tier 1: "Death Floor" - very low activity
+                penalties -= 32.0
+            elif trans_count == 2:
+                # Tier 1: "Death Floor" - very low activity
+                penalties -= 24.0
             elif trans_count < min_transitions_per_site:
-                # Tier 2: "Climbing Ramp" - linear gradient from ~-30 to -8
-                # Formula: -5.0 - (2.8 * deficit)
-                # At trans=1, deficit=9: -5.0 - 25.2 = -30.2
-                # At trans=9, deficit=1: -5.0 - 2.8 = -7.8
+                # Tier 2: "Climbing Ramp" - softened gradient from ~-16 to -4
+                # Formula: -2.0 - (2.0 * deficit)
+                # At trans=3, deficit=7: -2.0 - 14.0 = -16.0
+                # At trans=9, deficit=1: -2.0 - 2.0 = -4.0
                 deficit = min_transitions_per_site - trans_count
-                penalties -= (5.0 + 2.8 * deficit)
+                penalties -= (2.0 + 2.0 * deficit)
     
     # Note: sites_below_threshold tracked but no additional penalty
     # (tiered penalties already applied above)
     if sites_below_threshold > 0:
         print(f"  Warning: {sites_below_threshold} site(s) below {min_transitions_per_site} transitions")
     
-    # Penalty Shield: I_dead indicator (1 if any site has 0 transitions)
-    # This prevents "double jeopardy" by disabling secondary penalties for frozen simulations
-    I_dead = 1 if min_transitions_across_sites == 0 else 0
-    
     # Check 2: Minimum coverage (fraction of substituents visited)
-    # ONLY APPLIED IF SHIELD IS INACTIVE (I_dead = 0)
     pop_array = np.array(populations)
     nonzero_count = np.sum(pop_array > 0)
     coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
     
-    if (1 - I_dead) and coverage_ratio < min_coverage_ratio:
-        # Heavy penalty for low coverage (only if simulation is active)
+    if coverage_ratio < min_coverage_ratio:
+        # Heavy penalty for low coverage
         deficit = min_coverage_ratio - coverage_ratio
         penalties -= gamma * 20.0 * deficit
         print(f"  Warning: Coverage {coverage_ratio:.2f} below minimum {min_coverage_ratio}")
     
     # Check 3: Detect single-dominant-population per site
-    # ONLY APPLIED IF SHIELD IS INACTIVE (I_dead = 0)
     # Extract actual substituents per site from graph_info.json
     nsubs_per_site = None
     graph_info_path = combo_path / 'graph_info.json'
@@ -227,8 +221,8 @@ def compute_msld_reward_improved(
             total_pop = np.sum(site_pops)
             concentration_ratio = max_pop / total_pop
             
-            # If concentration exceeds threshold: penalty (only if shield is inactive)
-            if (1 - I_dead) and concentration_ratio > concentration_penalty_threshold:
+            # If concentration exceeds threshold: penalty
+            if concentration_ratio > concentration_penalty_threshold:
                 penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
                 print(f"  Warning: Site {site_idx} has {concentration_ratio:.2%} concentration")
         
@@ -313,7 +307,7 @@ def compute_msld_reward_improved(
           f"R_entropy={R_entropy:.2f}, penalties={penalties:.2f}, total={R:.2f}")
     print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.2%}), "
           f"Transitions: {list(site_transitions.values())}, "
-          f"Confidence: {confidence_factor:.2f}, Shield: {'ACTIVE' if I_dead else 'INACTIVE'}")
+          f"Confidence: {confidence_factor:.2f}")
     
     return R
 

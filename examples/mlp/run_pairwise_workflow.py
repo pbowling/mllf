@@ -242,7 +242,7 @@ def train_epoch(
 #SBATCH --output={slurm_output}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH -p ada6000 --gres=gpu:1 
+#SBATCH -p ada5000 --gres=gpu:1 
 #SBATCH --export=ALL
 #SBATCH --time=01:00:00
 
