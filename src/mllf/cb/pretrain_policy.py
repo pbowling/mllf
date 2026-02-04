@@ -70,6 +70,182 @@ def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=Non
     )
 
 
+def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None, warn_missing_types=True):
+    """Build fully-connected PyG graph for pretraining from saved variables.py.
+    
+    Unlike the standard graph builder which only creates edges for non-zero coefficients,
+    this function creates edges for ALL pairs within each site. This provides richer
+    training data for pretraining, especially for linear biases which can be estimated
+    for all pairs.
+    
+    **Key differences from standard graph builder:**
+    1. Creates ALL directed pairs within each site (O(N²) edges per site)
+    2. Computes linear coefficients correctly: linear_ij = b[j] - b[i]
+    3. Reads nonlinear coefficients from matrices (may be 0.0 for many pairs)
+    
+    **Why this helps pretraining:**
+    - More training data: ~10x more edges for typical systems
+    - Proper linear bias encoding: antisymmetric by construction
+    - Better gradient signal: model learns from all pairwise relationships
+    - Matches pairwise MLP approach: same data representation
+    
+    Args:
+        run_dir: Directory containing variables.py and graph_info.json
+        toppar_dir: Path to toppar directory (None uses package default)
+        toppar_files: List of specific toppar filenames to include
+        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+    
+    Returns:
+        Tuple of (data, targets, extras) where:
+        - data: PyG Data with fully-connected edges within each site
+        - targets: List of [linear, quadratic, skew, end] for each directed edge
+        - extras: Dict with relation_names, base_relation_map, etc.
+    """
+    import json
+    import yaml
+    from torch_geometric.data import Data
+    from mllf.cb import graph_utils
+    
+    run_dir = Path(run_dir)
+    
+    # Load graph_info.json to get node features and site structure
+    graph_info_path = run_dir / "graph_info.json"
+    if not graph_info_path.exists():
+        raise FileNotFoundError(f"graph_info.json not found in {run_dir}")
+    
+    with open(graph_info_path, 'r') as f:
+        graph_info = json.load(f)
+    
+    # Load node features using existing graph_utils
+    from mllf.cb.graph import Graph
+    g = Graph.from_graph_info(graph_info)
+    
+    # Build node features
+    data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
+        g, toppar_dir=toppar_dir, toppar_files=toppar_files, 
+        warn_missing_types=warn_missing_types
+    )
+    
+    # Extract site structure
+    nsubs_per_site = graph_info.get('nsubs_per_site', [])
+    if not nsubs_per_site:
+        raise ValueError(f"nsubs_per_site not found in graph_info.json")
+    
+    # Load bias coefficients from variables.py
+    variables_path = run_dir / "variables.py"
+    if not variables_path.exists():
+        raise FileNotFoundError(f"variables.py not found in {run_dir}")
+    
+    with open(variables_path, 'r') as f:
+        content = f.read()
+    
+    # Extract YAML string
+    yaml_start = content.find('bias_string = """') + len('bias_string = """')
+    if yaml_start < len('bias_string = """'):
+        yaml_start = content.find('bias_string="""') + len('bias_string="""')
+    if yaml_start < len('bias_string="""'):
+        yaml_start = content.find("bias_string = '''") + len("bias_string = '''")
+    if yaml_start < len("bias_string = '''"):
+        yaml_start = content.find("bias_string='''") + len("bias_string='''")
+    
+    yaml_end = content.find('"""', yaml_start)
+    if yaml_end == -1:
+        yaml_end = content.find("'''", yaml_start)
+    
+    yaml_str = content[yaml_start:yaml_end]
+    bias_data = yaml.safe_load(yaml_str)
+    
+    # Extract bias matrices
+    b_list = bias_data['b']
+    if isinstance(b_list[0], list):
+        b_vector = np.array(b_list[0], dtype=float)
+    else:
+        b_vector = np.array(b_list, dtype=float)
+    
+    c_matrix = np.array(bias_data['c'], dtype=float)
+    x_matrix = np.array(bias_data['x'], dtype=float)
+    s_matrix = np.array(bias_data['s'], dtype=float)
+    
+    # Build directed pairs for ALL substituents within each site
+    from mllf.cb.pairwise_utils import build_directed_pairs
+    pairs = build_directed_pairs(nsubs_per_site)
+    
+    # Get relation names from extras
+    relation_names = extras['relation_names']
+    base_relation_map = extras['base_relation_map']
+    rel_to_idx = extras['relation_map']
+    
+    # Build edge_index, edge_type, and edge_attr for all pairs
+    src_list = []
+    dst_list = []
+    edge_type_list = []
+    edge_attr_list = []
+    
+    # For each directed pair, create edges for all 4 bias types
+    for (i, j) in pairs:
+        for bias in ['linear', 'quadratic', 'skew', 'end']:
+            fwd_name, bwd_name = base_relation_map[bias]
+            
+            # Determine which relation (fwd or bwd) this edge represents
+            # For i<j: use forward relation; for i>j: use backward relation
+            if i < j:
+                rel_name = fwd_name
+            else:
+                rel_name = bwd_name
+            
+            rel_idx = rel_to_idx[rel_name]
+            
+            src_list.append(i)
+            dst_list.append(j)
+            edge_type_list.append(rel_idx)
+            
+            # One-hot edge attribute
+            k = len(relation_names)
+            one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
+            one_hot[rel_idx] = 1.0
+            edge_attr_list.append(one_hot)
+    
+    # Create PyG Data object
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_type = torch.tensor(edge_type_list, dtype=torch.long)
+    edge_attr = torch.stack(edge_attr_list, dim=0) if edge_attr_list else torch.zeros((0, len(relation_names)), dtype=torch.get_default_dtype())
+    
+    data = Data(
+        x=data_sparse.x,  # Use node features from sparse graph
+        edge_index=edge_index,
+        edge_type=edge_type,
+        edge_attr=edge_attr
+    )
+    
+    # Build targets for each edge: [linear, quadratic, skew, end]
+    base_order = list(base_relation_map.keys())  # ['linear', 'quadratic', 'skew', 'end']
+    
+    targets = []
+    for (i, j) in pairs:
+        # Linear: b[j] - b[i] (proper antisymmetric conversion)
+        # This naturally gives antisymmetric values: linear_ji = b[i] - b[j] = -linear_ij
+        linear = float(b_vector[j] - b_vector[i])
+        
+        # Quadratic: Antisymmetric, only upper triangle stored
+        # If i < j: use c[i,j] directly
+        # If i > j: use -c[j,i] (negate the opposite direction)
+        if i < j:
+            quadratic = float(c_matrix[i, j])
+        else:
+            quadratic = -float(c_matrix[j, i])
+        
+        # Skew and End: NOT antisymmetric, both directions stored independently
+        skew = float(x_matrix[i, j])
+        end = float(s_matrix[i, j])
+        
+        # Repeat target 4 times (once per bias type edge)
+        # Each bias type gets the same target values for this pair
+        for _ in range(4):
+            targets.append([linear, quadratic, skew, end])
+    
+    return data, targets, extras
+
+
 def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] = None) -> List[Dict]:
     """Filter runs to keep only the best run per unique system.
     
@@ -290,13 +466,16 @@ def compute_reward_from_sim_results(
     
     **Confidence Factor (C_F)**: Scales population reward by data reliability
     
-    Uses a **tiered transition penalty system** to provide continuous feedback:
-    - **Tier 1: "Death Floor" (0-2 transitions)**: -40.0 penalty per site
-    - **Tier 2: "Climbing Ramp" (3-9 transitions)**: Linear gradient ~-16 to -4
-    - **Tier 3: "Success Zone" (≥10 transitions)**: Unlocks R_T reward
+    Uses a **graduated transition penalty system** to provide continuous feedback:
+    - **0 transitions**: -40.0 penalty (death floor - zero activity)
+    - **1 transition**: -32.0 penalty (very low activity)
+    - **2 transitions**: -24.0 penalty (very low activity)
+    - **3-9 transitions**: -2.0 - (2.0 × deficit) penalty (climbing ramp, ranges -16 to -4)
+    - **≥10 transitions**: 0.0 penalty, unlocks R_T reward (success zone)
     
-    Default parameters match the 'higher_rewards_v1' configuration which achieved
-    64.10 point separation in testing on indolizine runs (good: 34.11, bad: -29.99).
+    Default parameters match the updated reward configuration which achieved
+    improved gradient signal for low-transition runs (graduated penalties help
+    1-2 transition runs compared to uniform -40 penalty).
     
     Args:
         sim_results: Dict with 'populations' and 'transitions' keys
@@ -481,6 +660,7 @@ def pretrain_epoch(
     toppar_dir=None,
     toppar_files=None,
     warn_missing_types=True,
+    use_fully_connected=True,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -494,6 +674,9 @@ def pretrain_epoch(
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+        use_fully_connected: If True, use fully-connected graph with all pairs within sites.
+                            If False, use sparse graph with only non-zero coefficient edges.
+                            Fully-connected provides more training data and proper linear bias encoding.
     
     Returns:
         Dict with epoch statistics
@@ -509,12 +692,23 @@ def pretrain_epoch(
         
         # Build graph from saved data AND get target coefficients
         try:
-            data, targets, extras = build_graph_from_saved_data(
-                run_dir, 
-                toppar_dir=toppar_dir,
-                toppar_files=toppar_files,
-                warn_missing_types=warn_missing_types
-            )
+            if use_fully_connected:
+                # Use fully-connected graph for richer training data
+                data, targets, extras = build_fully_connected_graph_for_pretraining(
+                    run_dir, 
+                    toppar_dir=toppar_dir,
+                    toppar_files=toppar_files,
+                    warn_missing_types=warn_missing_types
+                )
+            else:
+                # Use sparse graph (only edges with non-zero coefficients)
+                data, targets, extras = build_graph_from_saved_data(
+                    run_dir, 
+                    toppar_dir=toppar_dir,
+                    toppar_files=toppar_files,
+                    warn_missing_types=warn_missing_types
+                )
+            
             data = data.to(device)
             
             # Targets contain the actual bias coefficients from successful run
@@ -598,6 +792,8 @@ def pretrain_with_runs(
     epochs: int = 20,
     learning_rate: float = 1e-3,
     device: Optional[str] = None,
+    use_best_only: bool = False,
+    use_fully_connected: bool = True,
 ):
     """Run policy pretraining with provided runs.
     
@@ -608,6 +804,10 @@ def pretrain_with_runs(
         epochs: Number of training epochs
         learning_rate: Learning rate
         device: Device ('cuda' or 'cpu'). If None, auto-detect.
+        use_best_only: If True, filter to best run per system. If False, use all valid runs.
+        use_fully_connected: If True (default), build fully-connected graphs with all pairs
+                            within sites for richer training data and proper linear bias encoding.
+                            If False, use sparse graphs with only non-zero coefficient edges.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -624,20 +824,23 @@ def pretrain_with_runs(
         print("Error: No valid runs found")
         return
     
-    # Filter to keep only best run per system for behavior cloning
-    # Use reward config from workflow yaml for consistent reward calculation
-    reward_config = config.get('reward', {})
-    print(f"\nFiltering {len(runs)} runs to keep only best per system...")
-    print(f"Using reward config: {reward_config}")
-    best_runs = filter_best_runs_per_system(runs, reward_config=reward_config)
-    print(f"Filtered to {len(best_runs)} best runs for training\n")
-    
-    if len(best_runs) == 0:
-        print("Error: No valid runs after filtering")
-        return
-    
-    # Update runs to use filtered best runs
-    runs = best_runs
+    # Optionally filter to keep only best run per system for behavior cloning
+    if use_best_only:
+        # Use reward config from workflow yaml for consistent reward calculation
+        reward_config = config.get('reward', {})
+        print(f"\nFiltering {len(runs)} runs to keep only best per system...")
+        print(f"Using reward config: {reward_config}")
+        best_runs = filter_best_runs_per_system(runs, reward_config=reward_config)
+        print(f"Filtered to {len(best_runs)} best runs for training\n")
+        
+        if len(best_runs) == 0:
+            print("Error: No valid runs after filtering")
+            return
+        
+        # Update runs to use filtered best runs
+        runs = best_runs
+    else:
+        print(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
     
     # Extract toppar configuration
     vocab_config = config.get('vocabulary', {})
@@ -687,8 +890,9 @@ def pretrain_with_runs(
         mlp_out_dim=len(sample_extras['relation_names']) // 2
     ).to(device)
     
+    # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
     optimizer = optim.Adam(
-        list(encoder.parameters()) + list(policy.parameters()),
+        policy.parameters(),
         lr=learning_rate
     )
     
@@ -712,7 +916,8 @@ def pretrain_with_runs(
             encoder, policy, optimizer, runs, reward_config, device,
             toppar_dir=toppar_dir,
             toppar_files=toppar_files,
-            warn_missing_types=warn_missing_types
+            warn_missing_types=warn_missing_types,
+            use_fully_connected=use_fully_connected
         )
         
         print(f"  MSE Loss: {stats['loss']:.4f}")
@@ -813,6 +1018,16 @@ def main():
         default=None,
         help="Device to use (default: auto-detect)",
     )
+    parser.add_argument(
+        "--use-best-only",
+        action="store_true",
+        help="If set, filter to best run per system. Otherwise use all valid runs (default: use all)",
+    )
+    parser.add_argument(
+        "--use-sparse-graphs",
+        action="store_true",
+        help="If set, use sparse graphs (only non-zero coefficient edges). By default, uses fully-connected graphs with all pairs within sites for richer training data.",
+    )
     
     args = parser.parse_args()
     
@@ -839,6 +1054,8 @@ def main():
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         device=args.device,
+        use_best_only=args.use_best_only,
+        use_fully_connected=not args.use_sparse_graphs,  # Default to fully-connected
     )
 
 

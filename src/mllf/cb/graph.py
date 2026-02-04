@@ -365,9 +365,13 @@ class Graph:
             atom_types = list(data.get('atom_types', []))
             total_charge = float(data.get('total_charge', 0.0))
             
-            # Compute distinct atom types (excluding site intersection)
-            intersection_all = site_intersection.get(site, set())
-            distinct_list = [a for a in atom_types if a not in intersection_all]
+            # Use distinct_atom_types from saved data if available, otherwise compute it
+            if 'distinct_atom_types' in data:
+                distinct_list = list(data.get('distinct_atom_types', []))
+            else:
+                # Compute distinct atom types (excluding site intersection)
+                intersection_all = site_intersection.get(site, set())
+                distinct_list = [a for a in atom_types if a not in intersection_all]
             
             # Per-site unique atom types
             per_site_unique = set(unique_map.get((site, sub), []))

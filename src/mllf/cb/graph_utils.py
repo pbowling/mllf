@@ -154,8 +154,10 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
     x = torch.stack(node_feats, dim=0)
 
     # expand edges: for each undirected (i,j) and for each bias that is allowed.
-    # For each base bias we create two directed relation types so that A->B and B->A
-    # are represented by distinct relation ids and can be learned separately.
+    # Different bias types have different directionality rules:
+    # - Linear: Only FROM reference sub (sub 1) TO other subs (one direction only)
+    # - Quadratic: Only upper triangle (one direction: i->j where i<j)
+    # - Skew/End: Both directions (i->j and j->i)
     src = []
     dst = []
     edge_type_list = []
@@ -167,29 +169,70 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         mask = None
         if hasattr(g, 'edge_mask'):
             mask = g.edge_mask.get((i, j))
+        
+        # Get node metadata for directionality rules
+        node_i_info = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
+        node_j_info = g.get_node_info(j) if hasattr(g, 'get_node_info') else {}
+        sub_i = node_i_info.get('sub')
+        sub_j = node_j_info.get('sub')
+        
         for bias in base_relation_names:
             allowed = True if mask is None else bool(mask.get(bias, False))
             if not allowed:
                 continue
+            
             fwd_name, bwd_name = base_relation_map[bias]
             fwd_idx = rel_to_idx[fwd_name]
             bwd_idx = rel_to_idx[bwd_name]
-            # add directed edge i->j as the forward relation for this bias
-            src.append(int(i))
-            dst.append(int(j))
-            edge_type_list.append(fwd_idx)
-            # edge_attr: only include one-hot over directed relation types
             k = len(relation_names)
-            one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot[fwd_idx] = 1.0
-            edge_attr_list.append(one_hot)
-            # add reverse direction j->i as the backward relation type
-            src.append(int(j))
-            dst.append(int(i))
-            edge_type_list.append(bwd_idx)
-            one_hot_r = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot_r[bwd_idx] = 1.0
-            edge_attr_list.append(one_hot_r)
+            
+            # Determine directionality based on bias type
+            create_forward = True
+            create_backward = True
+            
+            if bias == 'linear':
+                # Linear: Only from reference sub (sub 1) to other subs
+                # If i is sub 1: create i->j only
+                # If j is sub 1: create j->i only
+                # If neither is sub 1: skip (edge_mask should have disabled this)
+                if sub_i == 1 and sub_j != 1:
+                    create_forward = True
+                    create_backward = False
+                elif sub_j == 1 and sub_i != 1:
+                    create_forward = False
+                    create_backward = True
+                else:
+                    # Both are sub 1 or neither is sub 1 - shouldn't happen with proper edge_mask
+                    continue
+                    
+            elif bias == 'quadratic':
+                # Quadratic: Only upper triangle (i < j)
+                if i < j:
+                    create_forward = True
+                    create_backward = False
+                else:
+                    create_forward = False
+                    create_backward = True
+                    
+            # Skew and end: both directions (default behavior)
+            
+            # Create forward edge (i->j)
+            if create_forward:
+                src.append(int(i))
+                dst.append(int(j))
+                edge_type_list.append(fwd_idx)
+                one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
+                one_hot[fwd_idx] = 1.0
+                edge_attr_list.append(one_hot)
+            
+            # Create backward edge (j->i)
+            if create_backward:
+                src.append(int(j))
+                dst.append(int(i))
+                edge_type_list.append(bwd_idx)
+                one_hot_r = torch.zeros((k,), dtype=torch.get_default_dtype())
+                one_hot_r[bwd_idx] = 1.0
+                edge_attr_list.append(one_hot_r)
 
     k = len(relation_names)
     if len(src) == 0:

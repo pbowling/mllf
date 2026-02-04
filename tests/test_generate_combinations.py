@@ -565,15 +565,15 @@ def test_print_combinations_for_example():
     out.flush()
     
     # Also write combos to a file for easy inspection
-    out_path = repo_root / 'combos_14benz_solv_5.5.txt'
-    with out_path.open('w') as fh:
-        fh.write(f"Found {len(eligible)} eligible sites\n")
-        fh.write(f"  Within-site: {len(within_site)} combinations\n")
-        fh.write(f"  Cross-site: {len(cross_site)} combinations\n")
-        fh.write(f"  Total: {len(combos)} combinations\n\n")
-        for idx, (sites, subs, _) in enumerate(combos, start=1):
-            name = make_combo_dir_name(idx, sites, subs)
-            fh.write(name + '\n')
+    #out_path = repo_root / 'combos_14benz_solv_5.5.txt'
+    #with out_path.open('w') as fh:
+    #    fh.write(f"Found {len(eligible)} eligible sites\n")
+    #    fh.write(f"  Within-site: {len(within_site)} combinations\n")
+    #    fh.write(f"  Cross-site: {len(cross_site)} combinations\n")
+    #    fh.write(f"  Total: {len(combos)} combinations\n\n")
+    #    for idx, (sites, subs, _) in enumerate(combos, start=1):
+    #        name = make_combo_dir_name(idx, sites, subs)
+    #        fh.write(name + '\n')
 
     # sanity check so CI treats this as a test: ensure some combos exist
     assert len(combos) > 0

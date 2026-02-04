@@ -279,18 +279,40 @@ def pretrain_pairwise(
         print("Error: No valid runs found")
         return
     
-    # Filter to keep only best run per system for behavior cloning
-    reward_config = config.get('reward', {})
-    print(f"\nFiltering {len(runs)} runs to keep only best per system...")
-    print(f"Using reward config: {reward_config}")
-    best_runs = filter_best_runs_per_system(runs, reward_config=reward_config)
-    print(f"Filtered to {len(best_runs)} best runs for training\n")
+    # Filter to keep only runs that terminated normally (based on metadata)
+    print(f"\nFiltering {len(runs)} runs to keep only valid runs...")
+    valid_runs = []
+    for run in runs:
+        metadata_file = run["run_dir"] / "metadata.json"
+        if metadata_file.exists():
+            try:
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                if metadata.get("terminated_normally", False):
+                    valid_runs.append(run)
+            except:
+                continue
     
-    if len(best_runs) == 0:
+    print(f"Filtered to {len(valid_runs)} valid runs (terminated normally)")
+    
+    # Optionally filter to best runs per system if desired
+    # For now, use all valid runs for richer training data
+    reward_config = config.get('reward', {})
+    use_best_only = config.get('pretraining', {}).get('use_best_only', False)
+    
+    if use_best_only:
+        print(f"Filtering to best run per system (use_best_only=True)...")
+        print(f"Using reward config: {reward_config}")
+        best_runs = filter_best_runs_per_system(valid_runs, reward_config=reward_config)
+        print(f"Filtered to {len(best_runs)} best runs\n")
+        runs = best_runs
+    else:
+        print(f"Using all {len(valid_runs)} valid runs for pretraining\n")
+        runs = valid_runs
+    
+    if len(runs) == 0:
         print("Error: No valid runs after filtering")
         return
-    
-    runs = best_runs
     
     # Get a sample run to determine feature dimension
     sample_features = None

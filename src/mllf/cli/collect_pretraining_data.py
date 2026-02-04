@@ -48,12 +48,14 @@ def find_run_directories(base_path: Path) -> List[Path]:
     
     if combo_dirs:
         # Generated combo structure - look for run_### inside each comb_###
+        # Exclude directories with _failed in name
         for combo_dir in combo_dirs:
-            run_dirs.extend([d for d in combo_dir.glob("run_*") if d.is_dir()])
+            run_dirs.extend([d for d in combo_dir.glob("run_*") if d.is_dir() and '_failed' not in d.name.lower()])
     else:
         # MSLD run structure - look for run# at base level
+        # Exclude directories with _failed in name
         run_dirs = list(base_path.glob("run*"))
-        run_dirs = [d for d in run_dirs if d.is_dir()]
+        run_dirs = [d for d in run_dirs if d.is_dir() and '_failed' not in d.name.lower()]
     
     # Sort numerically by extracting run number
     def get_run_num(p: Path) -> int:
@@ -231,21 +233,24 @@ def convert_to_json_serializable(data: Any) -> Any:
         return data
 
 
-def parse_output_file(output_file: Path) -> Dict[str, Any]:
+def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
     """Parse population and transition data from output file.
     
     Uses existing file_handling utilities to parse CHARMM output.
+    Assumes normal termination unless '_failed' appears in run directory name.
     
     Args:
         output_file: Path to output file
+        run_dir: Path to run directory (used to check for _failed)
         
     Returns:
         Dict with 'populations', 'transitions', 'rates', and 'terminated_normally'
     """
     content = output_file.read_text()
     
-    # Check termination status
-    terminated = terminated_normally(content)
+    # Check termination status based on directory name
+    # Assume normal termination unless _failed in path
+    terminated = '_failed' not in str(run_dir).lower()
     
     # Parse populations using existing utility
     populations = parse_single_population(content)
@@ -359,7 +364,7 @@ def collect_run_data(run_dir: Path, solvent_state: Optional[str] = None) -> Tupl
     if not output_file.exists():
         raise ValueError(f"output file not found in {run_dir}")
     
-    output_results = parse_output_file(output_file)
+    output_results = parse_output_file(output_file, run_dir)
     
     # Find prep directory - check local first, then parent (for generated combos)
     prep_path = run_dir / 'prep'

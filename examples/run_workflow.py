@@ -221,7 +221,7 @@ def train_epoch(
                 cached_reward_config = cached.get('reward_config', {})
                 reward_changed = (
                     cached_reward_config.get('w_P') != reward_config.get('w_P', 0.5) or
-                    cached_reward_config.get('w_T') != reward_config.get('w_T', 0.5) or
+                    cached_reward_config.get('w_T') != reward_config.get('w_T', 0.75) or
                     cached_reward_config.get('w_U') != reward_config.get('w_U', 0.3) or
                     cached_reward_config.get('gamma') != reward_config.get('gamma', 4.0) or
                     cached_reward_config.get('P_baseline') != reward_config.get('P_baseline', 500.0) or
@@ -239,7 +239,7 @@ def train_epoch(
                     reward = compute_msld_reward_improved(
                         str(epoch_dir),
                         w_P=reward_config.get('w_P', 0.5),
-                        w_T=reward_config.get('w_T', 0.5),
+                        w_T=reward_config.get('w_T', 0.75),
                         w_U=reward_config.get('w_U', 0.3),
                         gamma=reward_config.get('gamma', 4.0),
                         P_baseline=reward_config.get('P_baseline', 500.0),
@@ -337,7 +337,7 @@ def train_epoch(
 #SBATCH --cpus-per-task=1
 #SBATCH -p ada6000 --gres=gpu:1 
 #SBATCH --export=ALL
-#SBATCH --time=01:00:00
+#SBATCH --time=00:10:00
 
 module load charmm/charmm/c51a1
 
@@ -682,8 +682,9 @@ def main():
     ).to(device)
     
     optimizer_config = train_config.get('optimizer', {})
+    # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
     optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(policy.parameters()),
+        policy.parameters(),
         lr=optimizer_config.get('lr', 0.001)
     )
     
