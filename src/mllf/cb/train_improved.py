@@ -91,18 +91,18 @@ def compute_msld_reward_improved(
     
     if output_file is None:
         print(f"  Warning: No output file found in {combo_dir}")
-        return -100.0 * gamma  # Large penalty for failed simulation
+        return -50.0  # Capped penalty for failed simulation
     
     try:
         with open(output_file, 'r') as f:
             output_text = f.read()
     except Exception as e:
         print(f"  Warning: Could not read {output_file}: {e}")
-        return -100.0 * gamma
+        return -50.0
     
     if not terminated_normally(output_text):
         print(f"  Warning: Simulation did not terminate normally in {combo_dir}")
-        return -100.0 * gamma
+        return -50.0
     
     # Parse outputs
     population_data = parse_single_population(output_text)
@@ -110,7 +110,7 @@ def compute_msld_reward_improved(
     
     if not population_data or not transitions_data:
         print(f"  Warning: No population or transition data in {output_file}")
-        return -100.0 * gamma
+        return -50.0
     
     # Extract populations (per block/substituent) - use only HIGHEST lambda value
     populations = []
@@ -137,7 +137,7 @@ def compute_msld_reward_improved(
     total_sites = len(site_transitions)
     
     if total_subs == 0 or total_sites == 0:
-        return -100.0 * gamma
+        return -50.0
     
     # ========== STRICT DEGENERATE BEHAVIOR CHECKS ==========
     
@@ -332,16 +332,16 @@ def compute_msld_reward_per_site(
             break
     
     if output_file is None:
-        return -100.0, {'error': 'No output file'}
+        return -50.0, {'error': 'No output file'}
     
     try:
         with open(output_file, 'r') as f:
             output_text = f.read()
     except Exception:
-        return -100.0, {'error': 'Read failed'}
+        return -50.0, {'error': 'Read failed'}
     
     if not terminated_normally(output_text):
-        return -100.0, {'error': 'Abnormal termination'}
+        return -50.0, {'error': 'Abnormal termination'}
     
     population_data = parse_single_population(output_text)
     transitions_data, _ = parse_transitions_and_rates(output_text)

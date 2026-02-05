@@ -135,6 +135,7 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
     # Extract site information from node metadata
     sites_info = {}
     solvent_state = None
+    site_counts = defaultdict(int)
     
     for node_idx, node_info in g.nodes.items():
         if node_info:
@@ -150,13 +151,19 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
                     'distinct_atom_types': node_info.get('distinct_atom_types', []),
                     'unique_atom_types': node_info.get('unique_atom_types', []),
                 }
+                # Count substituents per site
+                site_counts[site] += 1
                 # Extract solvent state (should be consistent across nodes)
                 if solvent_state is None:
                     solvent_state = node_info.get('solvent', 'unknown')
     
+    # Build nsubs_per_site list in site order
+    nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
+    
     graph_info = {
         'solvent_state': solvent_state or 'unknown',
-        'sites': sites_info
+        'sites': sites_info,
+        'nsubs_per_site': nsubs_per_site
     }
     
     with open(graph_info_path, 'w') as f:

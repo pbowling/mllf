@@ -129,7 +129,18 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     # Extract site structure
     nsubs_per_site = graph_info.get('nsubs_per_site', [])
     if not nsubs_per_site:
-        raise ValueError(f"nsubs_per_site not found in graph_info.json")
+        # Compute from sites data (backward compatibility for old graph_info.json files)
+        from collections import defaultdict
+        site_counts = defaultdict(int)
+        sites_info = graph_info.get('sites', {})
+        for key, node_info in sites_info.items():
+            site = node_info.get('site')
+            if site is not None:
+                site_counts[site] += 1
+        if site_counts:
+            nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
+        else:
+            raise ValueError(f"Could not determine nsubs_per_site from graph_info.json in {run_dir}")
     
     # Load bias coefficients from variables.py
     variables_path = run_dir / "variables.py"
@@ -507,13 +518,13 @@ def compute_reward_from_sim_results(
             pop_list.append(counts[max_lambda])
     
     if not pop_list:
-        return -100.0 * gamma  # No population data
+        return -50.0  # No population data (capped at penalty limit)
     
     pop_array = np.array(pop_list, dtype=float)
     total_pop = pop_array.sum()
     
     if total_pop == 0:
-        return -100.0 * gamma  # No sampling occurred
+        return -50.0  # No sampling occurred (capped at penalty limit)
     
     # Extract transition counts per site (use only HIGHEST lambda value)
     trans_per_site = []
@@ -650,6 +661,358 @@ def compute_reward_from_sim_results(
     return reward
 
 
+def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """Compute mean and std dev for each bias coefficient type across all runs.
+    
+    Args:
+        runs: List of run dictionaries with run_dir paths
+    
+    Returns:
+        Dict with statistics per bias type:
+        {
+            'linear': {'mean': float, 'std': float, 'values': [...]},
+            'quadratic': {'mean': float, 'std': float, 'values': [...]},
+            'skew': {'mean': float, 'std': float, 'values': [...]},
+            'end': {'mean': float, 'std': float, 'values': [...]}
+        }
+    """
+    from collections import defaultdict
+    
+    # Collect all coefficient values by type
+    coeff_values = {
+        'linear': [],
+        'quadratic': [],
+        'skew': [],
+        'end': []
+    }
+    
+    print(f"Computing coefficient statistics across {len(runs)} runs...")
+    
+    for run in runs:
+        run_dir = run["run_dir"]
+        variables_path = run_dir / "variables.py"
+        
+        if not variables_path.exists():
+            continue
+        
+        try:
+            # Load bias coefficients
+            with open(variables_path, 'r') as f:
+                content = f.read()
+            
+            # Extract YAML
+            yaml_start = content.find('bias_string = """') + len('bias_string = """')
+            if yaml_start < len('bias_string = """'):
+                yaml_start = content.find('bias_string="""') + len('bias_string="""')
+            yaml_end = content.find('"""', yaml_start)
+            if yaml_end == -1:
+                continue
+            
+            yaml_content = content[yaml_start:yaml_end]
+            bias_data = yaml.safe_load(yaml_content)
+            
+            # Extract linear biases (b vector)
+            b = bias_data.get('b', [])
+            if isinstance(b, list):
+                for row in b:
+                    if isinstance(row, list):
+                        coeff_values['linear'].extend([abs(float(x)) for x in row if x != 0.0])
+                    else:
+                        val = float(row)
+                        if val != 0.0:
+                            coeff_values['linear'].append(abs(val))
+            
+            # Extract matrix coefficients
+            c_matrix = bias_data.get('c', [])
+            x_matrix = bias_data.get('x', [])
+            s_matrix = bias_data.get('s', [])
+            
+            for matrix, key in [(c_matrix, 'quadratic'), (x_matrix, 'skew'), (s_matrix, 'end')]:
+                if isinstance(matrix, list):
+                    for row in matrix:
+                        if isinstance(row, list):
+                            coeff_values[key].extend([abs(float(x)) for x in row if x != 0.0])
+        
+        except Exception as e:
+            continue
+    
+    # Compute statistics
+    stats = {}
+    for bias_type, values in coeff_values.items():
+        if len(values) > 0:
+            values_array = np.array(values)
+            stats[bias_type] = {
+                'mean': float(np.mean(values_array)),
+                'std': float(np.std(values_array)),
+                'median': float(np.median(values_array)),
+                'p95': float(np.percentile(values_array, 95)),
+                'max': float(np.max(values_array)),
+                'count': len(values)
+            }
+        else:
+            stats[bias_type] = {
+                'mean': 0.0,
+                'std': 0.0,
+                'median': 0.0,
+                'p95': 0.0,
+                'max': 0.0,
+                'count': 0
+            }
+    
+    # Print statistics
+    print("\n" + "="*80)
+    print("Coefficient Statistics Across All Runs")
+    print("="*80)
+    for bias_type, stat in stats.items():
+        print(f"{bias_type:12s}: mean={stat['mean']:7.2f}, std={stat['std']:7.2f}, "
+              f"p95={stat['p95']:7.2f}, max={stat['max']:7.2f}, n={stat['count']}")
+    print("="*80 + "\n")
+    
+    return stats
+
+
+def filter_runs_by_coefficient_range(
+    runs: List[Dict],
+    n_std: float = 3.0,
+    min_runs_to_compute_stats: int = 10
+) -> List[Dict]:
+    """Filter runs to exclude those with coefficients outside statistical range.
+    
+    Removes runs where ANY coefficient exceeds mean ± n_std for its type.
+    This filters out outlier runs that would dominate the loss during training.
+    
+    Args:
+        runs: List of run dictionaries
+        n_std: Number of standard deviations for threshold (default: 3.0)
+        min_runs_to_compute_stats: Minimum runs needed to compute statistics
+    
+    Returns:
+        Filtered list of runs
+    """
+    if len(runs) < min_runs_to_compute_stats:
+        print(f"Warning: Only {len(runs)} runs available, skipping statistical filtering")
+        return runs
+    
+    # Compute statistics across all runs
+    stats = compute_coefficient_statistics(runs)
+    
+    # Compute thresholds
+    thresholds = {}
+    print(f"Filtering thresholds (mean ± {n_std}σ):")
+    for bias_type, stat in stats.items():
+        threshold = stat['mean'] + n_std * stat['std']
+        thresholds[bias_type] = threshold
+        print(f"  {bias_type:12s}: ≤ {threshold:.2f}")
+    print()
+    
+    # Filter runs
+    filtered_runs = []
+    excluded_runs = []
+    
+    for run in runs:
+        run_dir = run["run_dir"]
+        variables_path = run_dir / "variables.py"
+        
+        if not variables_path.exists():
+            continue
+        
+        try:
+            # Load and parse coefficients
+            with open(variables_path, 'r') as f:
+                content = f.read()
+            
+            yaml_start = content.find('bias_string = """') + len('bias_string = """')
+            if yaml_start < len('bias_string = """'):
+                yaml_start = content.find('bias_string="""') + len('bias_string="""')
+            yaml_end = content.find('"""', yaml_start)
+            if yaml_end == -1:
+                continue
+            
+            yaml_content = content[yaml_start:yaml_end]
+            bias_data = yaml.safe_load(yaml_content)
+            
+            # Check all coefficients against thresholds
+            exceeds_threshold = False
+            violated_type = None
+            max_violation = 0.0
+            
+            # Check linear (b vector)
+            b = bias_data.get('b', [])
+            for row in (b if isinstance(b, list) else [b]):
+                vals = row if isinstance(row, list) else [row]
+                for val in vals:
+                    if val != 0.0 and abs(float(val)) > thresholds['linear']:
+                        exceeds_threshold = True
+                        violated_type = 'linear'
+                        max_violation = max(max_violation, abs(float(val)))
+                        break
+                if exceeds_threshold:
+                    break
+            
+            # Check matrices
+            if not exceeds_threshold:
+                for matrix_key, bias_type in [('c', 'quadratic'), ('x', 'skew'), ('s', 'end')]:
+                    matrix = bias_data.get(matrix_key, [])
+                    if isinstance(matrix, list):
+                        for row in matrix:
+                            if isinstance(row, list):
+                                for val in row:
+                                    if val != 0.0 and abs(float(val)) > thresholds[bias_type]:
+                                        exceeds_threshold = True
+                                        violated_type = bias_type
+                                        max_violation = max(max_violation, abs(float(val)))
+                                        break
+                            if exceeds_threshold:
+                                break
+                        if exceeds_threshold:
+                            break
+            
+            if exceeds_threshold:
+                excluded_runs.append((run_dir.parent.name, run_dir.name, violated_type, max_violation))
+            else:
+                filtered_runs.append(run)
+        
+        except Exception as e:
+            # On error, include the run (conservative approach)
+            filtered_runs.append(run)
+    
+    # Report results
+    print(f"\n{'='*80}")
+    print(f"Statistical Filtering Results (±{n_std}σ threshold)")
+    print(f"{'='*80}")
+    print(f"  Total runs: {len(runs)}")
+    print(f"  Kept: {len(filtered_runs)} ({100*len(filtered_runs)/len(runs):.1f}%)")
+    print(f"  Excluded: {len(excluded_runs)} ({100*len(excluded_runs)/len(runs):.1f}%)")
+    
+    if excluded_runs:
+        print(f"\n  Top 10 excluded runs:")
+        excluded_runs.sort(key=lambda x: x[3], reverse=True)
+        for system, run, bias_type, max_val in excluded_runs[:10]:
+            print(f"    {system:30s} {run:15s} ({bias_type:10s}: {max_val:.2f})")
+    
+    print(f"{'='*80}\n")
+    
+    return filtered_runs
+
+
+def filter_runs_by_reward(
+    runs: List[Dict],
+    min_reward: float = 0.0,
+) -> List[Dict]:
+    """Filter runs by minimum reward threshold.
+    
+    Computes reward for each run using compute_reward_from_sim_results() and
+    excludes runs below the threshold.
+    
+    Args:
+        runs: List of run dicts from load_pretraining_runs
+        min_reward: Minimum reward threshold (default: 0.0)
+    
+    Returns:
+        Filtered list of runs meeting reward threshold
+    """
+    from pathlib import Path
+    import json
+    
+    print(f"\n{'='*80}")
+    print(f"Reward Filtering (threshold: >= {min_reward})")
+    print(f"{'='*80}")
+    
+    filtered_runs = []
+    excluded_runs = []
+    error_counts = {}
+    
+    for run in runs:
+        try:
+            run_dir = Path(run['run_dir'])
+            
+            # Load simulation_results.json (note: not sim_results.json)
+            sim_results_path = run_dir / "simulation_results.json"
+            if not sim_results_path.exists():
+                # If no sim results, exclude the run
+                error_reason = "No simulation_results.json"
+                error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+                excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+                continue
+            
+            with open(sim_results_path, 'r') as f:
+                sim_results = json.load(f)
+            
+            # Load graph_info.json to get nsubs_per_site
+            graph_info_path = run_dir / "graph_info.json"
+            if not graph_info_path.exists():
+                error_reason = "No graph_info.json"
+                error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+                excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+                continue
+            
+            with open(graph_info_path, 'r') as f:
+                graph_info = json.load(f)
+            
+            # Extract nsubs_per_site from sites data (sites is a dict with block names as keys)
+            sites = graph_info.get('sites', {})
+            if not sites:
+                error_reason = "No sites in graph_info"
+                error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+                excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+                continue
+            
+            # Count substitutions per site
+            site_counts = {}
+            for block_name, block_data in sites.items():
+                site_num = block_data['site']
+                site_counts[site_num] = site_counts.get(site_num, 0) + 1
+            
+            num_sites = len(site_counts)
+            nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
+            
+            # Compute reward
+            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
+            
+            # Filter by threshold
+            if reward >= min_reward:
+                filtered_runs.append(run)
+            else:
+                excluded_runs.append((run_dir.parent.name, run_dir.name, reward, "Below threshold"))
+        
+        except Exception as e:
+            # On error, exclude the run (conservative approach for reward filtering)
+            error_reason = f"Error: {str(e)}"
+            error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+            excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+    
+    # Report results
+    print(f"  Total runs: {len(runs)}")
+    print(f"  Kept: {len(filtered_runs)} ({100*len(filtered_runs)/len(runs):.1f}%)")
+    print(f"  Excluded: {len(excluded_runs)} ({100*len(excluded_runs)/len(runs):.1f}%)")
+    
+    # Show error breakdown
+    if error_counts:
+        print(f"\n  Error breakdown:")
+        for error_reason, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {error_reason}: {count} runs")
+    
+    if excluded_runs:
+        # Show distribution of excluded runs
+        reward_excluded = [x for x in excluded_runs if isinstance(x[2], (int, float))]
+        if reward_excluded:
+            print(f"\n  Reward statistics for excluded runs:")
+            rewards = [x[2] for x in reward_excluded]
+            print(f"    Mean: {sum(rewards)/len(rewards):.2f}")
+            print(f"    Min: {min(rewards):.2f}")
+            print(f"    Max: {max(rewards):.2f}")
+        
+        print(f"\n  Top 10 excluded runs (by reward):")
+        # Sort by reward (descending) - show the "best" of the excluded runs
+        reward_excluded_sorted = sorted(reward_excluded, key=lambda x: x[2], reverse=True)
+        for system, run, reward, reason in reward_excluded_sorted[:10]:
+            print(f"    {system:30s} {run:15s} reward={reward:7.2f}")
+    
+    print(f"{'='*80}\n")
+    
+    return filtered_runs
+
+
 def pretrain_epoch(
     encoder: nn.Module,
     policy: nn.Module,
@@ -746,6 +1109,11 @@ def pretrain_epoch(
         epoch_loss += mse_loss.item()
         num_updates += 1
         
+        # Log high losses with run information
+        if mse_loss.item() > 500.0:
+            run_name = f"{run_dir.parent.name}/{run_dir.name}"
+            print(f"  ⚠️  HIGH LOSS: Run {run_idx+1}/{len(runs)} ({run_name}): loss={mse_loss.item():.2f}")
+        
         if (run_idx + 1) % 10 == 0:
             avg_loss = epoch_loss / num_updates
             print(f"  Run {run_idx+1}/{len(runs)}: mse_loss={mse_loss.item():.4f}, avg_loss={avg_loss:.4f}")
@@ -794,6 +1162,9 @@ def pretrain_with_runs(
     device: Optional[str] = None,
     use_best_only: bool = False,
     use_fully_connected: bool = True,
+    filter_outliers: bool = True,
+    outlier_std_threshold: float = 3.0,
+    min_reward_threshold: Optional[float] = None,
 ):
     """Run policy pretraining with provided runs.
     
@@ -808,6 +1179,9 @@ def pretrain_with_runs(
         use_fully_connected: If True (default), build fully-connected graphs with all pairs
                             within sites for richer training data and proper linear bias encoding.
                             If False, use sparse graphs with only non-zero coefficient edges.
+        filter_outliers: If True (default), exclude runs with coefficients outside statistical range
+        outlier_std_threshold: Number of standard deviations for outlier threshold (default: 3.0)
+        min_reward_threshold: If set, exclude runs with reward below this threshold (e.g., 5.0)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -841,6 +1215,26 @@ def pretrain_with_runs(
         runs = best_runs
     else:
         print(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
+    
+    # Optionally filter runs by minimum reward threshold (applied first)
+    if min_reward_threshold is not None:
+        print(f"\nApplying reward filtering (threshold: >= {min_reward_threshold})...")
+        runs = filter_runs_by_reward(runs, min_reward=min_reward_threshold)
+        
+        if len(runs) == 0:
+            print("Error: No runs remaining after reward filtering")
+            print("Try lowering min_reward_threshold or disable reward filtering")
+            return
+    
+    # Optionally filter outlier runs based on coefficient statistics (applied second)
+    if filter_outliers:
+        print(f"\nApplying statistical filtering (±{outlier_std_threshold}σ threshold)...")
+        runs = filter_runs_by_coefficient_range(runs, n_std=outlier_std_threshold)
+        
+        if len(runs) == 0:
+            print("Error: No runs remaining after statistical filtering")
+            print("Try increasing outlier_std_threshold or set filter_outliers=False")
+            return
     
     # Extract toppar configuration
     vocab_config = config.get('vocabulary', {})
@@ -1028,6 +1422,23 @@ def main():
         action="store_true",
         help="If set, use sparse graphs (only non-zero coefficient edges). By default, uses fully-connected graphs with all pairs within sites for richer training data.",
     )
+    parser.add_argument(
+        "--no-filter-outliers",
+        action="store_true",
+        help="If set, disable statistical filtering of outlier runs. By default, runs with coefficients outside ±N standard deviations are excluded.",
+    )
+    parser.add_argument(
+        "--outlier-std-threshold",
+        type=float,
+        default=3.0,
+        help="Number of standard deviations for outlier threshold (default: 3.0). Runs with any coefficient exceeding mean ± N*std are excluded.",
+    )
+    parser.add_argument(
+        "--min-reward-threshold",
+        type=float,
+        default=None,
+        help="Minimum reward threshold for filtering runs (e.g., 5.0). If set, only runs with reward >= threshold are used for pretraining.",
+    )
     
     args = parser.parse_args()
     
@@ -1056,6 +1467,9 @@ def main():
         device=args.device,
         use_best_only=args.use_best_only,
         use_fully_connected=not args.use_sparse_graphs,  # Default to fully-connected
+        filter_outliers=not args.no_filter_outliers,  # Default to True (filter enabled)
+        outlier_std_threshold=args.outlier_std_threshold,
+        min_reward_threshold=args.min_reward_threshold,
     )
 
 
