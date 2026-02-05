@@ -229,6 +229,7 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     )
     
     # Build targets for each edge: [linear, quadratic, skew, end]
+    # Each edge should only predict its specific coefficient type
     base_order = list(base_relation_map.keys())  # ['linear', 'quadratic', 'skew', 'end']
     
     targets = []
@@ -249,10 +250,15 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         skew = float(x_matrix[i, j])
         end = float(s_matrix[i, j])
         
-        # Repeat target 4 times (once per bias type edge)
-        # Each bias type gets the same target values for this pair
-        for _ in range(4):
-            targets.append([linear, quadratic, skew, end])
+        # Create 4 edges per pair, each with ONLY its target coefficient
+        # Edge 0 (linear type): predict [linear, 0, 0, 0]
+        # Edge 1 (quadratic type): predict [0, quadratic, 0, 0]
+        # Edge 2 (skew type): predict [0, 0, skew, 0]
+        # Edge 3 (end type): predict [0, 0, 0, end]
+        targets.append([linear, 0.0, 0.0, 0.0])
+        targets.append([0.0, quadratic, 0.0, 0.0])
+        targets.append([0.0, 0.0, skew, 0.0])
+        targets.append([0.0, 0.0, 0.0, end])
     
     return data, targets, extras
 

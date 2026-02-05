@@ -149,7 +149,6 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
                     'total_charge': node_info.get('total_charge', 0.0),
                     'atom_types': node_info.get('atom_types', []),
                     'distinct_atom_types': node_info.get('distinct_atom_types', []),
-                    'unique_atom_types': node_info.get('unique_atom_types', []),
                 }
                 # Count substituents per site
                 site_counts[site] += 1
@@ -395,14 +394,27 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         fwd_name, bwd_name = base_map.get(base, (f"{base}_fwd", f"{base}_bwd"))
         
         # Extract scalar value from action tensor/array
-        # (handles both scalar tensors and vector tensors with single element)
+        # For multi-output policies (mlp_out_dim=4), each edge predicts all 4 bias types
+        # and we need to extract the correct index based on the bias type:
+        # linear=0, quadratic=1, skew=2, end=3
+        bias_type_index = {'linear': 0, 'quadratic': 1, 'skew': 2, 'end': 3}
+        target_index = bias_type_index.get(base, 0)
+        
         try:
             a = actions[k]
             if hasattr(a, 'dim') and a.dim() == 0:
+                # Scalar action (single output per edge)
                 val = float(a.item())
+            elif hasattr(a, 'shape') and len(a.shape) > 0 and a.shape[-1] == 4:
+                # Multi-output action (4 values per edge) - extract the correct index
+                val = float(a[target_index].item() if hasattr(a[target_index], 'item') else a[target_index])
             else:
+                # Fallback: try to extract first element
                 vlist = a.detach().cpu().numpy().tolist() if hasattr(a, 'detach') else list(a)
-                val = float(vlist) if not isinstance(vlist, list) else float(vlist[0])
+                if isinstance(vlist, list) and len(vlist) == 4:
+                    val = float(vlist[target_index])
+                else:
+                    val = float(vlist) if not isinstance(vlist, list) else float(vlist[0])
         except Exception:
             try:
                 val = float(actions[k])
