@@ -18,7 +18,7 @@ from importlib import import_module
 from .graph_utils import build_pyg_graph_from_mllf_graph
 from .atom_vocab import get_atom_type_vocab
 from .policy import EdgePolicy
-from .train import reinforce_train_step
+from .train_improved import reinforce_train_step, compute_reward_from_raw_metrics
 
 # Try to import RGCNEncoder and pretraining modules lazily
 try:
@@ -39,6 +39,7 @@ __all__ = [
 	"EdgePolicy", 
 	"build_pyg_graph_from_mllf_graph", 
 	"reinforce_train_step",
+	"compute_reward_from_raw_metrics",
 	"load_pretrained_encoder",
 	"freeze_encoder",
 	"unfreeze_encoder",

@@ -178,7 +178,7 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     s_matrix = np.array(bias_data['s'], dtype=float)
     
     # Build directed pairs for ALL substituents within each site
-    from mllf.cb.pairwise_utils import build_directed_pairs
+    from mllf.cb.graph_utils import build_directed_pairs
     pairs = build_directed_pairs(nsubs_per_site)
     
     # Get relation names from extras

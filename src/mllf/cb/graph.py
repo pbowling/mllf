@@ -11,6 +11,25 @@ from typing import Dict, Tuple, List, Optional
 import numpy as np
 
 
+def _detect_solvent_state(filename: str) -> str:
+    """Detect solvent state from filename and normalize to standard values.
+    
+    Returns one of: 'solv', 'gas', 'protein'
+    Defaults to 'unknown' with a warning if not detected.
+    """
+    fn = (filename or "").lower()
+    if 'prot' in fn or 'protein' in fn:
+        return 'protein'
+    if 'vac' in fn or 'vacuum' in fn or 'gas' in fn:
+        return 'gas'
+    if 'solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn or 'solution' in fn or 'solvent' in fn:
+        return 'solv'
+    else:
+        import warnings
+        warnings.warn(f"Could not detect solvent state from filename '{filename}'; setting to 'unknown'", UserWarning)
+        return 'unknown'
+
+
 @dataclass
 class EdgeCoeffs:
     linear: float = 0.0
@@ -122,14 +141,6 @@ class Graph:
             sites[site].setdefault('rtf', {})
             sites[site]['rtf'][sub] = parsed
 
-        def detect_solvent_state(filename: str) -> str:
-            fn = (filename or "").lower()
-            if 'vac' in fn or 'vacuum' in fn:
-                return 'vacuum'
-            if 'solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn:
-                return 'solvated'
-            return 'unknown'
-
         # attach to nodes
         for site_idx, data in sites.items():
             if site_idx - 1 < 0 or site_idx - 1 >= self.num_nodes:
@@ -153,7 +164,7 @@ class Graph:
                     'total_charge': float(parsed.get('total_charge', 0.0) or 0.0),
                     'atom_types': atom_types,
                     'distinct_atom_types': distinct_list,
-                    'solvent': detect_solvent_state(fname),
+                    'solvent': _detect_solvent_state(fname),
                     'rtf': parsed,
                 }
 
@@ -203,15 +214,13 @@ class Graph:
         # sort by site then sub for deterministic ordering
         subs.sort(key=lambda x: (x[0], x[1]))
 
-        # compute atom type sets per site/sub to determine unique atom types
+        # compute atom type sets per site/sub to determine distinct atom types
         per_site = {}
         for site, sub, key, parsed in subs:
             per_site.setdefault(site, {})
             per_site[site][sub] = parsed
 
-        # compute unique atom types per sub within each site (difference from other subs at same site)
-        # and compute the intersection across all subs at a site (atoms common to every sub)
-        unique_map = {}
+        # compute the intersection across all subs at a site (atoms common to every sub)
         site_intersection = {}
         for site, subdict in per_site.items():
             atom_sets = {s: set((subdict[s].get('atom_types') or [])) for s in subdict}
@@ -220,29 +229,6 @@ class Graph:
             else:
                 intersection_all = set()
             site_intersection[site] = intersection_all
-            for s, aset in atom_sets.items():
-                others = set().union(*(atom_sets[o] for o in atom_sets if o != s)) if len(atom_sets) > 1 else set()
-                unique_map[(site, s)] = sorted(list(aset - others))
-
-        # Also compute globally unique atom types (appear only in a single sub across all sites)
-        all_atom_lists = [set(parsed.get('atom_types') or []) for (_, _, _, parsed) in subs]
-        global_counts = {}
-        for aset in all_atom_lists:
-            for a in aset:
-                global_counts[a] = global_counts.get(a, 0) + 1
-        globally_unique = {a for a, c in global_counts.items() if c == 1}
-
-        # helper to detect solvent and normalize to one of: 'solv', 'gas', 'protein'
-        def detect_solvent_state(filename: str) -> str:
-            fn = (filename or "").lower()
-            if 'prot' in fn or 'protein' in fn:
-                return 'protein'
-            if 'vac' in fn or 'vacuum' in fn or 'gas' in fn:
-                return 'gas'
-            if 'solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn:
-                return 'solv'
-            # default to 'solv' when ambiguous
-            return 'solv'
 
         # create graph with one node per substituent
         nsubs = len(subs)
@@ -273,7 +259,7 @@ class Graph:
                     )
                     sol_state = 'unknown'
             else:
-                sol_state = detect_solvent_state(fname)
+                sol_state = _detect_solvent_state(fname)
 
             subs_meta = {
                 'site': site,
@@ -300,7 +286,7 @@ class Graph:
         
         Args:
             graph_info: Dictionary loaded from graph_info.json with keys:
-                - 'solvent_state': Environment type ('solvent', 'protein', 'gas')
+                - 'solvent_state': Environment type ('solv', 'gas', 'protein')
                 - 'sites': Dict mapping 'site{N}_sub{M}' to metadata dicts containing:
                     - 'site': Site number
                     - 'sub': Substituent number
@@ -311,7 +297,7 @@ class Graph:
             Graph with nodes populated from site/sub data
         """
         sites_data = graph_info.get('sites', {})
-        solvent_state = graph_info.get('solvent_state', 'solvent')
+        solvent_state = graph_info.get('solvent_state', 'solv')
         
         # Parse and sort by (site, sub)
         subs = []

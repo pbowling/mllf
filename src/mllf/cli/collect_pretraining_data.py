@@ -313,16 +313,16 @@ def detect_solvent_state(run_dir: Path) -> str:
         run_dir: Path to run directory
         
     Returns:
-        Solvent state: "solvent", "vacuum", "protein", or "unknown"
+        Solvent state: 'solv', 'gas', 'protein', or 'unknown'
     """
     path_str = str(run_dir).lower()
     
-    if "solv" in path_str or "water" in path_str:
-        return "solvent"
-    elif "vac" in path_str:
-        return "vacuum"
-    elif "protein" in path_str or "prot" in path_str:
+    if "protein" in path_str or "prot" in path_str:
         return "protein"
+    elif "vac" in path_str or "vacuum" in path_str or "gas" in path_str:
+        return "gas"
+    elif "solv" in path_str or "water" in path_str or "aq" in path_str:
+        return "solv"
     else:
         return "unknown"
 

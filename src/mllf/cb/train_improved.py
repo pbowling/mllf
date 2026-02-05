@@ -6,8 +6,9 @@ to explore the full alchemical space rather than converging to single-substituen
 solutions.
 """
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Callable, Dict, Tuple
 
+import torch
 import numpy as np
 
 from mllf.file_handling.read_output import (
@@ -364,3 +365,225 @@ def compute_msld_reward_per_site(
     }
     
     return reward, metrics
+
+
+def compute_reward_from_raw_metrics(
+    populations: list,
+    transitions: list,
+    w_P: float = 0.5,
+    w_T: float = 0.75,
+    w_U: float = 0.3,
+    gamma: float = 4.0,
+    P_baseline: float = 500.0,
+    T_baseline: float = 50.0,
+    min_transitions_per_site: int = 10,
+    min_coverage_ratio: float = 0.5,
+    entropy_bonus: float = 8.0,
+    concentration_penalty_threshold: float = 0.8
+) -> float:
+    """Compute scalarized reward from raw simulation metrics using improved reward logic.
+    
+    This function allows recomputing rewards with different hyperparameters
+    without re-running simulations. It uses the same reward logic as
+    `compute_msld_reward_improved` but operates on pre-parsed metrics.
+    
+    This enables:
+    - Testing different reward configurations on existing simulation data
+    - Using simulations as "pretraining data" with flexible reward functions
+    - Hyperparameter tuning without expensive re-simulation
+    
+    Args:
+        populations: List of population counts per block/substituent.
+        transitions: List of transition counts per site.
+        w_P: Weight for population term (default: 0.5).
+        w_T: Weight for transition term (default: 0.75).
+        w_U: Weight for uniformity term (default: 0.3).
+        gamma: Base penalty coefficient (default: 4.0).
+        P_baseline: Normalization baseline for populations (default: 500.0).
+        T_baseline: Normalization baseline for transitions (default: 50.0).
+        min_transitions_per_site: Minimum transitions required per site (default: 10).
+        min_coverage_ratio: Minimum fraction of substituents that must be visited (default: 0.5).
+        entropy_bonus: Bonus coefficient for high-entropy distributions (default: 8.0).
+        concentration_penalty_threshold: Threshold for concentration penalty (default: 0.8).
+    
+    Returns:
+        Scalar reward value (higher is better). Returns -50.0 if inputs are empty.
+    """
+    if not populations and not transitions:
+        return -50.0
+    
+    total_subs = len(populations)
+    
+    # Assume uniform distribution across sites if not provided
+    # For transitions list, each element is a site's transition count
+    total_sites = len(transitions) if transitions else 1
+    
+    if total_subs == 0 or total_sites == 0:
+        return -50.0
+    
+    # ========== TRANSITION PENALTIES ==========
+    penalties = 0.0
+    sites_below_threshold = 0
+    min_transitions_across_sites = float('inf')
+    
+    for trans_count in transitions:
+        min_transitions_across_sites = min(min_transitions_across_sites, trans_count)
+        
+        if trans_count < min_transitions_per_site:
+            sites_below_threshold += 1
+            
+            if trans_count == 0:
+                penalties -= 40.0
+            elif trans_count == 1:
+                penalties -= 32.0
+            elif trans_count == 2:
+                penalties -= 24.0
+            elif trans_count < min_transitions_per_site:
+                deficit = min_transitions_per_site - trans_count
+                penalties -= (2.0 + 2.0 * deficit)
+    
+    # ========== COVERAGE PENALTIES ==========
+    pop_array = np.array(populations)
+    nonzero_count = np.sum(pop_array > 0)
+    coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
+    
+    if coverage_ratio < min_coverage_ratio:
+        deficit = min_coverage_ratio - coverage_ratio
+        penalties -= gamma * 20.0 * deficit
+    
+    # ========== CONCENTRATION PENALTIES ==========
+    # Assume uniform subs per site distribution
+    subs_per_site = total_subs // total_sites if total_sites > 0 else total_subs
+    nsubs_per_site = [subs_per_site] * total_sites
+    for i in range(total_subs % total_sites):
+        nsubs_per_site[i] += 1
+    
+    pop_idx = 0
+    for nsubs in nsubs_per_site:
+        site_pops = pop_array[pop_idx:pop_idx + nsubs]
+        
+        if len(site_pops) > 0 and np.sum(site_pops) > 0:
+            max_pop = np.max(site_pops)
+            total_pop = np.sum(site_pops)
+            concentration_ratio = max_pop / total_pop
+            
+            if concentration_ratio > concentration_penalty_threshold:
+                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
+        
+        pop_idx += nsubs
+    
+    # ========== POSITIVE REWARDS ==========
+    
+    # Confidence Factor
+    confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
+    
+    # R_P: Population balance reward
+    R_P = 0.0
+    if len(populations) > 1:
+        nonzero_pops = pop_array[pop_array > 0]
+        min_meaningful_coverage = max(2, total_sites * 1.5)
+        
+        if len(nonzero_pops) > 1 and len(nonzero_pops) >= min_meaningful_coverage:
+            pop_mean = np.mean(nonzero_pops)
+            pop_std = np.std(nonzero_pops)
+            cv = pop_std / pop_mean if pop_mean > 0 else 1.0
+            balance_factor = np.exp(-cv)
+            total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
+            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
+        else:
+            R_P = w_P * 0.01 * coverage_ratio * confidence_factor
+    
+    # R_T: Transition reward
+    R_T = 0.0
+    if sites_below_threshold == 0:
+        total_trans = sum(transitions)
+        R_T = w_T * (total_trans / T_baseline)
+        avg_trans_per_site = total_trans / total_sites if total_sites > 0 else 0
+        if avg_trans_per_site > min_transitions_per_site * 2:
+            R_T *= 1.5
+    
+    # R_U: Coverage uniformity reward
+    R_U = w_U * coverage_ratio
+    
+    # R_entropy: Shannon entropy bonus
+    R_entropy = 0.0
+    if np.sum(pop_array) > 0:
+        prob_dist = pop_array / np.sum(pop_array)
+        prob_dist = prob_dist[prob_dist > 0]
+        entropy = -np.sum(prob_dist * np.log(prob_dist + 1e-10))
+        max_entropy = np.log(len(prob_dist))
+        entropy_score = entropy / max_entropy if max_entropy > 0 else 0.0
+        R_entropy = entropy_bonus * entropy_score
+    
+    # Clamp penalties
+    max_penalty = 50.0
+    if penalties < -max_penalty:
+        penalties = -max_penalty
+    
+    R = R_P + R_T + R_U + R_entropy + penalties
+    
+    return R
+
+
+def reinforce_train_step(
+    policy,
+    optimizer: torch.optim.Optimizer,
+    data,
+    env_reward_fn: Callable,
+    baseline: float = 0.0,
+    lambda_entropy: float = 0.0
+):
+    """Perform one REINFORCE update with optional entropy regularization.
+
+    Args:
+        policy: instance of EdgePolicy
+        optimizer: optimizer for policy parameters
+        data: PyG data object with x, edge_index, edge_type, edge_attr
+        env_reward_fn: callable(actions: torch.Tensor) -> float (or tensor)
+        baseline: scalar baseline to reduce variance (default: 0.0)
+        lambda_entropy: entropy regularization coefficient (default: 0.0).
+            Positive values encourage exploration by maximizing policy entropy.
+    
+    Returns:
+        (loss_value, reward): Tuple of scalar loss and scalar reward
+    """
+    policy.train()
+    optimizer.zero_grad()
+
+    x = data.x
+    edge_index = data.edge_index
+    edge_type = data.edge_type
+    edge_attr = data.edge_attr if hasattr(data, 'edge_attr') else None
+
+    actions, logp, mean, std = policy.get_actions(x, edge_index, edge_type, edge_attr)
+
+    # Evaluate reward from environment (user-provided function)
+    # allow env_reward_fn to accept torch tensor or convert to numpy
+    with torch.no_grad():
+        r = env_reward_fn(actions)
+        if isinstance(r, torch.Tensor):
+            reward = float(r.item())
+        else:
+            reward = float(r)
+
+    # policy loss: -E[logp * (reward - baseline)] ; sum over edges
+    # here we treat reward as a scalar applied to all edge actions
+    adv = reward - baseline
+    policy_loss = -(logp.sum() * adv)
+    
+    # Entropy regularization: encourages exploration
+    # H(π) = 0.5 * log(2πe * σ²) for Gaussian policy
+    # We want to maximize entropy, so subtract it from loss (or add negative entropy)
+    entropy_loss = 0.0
+    if lambda_entropy > 0:
+        # std is already returned from get_actions as log_std in position 3
+        log_std = policy.log_std if hasattr(policy, 'log_std') else torch.zeros_like(mean)
+        entropy = 0.5 * torch.log(2 * 3.14159 * 2.71828 * torch.exp(2 * log_std)).sum()
+        entropy_loss = -lambda_entropy * entropy
+    
+    # Total loss
+    loss = policy_loss + entropy_loss
+    loss.backward()
+    optimizer.step()
+
+    return float(loss.item()), reward
