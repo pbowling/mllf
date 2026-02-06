@@ -2,6 +2,10 @@
 # This example has 2 sites: site1 (6 subs) and site2 (5 subs)
 # No atoms need to be deleted for single-site combinations
 
+# System configuration
+system:
+  solvent_state: solv  # Environment type: 'solv' (solvated), 'gas' (vacuum), or 'protein'
+
 # Combination generation
 create_combos:
   input_dir: /home/pbowling/mllf/examples/14benz
@@ -102,8 +106,11 @@ training:
   policy:
     mlp_hidden: 64          # Hidden units in shared trunk (before separate heads)
     # mlp_out_dim: 4        # Auto-computed: number of bias types (typically 4)
+  value_network:
+    hidden_dims: [64, 32]   # MLP layers for value prediction
+    lr: 0.001               # Learning rate for value network (10x policy LR for faster baseline learning)
   optimizer:
-    lr: 0.001               # Learning rate for Adam optimizer
+    lr: 0.0001              # Learning rate for Adam optimizer (reduced 10x for stability)
   bias_clip: 1000.0         # Safety net for write_variables (policy clips to [±83, ±171, ±11.6, ±7.4])
   
 # Simulation configuration
@@ -140,7 +147,7 @@ reward:
   concentration_penalty_threshold: 0.8  # Threshold for concentration penalty (0.8 = 80%)
   
   # REINFORCE entropy regularization
-  lambda_entropy: 0.01  # Entropy coefficient for exploration
+  lambda_entropy: 0.5   # Entropy coefficient for exploration (increased 50x for better exploration)
 
 # Output organization
 output:

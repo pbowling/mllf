@@ -181,7 +181,7 @@ class Graph:
             pass
 
     @classmethod
-    def from_rtf_results(cls, rtf_results: Dict[str, Dict], solvent_override: Optional[str] = None) -> "Graph":
+    def from_rtf_results(cls, rtf_results: Dict[str, Dict], solvent_override: Optional[str] = None, directory: Optional[str] = None) -> "Graph":
         """Create a Graph with one node per substituent (sub), populating node metadata.
 
         rtf_results is expected to contain parsed entries with keys including
@@ -195,7 +195,9 @@ class Graph:
                 - 'gas' or 'vacuum': Gas phase / vacuum environment
                 - 'solv' or 'solvent': Solvent / water environment
                 - 'protein': Protein environment
-                If not provided, environment is auto-detected from filenames.
+                If not provided, environment is auto-detected from directory name.
+            directory: Directory path containing the RTF files, used for auto-detection
+                      of solvent state from folder name (e.g., '14benz_solv' -> 'solv')
         """
         # collect entries that have site and sub
         subs = []
@@ -236,8 +238,6 @@ class Graph:
 
         # populate node metadata per substituent
         for idx, (site, sub, key, parsed) in enumerate(subs):
-            # prefer full file path for solvent detection (may include directory hints)
-            fname = parsed.get('filepath') or parsed.get('filename')
             atom_types = list(parsed.get('atom_types') or [])
             total_charge = float(parsed.get('total_charge', 0.0) or 0.0)
             # distinct_atom_types: preserve duplicates and order but exclude atoms
@@ -259,7 +259,8 @@ class Graph:
                     )
                     sol_state = 'unknown'
             else:
-                sol_state = _detect_solvent_state(fname)
+                # Auto-detect from directory name (e.g., '14benz_solv' -> 'solv')
+                sol_state = _detect_solvent_state(directory if directory else '')
 
             subs_meta = {
                 'site': site,

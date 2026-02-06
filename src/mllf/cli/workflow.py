@@ -170,7 +170,8 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
 
 
 def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadratic', verify_graph: bool = False,
-                                      toppar_dir: str = None, toppar_files: list = None, warn_missing_types: bool = True):
+                                      toppar_dir: str = None, toppar_files: list = None, warn_missing_types: bool = True,
+                                      solvent_state: str = None):
     """Build PyG Data object and per-edge targets from a combo directory.
 
     This function prefers RTF fragments when available (Graph.from_rtf_results).
@@ -186,6 +187,8 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
         toppar_dir: Path to toppar directory for vocabulary (None uses package default)
         toppar_files: List of specific toppar filenames to include (e.g., ['top_all36_cgenff.rtf'])
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+        solvent_state: Environment type for the system ('solv', 'gas', or 'protein').
+                      If None, attempts to detect from filenames.
 
     Returns:
         Tuple of (data, targets, extras) where:
@@ -204,13 +207,16 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
     
     # Check for RTF files in both combo_dir and combo_dir/prep
     rtf_results = parse_rtf_dir(combo_dir)
+    rtf_dir = combo_dir
     if not rtf_results:
         prep_dir = combo_path / 'prep'
         if prep_dir.exists() and prep_dir.is_dir():
             rtf_results = parse_rtf_dir(str(prep_dir))
+            rtf_dir = str(prep_dir)
     
     if rtf_results:
-        g = Graph.from_rtf_results(rtf_results)
+        # Pass the directory path for solvent state detection from folder name
+        g = Graph.from_rtf_results(rtf_results, solvent_override=solvent_state, directory=rtf_dir)
         # Save graph_info.json for reward function to extract actual nsubs_per_site
         save_graph_info_from_rtf(combo_dir, g)
     else:

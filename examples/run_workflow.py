@@ -22,6 +22,7 @@ from pathlib import Path
 import sys
 import yaml
 import torch
+import torch.nn.functional as F
 import numpy as np
 import json
 from typing import Dict, List
@@ -34,6 +35,7 @@ from mllf.cli.workflow import (
 )
 from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy
+from mllf.cb.value_net import ValueNetwork
 from mllf.cb.train_improved import compute_msld_reward_improved
 from mllf.cb.workflow_utils import (
     load_manifest,
@@ -160,7 +162,9 @@ def ensure_combo_dir_exists(combo_path: Path, config: Dict) -> Path:
 def train_epoch(
     encoder: RGCNEncoder,
     policy: EdgePolicy,
+    value_network: ValueNetwork,
     optimizer: torch.optim.Optimizer,
+    value_optimizer: torch.optim.Optimizer,
     combos: List[str],
     epoch: int,
     config: Dict,
@@ -171,22 +175,26 @@ def train_epoch(
     Args:
         encoder: RGCN node encoder.
         policy: Edge-level policy network.
+        value_network: Value network for baseline estimation.
         optimizer: Optimizer for policy parameters.
+        value_optimizer: Optimizer for value network parameters.
         combos: List of combo directory paths.
         epoch: Current epoch number.
         config: Full config dict with simulation settings.
         device: Device for computation ('cpu' or 'cuda').
     
     Returns:
-        Dict with epoch statistics (loss, avg_reward, etc.).
+        Dict with epoch statistics (loss, avg_reward, value_loss, etc.).
     """
     import subprocess
     import time
     
     policy.train()
     encoder.train()
+    value_network.train()
     
     epoch_loss = 0.0
+    epoch_value_loss = 0.0
     epoch_rewards = []
     
     # Track submitted jobs for concurrent execution
@@ -262,17 +270,30 @@ def train_epoch(
                 
                 # REINFORCE update: Recompute forward pass to get fresh gradients
                 try:
-                    data, targets, extras = build_data_and_targets_from_combo(str(combo_path))
+                    solvent_state = config.get('system', {}).get('solvent_state', None)
+                    data, targets, extras = build_data_and_targets_from_combo(str(combo_path), solvent_state=solvent_state)
                     data = data.to(device)
                     
-                    # Recompute logp with gradients enabled
+                    # Get node embeddings for value network
+                    node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
+                    
+                    # Compute value network baseline
+                    predicted_value = value_network(node_embeddings)
+                    advantage = reward - predicted_value.item()
+                    
+                    # Update value network (minimize MSE between prediction and actual reward)
+                    value_loss = F.mse_loss(predicted_value, torch.tensor([reward], device=device))
+                    value_optimizer.zero_grad()
+                    value_loss.backward()
+                    value_optimizer.step()
+                    epoch_value_loss += value_loss.item()
+                    
+                    # Recompute forward pass for policy update (need fresh gradients)
+                    node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
                     _, logp_new, _, _ = policy.get_actions(
                         data.x, data.edge_index, data.edge_type, data.edge_attr,
                         deterministic=False
                     )
-                    
-                    baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
-                    advantage = reward - baseline
                     
                     policy_loss = -(logp_new.sum() * advantage)
                     
@@ -298,7 +319,8 @@ def train_epoch(
         
         # 1. Build graph from RTF fragments
         try:
-            data, targets, extras = build_data_and_targets_from_combo(str(combo_path))
+            solvent_state = config.get('system', {}).get('solvent_state', None)
+            data, targets, extras = build_data_and_targets_from_combo(str(combo_path), solvent_state=solvent_state)
             data = data.to(device)
         except Exception as e:
             print(f"  Error building graph: {e}")
@@ -497,19 +519,32 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             
             # REINFORCE update: Recompute forward pass for this combo to get fresh gradients
             try:
-                data, targets, extras = build_data_and_targets_from_combo(str(jcombo_path))
+                solvent_state = config.get('system', {}).get('solvent_state', None)
+                data, targets, extras = build_data_and_targets_from_combo(str(jcombo_path), solvent_state=solvent_state)
                 data = data.to(device)
                 
-                # Recompute actions and logp with gradients enabled
+                # Get node embeddings for value network
+                node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
+                
+                # Compute value network baseline (learned, state-dependent)
+                predicted_value = value_network(node_embeddings)
+                advantage = reward - predicted_value.item()
+                
+                # Update value network (minimize MSE between prediction and actual reward)
+                value_loss = F.mse_loss(predicted_value, torch.tensor([reward], device=device))
+                value_optimizer.zero_grad()
+                value_loss.backward()
+                value_optimizer.step()
+                epoch_value_loss += value_loss.item()
+                
+                # Recompute forward pass for policy update (need fresh gradients, value net updated above)
+                node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
                 _, logp_new, _, _ = policy.get_actions(
                     data.x, data.edge_index, data.edge_type, data.edge_attr,
                     deterministic=False
                 )
                 
-                # REINFORCE loss with current policy
-                baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
-                advantage = reward - baseline
-                
+                # REINFORCE loss with learned baseline
                 policy_loss = -(logp_new.sum() * advantage)
                 
                 # Entropy regularization
@@ -543,10 +578,12 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             time.sleep(10)  # Wait before checking again
     
     avg_loss = epoch_loss / len(epoch_rewards) if epoch_rewards else 0.0
+    avg_value_loss = epoch_value_loss / len(epoch_rewards) if epoch_rewards else 0.0
     avg_reward = np.mean(epoch_rewards) if epoch_rewards else 0.0
     
     return {
         'loss': avg_loss,
+        'value_loss': avg_value_loss,
         'avg_reward': avg_reward,
         'num_combos': len(combos)
     }
@@ -660,7 +697,8 @@ def main():
     # Build sample graph to get dimensions
     sample_combo = train_combos[0]
     sample_combo_path = ensure_combo_dir_exists(Path(sample_combo), config)
-    sample_data, _, sample_extras = build_data_and_targets_from_combo(str(sample_combo_path))
+    solvent_state = config.get('system', {}).get('solvent_state', None)
+    sample_data, _, sample_extras = build_data_and_targets_from_combo(str(sample_combo_path), solvent_state=solvent_state)
     
     train_config = config.get('training', {})
     encoder_config = train_config.get('encoder', {})
@@ -681,6 +719,13 @@ def main():
         mlp_out_dim=len(sample_extras['relation_names']) // 2
     ).to(device)
     
+    # Initialize value network for learned baseline
+    value_config = train_config.get('value_network', {})
+    value_network = ValueNetwork(
+        emb_dim=encoder_config.get('out_dim', 32),
+        hidden_dims=value_config.get('hidden_dims', [64, 32])
+    ).to(device)
+    
     optimizer_config = train_config.get('optimizer', {})
     # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
     optimizer = torch.optim.Adam(
@@ -688,8 +733,16 @@ def main():
         lr=optimizer_config.get('lr', 0.001)
     )
     
+    # Separate optimizer for value network (typically uses higher LR)
+    value_lr = value_config.get('lr', optimizer_config.get('lr', 0.001) * 10)  # Default: 10x policy LR
+    value_optimizer = torch.optim.Adam(
+        value_network.parameters(),
+        lr=value_lr
+    )
+    
     print(f"Encoder: {sum(p.numel() for p in encoder.parameters())} params")
     print(f"Policy: {sum(p.numel() for p in policy.parameters())} params")
+    print(f"Value Network: {sum(p.numel() for p in value_network.parameters())} params")
     
     # Step 4: Load pretrained policy or resume from checkpoint
     output_config = config.get('output', {})
@@ -705,6 +758,7 @@ def main():
         pretrained = torch.load(pretrain_path, map_location=device, weights_only=False)
         encoder.load_state_dict(pretrained['encoder_state'])
         policy.load_state_dict(pretrained['policy_state'])
+        # Value network starts fresh (no pretraining needed)
         print(f"Loaded pretrained policy from epoch {pretrained.get('epoch', 'unknown')}")
         if 'avg_reward' in pretrained:
             print(f"Pretraining avg reward: {pretrained['avg_reward']:.4f}")
@@ -718,6 +772,11 @@ def main():
             encoder.load_state_dict(checkpoint['encoder_state'])
             policy.load_state_dict(checkpoint['policy_state'])
             optimizer.load_state_dict(checkpoint['optimizer_state'])
+            # Load value network if present (backward compatibility)
+            if 'value_network_state' in checkpoint:
+                value_network.load_state_dict(checkpoint['value_network_state'])
+                value_optimizer.load_state_dict(checkpoint['value_optimizer_state'])
+                print(f"Loaded value network from checkpoint")
             start_epoch = checkpoint['epoch']
             print(f"Resuming from epoch {start_epoch}")
     
@@ -846,13 +905,14 @@ def main():
         
         # Train on active training set
         stats = train_epoch(
-            encoder, policy, optimizer,
+            encoder, policy, value_network, optimizer, value_optimizer,
             active_train_combos, epoch, epoch_config, device
         )
         all_stats.append(stats)
         
         print(f"Epoch {epoch+1} Stats:")
         print(f"  Loss: {stats['loss']:.4f}")
+        print(f"  Value Loss: {stats['value_loss']:.4f}")
         print(f"  Avg Reward: {stats['avg_reward']:.4f}")
         
         # Save checkpoint
@@ -867,7 +927,9 @@ def main():
                     'epoch': epoch + 1,
                     'encoder_state': encoder.state_dict(),
                     'policy_state': policy.state_dict(),
+                    'value_network_state': value_network.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
+                    'value_optimizer_state': value_optimizer.state_dict(),
                     'stats': stats,
                 }, checkpoint_path)
                 print(f"  Saved checkpoint to {checkpoint_path}")
