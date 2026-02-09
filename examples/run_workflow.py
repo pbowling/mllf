@@ -282,13 +282,14 @@ def train_epoch(
                     advantage = reward - predicted_value.item()
                     
                     # Update value network (minimize MSE between prediction and actual reward)
-                    value_loss = F.mse_loss(predicted_value, torch.tensor([reward], device=device))
+                    value_loss = F.mse_loss(predicted_value, torch.tensor([reward], dtype=torch.float32, device=device))
                     value_optimizer.zero_grad()
                     value_loss.backward()
                     value_optimizer.step()
                     epoch_value_loss += value_loss.item()
                     
-                    # Recompute forward pass for policy update (need fresh gradients)
+                    # Policy update: Recompute forward pass with fresh gradients
+                    # (Note: Can't reuse node_embeddings from value network update due to backward())
                     node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
                     _, logp_new, _, _ = policy.get_actions(
                         data.x, data.edge_index, data.edge_type, data.edge_attr,
@@ -531,7 +532,7 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
                 advantage = reward - predicted_value.item()
                 
                 # Update value network (minimize MSE between prediction and actual reward)
-                value_loss = F.mse_loss(predicted_value, torch.tensor([reward], device=device))
+                value_loss = F.mse_loss(predicted_value, torch.tensor([reward], dtype=torch.float32, device=device))
                 value_optimizer.zero_grad()
                 value_loss.backward()
                 value_optimizer.step()

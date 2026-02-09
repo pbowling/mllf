@@ -22,23 +22,14 @@ Molecular systems are represented as undirected graphs where:
 
 Each edge can have multiple bias types:
 
-* ``linear`` (b): Per-node linear bias ensuring equal population of all perturbations 
+* ``linear`` (b): Per-node linear bias vector ensuring equal population of all perturbations 
   at each site when correctly parameterized
 * ``quadratic`` (c): Pairwise interaction bias that removes barriers in alchemical space 
-  due to electrostatic interactions between sites
+  due to electrostatic interactions between sites (antisymmetric: :math:`c_{ij} = -c_{ji}`)
 * ``skew`` (x): Asymmetry correction bias that fits residuals beyond quadratic and end 
   biases, particularly important after soft-core introduction
 * ``end`` (s): End-state bias compensating for the entropic and surface tension cost 
   of displacing solvent and nearby molecules when substituents appear
-
-**Key Property**: All bias matrices are antisymmetric:
-
-.. math::
-
-   B_{ij} = -B_{ji}
-
-This ensures that the bias interaction from site i→j is the negative of j→i,
-maintaining physical consistency in the bidirectional interactions.
 
 Graph Construction
 ^^^^^^^^^^^^^^^^^^
@@ -61,15 +52,21 @@ Graphs are built using one of two methods:
    This method reads ``site*_sub*_*_pres.rtf`` files and extracts connectivity
    information from the RTF topology fragments.
    
-   **Environment Detection**: The environment type (vacuum, solvent, or protein) is 
-   automatically detected from filenames. You can override this behavior using the 
-   ``solvent_override`` parameter with values: ``'gas'``/``'vacuum'``, ``'solv'``/``'solvent'``, 
-   or ``'protein'``.
+   **Environment Type**: The environment (vacuum, solvent, or protein) can be 
+   specified via the ``solvent_override`` parameter:
    
-   .. note::
-      While ``'gas'``/``'vacuum'`` is still accepted for compatibility, it has been 
-      deprecated as a distinct environment encoding in node features. Vacuum environments 
-      are now represented as neither solvent nor protein (both flags set to 0.0).
+   * ``'solv'`` or ``'solvent'``: Solvated/aqueous environment
+   * ``'gas'`` or ``'vacuum'``: Gas phase/vacuum environment
+   * ``'protein'``: Protein-embedded environment
+   
+   If not specified, the system attempts auto-detection from directory names
+   (e.g., ``14benz_solv`` → ``solv``). For production use, explicit configuration
+   via workflow YAML is recommended:
+   
+   .. code-block:: yaml
+   
+      system:
+        solvent_state: solv  # Explicit environment specification
 
 2. **From variables.py** (fallback):
    
@@ -99,9 +96,9 @@ For neural network training, graphs are converted to PyTorch Geometric format:
 * Total molecular charge (float) - sum of partial charges in the substituent
 * Binary indicators for environment type:
   
-  - ``is_solvent``: 1.0 for solvent/water environment, 0.0 otherwise
-  - ``is_protein``: 1.0 for protein environment, 0.0 otherwise
-  - Note: Vacuum/gas environments have both flags set to 0.0 (deprecated as explicit encoding)
+  - ``is_solvent``: 1 for solvent/water environment, 0 otherwise
+  - ``is_protein``: 1 for protein environment, 0 otherwise
+  - Note: Vacuum/gas environments have both flags set to 0 (deprecated as explicit encoding)
 
 * Multi-hot encoding of chemical elements present in the substituent 
   (e.g., C, H, N, O from the periodic table)
@@ -120,19 +117,14 @@ and their corresponding elements. By default, only CGenFF is loaded:
 * **Atom type vocabulary**: 161 CGenFF atom types
 * **Total feature dimensions**: ``3 + 14 + 161 = 178`` for CGenFF only
 
-This ensures:
-
-* Consistent feature dimensions across all graphs
-* No vocabulary mismatch between training and inference
-* Support for unseen atom types during deployment (with warnings)
-
 **Important**: Each undirected edge is expanded into **two directed edges**:
 
 * Forward relation: ``{base}_fwd`` (e.g., ``quadratic_fwd``)
 * Backward relation: ``{base}_bwd`` (e.g., ``quadratic_bwd``)
 
-This doubling is intentional and allows the model to learn directional interactions
-while maintaining the antisymmetry constraint during variable writing.
+This doubling is intentional and allows the model to learn directional interactions.
+During variable writing, quadratic maintains antisymmetry (:math:`c_{ij} = -c_{ji}`),
+while skew and end store both directions independently.
 
 The ``extras`` dict contains:
 
@@ -194,23 +186,24 @@ The ``EdgeValueMLP`` uses a two-stage design:
 
 **Key Features**:
 
-* **Output Scaling**: Mean predictions are scaled to [-20, 20] via ``tanh(mean) * 20.0``
-  
-  - Ensures bias magnitudes are in physically meaningful ranges
-  - Provides smooth gradients during training
-  - Eliminates need to learn scale from scratch
-
-* **Enhanced Exploration**: Log standard deviation clamped to [-20, 3.5]
-  
-  - Standard deviation range: [~0, 33]
-  - 4.5× larger than previous architecture (std ~7.4)
-  - Enables discovery of larger bias magnitudes during early training
-
 * **Specialized Predictions**: Each bias type gets its own predictor head
   
   - Reduces interference between different bias types
   - Allows learning type-specific patterns
   - Improves sample efficiency
+
+* **Output Scaling**: Mean predictions use bias-specific scale factors via ``tanh(mean) * scale_factors``
+  
+  - **Linear**: ±61.4, **Quadratic**: ±70.5, **Skew**: ±6.6, **End**: ±3.6
+  - Derived from analysis of 5,332 coefficients across 52 pretraining systems (95th percentile + 20% margin)
+  - Actions clipped to 1.05× scale factors during sampling: [±64.5, ±74.0, ±6.9, ±3.8]
+  - Ensures bias magnitudes are in physically meaningful ranges based on empirical data
+
+* **Enhanced Exploration**: Log standard deviation clamped to [-20, 2.0]
+  
+  - Standard deviation range: [~0, 7.4]
+  - Provides exploration while preventing extreme outliers
+  - Higher values (e.g., 3.5 → std≈33) can produce samples far beyond intended ranges
 
 **Usage Example**:
 
@@ -248,43 +241,60 @@ and actions are sampled independently:
 
 where :math:`k \\in \\{\\text{linear, quadratic, skew, end}\\}`.
 
-**Architecture Update (January 2026)**:
+Training with Actor-Critic (REINFORCE + Value Network)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The separate heads architecture replaced the previous single-head design. Key improvements:
+The policy is trained using an Actor-Critic architecture that combines REINFORCE 
+with a learned value network for variance reduction.
 
-* Bias magnitudes now correctly scaled (e.g., -16 instead of -3)
-* Wider exploration range allows discovering optimal large-magnitude biases
-* Specialized heads reduce learning interference between bias types
-* ~4k additional parameters (167k total vs 163k) for improved expressiveness
+**Components**:
 
-.. note::
-   Models trained with the old architecture are **not compatible** with the new separate 
-   heads design. Pretrained models must be retrained using the updated architecture.
+* **Actor (Policy Network)**: Predicts bias coefficients from graph structure
+* **Critic (Value Network)**: Predicts expected reward to provide state-dependent baselines
 
-Training with REINFORCE
-~~~~~~~~~~~~~~~~~~~~~~~
+Value Network Architecture
+^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The policy is trained using the REINFORCE algorithm:
+.. code-block:: python
 
-1. **Sample actions** from the policy for all edges
-2. **Write variables.py** with the sampled coefficients
-3. **Run simulation** to collect metrics (transitions, populations)
-4. **Compute reward** from simulation results
-5. **Update policy** using policy gradient:
+   from mllf.cb.value_net import ValueNetwork
+   
+   value_network = ValueNetwork(
+       emb_dim=32,           # Node embedding dimension from encoder
+       hidden_dims=[64, 32]  # MLP layers: input → 64 → 32 → 1
+   )
+   
+   # Predict expected reward for a combination
+   node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
+   predicted_value = value_network(node_embeddings)  # Scalar prediction
 
-.. math::
+The value network uses:
 
-   \\nabla_\\theta J = \\mathbb{E}\\left[\\sum_{edges} \\nabla_\\theta \\log \\pi_\\theta(a_e) \\cdot R\\right]
+1. **Global mean pooling** over node embeddings to get graph-level representation
+2. **MLP prediction** of scalar expected reward
+3. **MSE loss** to minimize :math:`(V(s) - R)^2`
+
+**Benefits**:
+
+* **Lower variance**: State-dependent baselines reduce gradient noise
+* **Faster learning**: Value network trains 10x faster than policy (higher LR)
+* **Better credit assignment**: Easy vs hard combinations get appropriate baselines
+* **Stability**: Prevents catastrophic forgetting of pretrained weights
 
 Training Loop Example
 ^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: python
 
+   import torch.nn.functional as F
+   
    for epoch in range(num_epochs):
        for combo_dir in combos:
            # Build graph and targets
            data, targets, extras = build_data_and_targets_from_combo(combo_dir)
+           
+           # Encode graph
+           node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
            
            # Sample actions from policy
            actions, logp, _, _ = policy.get_actions(
@@ -292,19 +302,30 @@ Training Loop Example
                deterministic=False
            )
            
-           # Write variables.py for simulator
+           # Write variables.py and run simulation
            write_variables_from_actions(combo_dir, data, extras, actions)
-           
-           # Run simulation and get reward
            run_simulation_command(combo_dir)
-           sim_results = parse_simulation_results(combo_dir)
-           reward = compute_reward(sim_results)
+           reward = compute_reward(parse_simulation_results(combo_dir))
            
-           # Update policy (REINFORCE)
-           loss = -(logp.sum() * reward)
+           # Predict expected value
+           predicted_value = value_network(node_embeddings)
+           advantage = reward - predicted_value.item()
+           
+           # Update value network
+           value_loss = F.mse_loss(predicted_value, torch.tensor([reward]))
+           value_optimizer.zero_grad()
+           value_loss.backward()
+           value_optimizer.step()
+           
+           # Update policy with advantage
+           policy_loss = -(logp.sum() * advantage)
            optimizer.zero_grad()
-           loss.backward()
+           policy_loss.backward()
            optimizer.step()
+
+**Key Insight**: The advantage :math:`A = R - V(s)` tells the policy whether the 
+actual reward was better or worse than expected for this specific combination, 
+providing more informative gradients than a global average baseline.
 
 Reward Function
 ^^^^^^^^^^^^^^^
@@ -319,7 +340,7 @@ protections against double jeopardy and unreliable data.
    def compute_msld_reward_improved(
        run_dir,
        w_P=0.5,           # Population balance weight
-       w_T=0.5,           # Transition count weight  
+       w_T=0.75,          # Transition count weight  
        w_U=0.3,           # Coverage uniformity weight
        gamma=4.0,         # Penalty scaling factor
        P_baseline=500.0,  # Population normalization (lower = higher rewards)
@@ -336,18 +357,18 @@ protections against double jeopardy and unreliable data.
        # Track minimum transitions across all sites
        min_transitions_across_sites = min(transitions.values())
        
-       # === PENALTY SHIELD (I_dead) ===
-       # Prevents "double jeopardy" for frozen simulations
-       I_dead = 1 if min_transitions_across_sites == 0 else 0
-       
        # === TIERED TRANSITION PENALTIES ===
        penalties = 0.0
        for site, trans in transitions.items():
            if trans == 0:
-               penalties -= 40.0  # Tier 1: "Death Floor"
+               penalties -= 40.0  # Tier 1: "Death Floor" (0 transitions)
+           elif trans == 1:
+               penalties -= 32.0  # Tier 1: "Death Floor" (1 transition)
+           elif trans == 2:
+               penalties -= 24.0  # Tier 1: "Death Floor" (2 transitions)
            elif trans < min_transitions_per_site:
                deficit = min_transitions_per_site - trans
-               penalties -= (5.0 + 2.8 * deficit)  # Tier 2: "Climbing Ramp"
+               penalties -= (2.0 + 2.0 * deficit)  # Tier 2: "Climbing Ramp"
            # Tier 3: "Success Zone" (>=10) gets no penalty
        
        # === CONFIDENCE FACTOR (C_F) ===
@@ -386,27 +407,23 @@ protections against double jeopardy and unreliable data.
        max_entropy = np.log(len(pop_probs))
        R_entropy = entropy_bonus * (entropy / max_entropy)
        
-       # === SECONDARY PENALTIES (only when shield inactive) ===
-       if (1 - I_dead):
-           # Coverage penalty
-           if coverage_ratio < min_coverage_ratio:
-               deficit = min_coverage_ratio - coverage_ratio
-               penalties -= gamma * 20.0 * deficit
-           
-           # Concentration penalty (per-site check)
-           for site_pops in get_site_populations(populations):
-               concentration = max(site_pops) / sum(site_pops)
-               if concentration > concentration_penalty_threshold:
-                   penalties -= gamma * 5.0 * (concentration - concentration_penalty_threshold)
+       # === SECONDARY PENALTIES ===
+       # Coverage penalty
+       if coverage_ratio < min_coverage_ratio:
+           deficit = min_coverage_ratio - coverage_ratio
+           penalties -= gamma * 20.0 * deficit
+       
+       # Concentration penalty (per-site check)
+       for site_pops in get_site_populations(populations):
+           concentration = max(site_pops) / sum(site_pops)
+           if concentration > concentration_penalty_threshold:
+               penalties -= gamma * 5.0 * (concentration - concentration_penalty_threshold)
        
        # Total reward
        reward = R_P + R_T + R_U + R_entropy + penalties
        return reward
 
 **Key Mechanisms**:
-
-* **Penalty Shield (I_dead)**: When ``min_transitions_across_sites = 0``, disables secondary
-  penalties (coverage, concentration) to prevent "double jeopardy" on frozen simulations.
 
 * **Confidence Factor (C_F)**: Scales population rewards by ``min(1.0, min_transitions / (2*N_req))``.
   Low-transition runs (1-5 transitions) have unreliable population distributions and receive
@@ -415,15 +432,15 @@ protections against double jeopardy and unreliable data.
 * **Tiered Transition Penalties**: Provides continuous gradient feedback instead of binary
   thresholds:
   
-  - Tier 1 "Death Floor" (0 trans): -40.0 penalty per site
-  - Tier 2 "Climbing Ramp" (1-9 trans): -30.2 to -7.8 (linear gradient)
+  - Tier 1 "Death Floor" (0-2 trans): -40.0, -32.0, -24.0 fixed penalties
+  - Tier 2 "Climbing Ramp" (3-9 trans): -16.0 to -4.0 via ``-2.0 - (2.0 × deficit)``
   - Tier 3 "Success Zone" (≥10 trans): 0.0 penalty, unlocks ``R_T`` reward
 
 **Default Configuration** (higher_rewards_v1):
 
 Tested on indolizine pretraining data with 64.10 point separation between good and bad runs:
 
-* ``w_P=0.5, w_T=0.5, w_U=0.3``
+* ``w_P=0.5, w_T=0.75, w_U=0.3``
 * ``gamma=4.0, P_baseline=500, T_baseline=50``
 * ``entropy_bonus=8.0, min_transitions_per_site=10``
 
@@ -442,18 +459,18 @@ The simulator reads bias coefficients from a ``variables.py`` file:
    - 0.1
    - 0.2
    - -0.05
-   c:  # NxN quadratic bias matrix (antisymmetric)
+   c:  # NxN quadratic bias matrix (antisymmetric: c[j][i] = -c[i][j])
    - [0.0, 0.3, -0.1]
    - [-0.3, 0.0, 0.2]
    - [0.1, -0.2, 0.0]
-   x:  # NxN skew bias matrix (antisymmetric)
-   - [0.0, 0.05, 0.0]
-   - [-0.05, 0.0, 0.0]
-   - [0.0, 0.0, 0.0]
-   s:  # NxN end bias matrix (antisymmetric)
-   - [0.0, 0.0, 0.0]
-   - [0.0, 0.0, 0.0]
-   - [0.0, 0.0, 0.0]
+   x:  # NxN skew bias matrix (NOT antisymmetric: both directions independent)
+   - [0.0, 0.05, -0.02]
+   - [-0.05, 0.0, 0.03]
+   - [0.02, -0.03, 0.0]
+   s:  # NxN end bias matrix (NOT antisymmetric: both directions independent)
+   - [0.0, 0.1, -0.05]
+   - [-0.1, 0.0, 0.08]
+   - [0.05, -0.08, 0.0]
    '''
 
 Forward-Only Canonical Mapping
@@ -461,11 +478,9 @@ Forward-Only Canonical Mapping
 
 When writing variables.py from edge-level predictions:
 
-1. Each undirected pair (i,j) stores **one canonical forward value**
-2. If only the backward relation exists, use its negative: ``forward = -backward``
-3. Build antisymmetric matrices: ``matrix[i][j] = v``, ``matrix[j][i] = -v``
+**For linear bias (per-node vector)**:
 
-For linear bias, per-edge predictions are aggregated into per-node values:
+Per-edge predictions are aggregated into per-node values:
 
 .. code-block:: python
 
@@ -477,6 +492,18 @@ For linear bias, per-edge predictions are aggregated into per-node values:
        count[j] += 1
    
    b = [b[i] / count[i] if count[i] > 0 else 0.0 for i in range(N)]
+
+**For quadratic bias (antisymmetric)**:
+
+1. Each undirected pair (i,j) stores **one canonical forward value**
+2. If only the backward relation exists, use its negative: ``forward = -backward``
+3. Build antisymmetric matrix: ``c[i][j] = v``, ``c[j][i] = -v``
+
+**For skew and end biases (NOT antisymmetric)**:
+
+1. Each directed pair (i→j) stores its **own independent value**
+2. Forward and backward relations are stored separately
+3. Build full matrix: ``x[i][j] = v_ij``, ``x[j][i] = v_ji`` (where v_ij ≠ -v_ji)
 
 See Also
 --------

@@ -40,10 +40,14 @@ A workflow config specifies which operations to run and their parameters:
 
 .. code-block:: yaml
 
+   # System configuration
+   system:
+     solvent_state: solv  # Environment: 'solv' (solvated), 'gas' (vacuum), or 'protein'
+   
    # Combination generation
    create_combos:
-     input_dir: examples/cb/14benz_solv_5.5  # Directory with site/sub fragment files
-     out_dir: examples/cb/generated_combos   # Output directory for combinations
+     input_dir: examples/14benz  # Directory with site/sub fragment files
+     out_dir: examples/generated_combos   # Output directory for combinations
      include_patterns:
        - msld_flat.py  # Additional files to copy to each combination
    
@@ -65,7 +69,7 @@ A workflow config specifies which operations to run and their parameters:
      num_epochs: 1                            # Usually 1 epoch is sufficient
      model_path: models/pretrained_policy.pt  # Save pretrained model here
    
-   # Training configuration
+   # Training configuration (Actor-Critic with value network)
    training:
      num_epochs: 50
      load_pretrained: models/pretrained_policy.pt  # Optional: load pretrained model
@@ -74,8 +78,18 @@ A workflow config specifies which operations to run and their parameters:
        out_dim: 32
      policy:
        mlp_hidden: 64
+     value_network:
+       hidden_dims: [64, 32]  # Value network for baseline estimation
+       lr: 0.001              # 10x policy LR (learns scalar prediction faster)
      optimizer:
-       lr: 0.001
+       lr: 0.0001             # Policy LR (reduced 10x for stability)
+   
+   # Reward configuration
+   reward:
+     lambda_entropy: 0.5      # Entropy regularization (increased 50x for exploration)
+     w_P: 0.5
+     w_T: 0.75
+     gamma: 4.0
    
    # Output and checkpointing
    output:
@@ -155,8 +169,8 @@ Example: With 5 subs at site1 (75 selections) and 6 subs at site2 (186 selection
 Single-Site Core Augmentation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When generating **single-site pair combinations** (e.g., testing only site1 pairs while
-site2 is excluded), the core structure must include atoms from the excluded site's first
+When generating **single-site pair combinations** (e.g., testing only site 1 pairs while
+site 2 is excluded), the core structure must include atoms from the excluded site's first
 substituent to maintain the complete molecular structure.
 
 The combination generator automatically augments ``core.rtf`` and ``core.pdb`` for
@@ -232,12 +246,6 @@ training. The workflow implements **lazy (on-demand) directory creation**:
 * **Filesystem efficiency**: Avoid creating thousands of unused directories
 * **Scalability**: Handle massive combination spaces (100K+ combinations)
 
-**Example**: For a 14,211-combination system with 1% train/1% val split:
-
-* Without lazy creation: ~14,211 directories created upfront
-* With lazy creation: ~284 directories created on-demand (only those used)
-* Space savings: ~98% fewer directories
-
 Directory Structure
 ~~~~~~~~~~~~~~~~~~~
 
@@ -260,10 +268,8 @@ Each combination directory (created on-demand) has a standardized structure:
    │       ├── site2_sub1_frag.pdb
    │       ├── site2_sub2_pres.rtf
    │       ├── site2_sub2_frag.pdb
-   │       ├── full_ligand.rtf
-   │       ├── full_ligand.prm
-   │       ├── top_all36_msld.rtf
-   │       ├── par_all36_msld.prm
+   │       ├── core.rtf
+   │       ├── core.prm
    │       └── other_support_files...
    ├── comb_0262_site1_1__site1_2__site2_1__site2_2/  # Cross-site
    │   ├── info.py
@@ -304,13 +310,6 @@ Each combination directory contains standardized metadata files:
    info['nnodes'] = 1                  # MPI nodes
    info['enginepath'] = os.environ.get('CHARMMEXEC', '')
    info['temp'] = 298.15               # Temperature in Kelvin
-
-**Key features**:
-
-* ``nsubs`` is a list showing substituent count per site (e.g., ``[3, 3]`` for 
-  3 subs at each of 2 sites)
-* ``nblocks`` is computed as the sum of ``nsubs`` (total substituents)
-* Used by ``msld_flat.py`` to determine site structure: ``nsites = len(info['nsubs'])``
 
 **mapping.json**: File renumbering information
 
@@ -388,7 +387,7 @@ Alternatively, build from existing ``variables.py``:
 
    from mllf.cli.workflow import load_bias_from_variables, graph_from_bias
    
-   bias = load_bias_from_variables('examples/cb/14benz_solv_5.5/variables.py')
+   bias = load_bias_from_variables('examples/14benz/variables.py')
    graph = graph_from_bias(bias)
 
 This parses the YAML ``bias_string`` to extract bias matrices.
@@ -433,7 +432,7 @@ where:
 The policy learns to **imitate successful bias coefficients** from existing simulation data.
 This provides a warm start before reinforcement learning begins.
 
-**Training Reward (Reinforcement Learning)**
+**Training Reward**
 
 During training, the policy is optimized using REINFORCE with rewards computed from simulation trajectories.
 The reward function prevents degenerate solutions (e.g., convergence to single-substituent states)
@@ -471,7 +470,7 @@ Rewards frequent transitions between substituents, with bonus for high transitio
 
 where:
 
-* :math:`w_T` is the transition weight (default: 0.5)
+* :math:`w_T` is the transition weight (default: 0.75)
 * :math:`T_s` is the transition count for site :math:`s`
 * :math:`T_{\text{baseline}}` is the normalization constant (default: 50.0)
 * The 1.5× bonus applies when average transitions per site exceeds 20
@@ -500,27 +499,31 @@ where :math:`H(\mathbf{p}) = -\sum_k \frac{p_k}{P_{\text{total}}} \log \frac{p_k
 
 The system uses a three-tier penalty structure to provide continuous feedback:
 
-**Tier 1: "Death Floor"** (0 transitions):
+**Tier 1: "Death Floor"** (0-2 transitions):
 
 .. math::
 
-   \text{penalty} = -40.0 \quad \text{(per site with 0 transitions)}
+   \text{penalty} = \begin{cases}
+   -40.0 & \text{if } T_s = 0 \\
+   -32.0 & \text{if } T_s = 1 \\
+   -24.0 & \text{if } T_s = 2
+   \end{cases}
 
 Worst possible state, signaling total inactivity is unacceptable.
 
-**Tier 2: "Climbing Ramp"** (1-9 transitions):
+**Tier 2: "Climbing Ramp"** (3-9 transitions):
 
 .. math::
 
-   \text{penalty} = -\left(5.0 + 2.8 \times \text{deficit}\right)
+   \text{penalty} = -\left(2.0 + 2.0 \times \text{deficit}\right)
 
 where :math:`\text{deficit} = 10 - T_s` for site :math:`s`. This creates a linear gradient:
 
-* 1 transition: :math:`-5.0 - 2.8 \times 9 = -30.2`
-* 5 transitions: :math:`-5.0 - 2.8 \times 5 = -19.0`
-* 9 transitions: :math:`-5.0 - 2.8 \times 1 = -7.8`
+* 3 transitions: :math:`-2.0 - 2.0 \times 7 = -16.0`
+* 5 transitions: :math:`-2.0 - 2.0 \times 5 = -12.0`
+* 9 transitions: :math:`-2.0 - 2.0 \times 1 = -4.0`
 
-Each additional transition improves the reward by ~2.8 points, providing continuous feedback.
+Each additional transition improves the reward by 2.0 points, providing continuous feedback.
 
 **Tier 3: "Success Zone"** (≥10 transitions):
 
@@ -542,7 +545,7 @@ Site is "unlocked" and eligible for positive :math:`R_T` rewards.
 
   .. math::
 
-     \text{penalty} = -\gamma \times 15.0 \quad \text{(per concentrated site)}
+     \text{penalty} = -\gamma \times 5.0 \times (\text{concentration} - 0.8) \quad \text{(per concentrated site)}
 
 * **Simulation failure**: :math:`R = -100 \times \gamma` if simulation does not terminate normally
 
@@ -552,7 +555,7 @@ Site is "unlocked" and eligible for positive :math:`R_T` rewards.
 
    reward:
      w_P: 0.5                                # Population weight
-     w_T: 0.5                                # Transition weight
+     w_T: 0.75                                # Transition weight
      w_U: 0.3                                # Uniformity weight
      gamma: 4.0                              # Base penalty coefficient
      P_baseline: 500.0                       # Population normalization
@@ -562,9 +565,46 @@ Site is "unlocked" and eligible for positive :math:`R_T` rewards.
      entropy_bonus: 8.0                      # Entropy bonus coefficient
      concentration_penalty_threshold: 0.8    # Single-substituent dominance threshold
 
-**Policy Gradient Update**:
+**Policy Gradient Update with Value Network**:
 
-The policy is updated using REINFORCE with the advantage function:
+The policy is updated using an **Actor-Critic** architecture that combines REINFORCE 
+with a learned value network for variance reduction.
+
+**Actor-Critic Architecture**:
+
+* **Actor (Policy Network)**: Predicts bias coefficients from graph structure
+* **Critic (Value Network)**: Predicts expected reward for a given graph
+
+The value network provides a state-dependent baseline :math:`V(s)` that adapts to 
+each combination's difficulty, rather than using a fixed or moving average baseline.
+
+**Value Network**:
+
+.. code-block:: python
+
+   # Architecture: Node embeddings → Global pooling → MLP → Scalar value
+   value_network = ValueNetwork(
+       emb_dim=32,           # Node embedding dimension from encoder
+       hidden_dims=[64, 32]  # MLP layers [input→64→32→1]
+   )
+   
+   # Predict expected reward
+   node_embeddings = encoder(graph)
+   predicted_value = value_network(node_embeddings)
+
+**Training Loop**:
+
+For each combination:
+
+1. Encode graph structure to get node embeddings
+2. Predict bias coefficients with policy (stochastic sampling)
+3. Run simulation and compute actual reward :math:`R`
+4. Predict expected value :math:`V(s)` with value network
+5. Compute advantage: :math:`A = R - V(s)`
+6. Update value network: minimize :math:`(V(s) - R)^2`
+7. Update policy: maximize :math:`\log \pi(a|s) \cdot A`
+
+**Policy Gradient with Advantage**:
 
 .. math::
 
@@ -574,7 +614,27 @@ where:
 
 * :math:`\mathbf{a}_t` is the action (bias coefficients) at time :math:`t`
 * :math:`\mathbf{s}_t` is the state (graph representation) at time :math:`t`
-* :math:`A_t = R_{\text{total}} - b` is the advantage (with baseline :math:`b`)
+* :math:`A_t = R - V(\mathbf{s}_t)` is the advantage (state-dependent baseline)
+
+**Benefits of Value Network**:
+
+* **Lower variance**: Advantages are centered around state-dependent expectations rather than global average
+* **Faster convergence**: Stable gradients enable higher learning rates
+* **Better credit assignment**: Easy vs hard combinations get different baselines
+* **Catastrophic forgetting prevention**: Reduces gradient noise that destroys pretrained weights
+
+**Hyperparameters**:
+
+.. code-block:: yaml
+
+   training:
+     value_network:
+       hidden_dims: [64, 32]  # MLP architecture
+       lr: 0.001              # 10x policy LR for faster baseline learning
+     optimizer:
+       lr: 0.0001             # Policy learning rate (reduced for stability)
+     reward:
+       lambda_entropy: 0.5    # Entropy regularization (exploration bonus)
 
 Pretraining from Existing Simulations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -602,25 +662,33 @@ simulated with known bias coefficients. These can come from:
 
 **Data Collection**:
 
-Organize pretraining data by copying completed runs into a unified directory:
+Organize pretraining data by grouping completed runs by system/environment:
 
 .. code-block:: bash
 
    pretraining/
-   ├── system1_run001/
-   │   ├── variables.py         # Bias coefficients used
-   │   ├── info.py              # System configuration
-   │   └── res/
-   │       └── *_flat.lmd       # Lambda trajectory
-   ├── system1_run002/
-   ├── system2_run001/
+   ├── system1_solv/         # System name with environment
+   │   ├── run1/
+   │   │   ├── graph_info.json           # Graph metadata (sites, substituents, edges)
+   │   │   ├── metadata.json             # Run metadata (transitions, populations, solvent_state)
+   │   │   ├── simulation_results.json   # Detailed populations and transitions by lambda
+   │   │   └── variables.py              # Bias coefficients that were used
+   │   ├── run2/
+   │   └── ...
+   ├── system2_solv/
+   │   └── run*/
+   ├── system3_prot/
+   │   └── run*/
    └── ...
 
-Each directory should contain:
+Each run directory should contain:
 
+* ``graph_info.json``: Graph structure with sites, substituents, and connectivity information
 * ``variables.py``: Bias coefficients that were used for the simulation
-* ``info.py``: System metadata (nsubs, nblocks, temp)
-* ``res/*_flat.lmd``: Lambda dynamics trajectory file for computing rewards
+* ``metadata.json``: High-level run information (total transitions, num sites/subs, solvent state, termination status)
+* ``simulation_results.json``: Detailed simulation outputs with populations and transitions organized by lambda value
+
+This structure enables multi-system pretraining by organizing runs hierarchically by system/environment.
 
 **Pretraining Configuration**:
 
@@ -670,48 +738,37 @@ resampled). This means:
 * The pretrained policy learns a mapping from graph structure to successful
   bias coefficients
 
-**Multi-System Pretraining**:
+System Configuration
+~~~~~~~~~~~~~~~~~~~~
 
-Pretraining can combine data from multiple systems to learn generalizable
-patterns:
+The ``system`` section specifies environment-level parameters that affect graph construction
+and node feature encoding:
 
-.. code-block:: bash
+.. code-block:: yaml
 
-   pretraining/
-   ├── 14benz_solv/      # Benzene derivatives in solvent
-   │   └── run_*/
-   ├── 14benz_vac/       # Same system in vacuum
-   │   └── run_*/
-   ├── indole_prot/      # Indole derivatives in protein
-   │   └── run_*/
-   └── indole_solv/      # Indole derivatives in solvent
-       └── run_*/
+   system:
+     solvent_state: solv  # Environment type
 
-The policy learns to adapt bias coefficients based on:
+**Solvent State**:
 
-* System size (number of sites, substituents)
-* Environment type (vacuum, solvent, protein)
-* Chemical properties (atom types, charge)
+Specifies the simulation environment for proper graph metadata:
 
-Quick Epoch
-~~~~~~~~~~~
+* ``solv`` or ``solvent``: Solvated/aqueous environment
+* ``gas`` or ``vacuum``: Gas phase/vacuum environment
+* ``protein``: Protein-embedded environment
 
-For rapid prototyping, run a single epoch without full simulations:
+This information is:
 
-.. code-block:: python
+* Embedded in graph metadata for each combination
+* Used by the encoder as contextual information
+* Preserved in ``graph_info.json`` for pretraining data reuse
 
-   from mllf.cli.workflow import run_quick_epoch_for_combo
-   
-   encoder, policy, optimizer = initialize_model(...)
-   
-   for combo_dir in train_combos:
-       loss = run_quick_epoch_for_combo(
-           encoder, policy, optimizer,
-           combo_dir, reward_fn
-       )
+**Auto-Detection** (legacy):
 
-This samples actions, writes ``variables.py``, computes a dummy reward,
-and updates the policy once per combo.
+Previously, the system attempted to auto-detect solvent state from directory names
+(e.g., ``14benz_solv`` → ``solv``). This is now deprecated in favor of explicit 
+configuration for clarity and reliability.
+
 
 Full Simulation Training
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -909,22 +966,6 @@ Troubleshooting
 * Check file permissions
 * Look for errors in log files about loading checkpoints
 
-Testing Checkpoint Functionality
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-To verify checkpoint functionality is working correctly:
-
-.. code-block:: bash
-
-   python tests/tools/test_checkpoint_resume.py
-
-This test script verifies:
-
-* YAML configuration has checkpointing enabled
-* Training checkpoints contain all required keys
-* Per-epoch result checkpoints are saved correctly
-* Checkpoint structure matches expected format
-
 Reward Function Experimentation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -948,14 +989,14 @@ recomputed with the new configuration:
    # Original configuration
    reward:
      w_P: 0.5
-     w_T: 0.5
-     gamma: 10.0
+     w_T: 0.75
+     gamma: 4.0
    
    # Change to emphasize transitions more
    reward:
      w_P: 0.3  # Changed
-     w_T: 0.7  # Changed
-     gamma: 10.0
+     w_T: 0.9  # Changed
+     gamma: 4.0
 
 When training resumes, rewards are recomputed from raw metrics without
 re-running simulations.
@@ -991,7 +1032,7 @@ ranked by mean reward.
      Range: [12.3456, 67.8901]
    
    Configuration: baseline
-     Parameters: w_P=0.5, w_T=0.5, gamma=10.0
+     Parameters: w_P=0.5, w_T=0.75, gamma=4.0
      Mean reward: 42.1234 ± 7.8901
      Range: [10.2345, 65.4321]
    
@@ -1202,28 +1243,6 @@ This executes:
 6. Checkpoint saving at ``checkpoint_freq`` intervals
 7. Archiving combinations (if ``archive.enabled`` is true)
 
-Workflow Structure
-~~~~~~~~~~~~~~~~~~
-
-.. code-block:: text
-
-   examples/
-   ├── run_workflow.py           # Main training script
-   ├── workflow_sample.yaml      # Configuration file
-   ├── training_test.sh          # SLURM submission script
-   └── cb/
-       ├── 14benz_solv_5.5/      # Base system with fragments
-       │   ├── site1_sub*.rtf
-       │   ├── site2_sub*.rtf
-       │   ├── msld_flat.py      # Simulation script
-       │   └── prep/
-       └── generated_combos/      # Generated combinations
-           ├── manifest.txt
-           ├── train_manifest.txt
-           ├── val_manifest.txt
-           ├── test_manifest.txt
-           └── comb_XXXX_*/       # Individual combinations
-
 Configuration File
 ~~~~~~~~~~~~~~~~~~
 
@@ -1233,7 +1252,7 @@ The ``workflow_sample.yaml`` file controls all aspects of the workflow:
 
    # Generate combinations from fragments
    create_combos:
-     input_dir: /path/to/14benz_solv_5.5
+     input_dir: /path/to/14benz
      out_dir: /path/to/generated_combos
      include_patterns:
        - msld_flat.py
@@ -1271,11 +1290,11 @@ The ``workflow_sample.yaml`` file controls all aspects of the workflow:
    # Reward function
    reward:
      w_P: 0.5
-     w_T: 0.5
-     gamma: 10.0
-     P_baseline: 1000.0
-     T_baseline: 100.0
-     lambda_entropy: 0.01
+     w_T: 0.75
+     gamma: 4.0
+     P_baseline: 500.0
+     T_baseline: 50.0
+     lambda_entropy: 0.5
    
    # Output and checkpoints
    output:
@@ -1290,182 +1309,70 @@ The ``workflow_sample.yaml`` file controls all aspects of the workflow:
      remove_after: false        # Remove originals after archiving
      archive_dir: /path/to/archives  # Where to store .tar.gz files
 
-Training Loop Details
-~~~~~~~~~~~~~~~~~~~~~
+Training Loop Structure
+~~~~~~~~~~~~~~~~~~~~~~~
 
-The main training loop in ``run_workflow.py`` implements:
+The main training loop implements epoch-based training with concurrent SLURM job management:
 
-.. code-block:: python
+**High-Level Flow**:
 
-   # Pseudocode showing the training loop structure
-   for epoch in range(start_epoch, num_epochs):
-       
-       for combo_dir in train_combos:
-           # Create epoch-specific output directory
-           epoch_dir = combo_dir / f"run_{epoch:03d}"
-           
-           # Check for cached results (resume capability)
-           if (epoch_dir / 'epoch_results.pt').exists():
-               # Load cached reward, actions, logp
-               # Apply REINFORCE update
-               # Continue to next combo
-           
-           # Build graph from RTF fragments
-           data, targets, extras = build_data_and_targets_from_combo(combo_dir)
-           
-           # Sample actions from policy
-           actions, logp, mean, log_std = policy.get_actions(
-               data.x, data.edge_index, data.edge_type, data.edge_attr,
-               deterministic=False
-           )
-           
-           # Write epoch-specific variables.py
-           write_variables_from_actions(
-               combo_dir, data, extras, actions,
-               out_name=f'run_{epoch:03d}/variables.py'
-           )
-           
-           # Submit SLURM job (non-blocking)
-           # Manages up to max_concurrent_jobs
-           job_id = submit_simulation_job(epoch_dir)
-           job_queue.append((combo_dir, epoch_dir, job_id, actions, logp))
-       
-       # Wait for all jobs to complete
-       for combo_dir, epoch_dir, job_id, actions, logp in job_queue:
-           # Parse simulation outputs
-           transitions, populations = parse_msld_output(epoch_dir)
-           
-           # Compute reward
-           reward = compute_msld_reward(
-               transitions, populations,
-               w_P=0.5, w_T=0.5, gamma=10.0,
-               P_baseline=1000.0, T_baseline=100.0
-           )
-           
-           # Save epoch results (for resume)
-           torch.save({
-               'reward': reward,
-               'actions': actions.detach().cpu(),
-               'logp': logp.detach().cpu(),
-               'epoch': epoch,
-               'combo': combo_dir.name
-           }, epoch_dir / 'epoch_results.pt')
-           
-           # REINFORCE update
-           baseline = mean(epoch_rewards)
-           advantage = reward - baseline
-           loss = -(logp.sum() * advantage)
-           
-           optimizer.zero_grad()
-           loss.backward()
-           optimizer.step()
-       
-       # Save training checkpoint
-       if (epoch + 1) % checkpoint_freq == 0:
-           save_checkpoint(epoch + 1, encoder, policy, optimizer, stats)
+1. For each combination in training set:
+   
+   - Check if epoch already completed (cached results)
+   - Build graph from RTF fragments
+   - Sample bias coefficients from policy (stochastic)
+   - Write ``variables.py`` with sampled coefficients
+   - Submit SLURM job for simulation
 
-Key Implementation Details
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+2. Wait for all jobs to complete (up to ``max_concurrent_jobs`` running)
+3. Parse simulation outputs (transitions, populations)
+4. Compute rewards from simulation metrics
+5. Update value network: minimize :math:`(V(s) - R)^2`
+6. Update policy: maximize :math:`\log \pi(a|s) \cdot (R - V(s))`
+7. Save checkpoints at specified intervals
 
-**Concurrent Job Management**: The workflow maintains a queue of active SLURM
-jobs and waits when ``max_concurrent_jobs`` is reached:
+**Key Features**:
 
-.. code-block:: python
-
-   while len(job_queue) >= max_concurrent_jobs:
-       # Poll squeue to check for completed jobs
-       completed_jobs = check_job_status(job_queue)
-       # Remove completed jobs from queue
-       time.sleep(5)  # Wait before checking again
-
-**SLURM Job Script**: Each epoch creates a job script that:
-
-1. Changes to the combination directory
-2. Runs ``msld_flat.py`` with epoch-specific ``variables.py``
-3. Writes outputs to epoch-specific directory
-4. Captures stdout/stderr
-
-**Reward Computation**: The reward function in ``src/mllf/cb/train.py``:
-
-.. code-block:: python
-
-   def compute_msld_reward(transitions, populations, w_P, w_T, gamma, ...):
-       # Transition-based reward (higher is better)
-       total_transitions = sum(transitions.values())
-       R_T = total_transitions / T_baseline
-       
-       # Population-based reward (balanced is better)
-       nonzero_pops = [p for p in populations.values() if p > 0]
-       balance_factor = exp(-coefficient_of_variation(nonzero_pops))
-       R_P = len(nonzero_pops) / len(populations) * balance_factor
-       
-       # Worst-case penalty
-       if max(nonzero_pops) / sum(nonzero_pops) > 0.9 and total_transitions < 10:
-           penalty = -2 * gamma
-       
-       # Scalarized reward
-       return w_P * R_P + w_T * R_T + penalty + gamma * len(nonzero_pops)
+* **Cached results**: Skip simulations if ``epoch_results.pt`` exists
+* **Concurrent jobs**: Manages SLURM queue with ``max_concurrent_jobs`` limit
+* **Resume capability**: Automatically resumes from latest checkpoint
+* **Reward recomputation**: Can update rewards with new config without re-running sims
 
 Custom Training Loop
 ~~~~~~~~~~~~~~~~~~~~
 
-For custom workflows, the key components are:
+For custom workflows, import the key components:
 
 .. code-block:: python
 
    from mllf.file_handling.generate_combinations import create_combination_dirs
-   from mllf.cli.workflow import (
-       build_data_and_targets_from_combo,
-       write_variables_from_actions
-   )
+   from mllf.cli.workflow import build_data_and_targets_from_combo, write_variables_from_actions
    from mllf.cb.rgcn import RGCNEncoder
    from mllf.cb.policy import EdgePolicy
-   from mllf.cb.train import compute_msld_reward
+   from mllf.cb.value_net import ValueNetwork
+   from mllf.cb.train_improved import compute_reward_from_raw_metrics
    
-   # 1. Generate combinations
+   # Generate combinations
    combos = create_combination_dirs(
-       input_dir=Path('14benz_solv_5.5'),
+       input_dir=Path('14benz'),
        output_dir=Path('generated_combos'),
-       include_patterns=['msld_flat.py'],
-       max_subs_per_site=10  # Limit combination size (default: 10)
+       include_patterns=['msld_flat.py']
    )
    
-   # Note: max_subs_per_site limits each combination to at most N substituents per site.
-   # All substituents can still participate, but individual combinations are capped.
-   # Increase this value if you need larger combinations (may significantly increase
-   # total number of combinations generated).
-   
-   # 2. Initialize model
+   # Initialize actor-critic model
    sample_data, _, sample_extras = build_data_and_targets_from_combo(combos[0])
    
-   encoder = RGCNEncoder(
-       in_dim=sample_data.x.size(1),
-       hidden_dims=[64, 64],
-       out_dim=32,
-       num_relations=sample_data.edge_type.max().item() + 1
-   )
+   encoder = RGCNEncoder(in_dim=sample_data.x.size(1), hidden_dims=[64, 64], out_dim=32,
+                         num_relations=sample_data.edge_type.max().item() + 1)
    
-   policy = EdgePolicy.from_pyg_data(
-       encoder=encoder,
-       emb_dim=32,
-       data=sample_data,
-       mlp_hidden=64,
-       mlp_out_dim=len(sample_extras['relation_names']) // 2
-   )
+   policy = EdgePolicy.from_pyg_data(encoder=encoder, emb_dim=32, data=sample_data,
+                                      mlp_hidden=64, mlp_out_dim=len(sample_extras['relation_names']) // 2)
    
-   optimizer = torch.optim.Adam(
-       list(encoder.parameters()) + list(policy.parameters()),
-       lr=0.001
-   )
+   value_network = ValueNetwork(emb_dim=32, hidden_dims=[64, 32])
    
-   # 3. Training loop (see pseudocode above for details)
-   for epoch in range(num_epochs):
-       # Your custom training logic here
-       pass
-
-See Also
---------
-
-* :doc:`cb_setup` - CB architecture and graph representation details
+   optimizer = torch.optim.Adam(policy.parameters(), lr=0.0001)
+   value_optimizer = torch.optim.Adam(value_network.parameters(), lr=0.001)
+   
+   # Training loop - see run_workflow.py for full implementation
 * :doc:`examples` - Example workflows and usage patterns
 * :doc:`api` - API reference for workflow modules
