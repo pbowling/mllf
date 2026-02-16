@@ -10,7 +10,20 @@
 # - Penalty Shield (I_dead): Disables secondary penalties when min_transitions = 0
 # - Confidence Factor (C_F): Scales R_P by min(1.0, min_transitions / (2*N_req))
 
-# Current default configuration
+# Current workflow_14benz training configuration
+current_training:
+  w_P: 0.5
+  w_T: 0.75
+  w_U: 0.3
+  gamma: 4.0
+  P_baseline: 500.0
+  T_baseline: 50.0
+  min_transitions_per_site: 10
+  min_coverage_ratio: 0.5
+  entropy_bonus: 8.0
+  concentration_penalty_threshold: 0.8
+
+# Current default configuration (original baseline)
 current_default:
   w_P: 0.4
   w_T: 0.4

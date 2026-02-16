@@ -558,37 +558,59 @@ def compute_reward_from_sim_results(
     # Match train_improved.py penalty calculation
     penalties = 0.0
     
-    # 1. Tiered transition penalty system
-    # Replaces binary threshold with continuous gradient feedback
+    # 1. Multi-site aware transition penalty system
+    # Apply base penalty once based on worst site, then add scaling for additional bad sites
+    # This prevents unfair accumulation when multiple sites are degenerate
     sites_below_threshold = 0
     
-    for site_idx, trans_count in enumerate(trans_array):
+    # Count sites below threshold
+    for trans_count in trans_array:
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-            
-            if trans_count == 0:
-                # Tier 1: "Death Floor" - zero activity (max penalty)
-                penalties -= 40.0
-            elif trans_count == 1:
-                # Tier 1: "Death Floor" - very low activity
-                penalties -= 32.0
-            elif trans_count == 2:
-                # Tier 1: "Death Floor" - very low activity
-                penalties -= 24.0
-            elif trans_count < min_transitions_per_site:
-                # Tier 2: "Climbing Ramp" - softened gradient from ~-16 to -4
-                # Formula: -2.0 - (2.0 * deficit)
-                deficit = min_transitions_per_site - trans_count
-                penalties -= (2.0 + 2.0 * deficit)
+    
+    # Determine base penalty based on worst site (minimum transitions)
+    if min_transitions_across_sites == 0:
+        base_penalty = 40.0
+    elif min_transitions_across_sites == 1:
+        base_penalty = 32.0
+    elif min_transitions_across_sites == 2:
+        base_penalty = 24.0
+    elif min_transitions_across_sites < min_transitions_per_site:
+        # Tier 2: "Climbing Ramp" - softened gradient from ~-16 to -4
+        # Formula: -2.0 - (2.0 * deficit)
+        deficit = min_transitions_per_site - min_transitions_across_sites
+        base_penalty = 2.0 + 2.0 * deficit
+    else:
+        base_penalty = 0.0
+    
+    # Add multi-site degradation penalty if multiple sites are bad
+    # Each additional bad site beyond the first adds a smaller incremental penalty
+    if sites_below_threshold > 1:
+        multisite_penalty = (sites_below_threshold - 1) * 4.0
+        total_transition_penalty = base_penalty + multisite_penalty
+        penalties -= total_transition_penalty
+    elif sites_below_threshold == 1:
+        penalties -= base_penalty
     
     # 2. Coverage requirement (minimum % of substituents visited)
     num_populated = np.count_nonzero(pop_array)
     total_subs = sum(nsubs_per_site)
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
     
-    if coverage_ratio < min_coverage_ratio:
-        deficit = min_coverage_ratio - coverage_ratio
-        penalties -= gamma * 20.0 * deficit
+    # Adaptive coverage requirement: scales with system size to encourage visiting multiple subs
+    # Formula: min_subs = 1 + 0.5*(total-1)
+    # Examples: 2 subs→1.5 (75%), 3 subs→2.0 (67%), 4 subs→2.5 (62.5%), 6 subs→3.5 (58%)
+    min_subs_required = 1.0 + 0.5 * (total_subs - 1) if total_subs > 1 else 0.5
+    adaptive_min_coverage = min_subs_required / total_subs if total_subs > 0 else 0.0
+    
+    # NO DOUBLE JEOPARDY: Don't penalize coverage if transitions are too low for reliable statistics
+    # Coverage is only meaningful when there are enough transitions to have statistical confidence
+    # Only apply coverage penalty if transitions are at or above the success threshold
+    if coverage_ratio < adaptive_min_coverage and min_transitions_across_sites >= min_transitions_per_site:
+        # System has sufficient transitions but poor coverage - penalize the sampling inefficiency
+        deficit = adaptive_min_coverage - coverage_ratio
+        penalty_scale = np.sqrt(total_subs) if total_subs > 1 else 1.0
+        penalties -= gamma * 20.0 * deficit / penalty_scale
     
     # 3. Concentration penalty (per-site check)
     pop_idx = 0
@@ -599,7 +621,8 @@ def compute_reward_from_sim_results(
         if site_total > 0:
             concentration_ratio = site_pops.max() / site_total
             if concentration_ratio > concentration_penalty_threshold:
-                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
+                # Reduced coefficient (2.0 instead of 5.0) to prevent excessive accumulation in multi-site systems
+                penalties -= gamma * 2.0 * (concentration_ratio - concentration_penalty_threshold)
         
         pop_idx += nsubs
     
@@ -657,7 +680,8 @@ def compute_reward_from_sim_results(
     
     # ========== PENALTY CLAMPING ==========
     # Prevent gradient explosion by capping maximum negative penalty
-    max_penalty = 50.0
+    # Increased from 50 to 60 to preserve gradient information with multi-site systems
+    max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
     

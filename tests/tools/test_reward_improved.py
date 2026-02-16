@@ -118,45 +118,72 @@ def compute_improved_reward_from_json(
     penalties = 0.0
     penalty_messages = []
     
-    # Check 1: Tiered transition penalty system
-    # Replaces binary threshold with continuous gradient feedback
+    # Check 1: Multi-site aware transition penalty system
+    # Apply base penalty once based on worst site, then add scaling for additional bad sites
+    # This prevents unfair accumulation when multiple sites are degenerate
     sites_below_threshold = 0
     min_site_trans = min(site_transitions.values()) if site_transitions else 0
     min_transitions_across_sites = min_site_trans
     
-    for site_id, trans_count in site_transitions.items():
+    # Count sites below threshold
+    for trans_count in site_transitions.values():
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-            
-            if trans_count == 0:
-                # Tier 1: "Death Floor" - worst possible state
-                penalties -= 40.0
-                penalty_messages.append(f"Site {site_id}: 0 transitions (Death Floor: -40.0)")
-            elif trans_count < min_transitions_per_site:
-                # Tier 2: "Climbing Ramp" - linear gradient from ~-30 to -8
-                # Formula: -5.0 - (2.8 * deficit)
-                deficit = min_transitions_per_site - trans_count
-                tier2_penalty = 5.0 + 2.8 * deficit
-                penalties -= tier2_penalty
-                penalty_messages.append(f"Site {site_id}: {trans_count} transitions (Climbing Ramp: -{tier2_penalty:.1f})")
     
-    if sites_below_threshold > 0:
-        penalty_messages.append(f"{sites_below_threshold} site(s) below {min_transitions_per_site} transitions")
+    # Determine base penalty based on worst site (minimum transitions)
+    if min_site_trans == 0:
+        base_penalty = 40.0
+        penalty_messages.append(f"Worst site: 0 transitions (base penalty: -40.0)")
+    elif min_site_trans == 1:
+        base_penalty = 32.0
+        penalty_messages.append(f"Worst site: 1 transition (base penalty: -32.0)")
+    elif min_site_trans == 2:
+        base_penalty = 24.0
+        penalty_messages.append(f"Worst site: 2 transitions (base penalty: -24.0)")
+    elif min_site_trans < min_transitions_per_site:
+        # Tier 2: "Climbing Ramp" - softened gradient from ~-16 to -4
+        # Formula: -2.0 - (2.0 * deficit)
+        # At trans=3, deficit=7: -2.0 - 14.0 = -16.0
+        # At trans=9, deficit=1: -2.0 - 2.0 = -4.0
+        deficit = min_transitions_per_site - min_site_trans
+        base_penalty = 2.0 + 2.0 * deficit
+        penalty_messages.append(f"Worst site: {min_site_trans} transitions (base penalty: -{base_penalty:.1f})")
+    else:
+        base_penalty = 0.0
     
-    # Penalty Shield: I_dead indicator (1 if any site has 0 transitions)
-    # This prevents "double jeopardy" by disabling secondary penalties for frozen simulations
-    I_dead = 1 if min_transitions_across_sites == 0 else 0
+    # Add multi-site degradation penalty if multiple sites are bad
+    # Each additional bad site beyond the first adds a smaller incremental penalty
+    if sites_below_threshold > 1:
+        multisite_penalty = (sites_below_threshold - 1) * 4.0
+        total_transition_penalty = base_penalty + multisite_penalty
+        penalties -= total_transition_penalty
+        penalty_messages.append(f"{sites_below_threshold} sites below threshold: -{base_penalty:.1f} (base) + -{multisite_penalty:.1f} (multisite) = -{total_transition_penalty:.1f}")
+    elif sites_below_threshold == 1:
+        penalties -= base_penalty
+        penalty_messages.append(f"1 site below threshold: -{base_penalty:.1f}")
     
-    # Check 2: Minimum coverage (ONLY APPLIED IF SHIELD IS INACTIVE) (ONLY APPLIED IF SHIELD IS INACTIVE)
+    # Check 2: Minimum coverage with adaptive requirement
+    # Use adaptive formula: min_subs = 1 + 0.5*(total-1) with sqrt normalization
+    # This prevents discrete jumps when going from 2→3 subs
+    min_subs_required = 1.0 + 0.5 * (total_subs - 1) if total_subs > 1 else 0.5
+    adaptive_min_coverage = min_subs_required / total_subs if total_subs > 0 else 0.0
+    
     nonzero_count = np.sum(pop_array > 0)
     coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
     
-    if (1 - I_dead) and coverage_ratio < min_coverage_ratio:
-        deficit = min_coverage_ratio - coverage_ratio
-        penalties -= gamma * 20.0 * deficit
-        penalty_messages.append(f"Coverage {coverage_ratio:.2%} below minimum {min_coverage_ratio:.0%}")
+    # NO DOUBLE JEOPARDY: Don't penalize coverage if transitions are too low for reliable statistics
+    # Coverage is only meaningful when there are enough transitions to have statistical confidence
+    # Only apply coverage penalty if transitions are at or above the success threshold
+    if coverage_ratio < adaptive_min_coverage and min_transitions_across_sites >= min_transitions_per_site:
+        # System has sufficient transitions but poor coverage - penalize the sampling inefficiency
+        deficit = adaptive_min_coverage - coverage_ratio
+        penalty_scale = np.sqrt(total_subs) if total_subs > 1 else 1.0
+        penalties -= gamma * 20.0 * deficit / penalty_scale
+        penalty_messages.append(f"Coverage {coverage_ratio:.2%} below adaptive minimum {adaptive_min_coverage:.0%} (need {min_subs_required:.1f}/{total_subs} subs)")
+    elif coverage_ratio < adaptive_min_coverage and min_transitions_across_sites < min_transitions_per_site:
+        penalty_messages.append(f"Coverage {coverage_ratio:.2%} below minimum, but transitions too low for reliable statistics ({min_transitions_across_sites}/{min_transitions_per_site}), no double penalty")
     
-    # Check 3: Detect single-dominant-population per site (ONLY APPLIED IF SHIELD IS INACTIVE)
+    # Check 3: Detect single-dominant-population per site
     # Extract actual substituents per site from graph_info.json
     nsubs_per_site = None
     graph_info_path = run_dir / 'graph_info.json'
@@ -192,8 +219,9 @@ def compute_improved_reward_from_json(
             concentration_ratio = max_pop / total_pop
             max_concentration = max(max_concentration, concentration_ratio)
             
-            if (1 - I_dead) and concentration_ratio > concentration_penalty_threshold:
-                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
+            if concentration_ratio > concentration_penalty_threshold:
+                # Reduced coefficient (2.0 instead of 5.0) to prevent excessive accumulation in multi-site systems
+                penalties -= gamma * 2.0 * (concentration_ratio - concentration_penalty_threshold)
                 penalty_messages.append(f"Site {site_idx} has {concentration_ratio:.0%} concentration")
         
         pop_idx += nsubs
@@ -261,7 +289,8 @@ def compute_improved_reward_from_json(
     
     # ========== PENALTY CLAMPING ==========
     # Prevent gradient explosion by capping maximum negative penalty
-    max_penalty = 50.0
+    # Increased from 50 to 60 to preserve gradient information with multi-site systems
+    max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
     
@@ -286,7 +315,6 @@ def compute_improved_reward_from_json(
         'entropy_score': entropy_score,
         'sites_below_threshold': sites_below_threshold,
         'confidence_factor': confidence_factor,
-        'shield_active': bool(I_dead),
         'penalty_messages': penalty_messages
     }
     
@@ -294,7 +322,7 @@ def compute_improved_reward_from_json(
         print(f"  R_P={R_P:.2f} R_T={R_T:.2f} R_U={R_U:.2f} R_entropy={R_entropy:.2f} penalties={penalties:.2f}")
         print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.0%}), "
               f"Transitions: {list(site_transitions.values())}, Max conc: {max_concentration:.0%}")
-        print(f"  Confidence: {confidence_factor:.2f}, Shield: {'ACTIVE' if I_dead else 'INACTIVE'}")
+        print(f"  Confidence: {confidence_factor:.2f}")
         if penalty_messages:
             for msg in penalty_messages:
                 print(f"  ⚠️  {msg}")
