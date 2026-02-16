@@ -27,7 +27,7 @@ curriculum:
   enabled: true
   # Optional: Limit number of training combos per stage (useful for later stages with many combos)
   # If not set or null, uses all combos that match stage criteria
-  max_train_combos_per_stage: null  # e.g., 100 to limit to 100 random combos per stage
+  max_train_combos_per_stage: 100  # e.g., 100 to limit to 100 random combos per stage
   
   stages:
     # 1. WARM UP: Learning the basics with a "Leaky Gate"
@@ -41,36 +41,36 @@ curriculum:
       # max_train_combos: 50
 
     # 2. MASTERY: Perfecting the pairwise edge weights
-    #- name: pairs_single_site_full
-    #  min_subs: 2
-    #  max_subs: 2
-    #  min_sites: 1
-    #  max_sites: 1
-    #  epochs: 50
+    - name: pairs_single_site_full
+      min_subs: 2
+      max_subs: 2
+      min_sites: 1
+      max_sites: 1
+      epochs: 50
 
     # 3. DENSITY: Learning crowding effects
-    #- name: triplets_single_site
-    #  min_subs: 3
-    #  max_subs: 3
-    #  min_sites: 1
-    #  max_sites: 1
-    #  epochs: 75  # Increased: Density is harder than pairs
+    - name: triplets_single_site
+      min_subs: 3
+      max_subs: 3
+      min_sites: 1
+      max_sites: 1
+      epochs: 50  # Increased: Density is harder than pairs
 
     # 4. EXTRAPOLATION: The big jump to Multi-Site
-    #- name: pairs_two_sites
-    #  min_subs: 4  # 2 per site
-    #  max_subs: 4
-    #  min_sites: 2
-    #  max_sites: 2
-    #  epochs: 100 # Increased: This is the hardest generalization step
+    - name: pairs_two_sites
+      min_subs: 4  # 2 per site
+      max_subs: 4
+      min_sites: 2
+      max_sites: 2
+      epochs: 50 # Increased: This is the hardest generalization step
 
     # 5. COMPLEXITY: The "Endgame"
-    #- name: complex_two_sites
-    #  min_subs: 5
-    #  max_subs: 8
-    #  min_sites: 2
-    #  max_sites: 2
-    #  epochs: 100
+    - name: complex_two_sites
+      min_subs: 5
+      max_subs: 8
+      min_sites: 2
+      max_sites: 2
+      epochs: 50
   
   # Progression criteria (advance after fixed epochs)
   progression:
@@ -155,9 +155,13 @@ output:
   save_checkpoints: true
   checkpoint_freq: 5  # Save checkpoint every 5 epochs
 
-# Archive completed combinations (compress after training)
+# Archive completed combinations (compress during/after training)
+# Archiving options:
+#   per_stage=false: Archive once at the end of all training
+#   per_stage=true: Archive at end of each curriculum stage (runs in background during next stage setup)
 archive:
-  enabled: false              # Set to true to archive combinations
-  pattern: 'comb_*'          # Glob pattern for directories to archive
+  enabled: true               # Set to true to archive combinations
+  per_stage: true             # Archive at end of each curriculum stage (runs in background)
+  pattern: 'comb_*'          # Glob pattern for directories to archive (unused with per_stage=true)
   remove_after: false        # Remove original directories after archiving
   archive_dir: /home/pbowling/mllf/examples/14benz/archives  # Where to store .tar.gz files

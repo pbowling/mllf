@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import json
+import subprocess
+import time
 from typing import Dict, List
 import re
 
@@ -754,16 +756,8 @@ def main():
     pretrain_config = config.get('pretrain', {})
     pretrain_path = pretrain_config.get('model_path', None)
     
-    if pretrain_path and Path(pretrain_path).exists():
-        print(f"\n=== Loading pretrained policy: {pretrain_path} ===")
-        pretrained = torch.load(pretrain_path, map_location=device, weights_only=False)
-        encoder.load_state_dict(pretrained['encoder_state'])
-        policy.load_state_dict(pretrained['policy_state'])
-        # Value network starts fresh (no pretraining needed)
-        print(f"Loaded pretrained policy from epoch {pretrained.get('epoch', 'unknown')}")
-        if 'avg_reward' in pretrained:
-            print(f"Pretraining avg reward: {pretrained['avg_reward']:.4f}")
-    elif checkpoint_dir.exists():
+    # Check for checkpoints FIRST (priority: resume > pretrain)
+    if checkpoint_dir.exists():
         # Find the latest checkpoint
         checkpoints = sorted(checkpoint_dir.glob('checkpoint_epoch_*.pt'))
         if checkpoints:
@@ -780,6 +774,16 @@ def main():
                 print(f"Loaded value network from checkpoint")
             start_epoch = checkpoint['epoch']
             print(f"Resuming from epoch {start_epoch}")
+    elif pretrain_path and Path(pretrain_path).exists():
+        # Fall back to pretrained policy if no checkpoints found
+        print(f"\n=== Loading pretrained policy: {pretrain_path} ===")
+        pretrained = torch.load(pretrain_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(pretrained['encoder_state'])
+        policy.load_state_dict(pretrained['policy_state'])
+        # Value network starts fresh (no pretraining needed)
+        print(f"Loaded pretrained policy from epoch {pretrained.get('epoch', 'unknown')}")
+        if 'avg_reward' in pretrained:
+            print(f"Pretraining avg reward: {pretrained['avg_reward']:.4f}")
     
     # Step 5: Training loop
     print("\n=== Training ===")
@@ -798,6 +802,7 @@ def main():
     all_stats = []
     current_stage_idx = 0
     current_stage_epoch = 0
+    active_archive_jobs = []  # Track background archive processes
     
     # Determine active combinations for curriculum
     if curriculum_enabled:
@@ -855,6 +860,54 @@ def main():
                     can_advance = True
                 
                 if can_advance and current_stage_idx + 1 < len(stages):
+                    # Archive completed stage if per-stage archiving is enabled
+                    archive_config = config.get('archive', {})
+                    if archive_config.get('enabled', False) and archive_config.get('per_stage', False):
+                        prev_stage_name = stages[current_stage_idx]['name']
+                        print(f"\n=== Archiving Stage {current_stage_idx + 1}: {prev_stage_name} ===")
+                        
+                        # Create stage-specific archive directory
+                        base_archive_dir = Path(archive_config.get('archive_dir', 'archives'))
+                        stage_archive_dir = base_archive_dir / f"stage_{current_stage_idx + 1}_{prev_stage_name}"
+                        stage_archive_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Get combination names for this stage
+                        combo_names = [combo['name'] for combo in active_train_combos]
+                        print(f"  Archiving {len(combo_names)} combinations from stage '{prev_stage_name}'")
+                        
+                        # Create bash script to archive each combination
+                        archive_script = stage_archive_dir / 'archive_stage.sh'
+                        with open(archive_script, 'w') as f:
+                            f.write("#!/bin/bash\n")
+                            f.write(f"# Archive script for stage {current_stage_idx + 1}: {prev_stage_name}\n")
+                            f.write(f"cd {Path.cwd()}\n\n")
+                            
+                            for combo_name in combo_names:
+                                combo_dir = Path(config['output']['base_dir']) / combo_name
+                                if combo_dir.exists():
+                                    tar_file = stage_archive_dir / f"{combo_name}.tar.gz"
+                                    f.write(f"echo 'Archiving {combo_name}...'\n")
+                                    f.write(f"tar -czf {tar_file} -C {combo_dir.parent} {combo_dir.name}\n")
+                                    if archive_config.get('remove_after', False):
+                                        f.write(f"rm -rf {combo_dir}\n")
+                                    f.write(f"echo '  -> {tar_file}'\n\n")
+                        
+                        # Make script executable and run in background
+                        archive_script.chmod(0o755)
+                        log_file = stage_archive_dir / 'archive.log'
+                        print(f"  Launching background archive job, logging to {log_file}")
+                        
+                        with open(log_file, 'w') as log:
+                            archive_proc = subprocess.Popen(
+                                ['bash', str(archive_script)],
+                                stdout=log,
+                                stderr=subprocess.STDOUT,
+                                cwd=Path.cwd()
+                            )
+                        
+                        active_archive_jobs.append((archive_proc, prev_stage_name, stage_archive_dir))
+                        print(f"  Archive job started (PID: {archive_proc.pid})")
+                    
                     # Advance to next stage
                     current_stage_idx += 1
                     current_stage_epoch = 1
@@ -937,9 +990,25 @@ def main():
     
     print("\n=== Training Complete ===")
     
-    # Step 6: Archive combinations if requested
+    # Wait for any background archive jobs to complete
+    if active_archive_jobs:
+        print("\n=== Waiting for Background Archive Jobs ===")
+        for proc, stage_name, archive_dir in active_archive_jobs:
+            print(f"  Waiting for stage '{stage_name}' archive (PID: {proc.pid})...")
+            try:
+                proc.wait(timeout=300)  # Wait up to 5 minutes
+                if proc.returncode == 0:
+                    print(f"    ✓ Stage '{stage_name}' archived successfully")
+                else:
+                    print(f"    ✗ Stage '{stage_name}' archive failed (exit code: {proc.returncode})")
+                print(f"    Log: {archive_dir}/archive.log")
+            except subprocess.TimeoutExpired:
+                print(f"    ⚠ Stage '{stage_name}' archive still running (continuing anyway)")
+                proc.terminate()
+    
+    # Step 6: Archive combinations if requested (final archive for non-curriculum or per_stage=false)
     archive_config = config.get('archive', {})
-    if archive_config.get('enabled', False):
+    if archive_config.get('enabled', False) and not archive_config.get('per_stage', False):
         print("\n=== Archiving Combinations ===")
         from mllf.file_handling.generate_combinations import archive_combo_dirs
         import shutil

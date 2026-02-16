@@ -30,6 +30,8 @@ pretraining/
 old_files/
 models/
 training_output/
+status*
+*.tar.gz
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

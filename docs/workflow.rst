@@ -36,70 +36,20 @@ Or using the convenience wrapper:
 Configuration Format
 ~~~~~~~~~~~~~~~~~~~~
 
-A workflow config specifies which operations to run and their parameters:
+A workflow config is a YAML file specifying which operations to run and their parameters.
+Key sections include:
 
-.. code-block:: yaml
+* **system**: Environment type (solvent, gas, protein)
+* **create_combos**: Generate combinations from fragment files
+* **split**: Divide combinations into train/val/test sets
+* **pretrain**: Optional pretraining from existing simulations
+* **curriculum**: Progressive training stages (see :ref:`Curriculum Learning`)
+* **training**: Model architecture and hyperparameters
+* **reward**: Reward function weights and thresholds
+* **output**: Checkpointing and output organization
+* **archive**: Automatic compression of completed runs
 
-   # System configuration
-   system:
-     solvent_state: solv  # Environment: 'solv' (solvated), 'gas' (vacuum), or 'protein'
-   
-   # Combination generation
-   create_combos:
-     input_dir: examples/14benz  # Directory with site/sub fragment files
-     out_dir: examples/generated_combos   # Output directory for combinations
-     include_patterns:
-       - msld_flat.py  # Additional files to copy to each combination
-   
-   # OR use existing combinations
-   manifest: examples/manifest_example.txt
-   
-   # Split into train/val/test
-   split:
-     manifest: examples/manifest_example.txt
-     train_manifest: examples/train.txt
-     val_manifest: examples/val.txt
-     test_manifest: examples/test.txt
-     train_fraction: 0.7
-     val_fraction: 0.15
-   
-   # Optional: Pretrain from existing simulations
-   pretrain:
-     data_dir: /path/to/pretraining_data     # Directory with completed runs
-     num_epochs: 1                            # Usually 1 epoch is sufficient
-     model_path: models/pretrained_policy.pt  # Save pretrained model here
-   
-   # Training configuration (Actor-Critic with value network)
-   training:
-     num_epochs: 50
-     load_pretrained: models/pretrained_policy.pt  # Optional: load pretrained model
-     encoder:
-       hidden_dims: [64, 64]
-       out_dim: 32
-     policy:
-       mlp_hidden: 64
-     value_network:
-       hidden_dims: [64, 32]  # Value network for baseline estimation
-       lr: 0.001              # 10x policy LR (learns scalar prediction faster)
-     optimizer:
-       lr: 0.0001             # Policy LR (reduced 10x for stability)
-   
-   # Reward configuration
-   reward:
-     lambda_entropy: 0.5      # Entropy regularization (increased 50x for exploration)
-     w_P: 0.5
-     w_T: 0.75
-     gamma: 4.0
-   
-   # Output and checkpointing
-   output:
-     base_dir: /path/to/training_output
-     save_checkpoints: true    # Enable automatic checkpoint/resume
-     checkpoint_freq: 5         # Save checkpoint every 5 epochs
-   
-   # Run MD simulations
-   run_sims: true
-   compress_after: true  # Archive outputs after each simulation
+See the :ref:`Complete Configuration Example` for a full annotated YAML file.
 
 Combination Generation
 ----------------------
@@ -791,6 +741,310 @@ For production training:
 This performs full MD simulations after each action sampling and uses
 real simulation metrics for rewards.
 
+Curriculum Learning
+-------------------
+
+.. _Curriculum Learning:
+
+Overview
+~~~~~~~~
+
+**Curriculum learning** progressively trains the policy on increasingly complex
+combinations, similar to how students learn from simple to complex problems.
+Instead of training on all possible combinations at once, the policy masters
+simpler tasks before advancing to harder ones.
+
+**Benefits**:
+
+* **Faster convergence**: Start with easier combinations that provide clearer learning signals
+* **Better generalization**: Build strong foundations before tackling complex interactions
+* **Reduced catastrophic forgetting**: Gradual progression prevents pretrained weights from being destroyed
+* **Sample efficiency**: Focus computational resources on combinations appropriate for current skill level
+
+Why Curriculum Learning for MSLD
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+MSLD bias coefficient optimization has a natural difficulty hierarchy:
+
+**Easy**: Single-site pairs (2 substituents, 1 site)
+
+* Simplest edge interactions to learn
+* Clear cause-and-effect relationships
+* Provides foundation for pairwise biases
+
+**Medium**: Single-site triplets (3 substituents, 1 site)
+
+* Introduces crowding/density effects
+* More complex interaction patterns
+* Tests generalization from pairs
+
+**Hard**: Multi-site combinations (2+ sites with multiple substituents each)
+
+* Cross-site interaction effects
+* Exponentially larger search space
+* Requires composition of learned patterns
+
+Training directly on hard combinations often fails because:
+
+* Reward signals are noisy and unclear
+* Policy has no foundation to build upon
+* Pretrained weights get overwhelmed by complex gradients
+
+Curriculum learning solves this by building skills incrementally.
+
+Configuration
+~~~~~~~~~~~~~
+
+Enable curriculum learning in your workflow YAML:
+
+.. code-block:: yaml
+
+   curriculum:
+     enabled: true
+     max_train_combos_per_stage: 100  # Optional: limit combinations per stage
+     
+     stages:
+       # Stage 1: Pairs at single sites
+       - name: pairs_single_site_easy
+         min_subs: 2
+         max_subs: 2
+         min_sites: 1
+         max_sites: 1
+         epochs: 50
+         
+       # Stage 2: Triplets at single sites
+       - name: triplets_single_site
+         min_subs: 3
+         max_subs: 3
+         min_sites: 1
+         max_sites: 1
+         epochs: 50
+         
+       # Stage 3: Cross-site combinations
+       - name: pairs_two_sites
+         min_subs: 4  # 2 per site
+         max_subs: 4
+         min_sites: 2
+         max_sites: 2
+         epochs: 50
+     
+     # Progression criteria
+     progression:
+       type: epoch  # Advance after completing stage epochs
+
+Stage Configuration
+~~~~~~~~~~~~~~~~~~~
+
+Each stage specifies:
+
+**Combination Filters**:
+
+* ``min_subs``, ``max_subs``: Total substituents in combination
+* ``min_sites``, ``max_sites``: Number of sites represented
+
+**Training Duration**:
+
+* ``epochs``: Number of training epochs for this stage
+
+**Optional Settings**:
+
+* ``max_train_combos``: Stage-specific limit on training combinations (overrides global setting)
+* ``reward_override``: Modify reward weights for this stage (e.g., emphasize transitions early)
+
+**Example - All Stages**:
+
+.. code-block:: yaml
+
+   stages:
+     # 1. WARM UP: Single-site pairs
+     - name: pairs_single_site_easy
+       min_subs: 2
+       max_subs: 2
+       min_sites: 1
+       max_sites: 1
+       epochs: 50
+     
+     # 2. MASTERY: More single-site pairs
+     - name: pairs_single_site_full
+       min_subs: 2
+       max_subs: 2
+       min_sites: 1
+       max_sites: 1
+       epochs: 50
+     
+     # 3. DENSITY: Single-site triplets
+     - name: triplets_single_site
+       min_subs: 3
+       max_subs: 3
+       min_sites: 1
+       max_sites: 1
+       epochs: 50
+     
+     # 4. EXTRAPOLATION: Multi-site learning
+     - name: pairs_two_sites
+       min_subs: 4
+       max_subs: 4
+       min_sites: 2
+       max_sites: 2
+       epochs: 50
+     
+     # 5. COMPLEXITY: Complex multi-site
+     - name: complex_two_sites
+       min_subs: 5
+       max_subs: 8
+       min_sites: 2
+       max_sites: 2
+       epochs: 50
+
+Combination Selection
+~~~~~~~~~~~~~~~~~~~~~
+
+**Filtering Process**:
+
+For each stage, the workflow:
+
+1. Filters all training combinations by stage criteria (min/max subs/sites)
+2. If filtered count exceeds ``max_train_combos_per_stage``, randomly selects subset
+3. Uses reproducible random selection (seeded by ``split.seed + stage_index``)
+
+**Example**:
+
+.. code-block:: text
+
+   Stage 1: pairs_single_site_easy (2 subs, 1 site)
+   - Filtered: 75 combinations match criteria
+   - Max limit: 100 combinations
+   - Selected: All 75 combinations (under limit)
+   
+   Stage 2: triplets_single_site (3 subs, 1 site)
+   - Filtered: 200 combinations match criteria  
+   - Max limit: 100 combinations
+   - Selected: 100 random combinations (uniform sampling)
+
+**Important**: Random selection is uniform across all matching combinations.
+If a stage allows both pairs (2 subs) and triplets (3 subs) via ``min_subs: 2,
+max_subs: 3``, the 100 selected combinations will be a random mix with no
+preference for either size.
+
+**Reproducibility**: Same seed produces same combination selection across runs.
+
+Progression Criteria
+~~~~~~~~~~~~~~~~~~~~
+
+Stages advance based on progression criteria:
+
+**Epoch-based** (default):
+
+.. code-block:: yaml
+
+   progression:
+     type: epoch
+
+Advances after completing the specified number of epochs for current stage.
+
+**Reward-based** (experimental):
+
+.. code-block:: yaml
+
+   progression:
+     type: reward
+     reward_threshold: 10.0  # Minimum average reward to advance
+
+Advances only if average reward over last 5 epochs exceeds threshold.
+
+**Combined**:
+
+.. code-block:: yaml
+
+   progression:
+     type: both
+     reward_threshold: 10.0
+
+Must complete all epochs AND meet reward threshold.
+
+Training Flow Example
+~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: text
+
+   === Training with Curriculum ===
+   
+   Stage 1: pairs_single_site_easy (epochs 1-50)
+   ├── Filtered: 41 combinations (2 subs, 1 site)
+   ├── Training on all 41 combinations
+   └── Epoch 50 completes → Advance to Stage 2
+   
+   Stage 2: triplets_single_site (epochs 51-100)
+   ├── Filtered: 186 combinations (3 subs, 1 site)
+   ├── Limited to 100 random combinations
+   └── Epoch 100 completes → Advance to Stage 3
+   
+   Stage 3: pairs_two_sites (epochs 101-150)
+   ├── Filtered: 1,681 combinations (4 subs, 2 sites)
+   ├── Limited to 100 random combinations
+   └── Epoch 150 completes → Training complete
+
+**Training Output**:
+
+.. code-block:: text
+
+   === Starting Stage 1/3: pairs_single_site_easy ===
+   Filtered to 41 training combinations for this stage
+   
+   --- Epoch 1/150 - Stage 1/3: pairs_single_site_easy (epoch 1/50) ---
+   Epoch 1 Stats:
+     Loss: 12.3456
+     Value Loss: 45.6789
+     Avg Reward: -28.5432
+   
+   [... epochs 2-50 ...]
+   
+   ============================================================
+   === Advancing to Stage 2/3: triplets_single_site ===
+   ============================================================
+   Filtered to 186 training combinations for this stage
+   Limiting to 100 random training combos (from 186 available)
+   
+   --- Epoch 51/150 - Stage 2/3: triplets_single_site (epoch 1/50) ---
+
+Stage-Specific Reward Tuning
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Advanced users can override reward parameters per stage:
+
+.. code-block:: yaml
+
+   stages:
+     - name: pairs_single_site_easy
+       min_subs: 2
+       max_subs: 2
+       min_sites: 1
+       max_sites: 1
+       epochs: 50
+       reward_override:
+         w_T: 0.9              # Emphasize transitions early
+         min_transitions_per_site: 5  # Lower threshold for easier combinations
+
+This allows fine-tuning the reward function to match stage difficulty.
+
+Best Practices
+~~~~~~~~~~~~~~
+
+* **Stage ordering**: Start simple (pairs), gradually increase complexity (triplets → multi-site)
+* **Combination limits**: 50-100 per stage; use ``max_train_combos_per_stage`` for large stages
+* **Pretraining**: Essential for curriculum success; provides foundation for stage 1
+* **Progress monitoring**: Expect reward drop at stage transitions; recovery within 10-20 epochs is normal
+* **Checkpointing**: Critical for long runs (200+ epochs); save every 5-10 epochs
+
+Troubleshooting
+~~~~~~~~~~~~~~~
+
+**Stage 1 not converging**: Check pretraining quality; increase epochs to 100 if needed
+
+**Poor post-transition performance**: Expected; reward should recover within 20 epochs. If not, add intermediate stage
+
+**Disk space**: Enable ``archive.per_stage: true`` to archive completed stages during training
+
 Checkpointing and Resume
 -------------------------
 
@@ -928,43 +1182,18 @@ File Structure Example
 Best Practices
 ~~~~~~~~~~~~~~
 
-**Checkpoint Frequency**: Balance storage vs resume granularity
-
-* Lower ``checkpoint_freq`` → more frequent saves, less lost work
-* Higher ``checkpoint_freq`` → less storage, more potential lost work
-* Default of 5 is reasonable for most workflows
-
-**Disk Space**: Monitor for long runs
-
-* Each training checkpoint: ~MB (relatively small)
-* Per-epoch results accumulate over time
-* Consider cleanup of old checkpoints after training completes
-
-**Reproducibility**: Optimizer state is saved
-
-* Resumed training continues identically
-* Same momentum, learning rate schedules, etc.
-* No discontinuity in training dynamics
+* **Checkpoint frequency**: Default of 5 epochs balances storage and resume granularity
+* **Disk monitoring**: Per-epoch results accumulate; cleanup old checkpoints after training
+* **Reproducibility**: Optimizer state ensures identical continuation after resume
 
 Troubleshooting
 ~~~~~~~~~~~~~~~
 
-**Training doesn't resume from checkpoint**
+**Training doesn't resume**: Check ``save_checkpoints: true`` in YAML and verify checkpoint files exist
 
-* Verify ``save_checkpoints: true`` in YAML
-* Check checkpoint directory exists with ``checkpoint_epoch_*.pt`` files
-* Ensure file permissions allow reading checkpoints
+**Out of memory**: Checkpoint device must match training device; free GPU memory if needed
 
-**Out of memory when loading checkpoint**
-
-* Checkpoint loads to same device (CPU/GPU) as training
-* May need to adjust ``device`` in config or free GPU memory
-
-**Per-epoch results not skipping simulations**
-
-* Verify ``epoch_results.pt`` files exist in epoch directories
-* Check file permissions
-* Look for errors in log files about loading checkpoints
+**Simulations not skipping**: Verify ``epoch_results.pt`` files exist with proper permissions
 
 Reward Function Experimentation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1051,9 +1280,10 @@ Archiving Combinations
 Overview
 ~~~~~~~~
 
-After training completes, combination directories can be automatically archived
-to save disk space. Each combination directory is compressed into a ``.tar.gz``
-file, optionally removing the original directory.
+Combination directories can be automatically archived to save disk space using
+two strategies: **per-stage archiving** (during curriculum training) or
+**post-training archiving** (after all training completes). Each combination
+directory is compressed into a ``.tar.gz`` file, optionally removing the original.
 
 Configuration
 ~~~~~~~~~~~~~
@@ -1063,15 +1293,92 @@ Enable archiving in your workflow YAML:
 .. code-block:: yaml
 
    archive:
-     enabled: true              # Enable post-training archiving
-     pattern: 'comb_*'          # Glob pattern for directories to archive
-     remove_after: false        # Remove originals after successful archiving
+     enabled: true               # Enable archiving
+     per_stage: true             # Archive after each curriculum stage (or false for post-training)
+     pattern: 'comb_*'           # Glob pattern for directories to archive (post-training only)
+     remove_after: false         # Remove originals after successful archiving
      archive_dir: /path/to/archives  # Where to store .tar.gz files
 
-Behavior
-~~~~~~~~
+Per-Stage Archiving (Curriculum Training)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When ``archive.enabled`` is ``true``:
+**Best for**: Long curriculum training runs where disk space is limited.
+
+When ``per_stage: true``, the workflow archives combinations at the end of each
+curriculum stage **in the background** while the next stage's simulations begin.
+This provides:
+
+* **Immediate space recovery**: Free up disk as soon as each stage completes
+* **No training delays**: Archiving runs concurrently with next stage setup
+* **Stage-specific organization**: Each stage gets its own archive directory
+
+**Behavior**:
+
+1. After a curriculum stage completes (e.g., after epoch 50 of stage 1)
+2. Archive job launches in background (bash script with tar commands)
+3. Next stage begins immediately (simulations submit while archiving runs)
+4. After training completes, workflow waits for any remaining archive jobs
+
+**Directory Structure**:
+
+.. code-block:: text
+
+   archives/
+   ├── stage_1_pairs_single_site_easy/
+   │   ├── comb_0001_site1_1__site1_2.tar.gz
+   │   ├── comb_0002_site1_1__site1_3.tar.gz
+   │   ├── ...
+   │   └── archive.log                      # Archive job output
+   ├── stage_2_pairs_single_site_full/
+   │   ├── comb_0001_site1_1__site1_2.tar.gz
+   │   └── ...
+   └── stage_3_triplets_single_site/
+       └── ...
+
+**Configuration Example**:
+
+.. code-block:: yaml
+
+   curriculum:
+     enabled: true
+     stages:
+       - name: pairs_single_site_easy
+         min_subs: 2
+         max_subs: 2
+         epochs: 50
+       - name: pairs_single_site_full
+         min_subs: 2
+         max_subs: 2
+         epochs: 50
+   
+   archive:
+     enabled: true
+     per_stage: true              # Archive after each stage
+     remove_after: false
+     archive_dir: /path/to/archives
+
+**Timeline**:
+
+.. code-block:: text
+
+   Epoch 1-50 (Stage 1) → Stage 1 completes → Archive job starts in background
+                                             ↓
+   Epoch 51 begins (Stage 2) ← Simulations submit while Stage 1 archives
+   
+   Epoch 51-100 (Stage 2) → Stage 2 completes → Archive job starts in background
+                                               ↓
+   Epoch 101 begins (Stage 3) ← Stage 2 continues archiving in background
+
+Post-Training Archiving
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Best for**: Non-curriculum training or when you want to keep all data until
+the end.
+
+When ``per_stage: false`` (or not specified), the workflow archives combinations
+once after all training completes.
+
+**Behavior**:
 
 1. After training completes successfully, all directories matching ``pattern``
    are compressed into individual ``.tar.gz`` archives
@@ -1105,6 +1412,17 @@ When ``archive.enabled`` is ``true``:
    ├── comb_0002_site1_1__site1_3.tar.gz
    └── ...
 
+**Configuration Example**:
+
+.. code-block:: yaml
+
+   archive:
+     enabled: true
+     per_stage: false             # Archive once at the end (default)
+     pattern: 'comb_*'            # Directories to archive
+     remove_after: false
+     archive_dir: /path/to/archives
+
 Use Cases
 ~~~~~~~~~
 
@@ -1115,10 +1433,25 @@ Archiving allows:
 * Reducing active disk usage by 50-90% (typical compression ratio)
 * Organizing completed runs for long-term storage
 
+**When to Use Per-Stage Archiving**:
+
+* Long curriculum training (multiple stages over many days)
+* Limited disk space on compute clusters
+* Need to free space continuously as training progresses
+* Want stage-specific organization for analysis
+
+**When to Use Post-Training Archiving**:
+
+* Short training runs (single stage or few epochs)
+* Sufficient disk space for full training run
+* Want to keep all data accessible during training
+* Simpler workflow without background jobs
+
 **Best Practices**:
 
 * Set ``remove_after: false`` initially to verify archives are valid
 * Test extracting an archive to ensure contents are intact
+* Monitor background archive jobs via ``archive.log`` files (per-stage mode)
 * Use ``remove_after: true`` for production runs with proven archiving
 * Keep archives and checkpoints separate (archives for data, checkpoints for resume)
 
@@ -1140,6 +1473,28 @@ You can also archive combinations manually:
    )
    
    print(f"Created {len(archived)} archive files")
+
+Monitoring Per-Stage Archives
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For per-stage archiving, monitor the background jobs:
+
+.. code-block:: bash
+
+   # Check archive logs for each stage
+   tail -f archives/stage_1_pairs_single_site_easy/archive.log
+   
+   # Training output shows archive job status
+   # === Archiving Stage 1 Combinations ===
+   #   Archiving 41 combinations to .../archives/stage_1_pairs_single_site_easy
+   #   Running archive in background (see .../archive.log)
+   #   Archive job started (PID: 12345)
+   
+   # After training completes, workflow waits for archive jobs
+   # === Waiting for Background Archive Jobs ===
+   #   Waiting for stage 'pairs_single_site_easy' archive (PID: 12345)...
+   #     ✓ Stage 'pairs_single_site_easy' archived successfully
+   #     Log: .../archives/stage_1_pairs_single_site_easy/archive.log
 
 Extracting Archives
 ~~~~~~~~~~~~~~~~~~~
@@ -1243,71 +1598,90 @@ This executes:
 6. Checkpoint saving at ``checkpoint_freq`` intervals
 7. Archiving combinations (if ``archive.enabled`` is true)
 
+.. _Complete Configuration Example:
+
 Configuration File
 ~~~~~~~~~~~~~~~~~~
 
-The ``workflow_sample.yaml`` file controls all aspects of the workflow:
+A complete workflow configuration (``workflow_14benz.yaml``) includes:
 
 .. code-block:: yaml
 
-   # Generate combinations from fragments
+   # System environment
+   system:
+     solvent_state: solv
+   
+   # Generate combinations
    create_combos:
      input_dir: /path/to/14benz
      out_dir: /path/to/generated_combos
-     include_patterns:
-       - msld_flat.py
+     include_patterns: [msld_flat.py]
    
-   # Split data
+   # Data splitting
    split:
-     train_frac: 0.70
-     val_frac: 0.15
+     train_frac: 0.9
+     val_frac: 0.1
      seed: 42
    
-   # Optional: Pretrain from existing simulations
+   # Pretraining (optional but recommended)
    pretrain:
-     data_dir: /path/to/pretraining_data
-     num_epochs: 1
      model_path: models/pretrained_policy.pt
    
-   # Model configuration
+   # Curriculum learning
+   curriculum:
+     enabled: true
+     max_train_combos_per_stage: 100
+     stages:
+       - name: pairs_single_site
+         min_subs: 2
+         max_subs: 2
+         epochs: 50
+       - name: triplets_single_site
+         min_subs: 3
+         max_subs: 3
+         epochs: 50
+     progression:
+       type: epoch
+   
+   # Model architecture
    training:
-     num_epochs: 50
-     load_pretrained: models/pretrained_policy.pt  # Use pretrained model
      encoder:
        hidden_dims: [64, 64]
        out_dim: 32
      policy:
        mlp_hidden: 64
-     optimizer:
+     value_network:
+       hidden_dims: [64, 32]
        lr: 0.001
+     optimizer:
+       lr: 0.0001
    
-   # SLURM settings
+   # Simulation settings
    run_sims: true
-   wait_for_jobs: true
-   max_concurrent_jobs: 30
-   timeout: 600
+   max_concurrent_jobs: 60
+   timeout: 1200
    
    # Reward function
    reward:
      w_P: 0.5
      w_T: 0.75
+     w_U: 0.3
      gamma: 4.0
-     P_baseline: 500.0
-     T_baseline: 50.0
      lambda_entropy: 0.5
    
-   # Output and checkpoints
+   # Checkpointing
    output:
      base_dir: /path/to/training_output
      save_checkpoints: true
      checkpoint_freq: 5
    
-   # Archive combinations after training
+   # Per-stage archiving
    archive:
-     enabled: true              # Compress combinations after training
-     pattern: 'comb_*'          # Directories to archive
-     remove_after: false        # Remove originals after archiving
-     archive_dir: /path/to/archives  # Where to store .tar.gz files
+     enabled: true
+     per_stage: true
+     archive_dir: /path/to/archives
+
+For detailed explanations of each section, see the relevant subsections below.
 
 Training Loop Structure
 ~~~~~~~~~~~~~~~~~~~~~~~
