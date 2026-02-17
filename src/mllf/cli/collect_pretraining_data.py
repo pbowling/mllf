@@ -433,20 +433,27 @@ bias = yaml.safe_load(bias_string)
         json.dump(output_results, f, indent=2)
     
     # Write metadata
-    # Calculate total transitions (sum of all transition counts)
+    # Calculate total transitions (sum across sites, using only HIGHEST lambda value per site)
     total_trans = 0
     for trans_dict in output_results['transitions'].values():
         if isinstance(trans_dict, dict):
-            total_trans += sum(trans_dict.values())
+            # Use only the highest lambda value for this site
+            if trans_dict:
+                max_lambda = max(trans_dict.keys(), key=lambda x: float(x))
+                total_trans += trans_dict[max_lambda]
         else:
             total_trans += trans_dict
     
-    # Count populated blocks (blocks with non-zero counts)
+    # Count populated blocks (blocks with non-zero counts at HIGHEST lambda value)
     num_populated = 0
     for block_data in output_results['populations'].values():
         if isinstance(block_data, dict) and 'counts' in block_data:
-            if sum(block_data['counts'].values()) > 0:
-                num_populated += 1
+            counts = block_data['counts']
+            if counts:
+                # Use only the highest lambda value
+                max_lambda = max(counts.keys(), key=lambda x: float(x))
+                if counts[max_lambda] > 0:
+                    num_populated += 1
     
     # Count unique sites (extract site number from site#_sub# keys)
     unique_sites = set()

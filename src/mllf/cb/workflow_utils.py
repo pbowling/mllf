@@ -148,16 +148,24 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         population_data = parse_single_population(output_text)
         transitions_data, _ = parse_transitions_and_rates(output_text)
         
-        # Extract total populations per block
+        # Extract populations per block - use only HIGHEST lambda value (0.990)
         for block_id, block_info in population_data.items():
             counts_dict = block_info.get('counts', {})
-            total_count = sum(counts_dict.values())
-            raw_metrics['populations'].append(total_count)
+            if counts_dict:
+                # Use only the highest lambda value
+                max_lambda = max(counts_dict.keys(), key=lambda x: float(x))
+                raw_metrics['populations'].append(counts_dict[max_lambda])
+            else:
+                raw_metrics['populations'].append(0)
         
-        # Extract total transitions per site
+        # Extract transitions per site - use only HIGHEST lambda value (0.990)
         for site_id, trans_dict in transitions_data.items():
-            total_trans = sum(trans_dict.values())
-            raw_metrics['transitions'].append(total_trans)
+            if trans_dict:
+                # Use only the highest lambda value
+                max_lambda = max(trans_dict.keys(), key=lambda x: float(x))
+                raw_metrics['transitions'].append(trans_dict[max_lambda])
+            else:
+                raw_metrics['transitions'].append(0)
     except Exception:
         pass
     
