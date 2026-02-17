@@ -116,14 +116,13 @@ def test_upper_triangular_bias_matrices():
             print("\n❌ FAILED:")
             for err in errors:
                 print(f"  - {err}")
-            return False
+            assert False, "Matrix validation failed:\n" + "\n".join(errors)
         else:
             print("\n✅ SUCCESS: Matrix is upper-triangular")
             print("  ✓ Upper triangle populated")
             print("  ✓ Lower triangle is zero")
             print("  ✓ Diagonal is zero")
             print("  ✓ No antisymmetry (no cancellation)")
-            return True
 
 
 if __name__ == '__main__':

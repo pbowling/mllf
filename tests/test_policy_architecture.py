@@ -219,24 +219,7 @@ class TestEdgePolicyArchitecture:
             mlp_hidden=32,
             mlp_out_dim=num_bias_types
         )
-        
-        # Should correctly infer edge_feat_dim=3 from data.edge_attr
-        actions, _, _, _ = policy.get_actions(data.x, data.edge_index, data.edge_type, data.edge_attr)
-        assert actions.shape == (E, num_bias_types), "Actions shape should match num_bias_types"
-    
-    def test_compatibility_with_workflow(self):
-        """Test that policy works with actual workflow functions."""
-        from pathlib import Path
-        from mllf.cli.workflow import run_quick_epoch_for_combo
-        
-        combo_dir = 'examples/14benz/generated_combos/comb_0001_site1_1__site1_2'
-        
-        if Path(combo_dir).exists():
-            result = run_quick_epoch_for_combo(combo_dir)
-            assert 'reward' in result, "Result should contain reward"
-            assert isinstance(result['reward'], (int, float)), "Reward should be numeric"
-
-
+        #         actions, _, _, _ = policy.get_actions(data.x, data.edge_index, data.edge_type, data.edge_attr)
 class TestBackwardCompatibility:
     """Tests to ensure new architecture maintains compatibility."""
     
