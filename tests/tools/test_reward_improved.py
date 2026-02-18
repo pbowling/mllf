@@ -436,16 +436,13 @@ def main():
         good_metrics = []
         
         for run_num, run_dir in sorted(good_runs):
-            if args.verbose:
-                print(f"\n{run_dir.name} (run {run_num}):")
+            print(f"\n{run_dir.name} (run {run_num}):")
             
-            reward, metrics = compute_improved_reward_from_json(run_dir, verbose=args.verbose, **config_params)
+            reward, metrics = compute_improved_reward_from_json(run_dir, verbose=True, **config_params)
             good_rewards.append(reward)
             good_metrics.append(metrics)
             
-            if not args.verbose and len(good_runs) <= 20:
-                print(f"  {run_dir.name}: reward={reward:7.2f}, coverage={metrics['coverage']:.0%}, "
-                      f"trans={metrics['total_transitions']:3d}, max_conc={metrics['max_concentration']:.0%}")
+            print(f"  Total reward: {reward:.2f}")
         
         # Test bad runs
         print("\nBad Runs:")
@@ -454,16 +451,13 @@ def main():
         bad_metrics = []
         
         for run_num, run_dir in sorted(bad_runs):
-            if args.verbose:
-                print(f"\n{run_dir.name} (run {run_num}):")
+            print(f"\n{run_dir.name} (run {run_num}):")
             
-            reward, metrics = compute_improved_reward_from_json(run_dir, verbose=args.verbose, **config_params)
+            reward, metrics = compute_improved_reward_from_json(run_dir, verbose=True, **config_params)
             bad_rewards.append(reward)
             bad_metrics.append(metrics)
             
-            if not args.verbose and len(bad_runs) <= 20:
-                print(f"  {run_dir.name}: reward={reward:7.2f}, coverage={metrics['coverage']:.0%}, "
-                      f"trans={metrics['total_transitions']:3d}, max_conc={metrics['max_concentration']:.0%}")
+            print(f"  Total reward: {reward:.2f}")
     
         # Summary statistics for this configuration
         print("\nSummary:")

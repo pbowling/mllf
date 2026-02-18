@@ -685,9 +685,14 @@ def compute_reward_from_sim_results(
     if penalties < -max_penalty:
         penalties = -max_penalty
     
-    # Total reward (matching train_improved.py)
-    reward = R_P + R_T + R_U + R_entropy + penalties  # penalties are already negative
-    
+    # Completeness gate: if any substituent was never visited, replace the positive
+    # reward components with -0.01 so the total is always negative. Penalties are
+    # still added to preserve gradient signal (worse behaviour = more negative).
+    if num_populated < total_subs:
+        reward = -0.01 + penalties
+    else:
+        reward = R_P + R_T + R_U + R_entropy + penalties
+
     return reward
 
 

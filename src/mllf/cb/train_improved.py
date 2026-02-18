@@ -325,16 +325,24 @@ def compute_msld_reward_improved(
         print(f"  Warning: Penalties clamped to -{max_penalty}")
     
     # ========== FINAL REWARD ==========
-    
-    R = R_P + R_T + R_U + R_entropy + penalties
-    
+
+    # Completeness gate: if any substituent was never visited, replace the positive
+    # reward components with -0.01 so the total is always negative. Penalties are
+    # still added to preserve gradient signal (worse behaviour = more negative).
+    if nonzero_count < total_subs:
+        R = -0.01 + penalties
+    else:
+        R = R_P + R_T + R_U + R_entropy + penalties
+
     # Debug output
     print(f"  Reward breakdown: R_P={R_P:.2f}, R_T={R_T:.2f}, R_U={R_U:.2f}, "
           f"R_entropy={R_entropy:.2f}, penalties={penalties:.2f}, total={R:.2f}")
+    if nonzero_count < total_subs:
+        print(f"  Completeness gate applied ({nonzero_count}/{total_subs} subs visited) → positive components replaced with -0.01, penalties retained")
     print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.2%}), "
           f"Transitions: {list(site_transitions.values())}, "
           f"Confidence: {confidence_factor:.2f}")
-    
+
     return R
 
 
@@ -545,8 +553,12 @@ def compute_reward_from_raw_metrics(
     if penalties < -max_penalty:
         penalties = -max_penalty
     
-    R = R_P + R_T + R_U + R_entropy + penalties
-    
+    # Completeness gate: replace positive components with -0.01, keep penalties
+    if nonzero_count < total_subs:
+        R = -0.01 + penalties
+    else:
+        R = R_P + R_T + R_U + R_entropy + penalties
+
     return R
 
 

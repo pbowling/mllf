@@ -14,11 +14,11 @@ echo "Starting archive at $(date)"
 echo "Current directory: $(pwd)"
 echo "Archiving generated_combos directory..."
 
-tar -czvf pairwise_test1.tar.gz generated_combos/
+tar -czvf test2.tar.gz generated_combos/
 
 if [ $? -eq 0 ]; then
-    echo "Archive created successfully: pairwise_test1.tar.gz"
-    ls -lh pairwise_test1.tar.gz
+    echo "Archive created successfully: test1.tar.gz"
+    ls -lh test2.tar.gz
 else
     echo "Error creating archive"
     exit 1

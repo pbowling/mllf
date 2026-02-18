@@ -30,7 +30,7 @@ pretraining/
 old_files/
 models/
 examples/14benz/training_output/
-status*
+*status.out
 *.tar.gz
 
 # PyInstaller
