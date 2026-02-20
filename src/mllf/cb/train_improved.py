@@ -59,7 +59,7 @@ def compute_msld_reward_improved(
     Args:
         combo_dir: Path to combination directory with simulation outputs.
         w_P: Weight for population term (default: 0.5).
-        w_T: Weight for transition term (default: 0.5).
+        w_T: Weight for transition term (default: 0.75).
         w_U: Weight for uniformity term (default: 0.3).
         gamma: Base penalty coefficient (default: 4.0).
         P_baseline: Normalization baseline for populations (default: 500.0).
