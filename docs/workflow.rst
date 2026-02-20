@@ -435,77 +435,71 @@ where:
 
 **Uniformity Reward** :math:`R_U`:
 
-Rewards visiting a minimum fraction of substituents:
+Rewards visiting a high fraction of available substituents:
 
 .. math::
 
-   R_U = w_U \cdot \frac{\text{coverage\_ratio}}{\text{min\_coverage\_ratio}}
-
-where coverage_ratio is the fraction of substituents with non-zero population.
+   R_U = w_U \cdot \frac{|\{k : p_k > 0\}|}{N_{\text{subs}}}
 
 **Entropy Bonus** :math:`R_{\text{entropy}}`:
 
-Rewards uniform population distributions using Shannon entropy:
+Rewards uniform population distributions using normalized Shannon entropy:
 
 .. math::
 
-   R_{\text{entropy}} = \beta_{\text{entropy}} \cdot H(\mathbf{p})
+   R_{\text{entropy}} = \alpha_{\text{entropy}} \cdot \frac{H(\mathbf{p})}{H_{\max}}
 
-where :math:`H(\mathbf{p}) = -\sum_k \frac{p_k}{P_{\text{total}}} \log \frac{p_k}{P_{\text{total}}}` is the normalized entropy.
+where :math:`H(\mathbf{p}) = -\sum_k \frac{p_k}{P_{\text{total}}} \log \frac{p_k}{P_{\text{total}}}` 
+is Shannon entropy and :math:`H_{\max} = \log(N_{\text{subs}})` is maximum possible entropy.
 
 **Tiered Transition Penalties** :math:`R_{\text{penalties}}`:
 
-The system uses a three-tier penalty structure to provide continuous feedback:
+The penalty system uses three tiers based on the worst-performing site, with 
+multi-site awareness to fairly handle systems with multiple λ-sites:
 
-**Tier 1: "Death Floor"** (0-2 transitions):
+**Base Penalty** (determined by :math:`T_{\min}`, the minimum transitions across all sites):
 
 .. math::
 
-   \text{penalty} = \begin{cases}
-   -40.0 & \text{if } T_s = 0 \\
-   -32.0 & \text{if } T_s = 1 \\
-   -24.0 & \text{if } T_s = 2
+   P_{\text{base}} = \begin{cases}
+   40.0 & \text{if } T_{\min} = 0 \quad \text{(Tier 1: "Death Floor")} \\
+   32.0 & \text{if } T_{\min} = 1 \\
+   24.0 & \text{if } T_{\min} = 2 \\
+   2.0 + 2.0(N_{\text{req}} - T_{\min}) & \text{if } 3 \leq T_{\min} < N_{\text{req}} \quad \text{(Tier 2: "Climbing Ramp")} \\
+   0.0 & \text{if } T_{\min} \geq N_{\text{req}} \quad \text{(Tier 3: "Success Zone")}
    \end{cases}
 
-Worst possible state, signaling total inactivity is unacceptable.
-
-**Tier 2: "Climbing Ramp"** (3-9 transitions):
+**Multi-Site Degradation** (incremental penalty for multiple failing sites):
 
 .. math::
 
-   \text{penalty} = -\left(2.0 + 2.0 \times \text{deficit}\right)
+   P_{\text{trans}} = \begin{cases}
+   P_{\text{base}} + 4.0(n_{\text{bad}} - 1) & \text{if } n_{\text{bad}} > 1 \\
+   P_{\text{base}} & \text{if } n_{\text{bad}} = 1 \\
+   0 & \text{if } n_{\text{bad}} = 0
+   \end{cases}
 
-where :math:`\text{deficit} = 10 - T_s` for site :math:`s`. This creates a linear gradient:
+where :math:`n_{\text{bad}} = |\{s : T_s < N_{\text{req}}\}|` counts sites below threshold.
 
-* 3 transitions: :math:`-2.0 - 2.0 \times 7 = -16.0`
-* 5 transitions: :math:`-2.0 - 2.0 \times 5 = -12.0`
-* 9 transitions: :math:`-2.0 - 2.0 \times 1 = -4.0`
-
-Each additional transition improves the reward by 2.0 points, providing continuous feedback.
-
-**Tier 3: "Success Zone"** (≥10 transitions):
+**Coverage Penalty** (applied only when transitions are sufficient for reliable statistics):
 
 .. math::
 
-   \text{penalty} = 0.0
+   P_{\text{cov}} = \begin{cases}
+   \gamma \cdot 20.0 \cdot \frac{r_{\text{min}} - r_{\text{actual}}}{\sqrt{N_{\text{subs}}}} & \text{if } r_{\text{actual}} < r_{\text{min}} \text{ and } T_{\min} \geq N_{\text{req}} \\
+   0 & \text{otherwise}
+   \end{cases}
 
-Site is "unlocked" and eligible for positive :math:`R_T` rewards.
+The adaptive coverage requirement :math:`r_{\text{min}} = \frac{1 + 0.5(N_{\text{subs}} - 1)}{N_{\text{subs}}}` 
+scales with system size (e.g., 2 subs → 75%, 4 subs → 62.5%, 6 subs → 58%).
 
-**Additional Penalties**:
+**Concentration Penalty** (per-site check for single-substituent dominance):
 
-* **Coverage penalty**: If fewer than :math:`\text{min\_coverage\_ratio}` of substituents are visited:
+.. math::
 
-  .. math::
+   P_{\text{conc}} = \sum_{s=1}^{N_{\text{sites}}} \mathbb{1}\left[\frac{\max_k p_{s,k}}{\sum_k p_{s,k}} > 0.8\right] \cdot \gamma \cdot 5.0 \cdot \left(\frac{\max_k p_{s,k}}{\sum_k p_{s,k}} - 0.8\right)
 
-     \text{penalty} = -\gamma \times 20.0 \times \left(\text{min\_coverage\_ratio} - \text{coverage\_ratio}\right)
-
-* **Concentration penalty**: Per-site penalty if any substituent exceeds 80% of that site's population:
-
-  .. math::
-
-     \text{penalty} = -\gamma \times 5.0 \times (\text{concentration} - 0.8) \quad \text{(per concentrated site)}
-
-* **Simulation failure**: :math:`R = -100 \times \gamma` if simulation does not terminate normally
+Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0, P_{\text{trans}} + P_{\text{cov}} + P_{\text{conc}})`
 
 **Default Hyperparameters**:
 
@@ -523,83 +517,21 @@ Site is "unlocked" and eligible for positive :math:`R_T` rewards.
      entropy_bonus: 8.0                      # Entropy bonus coefficient
      concentration_penalty_threshold: 0.8    # Single-substituent dominance threshold
 
-**Policy Gradient Update with Value Network**:
+**Policy Gradient Training**:
 
-The policy is updated using an **Actor-Critic** architecture that combines REINFORCE 
-with a learned value network for variance reduction.
+The policy is optimized using an **Actor-Critic** architecture where the policy network 
+(actor) predicts bias coefficients and a value network (critic) provides state-dependent 
+baselines for variance reduction. This approach prevents catastrophic forgetting of 
+pretrained weights and enables more stable learning.
 
-**Actor-Critic Architecture**:
-
-* **Actor (Policy Network)**: Predicts bias coefficients from graph structure
-* **Critic (Value Network)**: Predicts expected reward for a given graph
-
-The value network provides a state-dependent baseline :math:`V(s)` that adapts to 
-each combination's difficulty, rather than using a fixed or moving average baseline.
-
-**Value Network**:
-
-.. code-block:: python
-
-   # Architecture: Node embeddings → Global pooling → MLP → Scalar value
-   value_network = ValueNetwork(
-       emb_dim=32,           # Node embedding dimension from encoder
-       hidden_dims=[64, 32]  # MLP layers [input→64→32→1]
-   )
-   
-   # Predict expected reward
-   node_embeddings = encoder(graph)
-   predicted_value = value_network(node_embeddings)
-
-**Training Loop**:
-
-For each combination:
-
-1. Encode graph structure to get node embeddings
-2. Predict bias coefficients with policy (stochastic sampling)
-3. Run simulation and compute actual reward :math:`R`
-4. Predict expected value :math:`V(s)` with value network
-5. Compute advantage: :math:`A = R - V(s)`
-6. Update value network: minimize :math:`(V(s) - R)^2`
-7. Update policy: maximize :math:`\log \pi(a|s) \cdot A`
-
-**Policy Gradient with Advantage**:
-
-.. math::
-
-   \nabla_\theta J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=0}^{T} \nabla_\theta \log \pi_\theta(\mathbf{a}_t | \mathbf{s}_t) \cdot A_t \right]
-
-where:
-
-* :math:`\mathbf{a}_t` is the action (bias coefficients) at time :math:`t`
-* :math:`\mathbf{s}_t` is the state (graph representation) at time :math:`t`
-* :math:`A_t = R - V(\mathbf{s}_t)` is the advantage (state-dependent baseline)
-
-**Benefits of Value Network**:
-
-* **Lower variance**: Advantages are centered around state-dependent expectations rather than global average
-* **Faster convergence**: Stable gradients enable higher learning rates
-* **Better credit assignment**: Easy vs hard combinations get different baselines
-* **Catastrophic forgetting prevention**: Reduces gradient noise that destroys pretrained weights
-
-**Hyperparameters**:
-
-.. code-block:: yaml
-
-   training:
-     value_network:
-       hidden_dims: [64, 32]  # MLP architecture
-       lr: 0.001              # 10x policy LR for faster baseline learning
-     optimizer:
-       lr: 0.0001             # Policy learning rate (reduced for stability)
-     reward:
-       lambda_entropy: 0.5    # Entropy regularization (exploration bonus)
+For architectural details on the RGCN encoder, policy network, and value network, see :doc:`cb_setup`.
 
 Pretraining from Existing Simulations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Before starting main training, you can pretrain the policy on existing MSLD
-simulation data. This provides a warm start with meaningful bias coefficients
-rather than random initialization.
+Before reinforcement learning, the policy can be pretrained on existing MSLD simulation 
+data using behavior cloning (supervised learning with MSE loss to imitate successful bias 
+coefficients). This provides a warm start with meaningful initializations.
 
 **Pretraining Data Sources**:
 
@@ -1524,64 +1456,31 @@ Simulation Execution
 Launching Simulations
 ~~~~~~~~~~~~~~~~~~~~~
 
-Simulations are launched via subprocess:
-
-.. code-block:: python
-
-   import subprocess
-   
-   # Write variables.py first (from CB policy)
-   write_variables_from_actions(combo_dir, data, extras, actions)
-   
-   # Run CHARMM simulation
-   subprocess.run(['charmm', '-i', 'input.inp'], cwd=combo_dir)
-
-The simulator reads bias coefficients from ``variables.py`` and outputs
-transition counts and population distributions.
+Simulations are launched via subprocess, running CHARMM with bias coefficients 
+written to ``variables.py`` from the policy's sampled actions. The simulator 
+outputs transition counts and population distributions for reward computation.
 
 Output Parsing
 ~~~~~~~~~~~~~~
 
-After simulation:
+After simulation completes, the framework parses ``transitions.txt`` and 
+``populations.txt`` from the output directory to extract:
 
-.. code-block:: python
+* Total transitions per site :math:`T_s` for each λ-site
+* Per-substituent populations :math:`p_{s,k}` at each site
+* Coverage ratio (fraction of substituents visited)
+* Per-site concentration (maximum population fraction at each site)
 
-   from mllf.file_handling.parse_sim_output import parse_transitions, parse_population
-   
-   transitions = parse_transitions(f'{combo_dir}/output/transitions.txt')
-   population = parse_population(f'{combo_dir}/output/populations.txt')
-   
-   reward = compute_reward(transitions, population)
-
-Typical reward functions:
-
-.. code-block:: python
-
-   def default_env_reward(transitions, population):
-       # Count total successful transitions
-       total_trans = sum(transitions.values())
-       
-       # Measure coverage of state space
-       visited_states = len([p for p in population.values() if p['counts'] > 0])
-       total_states = len(population)
-       coverage = visited_states / total_states if total_states > 0 else 0
-       
-       # Weighted combination
-       return 0.7 * total_trans + 0.3 * coverage * 1000
+These metrics feed directly into the reward function components described 
+in the Reward and Loss Functions section above.
 
 Compression
 ~~~~~~~~~~~
 
-To save disk space, compress simulation outputs:
-
-.. code-block:: python
-
-   from mllf.cli.workflow import compress_runs
-   
-   compress_runs(combos, patterns=['*.dcd', '*.coor', '*.vel'])
-
-This creates ``output.tar.gz`` in each combo directory and removes
-the specified file patterns.
+To save disk space, the framework can compress simulation outputs (e.g., ``.dcd``, 
+``.coor``, ``.vel`` files) into ``output.tar.gz`` archives in each combination 
+directory, removing the original files. This is particularly useful for large-scale 
+training runs where trajectory files consume significant storage.
 
 Complete Workflow Example
 --------------------------
@@ -1723,39 +1622,19 @@ The main training loop implements epoch-based training with concurrent SLURM job
 Custom Training Loop
 ~~~~~~~~~~~~~~~~~~~~
 
-For custom workflows, import the key components:
+For custom workflows, the framework provides modular components that can be 
+composed programmatically:
 
-.. code-block:: python
+* ``create_combination_dirs``: Generate combination directories from RTF files
+* ``build_data_and_targets_from_combo``: Convert combinations to PyG graph representations
+* ``RGCNEncoder``: 3-layer relational GCN (e.g., [178→64→64→32])
+* ``EdgePolicy``: Shared-trunk + separate-heads architecture for bias prediction
+* ``ValueNetwork``: 3-layer MLP for advantage estimation ([32→64→32→1])
+* ``compute_reward_from_raw_metrics``: Multi-component reward function with tiered penalties
 
-   from mllf.file_handling.generate_combinations import create_combination_dirs
-   from mllf.cli.workflow import build_data_and_targets_from_combo, write_variables_from_actions
-   from mllf.cb.rgcn import RGCNEncoder
-   from mllf.cb.policy import EdgePolicy
-   from mllf.cb.value_net import ValueNetwork
-   from mllf.cb.train_improved import compute_reward_from_raw_metrics
-   
-   # Generate combinations
-   combos = create_combination_dirs(
-       input_dir=Path('14benz'),
-       output_dir=Path('generated_combos'),
-       include_patterns=['msld_flat.py']
-   )
-   
-   # Initialize actor-critic model
-   sample_data, _, sample_extras = build_data_and_targets_from_combo(combos[0])
-   
-   encoder = RGCNEncoder(in_dim=sample_data.x.size(1), hidden_dims=[64, 64], out_dim=32,
-                         num_relations=sample_data.edge_type.max().item() + 1)
-   
-   policy = EdgePolicy.from_pyg_data(encoder=encoder, emb_dim=32, data=sample_data,
-                                      mlp_hidden=64, mlp_out_dim=len(sample_extras['relation_names']) // 2)
-   
-   value_network = ValueNetwork(emb_dim=32, hidden_dims=[64, 32])
-   
-   optimizer = torch.optim.Adam(policy.parameters(), lr=0.0001)
-   value_optimizer = torch.optim.Adam(value_network.parameters(), lr=0.001)
-   
-   # Training loop - see run_workflow.py for full implementation
+These components can be initialized and trained with custom loops for specialized 
+workflows beyond the standard curriculum training pipeline. See [examples/run_workflow.py](examples/run_workflow.py) 
+for a complete implementation reference.
 
 See Also
 ~~~~~~~~

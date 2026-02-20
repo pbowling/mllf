@@ -4,14 +4,12 @@ Running Examples
 Overview
 --------
 
-The repository includes a complete contextual bandit training workflow for
-multisite λ-dynamics simulations. The main example demonstrates:
+The repository includes a complete training workflow for multisite λ-dynamics 
+bias coefficient optimization. The main example demonstrates the end-to-end pipeline 
+from combination generation through training and simulation execution.
 
-1. Generating combinations from site/substituent fragments
-2. Training an Actor-Critic model (policy + value network) to predict bias coefficients
-3. Running CHARMM simulations with predicted biases
-4. Computing rewards from simulation metrics
-5. Updating policy with REINFORCE and value network for variance reduction
+For architectural details, see :doc:`cb_setup`. For workflow configuration options, 
+see :doc:`workflow`.
 
 Main Training Workflow
 ----------------------
@@ -38,132 +36,51 @@ This will:
 Configuration
 ~~~~~~~~~~~~~
 
-Edit ``examples/workflow_sample.yaml`` to customize:
+Edit ``examples/workflow_sample.yaml`` to customize paths and basic settings:
 
 .. code-block:: yaml
 
-   # System configuration
    system:
-     solvent_state: solv  # Environment: 'solv' (solvated), 'gas' (vacuum), or 'protein'
+     solvent_state: solv
    
-   # Combination generation
    create_combos:
      input_dir: /path/to/site_sub_fragments
      out_dir: /path/to/generated_combos
-     include_patterns:
-       - msld_flat.py  # Copy simulation scripts
    
-   # Training/validation split
    split:
      train_frac: 0.70
      val_frac: 0.15
-     seed: 42
    
-   # Model architecture (Actor-Critic with value network)
    training:
      num_epochs: 50
-     encoder:
-       hidden_dims: [64, 64]
-       out_dim: 32
-     policy:
-       mlp_hidden: 64
-     value_network:
-       hidden_dims: [64, 32]  # Value network for variance reduction
-       lr: 0.001              # 10x policy LR (learns scalar prediction faster)
-     optimizer:
-       lr: 0.0001             # Policy LR (reduced 10x for stability)
    
-   # Reward configuration
-   reward:
-     lambda_entropy: 0.5      # Entropy regularization (increased 50x for exploration)
-   
-   # Checkpointing
    output:
      base_dir: /path/to/training_output
      save_checkpoints: true
      checkpoint_freq: 5
-   
-   # Optional: Pretrain from existing simulations
-   pretrain:
-     data_dir: /path/to/pretraining_data
-     num_epochs: 1
-     model_path: models/pretrained_policy.pt
-   
-   # Load pretrained model before training
-   training:
-     load_pretrained: models/pretrained_policy.pt
-   
-   # Archive combinations after training (optional)
-   archive:
-     enabled: true
-     remove_after: false  # Keep originals for verification
+
+See :doc:`workflow` for complete configuration options including curriculum learning, 
+pretraining, archiving, and reward function tuning.
 
 Pretraining Example
 -------------------
 
-Before running main training, you can pretrain the policy on existing
-simulation data to warm-start the model with meaningful bias coefficients.
-
-Setup Pretraining Data
-~~~~~~~~~~~~~~~~~~~~~~~
-
-Collect completed simulation runs into a pretraining directory:
+To pretrain from existing simulations:
 
 .. code-block:: bash
 
+   # Organize existing simulation data
    mkdir -p pretraining
+   cp -r previous_runs/good_combos/* pretraining/
    
-   # Copy runs from various sources
-   cp -r previous_training/epoch_*/comb_* pretraining/
-   cp -r manual_tuning/good_runs/* pretraining/
-   cp -r systematic_sweep/successful_configs/* pretraining/
-
-Each run directory should contain:
-
-- ``variables.py``: Bias coefficients used in the simulation
-- ``info.py``: System configuration (nsubs, nblocks, temp)
-- ``res/*_flat.lmd``: Lambda dynamics trajectory for reward computation
-
-Run Pretraining
-~~~~~~~~~~~~~~~
-
-.. code-block:: bash
-
-   # Run pretraining (1 epoch is usually sufficient)
+   # Run pretraining
    python run_pretraining.py --config workflow_sample.yaml
    
-   # This saves: models/pretrained_policy.pt
-
-Then update ``workflow_sample.yaml`` to use the pretrained model:
-
-.. code-block:: yaml
-
-   training:
-     load_pretrained: models/pretrained_policy.pt
-     num_epochs: 50  # Main training epochs
-
-Finally run main training:
-
-.. code-block:: bash
-
+   # Use pretrained model in main training
    python run_workflow.py workflow_sample.yaml
 
-Benefits
-~~~~~~~~
-
-- **Faster convergence**: Start with reasonable bias values
-- **Better sample efficiency**: Fewer training epochs needed
-- **Transfer learning**: Leverage knowledge from related systems
-- **Multi-system learning**: Combine data from different ligands/environments
-
-The pretrained policy learns to map graph structure (system size, atom types,
-environment) to successful bias coefficients, providing a strong initialization
-for the main training phase.
-
-.. note::
-   The value network does not require pretraining. It starts from random initialization
-   and learns to predict rewards during reinforcement learning training by observing
-   actual simulation outcomes.
+See :doc:`workflow` for detailed pretraining configuration, data organization, 
+and benefits.
 
 Example System: 14benz
 ----------------------
@@ -210,42 +127,25 @@ The ``-u`` flag enables unbuffered output for real-time monitoring:
 Resume Capability
 -----------------
 
-If training is interrupted, simply resubmit the job:
+Training automatically resumes from the latest checkpoint if interrupted:
 
 .. code-block:: bash
 
-   sbatch training_test.sh
+   sbatch training_test.sh  # Automatically detects and resumes
 
-The workflow automatically:
-
-- Detects the latest checkpoint (``checkpoint_epoch_XXX.pt``)
-- Loads model and optimizer state
-- Resumes from the next epoch
-- Skips combinations with existing ``epoch_results.pt`` files
-
-See :doc:`workflow` for details on checkpoint/resume functionality.
+See :doc:`workflow` for checkpoint configuration and resume details.
 
 Customizing the Workflow
 ------------------------
 
-To adapt the workflow for your system:
+To adapt for your system:
 
-1. **Prepare fragments**: Create ``siteN_subM_pres.rtf`` files for each
-   site/substituent combination
+1. **Prepare fragments**: Create ``siteN_subM_pres.rtf`` files for your sites/substituents
+2. **Update config**: Edit ``workflow_sample.yaml`` with your paths and ``system.solvent_state``
+3. **Modify simulation script**: Adapt ``msld_flat.py`` for your force field and protocol
+4. **Run training**: Execute ``python run_workflow.py your_config.yaml``
 
-2. **Update config**: Edit ``workflow_sample.yaml`` with your paths and system settings:
-   
-   - Set ``system.solvent_state`` to match your environment ('solv', 'gas', or 'protein')
-   - Adjust ``value_network.hidden_dims`` if needed (default [64, 32] works well)
-   - Tune ``reward.lambda_entropy`` for exploration (0.5 is recommended)
-
-3. **Modify simulation script**: Adapt ``msld_flat.py`` for your system
-   (force field, topology, equilibration protocol)
-
-4. **Adjust reward function**: Edit ``src/mllf/cb/train_improved.py::compute_msld_reward_improved``
-   to weight different simulation metrics
-
-5. **Run training**: Execute ``python run_workflow.py your_config.yaml``
+See :doc:`workflow` for configuration options and :doc:`cb_setup` for architecture details.
 
 Tips
 ----
@@ -259,28 +159,14 @@ Tips
 Reward Function Tuning
 -----------------------
 
-Epoch checkpoints save raw simulation metrics, enabling reward function
-experimentation without re-running simulations:
+Epoch checkpoints enable testing different reward configurations without re-running simulations:
 
 .. code-block:: bash
 
-   # Test different reward configurations on pretraining data
-   cd tests/tools
-   python test_reward_improved.py ../../pretraining/indolizine_solv \
-       --good-threshold 215 \
-       --bad-threshold 15 \
-       --configs reward_configs_improved.yaml
+   python examples/test_reward_configs.py training_output/epoch_005 \
+       --configs reward_configs_example.yaml
 
-This compares multiple reward configurations and identifies which yields
-the best separation between good and bad runs. The improved reward function
-includes:
-
-* **Confidence Factor**: Scales population rewards by data reliability
-* **Tiered Penalties**: Continuous gradient feedback instead of binary thresholds
-
-You can then update ``workflow_sample.yaml`` with the best configuration
-(e.g., ``higher_rewards_v1``) and resume training—cached results will be
-automatically recomputed with the new reward parameters.
+See :doc:`workflow` for reward function details and experimentation workflow.
 
 See Also
 --------

@@ -140,25 +140,16 @@ Policy Network Architecture
 RGCN Encoder
 ^^^^^^^^^^^^
 
-Node embeddings are computed using a Relational Graph Convolutional Network:
+Node embeddings are computed using a 3-layer Relational Graph Convolutional Network 
+that handles different edge types explicitly by learning separate transformation matrices 
+for each relation type. The standard architecture uses:
 
-.. code-block:: python
+.. math::
 
-   from mllf.cb.rgcn import RGCNEncoder
-   
-   # input_features = 3 + len(element_vocab) + len(atom_type_vocab)
-   # For CGenFF only: 3 + 14 + 161 = 178
-   encoder = RGCNEncoder(
-       in_dim=input_features,
-       hidden_dims=[64, 64],
-       out_dim=32,
-       num_relations=num_edge_types
-   )
-   
-   node_embeddings = encoder(x, edge_index, edge_type)
+   \text{RGCN}: \mathbb{R}^{178} \to \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{32}
 
-The RGCN handles different edge types (relation types) explicitly, learning
-separate transformation matrices for each interaction type.
+where the input dimension is 178 for CGenFF (3 scalar features + 14 elements + 161 atom types) 
+and the output produces 32-dimensional node embeddings used by the policy and value networks.
 
 Edge Policy
 ^^^^^^^^^^^
@@ -241,219 +232,47 @@ and actions are sampled independently:
 
 where :math:`k \\in \\{\\text{linear, quadratic, skew, end}\\}`.
 
-Training with Actor-Critic (REINFORCE + Value Network)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Training and Optimization
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The policy is trained using an Actor-Critic architecture that combines REINFORCE 
-with a learned value network for variance reduction.
+The policy network is trained using an **Actor-Critic** architecture (REINFORCE with learned 
+value network) that provides state-dependent baselines for variance reduction.
 
-**Components**:
+**Actor-Critic Components**:
 
-* **Actor (Policy Network)**: Predicts bias coefficients from graph structure
-* **Critic (Value Network)**: Predicts expected reward to provide state-dependent baselines
+* **Actor (Policy Network)**: RGCN encoder + EdgeValueMLP that predicts bias coefficients from graph structure
+* **Critic (Value Network)**: 3-layer MLP that predicts expected reward for a combination
 
-Value Network Architecture
-^^^^^^^^^^^^^^^^^^^^^^^^^^
+**Value Network Architecture**:
 
-.. code-block:: python
+The value network maps node embeddings to expected rewards via global pooling and MLP:
 
-   from mllf.cb.value_net import ValueNetwork
-   
-   value_network = ValueNetwork(
-       emb_dim=32,           # Node embedding dimension from encoder
-       hidden_dims=[64, 32]  # MLP layers: input → 64 → 32 → 1
-   )
-   
-   # Predict expected reward for a combination
-   node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
-   predicted_value = value_network(node_embeddings)  # Scalar prediction
+.. math::
 
-The value network uses:
+   V(\mathbf{s}) = \text{MLP}_{32 \to 64 \to 32 \to 1}\left(\text{GlobalMeanPool}(\mathbf{H})\right)
 
-1. **Global mean pooling** over node embeddings to get graph-level representation
-2. **MLP prediction** of scalar expected reward
-3. **MSE loss** to minimize :math:`(V(s) - R)^2`
+where :math:`\mathbf{H} \in \mathbb{R}^{N \times 32}` are node embeddings from the RGCN encoder. 
+The network is trained to minimize :math:`(V(s) - R)^2` where :math:`R` is the actual reward.
+
+**Training Updates**:
+
+For each combination:
+
+1. Encode graph to node embeddings :math:`\mathbf{H}` via RGCN
+2. Sample bias coefficients :math:`\mathbf{a} \sim \pi_\theta(\cdot | \mathbf{s})` from policy
+3. Run simulation and compute reward :math:`R` from metrics
+4. Compute advantage: :math:`A = R - V_\phi(\mathbf{s})`
+5. Update value network: minimize :math:`(V_\phi(\mathbf{s}) - R)^2`
+6. Update policy: maximize :math:`\log \pi_\theta(\mathbf{a} | \mathbf{s}) \cdot A`
 
 **Benefits**:
 
-* **Lower variance**: State-dependent baselines reduce gradient noise
-* **Faster learning**: Value network trains 10x faster than policy (higher LR)
-* **Better credit assignment**: Easy vs hard combinations get appropriate baselines
-* **Stability**: Prevents catastrophic forgetting of pretrained weights
+* **Lower variance**: State-dependent baselines reduce gradient noise compared to fixed baselines
+* **Stability**: Prevents catastrophic forgetting of pretrained weights during RL training
+* **Better credit assignment**: Difficult combinations get lower baseline expectations
 
-Training Loop Example
-^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
-   import torch.nn.functional as F
-   
-   for epoch in range(num_epochs):
-       for combo_dir in combos:
-           # Build graph and targets
-           data, targets, extras = build_data_and_targets_from_combo(combo_dir)
-           
-           # Encode graph
-           node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
-           
-           # Sample actions from policy
-           actions, logp, _, _ = policy.get_actions(
-               data.x, data.edge_index, data.edge_type, data.edge_attr,
-               deterministic=False
-           )
-           
-           # Write variables.py and run simulation
-           write_variables_from_actions(combo_dir, data, extras, actions)
-           run_simulation_command(combo_dir)
-           reward = compute_reward(parse_simulation_results(combo_dir))
-           
-           # Predict expected value
-           predicted_value = value_network(node_embeddings)
-           advantage = reward - predicted_value.item()
-           
-           # Update value network
-           value_loss = F.mse_loss(predicted_value, torch.tensor([reward]))
-           value_optimizer.zero_grad()
-           value_loss.backward()
-           value_optimizer.step()
-           
-           # Update policy with advantage
-           policy_loss = -(logp.sum() * advantage)
-           optimizer.zero_grad()
-           policy_loss.backward()
-           optimizer.step()
-
-**Key Insight**: The advantage :math:`A = R - V(s)` tells the policy whether the 
-actual reward was better or worse than expected for this specific combination, 
-providing more informative gradients than a global average baseline.
-
-Reward Function
-^^^^^^^^^^^^^^^
-
-The reward function balances multiple simulation objectives using a tiered system with
-protections against double jeopardy and unreliable data.
-
-**Improved Reward Structure** (``compute_msld_reward_improved``):
-
-.. code-block:: python
-
-   def compute_msld_reward_improved(
-       run_dir,
-       w_P=0.5,           # Population balance weight
-       w_T=0.75,          # Transition count weight  
-       w_U=0.3,           # Coverage uniformity weight
-       gamma=4.0,         # Penalty scaling factor
-       P_baseline=500.0,  # Population normalization (lower = higher rewards)
-       T_baseline=50.0,   # Transition normalization (lower = higher rewards)
-       min_transitions_per_site=10,  # Threshold for "Success Zone"
-       min_coverage_ratio=0.5,       # Minimum % of substituents visited
-       entropy_bonus=8.0,            # Bonus for uniform distributions
-       concentration_penalty_threshold=0.8  # Max concentration ratio
-   ):
-       # Parse simulation outputs
-       populations = parse_populations(run_dir)
-       transitions = parse_transitions(run_dir)
-       
-       # Track minimum transitions across all sites
-       min_transitions_across_sites = min(transitions.values())
-       sites_below_threshold = sum(1 for t in transitions.values() if t < min_transitions_per_site)
-       
-       # === TIERED TRANSITION PENALTIES (multi-site aware) ===
-       # Base penalty determined by worst site (minimum transitions)
-       penalties = 0.0
-       if min_transitions_across_sites == 0:
-           base_penalty = 40.0  # Tier 1: "Death Floor" (0 transitions)
-       elif min_transitions_across_sites == 1:
-           base_penalty = 32.0  # Tier 1: "Death Floor" (1 transition)
-       elif min_transitions_across_sites == 2:
-           base_penalty = 24.0  # Tier 1: "Death Floor" (2 transitions)
-       elif min_transitions_across_sites < min_transitions_per_site:
-           deficit = min_transitions_per_site - min_transitions_across_sites
-           base_penalty = 2.0 + 2.0 * deficit  # Tier 2: "Climbing Ramp"
-       else:
-           base_penalty = 0.0  # Tier 3: "Success Zone"
-       
-       # Multi-site degradation: add incremental penalty for each additional bad site
-       if sites_below_threshold > 1:
-           multisite_penalty = (sites_below_threshold - 1) * 4.0
-           penalties -= (base_penalty + multisite_penalty)
-       elif sites_below_threshold == 1:
-           penalties -= base_penalty
-       
-       # === CONFIDENCE FACTOR (C_F) ===
-       # Scale population rewards by data reliability
-       confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
-       
-       # === REWARD COMPONENTS ===
-       
-       # R_P: Population balance (scaled by confidence)
-       pop_array = np.array(list(populations.values()))
-       nonzero_pops = pop_array[pop_array > 0]
-       if len(nonzero_pops) > 1:
-           cv = np.std(nonzero_pops) / np.mean(nonzero_pops)
-           balance_factor = np.exp(-cv)
-           total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-           R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
-       else:
-           R_P = 0.0
-       
-       # R_T: Transitions (only if all sites meet threshold)
-       sites_below_threshold = sum(1 for t in transitions.values() 
-                                  if t < min_transitions_per_site)
-       if sites_below_threshold == 0:
-           total_trans = sum(transitions.values())
-           R_T = w_T * (total_trans / T_baseline)
-       else:
-           R_T = 0.0
-       
-       # R_U: Coverage uniformity
-       coverage_ratio = len(nonzero_pops) / len(populations)
-       R_U = w_U * coverage_ratio
-       
-       # R_entropy: Shannon entropy bonus
-       pop_probs = pop_array / pop_array.sum()
-       entropy = -np.sum(pop_probs * np.log(pop_probs + 1e-10))
-       max_entropy = np.log(len(pop_probs))
-       R_entropy = entropy_bonus * (entropy / max_entropy)
-       
-       # === SECONDARY PENALTIES ===
-       # Coverage penalty
-       if coverage_ratio < min_coverage_ratio:
-           deficit = min_coverage_ratio - coverage_ratio
-           penalties -= gamma * 20.0 * deficit
-       
-       # Concentration penalty (per-site check)
-       for site_pops in get_site_populations(populations):
-           concentration = max(site_pops) / sum(site_pops)
-           if concentration > concentration_penalty_threshold:
-               penalties -= gamma * 5.0 * (concentration - concentration_penalty_threshold)
-       
-       # Total reward
-       reward = R_P + R_T + R_U + R_entropy + penalties
-       return reward
-
-**Key Mechanisms**:
-
-* **Confidence Factor (C_F)**: Scales population rewards by ``min(1.0, min_transitions / (2*N_req))``.
-  Low-transition runs (1-5 transitions) have unreliable population distributions and receive
-  reduced ``R_P`` accordingly.
-
-* **Tiered Transition Penalties**: Provides continuous gradient feedback instead of binary
-  thresholds:
-  
-  - Tier 1 "Death Floor" (0-2 trans): -40.0, -32.0, -24.0 fixed penalties
-  - Tier 2 "Climbing Ramp" (3-9 trans): -16.0 to -4.0 via ``-2.0 - (2.0 × deficit)``
-  - Tier 3 "Success Zone" (≥10 trans): 0.0 penalty, unlocks ``R_T`` reward
-
-**Default Configuration** (higher_rewards_v1):
-
-Tested on indolizine pretraining data with 64.10 point separation between good and bad runs:
-
-* ``w_P=0.5, w_T=0.75, w_U=0.3``
-* ``gamma=4.0, P_baseline=500, T_baseline=50``
-* ``entropy_bonus=8.0, min_transitions_per_site=10``
-
-Higher rewards indicate better bias coefficients that improve sampling efficiency.
+For details on reward function components, curriculum learning, and workflow configuration, 
+see :doc:`workflow`.
 
 Variables.py Format
 ~~~~~~~~~~~~~~~~~~~
@@ -468,10 +287,10 @@ The simulator reads bias coefficients from a ``variables.py`` file:
    - 0.1
    - 0.2
    - -0.05
-   c:  # NxN quadratic bias matrix (antisymmetric: c[j][i] = -c[i][j])
+   c:  # NxN quadratic bias matrix (antisymmetric: c[j][i] = -c[i][j], use only upper triangle)
    - [0.0, 0.3, -0.1]
-   - [-0.3, 0.0, 0.2]
-   - [0.1, -0.2, 0.0]
+   - [0.0, 0.0, 0.2]
+   - [0.0, 0.0, 0.0]
    x:  # NxN skew bias matrix (NOT antisymmetric: both directions independent)
    - [0.0, 0.05, -0.02]
    - [-0.05, 0.0, 0.03]
@@ -482,37 +301,19 @@ The simulator reads bias coefficients from a ``variables.py`` file:
    - [0.05, -0.08, 0.0]
    '''
 
-Forward-Only Canonical Mapping
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Edge-to-Matrix Mapping
+^^^^^^^^^^^^^^^^^^^^^^
 
-When writing variables.py from edge-level predictions:
+The policy network predicts per-edge coefficients which are mapped to bias matrices:
 
-**For linear bias (per-node vector)**:
+* **Linear bias (b)**: Per-edge predictions are averaged at each node to produce the 
+  per-node linear bias vector (length N)
 
-Per-edge predictions are aggregated into per-node values:
+* **Quadratic bias (c)**: Antisymmetric matrix where each undirected pair (i,j) uses 
+  one canonical forward value to set ``c[i][j] = v`` and ``c[j][i] = -v``
 
-.. code-block:: python
-
-   # Average linear values from incident edges
-   for (i, j), value in edge_linear_values.items():
-       b[i] += value
-       b[j] += value
-       count[i] += 1
-       count[j] += 1
-   
-   b = [b[i] / count[i] if count[i] > 0 else 0.0 for i in range(N)]
-
-**For quadratic bias (antisymmetric)**:
-
-1. Each undirected pair (i,j) stores **one canonical forward value**
-2. If only the backward relation exists, use its negative: ``forward = -backward``
-3. Build antisymmetric matrix: ``c[i][j] = v``, ``c[j][i] = -v``
-
-**For skew and end biases (NOT antisymmetric)**:
-
-1. Each directed pair (i→j) stores its **own independent value**
-2. Forward and backward relations are stored separately
-3. Build full matrix: ``x[i][j] = v_ij``, ``x[j][i] = v_ji`` (where v_ij ≠ -v_ji)
+* **Skew (x) and End (s) biases**: Full matrices where forward and backward directions 
+  are stored independently (NOT antisymmetric): ``x[i][j]`` and ``x[j][i]`` are separate values
 
 See Also
 --------
