@@ -167,6 +167,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
                 b_vector[idx] = float(value)
     
     # Fill c matrix from cs entries (quadratic coefficients)
+    # Note: Original format stores full matrix, not just upper triangle
     for key, value in old_data.get("cs", {}).items():
         match = re.match(r'cs(\d+)s(\d+)s(\d+)s(\d+)', key)
         if match:
@@ -175,7 +176,6 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
                 c_matrix[i][j] = float(value)
-                c_matrix[j][i] = float(value)  # Symmetric
     
     # Fill x matrix from xs entries (skew coefficients)
     for key, value in old_data.get("xs", {}).items():
@@ -189,6 +189,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
                 # Note: x is typically asymmetric
     
     # Fill s matrix from ss entries (end-state coefficients)
+    # Note: Original format stores full matrix, not just upper triangle
     for key, value in old_data.get("ss", {}).items():
         match = re.match(r'ss(\d+)s(\d+)s(\d+)s(\d+)', key)
         if match:
@@ -197,7 +198,6 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
                 s_matrix[i][j] = float(value)
-                s_matrix[j][i] = float(value)  # Symmetric
     
     return {
         "b": b_vector,

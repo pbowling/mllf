@@ -356,20 +356,29 @@ protections against double jeopardy and unreliable data.
        
        # Track minimum transitions across all sites
        min_transitions_across_sites = min(transitions.values())
+       sites_below_threshold = sum(1 for t in transitions.values() if t < min_transitions_per_site)
        
-       # === TIERED TRANSITION PENALTIES ===
+       # === TIERED TRANSITION PENALTIES (multi-site aware) ===
+       # Base penalty determined by worst site (minimum transitions)
        penalties = 0.0
-       for site, trans in transitions.items():
-           if trans == 0:
-               penalties -= 40.0  # Tier 1: "Death Floor" (0 transitions)
-           elif trans == 1:
-               penalties -= 32.0  # Tier 1: "Death Floor" (1 transition)
-           elif trans == 2:
-               penalties -= 24.0  # Tier 1: "Death Floor" (2 transitions)
-           elif trans < min_transitions_per_site:
-               deficit = min_transitions_per_site - trans
-               penalties -= (2.0 + 2.0 * deficit)  # Tier 2: "Climbing Ramp"
-           # Tier 3: "Success Zone" (>=10) gets no penalty
+       if min_transitions_across_sites == 0:
+           base_penalty = 40.0  # Tier 1: "Death Floor" (0 transitions)
+       elif min_transitions_across_sites == 1:
+           base_penalty = 32.0  # Tier 1: "Death Floor" (1 transition)
+       elif min_transitions_across_sites == 2:
+           base_penalty = 24.0  # Tier 1: "Death Floor" (2 transitions)
+       elif min_transitions_across_sites < min_transitions_per_site:
+           deficit = min_transitions_per_site - min_transitions_across_sites
+           base_penalty = 2.0 + 2.0 * deficit  # Tier 2: "Climbing Ramp"
+       else:
+           base_penalty = 0.0  # Tier 3: "Success Zone"
+       
+       # Multi-site degradation: add incremental penalty for each additional bad site
+       if sites_below_threshold > 1:
+           multisite_penalty = (sites_below_threshold - 1) * 4.0
+           penalties -= (base_penalty + multisite_penalty)
+       elif sites_below_threshold == 1:
+           penalties -= base_penalty
        
        # === CONFIDENCE FACTOR (C_F) ===
        # Scale population rewards by data reliability

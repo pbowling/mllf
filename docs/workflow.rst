@@ -394,17 +394,24 @@ through multiple components:
 
 **Population Balance Reward** :math:`R_P`:
 
-Encourages equal sampling across all substituents:
+Encourages equal sampling across all substituents with balanced populations:
 
 .. math::
 
-   R_P = w_P \cdot \frac{\sum_{k=1}^{N_{\text{subs}}} p_k}{P_{\text{baseline}}}
+   R_P = w_P \cdot \frac{\sum_{k \in \text{visited}} p_k}{P_{\text{baseline}}} \cdot e^{-CV} \cdot C_F
 
 where:
 
 * :math:`w_P` is the population weight (default: 0.5)
-* :math:`p_k` is the population count for substituent :math:`k`
+* :math:`p_k` is the population count for visited substituent :math:`k`
 * :math:`P_{\text{baseline}}` is the normalization constant (default: 500.0)
+* :math:`CV = \sigma / \mu` is the coefficient of variation (std/mean of nonzero populations)
+* :math:`C_F = \min(1.0, T_{\min} / (2 \times N_{\text{req}}))` is the confidence factor
+* :math:`T_{\min}` is the minimum transitions across all sites
+* :math:`N_{\text{req}}` is the minimum required transitions per site (default: 10)
+
+The confidence factor scales population rewards based on data reliability, reducing
+false rewards from low-transition runs with unreliable population distributions.
 
 **Transition Reward** :math:`R_T`:
 
@@ -413,8 +420,8 @@ Rewards frequent transitions between substituents, with bonus for high transitio
 .. math::
 
    R_T = \begin{cases}
-   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} & \text{if all sites have } \geq 10 \text{ transitions} \\
-   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} \times 1.5 & \text{if avg. trans/site} > 20 \\
+   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} & \text{if all sites have } \geq \text{min\_transitions\_per\_site} \\
+   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} \times 1.5 & \text{if avg. trans/site} > 2 \times \text{min\_transitions\_per\_site} \\
    0 & \text{otherwise (sites below threshold)}
    \end{cases}
 
@@ -423,6 +430,7 @@ where:
 * :math:`w_T` is the transition weight (default: 0.75)
 * :math:`T_s` is the transition count for site :math:`s`
 * :math:`T_{\text{baseline}}` is the normalization constant (default: 50.0)
+* The 1.5× bonus applies when average transitions per site exceeds 20 (2× the default minimum)
 * The 1.5× bonus applies when average transitions per site exceeds 20
 
 **Uniformity Reward** :math:`R_U`:
@@ -1748,5 +1756,9 @@ For custom workflows, import the key components:
    value_optimizer = torch.optim.Adam(value_network.parameters(), lr=0.001)
    
    # Training loop - see run_workflow.py for full implementation
+
+See Also
+~~~~~~~~
+
 * :doc:`examples` - Example workflows and usage patterns
 * :doc:`api` - API reference for workflow modules
