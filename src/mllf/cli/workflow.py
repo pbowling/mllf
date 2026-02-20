@@ -135,6 +135,7 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
     # Extract site information from node metadata
     sites_info = {}
     solvent_state = None
+    site_counts = defaultdict(int)
     
     for node_idx, node_info in g.nodes.items():
         if node_info:
@@ -147,15 +148,21 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
                     'sub': sub,
                     'total_charge': node_info.get('total_charge', 0.0),
                     'atom_types': node_info.get('atom_types', []),
-                    'unique_atom_types': node_info.get('unique_atom_types', []),
+                    'distinct_atom_types': node_info.get('distinct_atom_types', []),
                 }
+                # Count substituents per site
+                site_counts[site] += 1
                 # Extract solvent state (should be consistent across nodes)
                 if solvent_state is None:
                     solvent_state = node_info.get('solvent', 'unknown')
     
+    # Build nsubs_per_site list in site order
+    nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
+    
     graph_info = {
         'solvent_state': solvent_state or 'unknown',
-        'sites': sites_info
+        'sites': sites_info,
+        'nsubs_per_site': nsubs_per_site
     }
     
     with open(graph_info_path, 'w') as f:
@@ -163,7 +170,8 @@ def save_graph_info_from_rtf(combo_dir: str, g) -> None:
 
 
 def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadratic', verify_graph: bool = False,
-                                      toppar_dir: str = None, toppar_files: list = None, warn_missing_types: bool = True):
+                                      toppar_dir: str = None, toppar_files: list = None, warn_missing_types: bool = True,
+                                      solvent_state: str = None):
     """Build PyG Data object and per-edge targets from a combo directory.
 
     This function prefers RTF fragments when available (Graph.from_rtf_results).
@@ -179,6 +187,8 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
         toppar_dir: Path to toppar directory for vocabulary (None uses package default)
         toppar_files: List of specific toppar filenames to include (e.g., ['top_all36_cgenff.rtf'])
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+        solvent_state: Environment type for the system ('solv', 'gas', or 'protein').
+                      If None, attempts to detect from filenames.
 
     Returns:
         Tuple of (data, targets, extras) where:
@@ -197,13 +207,16 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
     
     # Check for RTF files in both combo_dir and combo_dir/prep
     rtf_results = parse_rtf_dir(combo_dir)
+    rtf_dir = combo_dir
     if not rtf_results:
         prep_dir = combo_path / 'prep'
         if prep_dir.exists() and prep_dir.is_dir():
             rtf_results = parse_rtf_dir(str(prep_dir))
+            rtf_dir = str(prep_dir)
     
     if rtf_results:
-        g = Graph.from_rtf_results(rtf_results)
+        # Pass the directory path for solvent state detection from folder name
+        g = Graph.from_rtf_results(rtf_results, solvent_override=solvent_state, directory=rtf_dir)
         # Save graph_info.json for reward function to extract actual nsubs_per_site
         save_graph_info_from_rtf(combo_dir, g)
     else:
@@ -324,10 +337,10 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     """Write a variables.py file from per-directed-edge policy actions.
 
     This function maps directed relation actions back to base biases (quadratic, skew,
-    end, linear). For nonlinear biases (quadratic, skew, end), each undirected pair (i,j)
-    is represented by a SINGLE value stored in the upper triangle of the matrix (i < j).
-    The lower triangle remains zero to prevent cancellation issues. Linear biases are
-    aggregated into per-node 'b' vector by averaging incident edges.
+    end, linear). Quadratic (antisymmetric) uses upper triangle only (i < j). Skew and
+    end (NOT antisymmetric) store BOTH directions independently - each directed edge
+    (i→j) has its own value. Linear biases are aggregated into per-node 'b' vector by
+    averaging incident edges.
 
     Args:
         combo_dir: Path to combo directory where variables.py will be written.
@@ -342,9 +355,9 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     Returns:
         None. Writes a Python file containing a triple-quoted YAML bias_string with keys:
         - 'b': per-node linear bias vector (length N)
-        - 'c': NxN quadratic bias matrix (upper triangular only)
-        - 'x': NxN skew bias matrix (upper triangular only)
-        - 's': NxN end bias matrix (upper triangular only)
+        - 'c': NxN quadratic bias matrix (upper triangular only, antisymmetric)
+        - 'x': NxN skew bias matrix (full matrix, both directions, NOT antisymmetric)
+        - 's': NxN end bias matrix (full matrix, both directions, NOT antisymmetric)
     """
     combo_dir = Path(combo_dir)
     N = int(data.x.shape[0])
@@ -366,12 +379,12 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             rel_to_base[fwd] = base
             rel_to_base[bwd] = base
 
-    # Collect per-undirected-pair forward-only values. For each directed edge,
-    # the canonical forward relation (e.g. 'quadratic_fwd') is the source of
-    # truth for the undirected pair. If only the backward relation is present,
-    # we invert its sign to produce the forward value (forward = -backward).
-    # This ensures each undirected pair (i,j) has exactly one canonical value.
-    per_base_forward = {name: {} for name in base_order}
+    # Collect values for each base type
+    # - For quadratic (antisymmetric): Use undirected pairs (min,max) with forward canonicalization
+    # - For skew/end (NOT antisymmetric): Use directed pairs (src,dst) to preserve both directions
+    per_base_forward = {name: {} for name in base_order}  # For quadratic: undirected pairs
+    per_base_directed = {'skew': {}, 'end': {}}  # For skew/end: directed pairs
+    
     ei = data.edge_index
     et = data.edge_type
     for k in range(ei.shape[1]):
@@ -385,39 +398,55 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         if base is None:
             continue
         fwd_name, bwd_name = base_map.get(base, (f"{base}_fwd", f"{base}_bwd"))
-        # Canonical pair: always (min, max) for consistency
-        pair = (min(src, dst), max(src, dst))
         
         # Extract scalar value from action tensor/array
-        # (handles both scalar tensors and vector tensors with single element)
+        # For multi-output policies (mlp_out_dim=4), each edge predicts all 4 bias types
+        # and we need to extract the correct index based on the bias type:
+        # linear=0, quadratic=1, skew=2, end=3
+        bias_type_index = {'linear': 0, 'quadratic': 1, 'skew': 2, 'end': 3}
+        target_index = bias_type_index.get(base, 0)
+        
         try:
             a = actions[k]
             if hasattr(a, 'dim') and a.dim() == 0:
+                # Scalar action (single output per edge)
                 val = float(a.item())
+            elif hasattr(a, 'shape') and len(a.shape) > 0 and a.shape[-1] == 4:
+                # Multi-output action (4 values per edge) - extract the correct index
+                val = float(a[target_index].item() if hasattr(a[target_index], 'item') else a[target_index])
             else:
+                # Fallback: try to extract first element
                 vlist = a.detach().cpu().numpy().tolist() if hasattr(a, 'detach') else list(a)
-                val = float(vlist) if not isinstance(vlist, list) else float(vlist[0])
+                if isinstance(vlist, list) and len(vlist) == 4:
+                    val = float(vlist[target_index])
+                else:
+                    val = float(vlist) if not isinstance(vlist, list) else float(vlist[0])
         except Exception:
             try:
                 val = float(actions[k])
             except Exception:
                 val = 0.0
 
-        # Store forward value if this is the forward relation and we haven't seen this pair yet
-        if rel_name == fwd_name and (pair not in per_base_forward[base]):
-            per_base_forward[base][pair] = val
-        # If only backward exists, store its negative as the canonical forward value
-        elif rel_name == bwd_name and (pair not in per_base_forward[base]):
-            per_base_forward[base][pair] = -val
+        # For skew and end: store directed pairs (preserve both directions independently)
+        if base in ['skew', 'end']:
+            per_base_directed[base][(src, dst)] = val
+        else:
+            # For quadratic and linear: use undirected canonical pairs
+            pair = (min(src, dst), max(src, dst))
+            # Store forward value if this is the forward relation and we haven't seen this pair yet
+            if rel_name == fwd_name and (pair not in per_base_forward[base]):
+                per_base_forward[base][pair] = val
+            # If only backward exists, store its negative as the canonical forward value
+            elif rel_name == bwd_name and (pair not in per_base_forward[base]):
+                per_base_forward[base][pair] = -val
 
     # Assemble bias matrices for nonlinear terms
-    # IMPORTANT: For quadratic, skew, and end biases, we store ONLY the upper triangle
-    # (i.e., only for pairs where i < j). This prevents cancellation issues where
-    # mat[i][j] = v and mat[j][i] = -v would effectively cancel out in simulations.
-    # The lower triangle remains zero.
-    def build_mat_for(base_name: str):
+    # IMPORTANT: Quadratic is antisymmetric, so we store ONLY the upper triangle (i < j).
+    # Skew and end are NOT antisymmetric - they need BOTH directions stored independently.
+    def build_mat_for_quadratic():
+        """Build quadratic matrix (antisymmetric, upper triangle only)."""
         mat = [[0.0 for _ in range(N)] for _ in range(N)]
-        vals_map = per_base_forward.get(base_name, {})
+        vals_map = per_base_forward.get('quadratic', {})
         for (i, j), val in vals_map.items():
             try:
                 v = float(val)
@@ -426,7 +455,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             # Clip to prevent extreme values
             v = max(-bias_clip, min(bias_clip, v))
             # Only set the canonical forward entry (i < j means store in upper triangle)
-            # This ensures each undirected pair has exactly ONE bias value, not two opposing values
+            # This ensures each undirected pair has exactly ONE bias value
             if i < j:
                 mat[i][j] = v
                 # mat[j][i] remains 0.0 (not -v)
@@ -434,10 +463,26 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                 mat[j][i] = v
                 # mat[i][j] remains 0.0 (not -v)
         return mat
+    
+    def build_mat_for_bidirectional(base_name: str):
+        """Build skew/end matrix (NOT antisymmetric, both directions stored)."""
+        mat = [[0.0 for _ in range(N)] for _ in range(N)]
+        directed_vals = per_base_directed.get(base_name, {})
+        
+        # Populate matrix from directed pairs
+        for (src, dst), val in directed_vals.items():
+            try:
+                v = float(val)
+            except Exception:
+                v = 0.0
+            v = max(-bias_clip, min(bias_clip, v))
+            mat[src][dst] = v
+        
+        return mat
 
-    c_mat = build_mat_for('quadratic')
-    x_mat = build_mat_for('skew')
-    s_mat = build_mat_for('end')
+    c_mat = build_mat_for_quadratic()
+    x_mat = build_mat_for_bidirectional('skew')
+    s_mat = build_mat_for_bidirectional('end')
 
     # Derive per-node linear bias 'b' from per-edge linear values
     # Strategy: average the linear values of all incident edges for each node

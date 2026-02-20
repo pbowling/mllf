@@ -29,7 +29,9 @@ generated_combos*/
 pretraining/
 old_files/
 models/
-training_output/
+examples/14benz/training_output/
+*status.out
+*.tar.gz
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

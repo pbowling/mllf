@@ -11,6 +11,25 @@ from typing import Dict, Tuple, List, Optional
 import numpy as np
 
 
+def _detect_solvent_state(filename: str) -> str:
+    """Detect solvent state from filename and normalize to standard values.
+    
+    Returns one of: 'solv', 'gas', 'protein'
+    Defaults to 'unknown' with a warning if not detected.
+    """
+    fn = (filename or "").lower()
+    if 'prot' in fn or 'protein' in fn:
+        return 'protein'
+    if 'vac' in fn or 'vacuum' in fn or 'gas' in fn:
+        return 'gas'
+    if 'solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn or 'solution' in fn or 'solvent' in fn:
+        return 'solv'
+    else:
+        import warnings
+        warnings.warn(f"Could not detect solvent state from filename '{filename}'; setting to 'unknown'", UserWarning)
+        return 'unknown'
+
+
 @dataclass
 class EdgeCoeffs:
     linear: float = 0.0
@@ -106,8 +125,8 @@ class Graph:
         filename. For keys with site information, we will collect per-site lists
         of substituents and attach them to the node metadata under 'subs' and
         also store the raw parsed entries under 'rtf'. For each substituent we
-        populate metadata: total_charge, atom_types, unique_atom_types (atoms
-        that differ from other subs at the same site) and solvent state (a
+        populate metadata: total_charge, atom_types, distinct_atom_types (atoms
+        not present in ALL subs at the same site) and solvent state (a
         simple heuristic based on filename).
         """
         # collect subs per site
@@ -122,38 +141,30 @@ class Graph:
             sites[site].setdefault('rtf', {})
             sites[site]['rtf'][sub] = parsed
 
-        def detect_solvent_state(filename: str) -> str:
-            fn = (filename or "").lower()
-            if 'vac' in fn or 'vacuum' in fn:
-                return 'vacuum'
-            if 'solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn:
-                return 'solvated'
-            return 'unknown'
-
         # attach to nodes
         for site_idx, data in sites.items():
             if site_idx - 1 < 0 or site_idx - 1 >= self.num_nodes:
                 # ignore out-of-range site indices
                 continue
-            # compute atom type sets per sub for uniqueness computation
+            # compute atom type sets per sub for distinct types computation
             per_sub = data['rtf']
             atom_sets = {s: set((per_sub[s].get('atom_types') or [])) for s in per_sub}
-            # compute unique atom types per sub (difference from other subs at site)
-            unique = {}
-            for s, aset in atom_sets.items():
-                others = set().union(*(atom_sets[o] for o in atom_sets if o != s)) if len(atom_sets) > 1 else set()
-                unique[s] = sorted(list(aset - others))
+            # compute intersection of all subs at this site
+            intersection_all = set.intersection(*atom_sets.values()) if len(atom_sets) > 0 else set()
 
             subs_meta = {}
             for s, parsed in per_sub.items():
                 fname = parsed.get('filename')
+                atom_types = list(parsed.get('atom_types') or [])
+                # distinct_atom_types: preserve duplicates and order but exclude atoms in intersection
+                distinct_list = [a for a in atom_types if a not in intersection_all]
                 subs_meta[s] = {
                     'site': site_idx,
                     'sub': s,
                     'total_charge': float(parsed.get('total_charge', 0.0) or 0.0),
-                    'atom_types': list(parsed.get('atom_types') or []),
-                    'unique_atom_types': unique.get(s, []),
-                    'solvent': detect_solvent_state(fname),
+                    'atom_types': atom_types,
+                    'distinct_atom_types': distinct_list,
+                    'solvent': _detect_solvent_state(fname),
                     'rtf': parsed,
                 }
 
@@ -170,7 +181,7 @@ class Graph:
             pass
 
     @classmethod
-    def from_rtf_results(cls, rtf_results: Dict[str, Dict], solvent_override: Optional[str] = None) -> "Graph":
+    def from_rtf_results(cls, rtf_results: Dict[str, Dict], solvent_override: Optional[str] = None, directory: Optional[str] = None) -> "Graph":
         """Create a Graph with one node per substituent (sub), populating node metadata.
 
         rtf_results is expected to contain parsed entries with keys including
@@ -184,7 +195,9 @@ class Graph:
                 - 'gas' or 'vacuum': Gas phase / vacuum environment
                 - 'solv' or 'solvent': Solvent / water environment
                 - 'protein': Protein environment
-                If not provided, environment is auto-detected from filenames.
+                If not provided, environment is auto-detected from directory name.
+            directory: Directory path containing the RTF files, used for auto-detection
+                      of solvent state from folder name (e.g., '14benz_solv' -> 'solv')
         """
         # collect entries that have site and sub
         subs = []
@@ -203,15 +216,13 @@ class Graph:
         # sort by site then sub for deterministic ordering
         subs.sort(key=lambda x: (x[0], x[1]))
 
-        # compute atom type sets per site/sub to determine unique atom types
+        # compute atom type sets per site/sub to determine distinct atom types
         per_site = {}
         for site, sub, key, parsed in subs:
             per_site.setdefault(site, {})
             per_site[site][sub] = parsed
 
-        # compute unique atom types per sub within each site (difference from other subs at same site)
-        # and compute the intersection across all subs at a site (atoms common to every sub)
-        unique_map = {}
+        # compute the intersection across all subs at a site (atoms common to every sub)
         site_intersection = {}
         for site, subdict in per_site.items():
             atom_sets = {s: set((subdict[s].get('atom_types') or [])) for s in subdict}
@@ -220,29 +231,6 @@ class Graph:
             else:
                 intersection_all = set()
             site_intersection[site] = intersection_all
-            for s, aset in atom_sets.items():
-                others = set().union(*(atom_sets[o] for o in atom_sets if o != s)) if len(atom_sets) > 1 else set()
-                unique_map[(site, s)] = sorted(list(aset - others))
-
-        # Also compute globally unique atom types (appear only in a single sub across all sites)
-        all_atom_lists = [set(parsed.get('atom_types') or []) for (_, _, _, parsed) in subs]
-        global_counts = {}
-        for aset in all_atom_lists:
-            for a in aset:
-                global_counts[a] = global_counts.get(a, 0) + 1
-        globally_unique = {a for a, c in global_counts.items() if c == 1}
-
-        # helper to detect solvent and normalize to one of: 'solv', 'gas', 'protein'
-        def detect_solvent_state(filename: str) -> str:
-            fn = (filename or "").lower()
-            if 'prot' in fn or 'protein' in fn:
-                return 'protein'
-            if 'vac' in fn or 'vacuum' in fn or 'gas' in fn:
-                return 'gas'
-            if 'solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn:
-                return 'solv'
-            # default to 'solv' when ambiguous
-            return 'solv'
 
         # create graph with one node per substituent
         nsubs = len(subs)
@@ -250,21 +238,12 @@ class Graph:
 
         # populate node metadata per substituent
         for idx, (site, sub, key, parsed) in enumerate(subs):
-            # prefer full file path for solvent detection (may include directory hints)
-            fname = parsed.get('filepath') or parsed.get('filename')
             atom_types = list(parsed.get('atom_types') or [])
             total_charge = float(parsed.get('total_charge', 0.0) or 0.0)
             # distinct_atom_types: preserve duplicates and order but exclude atoms
             # that are present in every sub at this site (site_intersection)
             intersection_all = site_intersection.get(site, set())
             distinct_list = [a for a in atom_types if a not in intersection_all]
-
-            # per-site unique atom types (present only in this sub at the site)
-            per_site_unique = set(unique_map.get((site, sub), []))
-            # globally unique atom types that appear in this sub
-            global_unique_in_sub = sorted(list(set(atom_types).intersection(globally_unique)))
-            # merged unique types (no duplicates)
-            merged_unique = sorted(list(per_site_unique.union(global_unique_in_sub)))
 
             # Validate solvent_override if provided; warn and set to 'unknown' if invalid
             allowed_solvents = {'solv', 'gas', 'protein'}
@@ -280,16 +259,15 @@ class Graph:
                     )
                     sol_state = 'unknown'
             else:
-                sol_state = detect_solvent_state(fname)
+                # Auto-detect from directory name (e.g., '14benz_solv' -> 'solv')
+                sol_state = _detect_solvent_state(directory if directory else '')
 
             subs_meta = {
                 'site': site,
                 'sub': sub,
                 'total_charge': total_charge,
                 'atom_types': atom_types,
-                # distinct (preserve duplicates) and unique (set) representations
                 'distinct_atom_types': distinct_list,
-                'unique_atom_types': merged_unique,
                 'solvent': sol_state,
                 'rtf': parsed,
             }
@@ -309,7 +287,7 @@ class Graph:
         
         Args:
             graph_info: Dictionary loaded from graph_info.json with keys:
-                - 'solvent_state': Environment type ('solvent', 'protein', 'gas')
+                - 'solvent_state': Environment type ('solv', 'gas', 'protein')
                 - 'sites': Dict mapping 'site{N}_sub{M}' to metadata dicts containing:
                     - 'site': Site number
                     - 'sub': Substituent number
@@ -320,7 +298,7 @@ class Graph:
             Graph with nodes populated from site/sub data
         """
         sites_data = graph_info.get('sites', {})
-        solvent_state = graph_info.get('solvent_state', 'solvent')
+        solvent_state = graph_info.get('solvent_state', 'solv')
         
         # Parse and sort by (site, sub)
         subs = []
@@ -343,7 +321,6 @@ class Graph:
             per_site[site][sub] = data
         
         # Compute distinct atom types (excluding atoms common to all subs at site)
-        unique_map = {}
         site_intersection = {}
         for site, subdict in per_site.items():
             atom_sets = {s: set(subdict[s].get('atom_types', [])) for s in subdict}
@@ -352,9 +329,6 @@ class Graph:
             else:
                 intersection_all = set()
             site_intersection[site] = intersection_all
-            for s, aset in atom_sets.items():
-                others = set().union(*(atom_sets[o] for o in atom_sets if o != s)) if len(atom_sets) > 1 else set()
-                unique_map[(site, s)] = sorted(list(aset - others))
         
         # Create graph with one node per substituent
         nsubs = len(subs)
@@ -365,13 +339,13 @@ class Graph:
             atom_types = list(data.get('atom_types', []))
             total_charge = float(data.get('total_charge', 0.0))
             
-            # Compute distinct atom types (excluding site intersection)
-            intersection_all = site_intersection.get(site, set())
-            distinct_list = [a for a in atom_types if a not in intersection_all]
-            
-            # Per-site unique atom types
-            per_site_unique = set(unique_map.get((site, sub), []))
-            merged_unique = sorted(list(per_site_unique))
+            # Use distinct_atom_types from saved data if available, otherwise compute it
+            if 'distinct_atom_types' in data:
+                distinct_list = list(data.get('distinct_atom_types', []))
+            else:
+                # Compute distinct atom types (excluding site intersection)
+                intersection_all = site_intersection.get(site, set())
+                distinct_list = [a for a in atom_types if a not in intersection_all]
             
             node_meta = {
                 'site': site,
@@ -379,7 +353,6 @@ class Graph:
                 'total_charge': total_charge,
                 'atom_types': atom_types,
                 'distinct_atom_types': distinct_list,
-                'unique_atom_types': merged_unique,
                 'solvent': solvent_state,
             }
             g.set_node_info(idx, node_meta)

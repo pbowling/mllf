@@ -3,10 +3,44 @@
 This module is intentionally defensive: it will try to import the project's
 Graph class and fall back to handling networkx-like graph objects.
 """
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 import torch
 from torch_geometric.data import Data
 from .atom_vocab import get_atom_type_vocab
+
+
+def build_directed_pairs(nsubs_per_site: List[int]) -> List[Tuple[int, int]]:
+    """Build list of directed pairs for all substituents within each site.
+    
+    Generates BOTH directions (i→j and j→i) within each site to allow
+    independent predictions for skew and end biases.
+    No cross-site pairs are generated.
+    
+    This is useful for both graph-based and pairwise approaches when you need
+    all directed edges within sites for training or prediction.
+    
+    Args:
+        nsubs_per_site: List of substituent counts per site
+    
+    Returns:
+        List of (i, j) pairs including both directions within the same site
+        
+    Example:
+        >>> build_directed_pairs([2, 3])  # Site 1: 2 subs, Site 2: 3 subs
+        [(0, 1), (1, 0), (2, 3), (2, 4), (3, 2), (3, 4), (4, 2), (4, 3)]
+    """
+    pairs = []
+    offset = 0
+    
+    for nsubs in nsubs_per_site:
+        # Generate both directions for all pairs within site
+        for i in range(nsubs):
+            for j in range(nsubs):
+                if i != j:  # Skip diagonal (self-pairs)
+                    pairs.append((offset + i, offset + j))
+        offset += nsubs
+    
+    return pairs
 
 
 
@@ -16,21 +50,22 @@ def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vo
     Expected keys in meta: 
     - 'total_charge' (float)
     - 'solvent' (str: 'solvent'/'solv' or 'protein')
-    - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61'])
+    - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61', 'CG2R61'])
     
     The function returns a 1-D torch.float tensor with features:
-    [charge, is_solvent, is_protein, <element one-hot>, <atom type one-hot>]
+    [charge, is_solvent, is_protein, <element counts>, <atom type counts>]
     
     If atom_type_vocab, element_vocab, and atom_to_element mapping are provided, distinct_atom_types
-    are encoded as two separate one-hot vectors:
-    - Element one-hot: which elements are present in the substituent (e.g., C, H, N, O)
-    - Atom type one-hot: which specific atom types are present (e.g., CG2R61, HGR61)
+    are encoded as two separate count vectors:
+    - Element counts: how many atoms of each element (e.g., 6 C, 4 H, 1 O)
+    - Atom type counts: how many of each specific atom type (e.g., 3 CG2R61, 2 HGR61)
     
     Elements are extracted from atom types using the atom_to_element mapping.
     
-    This is more efficient than a single multi-hot encoding since:
-    - Element vocab is small (~14 elements in CGenFF)
-    - Provides both coarse (element) and fine (atom type) chemical information
+    This encoding captures both composition (counts) and chemical diversity:
+    - Coarse counts: total atoms per element
+    - Fine counts: atoms per specific CHARMM type
+    - More informative than binary presence/absence
     """
     charge = float(meta.get('total_charge', 0.0))
     
@@ -41,33 +76,29 @@ def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vo
     
     base_features = [charge, is_solvent, is_protein]
     
-    # Encode elements and atom types as separate one-hot vectors if vocabularies provided
+    # Encode elements and atom types with counts if vocabularies provided
     if element_vocab is not None and atom_type_vocab is not None and atom_to_element is not None:
         distinct_types = meta.get('distinct_atom_types', [])
         if not isinstance(distinct_types, (list, tuple)):
             distinct_types = []
         
-        # Create element one-hot encoding (which elements are present)
+        # Create element count encoding (how many atoms of each element)
         element_encoding = [0.0] * len(element_vocab)
-        # Create atom type one-hot encoding (which specific types are present)
+        # Create atom type count encoding (how many of each specific type)
         atom_type_encoding = [0.0] * len(atom_type_vocab)
         
-        # Track which elements we've seen to avoid duplicates
-        seen_elements = set()
-        
+        # Count occurrences of each atom type and element
         for atom_type in distinct_types:
-            # Mark atom type as present
+            # Increment atom type count
             if atom_type in atom_type_vocab:
                 idx = atom_type_vocab[atom_type]
-                atom_type_encoding[idx] = 1.0
+                atom_type_encoding[idx] += 1.0
                 
-                # Extract element from atom type using the mapping
+                # Increment element count using the mapping
                 element = atom_to_element.get(atom_type)
-                if element and element not in seen_elements:
-                    seen_elements.add(element)
-                    if element in element_vocab:
-                        elem_idx = element_vocab[element]
-                        element_encoding[elem_idx] = 1.0
+                if element and element in element_vocab:
+                    elem_idx = element_vocab[element]
+                    element_encoding[elem_idx] += 1.0
         
         base_features.extend(element_encoding)
         base_features.extend(atom_type_encoding)
@@ -157,8 +188,10 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
     x = torch.stack(node_feats, dim=0)
 
     # expand edges: for each undirected (i,j) and for each bias that is allowed.
-    # For each base bias we create two directed relation types so that A->B and B->A
-    # are represented by distinct relation ids and can be learned separately.
+    # Different bias types have different directionality rules:
+    # - Linear: Only FROM reference sub (sub 1) TO other subs (one direction only)
+    # - Quadratic: Only upper triangle (one direction: i->j where i<j)
+    # - Skew/End: Both directions (i->j and j->i)
     src = []
     dst = []
     edge_type_list = []
@@ -170,29 +203,70 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         mask = None
         if hasattr(g, 'edge_mask'):
             mask = g.edge_mask.get((i, j))
+        
+        # Get node metadata for directionality rules
+        node_i_info = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
+        node_j_info = g.get_node_info(j) if hasattr(g, 'get_node_info') else {}
+        sub_i = node_i_info.get('sub')
+        sub_j = node_j_info.get('sub')
+        
         for bias in base_relation_names:
             allowed = True if mask is None else bool(mask.get(bias, False))
             if not allowed:
                 continue
+            
             fwd_name, bwd_name = base_relation_map[bias]
             fwd_idx = rel_to_idx[fwd_name]
             bwd_idx = rel_to_idx[bwd_name]
-            # add directed edge i->j as the forward relation for this bias
-            src.append(int(i))
-            dst.append(int(j))
-            edge_type_list.append(fwd_idx)
-            # edge_attr: only include one-hot over directed relation types
             k = len(relation_names)
-            one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot[fwd_idx] = 1.0
-            edge_attr_list.append(one_hot)
-            # add reverse direction j->i as the backward relation type
-            src.append(int(j))
-            dst.append(int(i))
-            edge_type_list.append(bwd_idx)
-            one_hot_r = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot_r[bwd_idx] = 1.0
-            edge_attr_list.append(one_hot_r)
+            
+            # Determine directionality based on bias type
+            create_forward = True
+            create_backward = True
+            
+            if bias == 'linear':
+                # Linear: Only from reference sub (sub 1) to other subs
+                # If i is sub 1: create i->j only
+                # If j is sub 1: create j->i only
+                # If neither is sub 1: skip (edge_mask should have disabled this)
+                if sub_i == 1 and sub_j != 1:
+                    create_forward = True
+                    create_backward = False
+                elif sub_j == 1 and sub_i != 1:
+                    create_forward = False
+                    create_backward = True
+                else:
+                    # Both are sub 1 or neither is sub 1 - shouldn't happen with proper edge_mask
+                    continue
+                    
+            elif bias == 'quadratic':
+                # Quadratic: Only upper triangle (i < j)
+                if i < j:
+                    create_forward = True
+                    create_backward = False
+                else:
+                    create_forward = False
+                    create_backward = True
+                    
+            # Skew and end: both directions (default behavior)
+            
+            # Create forward edge (i->j)
+            if create_forward:
+                src.append(int(i))
+                dst.append(int(j))
+                edge_type_list.append(fwd_idx)
+                one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
+                one_hot[fwd_idx] = 1.0
+                edge_attr_list.append(one_hot)
+            
+            # Create backward edge (j->i)
+            if create_backward:
+                src.append(int(j))
+                dst.append(int(i))
+                edge_type_list.append(bwd_idx)
+                one_hot_r = torch.zeros((k,), dtype=torch.get_default_dtype())
+                one_hot_r[bwd_idx] = 1.0
+                edge_attr_list.append(one_hot_r)
 
     k = len(relation_names)
     if len(src) == 0:

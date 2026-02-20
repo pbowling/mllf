@@ -24,7 +24,7 @@ import yaml
 import numpy as np
 from typing import Dict, List
 
-from mllf.cb.train import compute_reward_from_raw_metrics
+from mllf.cb.train_improved import compute_reward_from_raw_metrics
 
 
 def load_epoch_results(epoch_dir: Path) -> List[Dict]:

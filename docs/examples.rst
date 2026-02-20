@@ -8,10 +8,10 @@ The repository includes a complete contextual bandit training workflow for
 multisite λ-dynamics simulations. The main example demonstrates:
 
 1. Generating combinations from site/substituent fragments
-2. Training a graph neural network policy to predict bias coefficients
+2. Training an Actor-Critic model (policy + value network) to predict bias coefficients
 3. Running CHARMM simulations with predicted biases
 4. Computing rewards from simulation metrics
-5. Updating the policy with REINFORCE
+5. Updating policy with REINFORCE and value network for variance reduction
 
 Main Training Workflow
 ----------------------
@@ -29,7 +29,7 @@ Quick Start
 
 This will:
 
-- Generate combinations from the 14benz_solv_5.5 system
+- Generate combinations from the 14benz system
 - Split into train/val/test sets (70/15/15)
 - Train for 50 epochs with SLURM job submission
 - Save checkpoints every 5 epochs
@@ -42,6 +42,10 @@ Edit ``examples/workflow_sample.yaml`` to customize:
 
 .. code-block:: yaml
 
+   # System configuration
+   system:
+     solvent_state: solv  # Environment: 'solv' (solvated), 'gas' (vacuum), or 'protein'
+   
    # Combination generation
    create_combos:
      input_dir: /path/to/site_sub_fragments
@@ -55,7 +59,7 @@ Edit ``examples/workflow_sample.yaml`` to customize:
      val_frac: 0.15
      seed: 42
    
-   # Model architecture
+   # Model architecture (Actor-Critic with value network)
    training:
      num_epochs: 50
      encoder:
@@ -63,8 +67,15 @@ Edit ``examples/workflow_sample.yaml`` to customize:
        out_dim: 32
      policy:
        mlp_hidden: 64
+     value_network:
+       hidden_dims: [64, 32]  # Value network for variance reduction
+       lr: 0.001              # 10x policy LR (learns scalar prediction faster)
      optimizer:
-       lr: 0.001
+       lr: 0.0001             # Policy LR (reduced 10x for stability)
+   
+   # Reward configuration
+   reward:
+     lambda_entropy: 0.5      # Entropy regularization (increased 50x for exploration)
    
    # Checkpointing
    output:
@@ -149,10 +160,15 @@ The pretrained policy learns to map graph structure (system size, atom types,
 environment) to successful bias coefficients, providing a strong initialization
 for the main training phase.
 
-Example System: 14benz_solv_5.5
---------------------------------
+.. note::
+   The value network does not require pretraining. It starts from random initialization
+   and learns to predict rewards during reinforcement learning training by observing
+   actual simulation outcomes.
 
-The ``examples/cb/14benz_solv_5.5/`` directory contains:
+Example System: 14benz
+----------------------
+
+The ``examples/14benz/`` directory contains:
 
 - ``site1_sub1_pres.rtf`` through ``site1_sub5_pres.rtf``: Site 1 substituents
 - ``site2_sub1_pres.rtf`` through ``site2_sub6_pres.rtf``: Site 2 substituents
@@ -174,7 +190,7 @@ For production training on a cluster:
 
 .. code-block:: bash
 
-   cd examples
+   cd examples/
    sbatch training_test.sh
 
 The training script:
@@ -217,13 +233,17 @@ To adapt the workflow for your system:
 1. **Prepare fragments**: Create ``siteN_subM_pres.rtf`` files for each
    site/substituent combination
 
-2. **Update config**: Edit ``workflow_sample.yaml`` with your paths
+2. **Update config**: Edit ``workflow_sample.yaml`` with your paths and system settings:
+   
+   - Set ``system.solvent_state`` to match your environment ('solv', 'gas', or 'protein')
+   - Adjust ``value_network.hidden_dims`` if needed (default [64, 32] works well)
+   - Tune ``reward.lambda_entropy`` for exploration (0.5 is recommended)
 
 3. **Modify simulation script**: Adapt ``msld_flat.py`` for your system
    (force field, topology, equilibration protocol)
 
 4. **Adjust reward function**: Edit ``src/mllf/cb/train_improved.py::compute_msld_reward_improved``
-   to weight different simulation metrics (uses Penalty Shield and Confidence Factor)
+   to weight different simulation metrics
 
 5. **Run training**: Execute ``python run_workflow.py your_config.yaml``
 
@@ -255,22 +275,12 @@ This compares multiple reward configurations and identifies which yields
 the best separation between good and bad runs. The improved reward function
 includes:
 
-* **Penalty Shield**: Prevents double jeopardy on frozen simulations (0 transitions)
 * **Confidence Factor**: Scales population rewards by data reliability
 * **Tiered Penalties**: Continuous gradient feedback instead of binary thresholds
 
 You can then update ``workflow_sample.yaml`` with the best configuration
 (e.g., ``higher_rewards_v1``) and resume training—cached results will be
 automatically recomputed with the new reward parameters.
-
-**Example workflow**:
-
-1. Run 5 epochs with baseline configuration
-2. Test various reward configs on epoch 5 data
-3. Identify best configuration
-4. Update ``workflow_sample.yaml`` with best config
-5. Resume training—rewards recompute automatically
-6. Continue for remaining 45 epochs with optimized reward
 
 See Also
 --------

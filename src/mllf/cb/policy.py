@@ -137,11 +137,11 @@ class EdgePolicy(nn.Module):
         
         # Scale mean outputs to expected bias coefficient range using tanh
         # Different scaling factors per bias type: [linear, quadratic, skew, end]
-        # Based on analysis of 5,332 coefficients from 52 pretraining systems:
-        # Linear: ±79 (95th percentile=65.74), Quadratic: ±163 (95th=135.15)
-        # Skew: ±11 (95th=8.74), End: ±7 (95th=5.69)
+        # Based on filtered pretraining statistics (803 runs after reward + 2.5σ filtering):
+        # Linear: ±61.4 (95th percentile=51.16), Quadratic: ±70.5 (95th=58.74)
+        # Skew: ±6.6 (95th=5.48), End: ±3.6 (95th=2.98)
         # Each factor provides 95th percentile + 20% headroom for safety
-        scale_factors = torch.tensor([79.0, 163.0, 11.0, 7.0], device=mean.device)
+        scale_factors = torch.tensor([61.4, 70.5, 6.6, 3.6], device=mean.device)
         mean = torch.tanh(mean) * scale_factors.unsqueeze(0)
         
         # Clamp log_std to prevent extreme standard deviations that can cause NaN
@@ -178,8 +178,8 @@ class EdgePolicy(nn.Module):
             
             # CRITICAL: Clip sampled actions to intended ranges per bias type
             # Without this, exploration noise (std up to ~7.4) can produce extreme outliers
-            # Scale factors: [linear=79, quadratic=163, skew=11, end=7]
-            scale_factors = torch.tensor([79.0, 163.0, 11.0, 7.0], device=actions.device)
+            # Scale factors: [linear=61.4, quadratic=70.5, skew=6.6, end=3.6]
+            scale_factors = torch.tensor([61.4, 70.5, 6.6, 3.6], device=actions.device)
             # Add small margin (5%) to allow slight overshoot during exploration
             clip_limits = scale_factors * 1.05
             actions = torch.clamp(actions, -clip_limits.unsqueeze(0), clip_limits.unsqueeze(0))

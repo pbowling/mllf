@@ -70,6 +70,199 @@ def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=Non
     )
 
 
+def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None, warn_missing_types=True):
+    """Build fully-connected PyG graph for pretraining from saved variables.py.
+    
+    Unlike the standard graph builder which only creates edges for non-zero coefficients,
+    this function creates edges for ALL pairs within each site. This provides richer
+    training data for pretraining, especially for linear biases which can be estimated
+    for all pairs.
+    
+    **Key differences from standard graph builder:**
+    1. Creates ALL directed pairs within each site (O(N²) edges per site)
+    2. Computes linear coefficients correctly: linear_ij = b[j] - b[i]
+    3. Reads nonlinear coefficients from matrices (may be 0.0 for many pairs)
+    
+    **Why this helps pretraining:**
+    - More training data: ~10x more edges for typical systems
+    - Proper linear bias encoding: antisymmetric by construction
+    - Better gradient signal: model learns from all pairwise relationships
+    - Matches pairwise MLP approach: same data representation
+    
+    Args:
+        run_dir: Directory containing variables.py and graph_info.json
+        toppar_dir: Path to toppar directory (None uses package default)
+        toppar_files: List of specific toppar filenames to include
+        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+    
+    Returns:
+        Tuple of (data, targets, extras) where:
+        - data: PyG Data with fully-connected edges within each site
+        - targets: List of [linear, quadratic, skew, end] for each directed edge
+        - extras: Dict with relation_names, base_relation_map, etc.
+    """
+    import json
+    import yaml
+    from torch_geometric.data import Data
+    from mllf.cb import graph_utils
+    
+    run_dir = Path(run_dir)
+    
+    # Load graph_info.json to get node features and site structure
+    graph_info_path = run_dir / "graph_info.json"
+    if not graph_info_path.exists():
+        raise FileNotFoundError(f"graph_info.json not found in {run_dir}")
+    
+    with open(graph_info_path, 'r') as f:
+        graph_info = json.load(f)
+    
+    # Load node features using existing graph_utils
+    from mllf.cb.graph import Graph
+    g = Graph.from_graph_info(graph_info)
+    
+    # Build node features
+    data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
+        g, toppar_dir=toppar_dir, toppar_files=toppar_files, 
+        warn_missing_types=warn_missing_types
+    )
+    
+    # Extract site structure
+    nsubs_per_site = graph_info.get('nsubs_per_site', [])
+    if not nsubs_per_site:
+        # Compute from sites data (backward compatibility for old graph_info.json files)
+        from collections import defaultdict
+        site_counts = defaultdict(int)
+        sites_info = graph_info.get('sites', {})
+        for key, node_info in sites_info.items():
+            site = node_info.get('site')
+            if site is not None:
+                site_counts[site] += 1
+        if site_counts:
+            nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
+        else:
+            raise ValueError(f"Could not determine nsubs_per_site from graph_info.json in {run_dir}")
+    
+    # Load bias coefficients from variables.py
+    variables_path = run_dir / "variables.py"
+    if not variables_path.exists():
+        raise FileNotFoundError(f"variables.py not found in {run_dir}")
+    
+    with open(variables_path, 'r') as f:
+        content = f.read()
+    
+    # Extract YAML string
+    yaml_start = content.find('bias_string = """') + len('bias_string = """')
+    if yaml_start < len('bias_string = """'):
+        yaml_start = content.find('bias_string="""') + len('bias_string="""')
+    if yaml_start < len('bias_string="""'):
+        yaml_start = content.find("bias_string = '''") + len("bias_string = '''")
+    if yaml_start < len("bias_string = '''"):
+        yaml_start = content.find("bias_string='''") + len("bias_string='''")
+    
+    yaml_end = content.find('"""', yaml_start)
+    if yaml_end == -1:
+        yaml_end = content.find("'''", yaml_start)
+    
+    yaml_str = content[yaml_start:yaml_end]
+    bias_data = yaml.safe_load(yaml_str)
+    
+    # Extract bias matrices
+    b_list = bias_data['b']
+    if isinstance(b_list[0], list):
+        b_vector = np.array(b_list[0], dtype=float)
+    else:
+        b_vector = np.array(b_list, dtype=float)
+    
+    c_matrix = np.array(bias_data['c'], dtype=float)
+    x_matrix = np.array(bias_data['x'], dtype=float)
+    s_matrix = np.array(bias_data['s'], dtype=float)
+    
+    # Build directed pairs for ALL substituents within each site
+    from mllf.cb.graph_utils import build_directed_pairs
+    pairs = build_directed_pairs(nsubs_per_site)
+    
+    # Get relation names from extras
+    relation_names = extras['relation_names']
+    base_relation_map = extras['base_relation_map']
+    rel_to_idx = extras['relation_map']
+    
+    # Build edge_index, edge_type, and edge_attr for all pairs
+    src_list = []
+    dst_list = []
+    edge_type_list = []
+    edge_attr_list = []
+    
+    # For each directed pair, create edges for all 4 bias types
+    for (i, j) in pairs:
+        for bias in ['linear', 'quadratic', 'skew', 'end']:
+            fwd_name, bwd_name = base_relation_map[bias]
+            
+            # Determine which relation (fwd or bwd) this edge represents
+            # For i<j: use forward relation; for i>j: use backward relation
+            if i < j:
+                rel_name = fwd_name
+            else:
+                rel_name = bwd_name
+            
+            rel_idx = rel_to_idx[rel_name]
+            
+            src_list.append(i)
+            dst_list.append(j)
+            edge_type_list.append(rel_idx)
+            
+            # One-hot edge attribute
+            k = len(relation_names)
+            one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
+            one_hot[rel_idx] = 1.0
+            edge_attr_list.append(one_hot)
+    
+    # Create PyG Data object
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_type = torch.tensor(edge_type_list, dtype=torch.long)
+    edge_attr = torch.stack(edge_attr_list, dim=0) if edge_attr_list else torch.zeros((0, len(relation_names)), dtype=torch.get_default_dtype())
+    
+    data = Data(
+        x=data_sparse.x,  # Use node features from sparse graph
+        edge_index=edge_index,
+        edge_type=edge_type,
+        edge_attr=edge_attr
+    )
+    
+    # Build targets for each edge: [linear, quadratic, skew, end]
+    # Each edge should only predict its specific coefficient type
+    base_order = list(base_relation_map.keys())  # ['linear', 'quadratic', 'skew', 'end']
+    
+    targets = []
+    for (i, j) in pairs:
+        # Linear: b[j] - b[i] (proper antisymmetric conversion)
+        # This naturally gives antisymmetric values: linear_ji = b[i] - b[j] = -linear_ij
+        linear = float(b_vector[j] - b_vector[i])
+        
+        # Quadratic: Antisymmetric, only upper triangle stored
+        # If i < j: use c[i,j] directly
+        # If i > j: use -c[j,i] (negate the opposite direction)
+        if i < j:
+            quadratic = float(c_matrix[i, j])
+        else:
+            quadratic = -float(c_matrix[j, i])
+        
+        # Skew and End: NOT antisymmetric, both directions stored independently
+        skew = float(x_matrix[i, j])
+        end = float(s_matrix[i, j])
+        
+        # Create 4 edges per pair, each with ONLY its target coefficient
+        # Edge 0 (linear type): predict [linear, 0, 0, 0]
+        # Edge 1 (quadratic type): predict [0, quadratic, 0, 0]
+        # Edge 2 (skew type): predict [0, 0, skew, 0]
+        # Edge 3 (end type): predict [0, 0, 0, end]
+        targets.append([linear, 0.0, 0.0, 0.0])
+        targets.append([0.0, quadratic, 0.0, 0.0])
+        targets.append([0.0, 0.0, skew, 0.0])
+        targets.append([0.0, 0.0, 0.0, end])
+    
+    return data, targets, extras
+
+
 def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] = None) -> List[Dict]:
     """Filter runs to keep only the best run per unique system.
     
@@ -273,7 +466,7 @@ def compute_reward_from_sim_results(
     num_sites: int,
     nsubs_per_site: List[int],
     w_P: float = 0.5,
-    w_T: float = 0.5,
+    w_T: float = 0.75,
     w_U: float = 0.3,
     gamma: float = 4.0,
     P_baseline: float = 500.0,  # Updated to higher_rewards_v1 config
@@ -288,17 +481,18 @@ def compute_reward_from_sim_results(
     This implements the same logic as train_improved.py but works with cached
     simulation results instead of reading from output files.
     
-    **New Mechanisms (matches train_improved.py):**
-    - **Penalty Shield (I_dead)**: Disables coverage/concentration penalties when min_transitions = 0
-    - **Confidence Factor (C_F)**: Scales population reward by data reliability
+    **Confidence Factor (C_F)**: Scales population reward by data reliability
     
-    Uses a **tiered transition penalty system** to provide continuous feedback:
-    - **Tier 1: "Death Floor" (0 transitions)**: -40.0 penalty per site
-    - **Tier 2: "Climbing Ramp" (1-9 transitions)**: Linear gradient ~-30 to -8
-    - **Tier 3: "Success Zone" (≥10 transitions)**: Unlocks R_T reward
+    Uses a **graduated transition penalty system** to provide continuous feedback:
+    - **0 transitions**: -40.0 penalty (death floor - zero activity)
+    - **1 transition**: -32.0 penalty (very low activity)
+    - **2 transitions**: -24.0 penalty (very low activity)
+    - **3-9 transitions**: -2.0 - (2.0 × deficit) penalty (climbing ramp, ranges -16 to -4)
+    - **≥10 transitions**: 0.0 penalty, unlocks R_T reward (success zone)
     
-    Default parameters match the 'higher_rewards_v1' configuration which achieved
-    64.10 point separation in testing on indolizine runs (good: 34.11, bad: -29.99).
+    Default parameters match the updated reward configuration which achieved
+    improved gradient signal for low-transition runs (graduated penalties help
+    1-2 transition runs compared to uniform -40 penalty).
     
     Args:
         sim_results: Dict with 'populations' and 'transitions' keys
@@ -330,13 +524,13 @@ def compute_reward_from_sim_results(
             pop_list.append(counts[max_lambda])
     
     if not pop_list:
-        return -100.0 * gamma  # No population data
+        return -50.0  # No population data (capped at penalty limit)
     
     pop_array = np.array(pop_list, dtype=float)
     total_pop = pop_array.sum()
     
     if total_pop == 0:
-        return -100.0 * gamma  # No sampling occurred
+        return -50.0  # No sampling occurred (capped at penalty limit)
     
     # Extract transition counts per site (use only HIGHEST lambda value)
     trans_per_site = []
@@ -357,55 +551,78 @@ def compute_reward_from_sim_results(
     trans_array = np.array(trans_per_site[:num_sites], dtype=float)
     total_trans = trans_array.sum()
     
-    # Track minimum transitions across all sites for Penalty Shield and Confidence Factor
+    # Track minimum transitions across all sites for Confidence Factor
     min_transitions_across_sites = int(trans_array.min())
-    
-    # === PENALTY SHIELD (I_dead) ===
-    # Prevents "double jeopardy" by disabling secondary penalties when sim is frozen
-    I_dead = 1 if min_transitions_across_sites == 0 else 0
     
     # === STRICT REQUIREMENTS (penalties) ===
     # Match train_improved.py penalty calculation
     penalties = 0.0
     
-    # 1. Tiered transition penalty system
-    # Replaces binary threshold with continuous gradient feedback
+    # 1. Multi-site aware transition penalty system
+    # Apply base penalty once based on worst site, then add scaling for additional bad sites
+    # This prevents unfair accumulation when multiple sites are degenerate
     sites_below_threshold = 0
     
-    for site_idx, trans_count in enumerate(trans_array):
+    # Count sites below threshold
+    for trans_count in trans_array:
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-            
-            if trans_count == 0:
-                # Tier 1: "Death Floor" - worst possible state
-                penalties -= 40.0
-            elif trans_count < min_transitions_per_site:
-                # Tier 2: "Climbing Ramp" - linear gradient from ~-30 to -8
-                # Formula: -5.0 - (2.8 * deficit)
-                deficit = min_transitions_per_site - trans_count
-                penalties -= (5.0 + 2.8 * deficit)
+    
+    # Determine base penalty based on worst site (minimum transitions)
+    if min_transitions_across_sites == 0:
+        base_penalty = 40.0
+    elif min_transitions_across_sites == 1:
+        base_penalty = 32.0
+    elif min_transitions_across_sites == 2:
+        base_penalty = 24.0
+    elif min_transitions_across_sites < min_transitions_per_site:
+        # Tier 2: "Climbing Ramp" - softened gradient from ~-16 to -4
+        # Formula: -2.0 - (2.0 * deficit)
+        deficit = min_transitions_per_site - min_transitions_across_sites
+        base_penalty = 2.0 + 2.0 * deficit
+    else:
+        base_penalty = 0.0
+    
+    # Add multi-site degradation penalty if multiple sites are bad
+    # Each additional bad site beyond the first adds a smaller incremental penalty
+    if sites_below_threshold > 1:
+        multisite_penalty = (sites_below_threshold - 1) * 4.0
+        total_transition_penalty = base_penalty + multisite_penalty
+        penalties -= total_transition_penalty
+    elif sites_below_threshold == 1:
+        penalties -= base_penalty
     
     # 2. Coverage requirement (minimum % of substituents visited)
-    # ONLY applied when shield is INACTIVE (I_dead = 0)
     num_populated = np.count_nonzero(pop_array)
     total_subs = sum(nsubs_per_site)
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
     
-    if (1 - I_dead) and coverage_ratio < min_coverage_ratio:
-        deficit = min_coverage_ratio - coverage_ratio
-        penalties -= gamma * 20.0 * deficit
+    # Adaptive coverage requirement: scales with system size to encourage visiting multiple subs
+    # Formula: min_subs = 1 + 0.5*(total-1)
+    # Examples: 2 subs→1.5 (75%), 3 subs→2.0 (67%), 4 subs→2.5 (62.5%), 6 subs→3.5 (58%)
+    min_subs_required = 1.0 + 0.5 * (total_subs - 1) if total_subs > 1 else 0.5
+    adaptive_min_coverage = min_subs_required / total_subs if total_subs > 0 else 0.0
+    
+    # NO DOUBLE JEOPARDY: Don't penalize coverage if transitions are too low for reliable statistics
+    # Coverage is only meaningful when there are enough transitions to have statistical confidence
+    # Only apply coverage penalty if transitions are at or above the success threshold
+    if coverage_ratio < adaptive_min_coverage and min_transitions_across_sites >= min_transitions_per_site:
+        # System has sufficient transitions but poor coverage - penalize the sampling inefficiency
+        deficit = adaptive_min_coverage - coverage_ratio
+        penalty_scale = np.sqrt(total_subs) if total_subs > 1 else 1.0
+        penalties -= gamma * 20.0 * deficit / penalty_scale
     
     # 3. Concentration penalty (per-site check)
-    # ONLY applied when shield is INACTIVE (I_dead = 0)
     pop_idx = 0
     for site_idx, nsubs in enumerate(nsubs_per_site):
         site_pops = pop_array[pop_idx:pop_idx + nsubs]
         site_total = site_pops.sum()
         
-        if (1 - I_dead) and site_total > 0:
+        if site_total > 0:
             concentration_ratio = site_pops.max() / site_total
             if concentration_ratio > concentration_penalty_threshold:
-                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
+                # Reduced coefficient (2.0 instead of 5.0) to prevent excessive accumulation in multi-site systems
+                penalties -= gamma * 2.0 * (concentration_ratio - concentration_penalty_threshold)
         
         pop_idx += nsubs
     
@@ -463,14 +680,372 @@ def compute_reward_from_sim_results(
     
     # ========== PENALTY CLAMPING ==========
     # Prevent gradient explosion by capping maximum negative penalty
-    max_penalty = 50.0
+    # Increased from 50 to 60 to preserve gradient information with multi-site systems
+    max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
     
-    # Total reward (matching train_improved.py)
-    reward = R_P + R_T + R_U + R_entropy + penalties  # penalties are already negative
-    
+    # Completeness gate: if any substituent was never visited, replace the positive
+    # reward components with -0.01 so the total is always negative. Penalties are
+    # still added to preserve gradient signal (worse behaviour = more negative).
+    if num_populated < total_subs:
+        reward = -0.01 + penalties
+    else:
+        reward = R_P + R_T + R_U + R_entropy + penalties
+
     return reward
+
+
+def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """Compute mean and std dev for each bias coefficient type across all runs.
+    
+    Args:
+        runs: List of run dictionaries with run_dir paths
+    
+    Returns:
+        Dict with statistics per bias type:
+        {
+            'linear': {'mean': float, 'std': float, 'values': [...]},
+            'quadratic': {'mean': float, 'std': float, 'values': [...]},
+            'skew': {'mean': float, 'std': float, 'values': [...]},
+            'end': {'mean': float, 'std': float, 'values': [...]}
+        }
+    """
+    from collections import defaultdict
+    
+    # Collect all coefficient values by type
+    coeff_values = {
+        'linear': [],
+        'quadratic': [],
+        'skew': [],
+        'end': []
+    }
+    
+    print(f"Computing coefficient statistics across {len(runs)} runs...")
+    
+    for run in runs:
+        run_dir = run["run_dir"]
+        variables_path = run_dir / "variables.py"
+        
+        if not variables_path.exists():
+            continue
+        
+        try:
+            # Load bias coefficients
+            with open(variables_path, 'r') as f:
+                content = f.read()
+            
+            # Extract YAML
+            yaml_start = content.find('bias_string = """') + len('bias_string = """')
+            if yaml_start < len('bias_string = """'):
+                yaml_start = content.find('bias_string="""') + len('bias_string="""')
+            yaml_end = content.find('"""', yaml_start)
+            if yaml_end == -1:
+                continue
+            
+            yaml_content = content[yaml_start:yaml_end]
+            bias_data = yaml.safe_load(yaml_content)
+            
+            # Extract linear biases (b vector)
+            b = bias_data.get('b', [])
+            if isinstance(b, list):
+                for row in b:
+                    if isinstance(row, list):
+                        coeff_values['linear'].extend([abs(float(x)) for x in row if x != 0.0])
+                    else:
+                        val = float(row)
+                        if val != 0.0:
+                            coeff_values['linear'].append(abs(val))
+            
+            # Extract matrix coefficients
+            c_matrix = bias_data.get('c', [])
+            x_matrix = bias_data.get('x', [])
+            s_matrix = bias_data.get('s', [])
+            
+            for matrix, key in [(c_matrix, 'quadratic'), (x_matrix, 'skew'), (s_matrix, 'end')]:
+                if isinstance(matrix, list):
+                    for row in matrix:
+                        if isinstance(row, list):
+                            coeff_values[key].extend([abs(float(x)) for x in row if x != 0.0])
+        
+        except Exception as e:
+            continue
+    
+    # Compute statistics
+    stats = {}
+    for bias_type, values in coeff_values.items():
+        if len(values) > 0:
+            values_array = np.array(values)
+            stats[bias_type] = {
+                'mean': float(np.mean(values_array)),
+                'std': float(np.std(values_array)),
+                'median': float(np.median(values_array)),
+                'p95': float(np.percentile(values_array, 95)),
+                'max': float(np.max(values_array)),
+                'count': len(values)
+            }
+        else:
+            stats[bias_type] = {
+                'mean': 0.0,
+                'std': 0.0,
+                'median': 0.0,
+                'p95': 0.0,
+                'max': 0.0,
+                'count': 0
+            }
+    
+    # Print statistics
+    print("\n" + "="*80)
+    print("Coefficient Statistics Across All Runs")
+    print("="*80)
+    for bias_type, stat in stats.items():
+        print(f"{bias_type:12s}: mean={stat['mean']:7.2f}, std={stat['std']:7.2f}, "
+              f"p95={stat['p95']:7.2f}, max={stat['max']:7.2f}, n={stat['count']}")
+    print("="*80 + "\n")
+    
+    return stats
+
+
+def filter_runs_by_coefficient_range(
+    runs: List[Dict],
+    n_std: float = 3.0,
+    min_runs_to_compute_stats: int = 10
+) -> List[Dict]:
+    """Filter runs to exclude those with coefficients outside statistical range.
+    
+    Removes runs where ANY coefficient exceeds mean ± n_std for its type.
+    This filters out outlier runs that would dominate the loss during training.
+    
+    Args:
+        runs: List of run dictionaries
+        n_std: Number of standard deviations for threshold (default: 3.0)
+        min_runs_to_compute_stats: Minimum runs needed to compute statistics
+    
+    Returns:
+        Filtered list of runs
+    """
+    if len(runs) < min_runs_to_compute_stats:
+        print(f"Warning: Only {len(runs)} runs available, skipping statistical filtering")
+        return runs
+    
+    # Compute statistics across all runs
+    stats = compute_coefficient_statistics(runs)
+    
+    # Compute thresholds
+    thresholds = {}
+    print(f"Filtering thresholds (mean ± {n_std}σ):")
+    for bias_type, stat in stats.items():
+        threshold = stat['mean'] + n_std * stat['std']
+        thresholds[bias_type] = threshold
+        print(f"  {bias_type:12s}: ≤ {threshold:.2f}")
+    print()
+    
+    # Filter runs
+    filtered_runs = []
+    excluded_runs = []
+    
+    for run in runs:
+        run_dir = run["run_dir"]
+        variables_path = run_dir / "variables.py"
+        
+        if not variables_path.exists():
+            continue
+        
+        try:
+            # Load and parse coefficients
+            with open(variables_path, 'r') as f:
+                content = f.read()
+            
+            yaml_start = content.find('bias_string = """') + len('bias_string = """')
+            if yaml_start < len('bias_string = """'):
+                yaml_start = content.find('bias_string="""') + len('bias_string="""')
+            yaml_end = content.find('"""', yaml_start)
+            if yaml_end == -1:
+                continue
+            
+            yaml_content = content[yaml_start:yaml_end]
+            bias_data = yaml.safe_load(yaml_content)
+            
+            # Check all coefficients against thresholds
+            exceeds_threshold = False
+            violated_type = None
+            max_violation = 0.0
+            
+            # Check linear (b vector)
+            b = bias_data.get('b', [])
+            for row in (b if isinstance(b, list) else [b]):
+                vals = row if isinstance(row, list) else [row]
+                for val in vals:
+                    if val != 0.0 and abs(float(val)) > thresholds['linear']:
+                        exceeds_threshold = True
+                        violated_type = 'linear'
+                        max_violation = max(max_violation, abs(float(val)))
+                        break
+                if exceeds_threshold:
+                    break
+            
+            # Check matrices
+            if not exceeds_threshold:
+                for matrix_key, bias_type in [('c', 'quadratic'), ('x', 'skew'), ('s', 'end')]:
+                    matrix = bias_data.get(matrix_key, [])
+                    if isinstance(matrix, list):
+                        for row in matrix:
+                            if isinstance(row, list):
+                                for val in row:
+                                    if val != 0.0 and abs(float(val)) > thresholds[bias_type]:
+                                        exceeds_threshold = True
+                                        violated_type = bias_type
+                                        max_violation = max(max_violation, abs(float(val)))
+                                        break
+                            if exceeds_threshold:
+                                break
+                        if exceeds_threshold:
+                            break
+            
+            if exceeds_threshold:
+                excluded_runs.append((run_dir.parent.name, run_dir.name, violated_type, max_violation))
+            else:
+                filtered_runs.append(run)
+        
+        except Exception as e:
+            # On error, include the run (conservative approach)
+            filtered_runs.append(run)
+    
+    # Report results
+    print(f"\n{'='*80}")
+    print(f"Statistical Filtering Results (±{n_std}σ threshold)")
+    print(f"{'='*80}")
+    print(f"  Total runs: {len(runs)}")
+    print(f"  Kept: {len(filtered_runs)} ({100*len(filtered_runs)/len(runs):.1f}%)")
+    print(f"  Excluded: {len(excluded_runs)} ({100*len(excluded_runs)/len(runs):.1f}%)")
+    
+    if excluded_runs:
+        print(f"\n  Top 10 excluded runs:")
+        excluded_runs.sort(key=lambda x: x[3], reverse=True)
+        for system, run, bias_type, max_val in excluded_runs[:10]:
+            print(f"    {system:30s} {run:15s} ({bias_type:10s}: {max_val:.2f})")
+    
+    print(f"{'='*80}\n")
+    
+    return filtered_runs
+
+
+def filter_runs_by_reward(
+    runs: List[Dict],
+    min_reward: float = 0.0,
+) -> List[Dict]:
+    """Filter runs by minimum reward threshold.
+    
+    Computes reward for each run using compute_reward_from_sim_results() and
+    excludes runs below the threshold.
+    
+    Args:
+        runs: List of run dicts from load_pretraining_runs
+        min_reward: Minimum reward threshold (default: 0.0)
+    
+    Returns:
+        Filtered list of runs meeting reward threshold
+    """
+    from pathlib import Path
+    import json
+    
+    print(f"\n{'='*80}")
+    print(f"Reward Filtering (threshold: >= {min_reward})")
+    print(f"{'='*80}")
+    
+    filtered_runs = []
+    excluded_runs = []
+    error_counts = {}
+    
+    for run in runs:
+        try:
+            run_dir = Path(run['run_dir'])
+            
+            # Load simulation_results.json (note: not sim_results.json)
+            sim_results_path = run_dir / "simulation_results.json"
+            if not sim_results_path.exists():
+                # If no sim results, exclude the run
+                error_reason = "No simulation_results.json"
+                error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+                excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+                continue
+            
+            with open(sim_results_path, 'r') as f:
+                sim_results = json.load(f)
+            
+            # Load graph_info.json to get nsubs_per_site
+            graph_info_path = run_dir / "graph_info.json"
+            if not graph_info_path.exists():
+                error_reason = "No graph_info.json"
+                error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+                excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+                continue
+            
+            with open(graph_info_path, 'r') as f:
+                graph_info = json.load(f)
+            
+            # Extract nsubs_per_site from sites data (sites is a dict with block names as keys)
+            sites = graph_info.get('sites', {})
+            if not sites:
+                error_reason = "No sites in graph_info"
+                error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+                excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+                continue
+            
+            # Count substitutions per site
+            site_counts = {}
+            for block_name, block_data in sites.items():
+                site_num = block_data['site']
+                site_counts[site_num] = site_counts.get(site_num, 0) + 1
+            
+            num_sites = len(site_counts)
+            nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
+            
+            # Compute reward
+            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
+            
+            # Filter by threshold
+            if reward >= min_reward:
+                filtered_runs.append(run)
+            else:
+                excluded_runs.append((run_dir.parent.name, run_dir.name, reward, "Below threshold"))
+        
+        except Exception as e:
+            # On error, exclude the run (conservative approach for reward filtering)
+            error_reason = f"Error: {str(e)}"
+            error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
+            excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
+    
+    # Report results
+    print(f"  Total runs: {len(runs)}")
+    print(f"  Kept: {len(filtered_runs)} ({100*len(filtered_runs)/len(runs):.1f}%)")
+    print(f"  Excluded: {len(excluded_runs)} ({100*len(excluded_runs)/len(runs):.1f}%)")
+    
+    # Show error breakdown
+    if error_counts:
+        print(f"\n  Error breakdown:")
+        for error_reason, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {error_reason}: {count} runs")
+    
+    if excluded_runs:
+        # Show distribution of excluded runs
+        reward_excluded = [x for x in excluded_runs if isinstance(x[2], (int, float))]
+        if reward_excluded:
+            print(f"\n  Reward statistics for excluded runs:")
+            rewards = [x[2] for x in reward_excluded]
+            print(f"    Mean: {sum(rewards)/len(rewards):.2f}")
+            print(f"    Min: {min(rewards):.2f}")
+            print(f"    Max: {max(rewards):.2f}")
+        
+        print(f"\n  Top 10 excluded runs (by reward):")
+        # Sort by reward (descending) - show the "best" of the excluded runs
+        reward_excluded_sorted = sorted(reward_excluded, key=lambda x: x[2], reverse=True)
+        for system, run, reward, reason in reward_excluded_sorted[:10]:
+            print(f"    {system:30s} {run:15s} reward={reward:7.2f}")
+    
+    print(f"{'='*80}\n")
+    
+    return filtered_runs
 
 
 def pretrain_epoch(
@@ -483,6 +1058,7 @@ def pretrain_epoch(
     toppar_dir=None,
     toppar_files=None,
     warn_missing_types=True,
+    use_fully_connected=True,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -496,6 +1072,9 @@ def pretrain_epoch(
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+        use_fully_connected: If True, use fully-connected graph with all pairs within sites.
+                            If False, use sparse graph with only non-zero coefficient edges.
+                            Fully-connected provides more training data and proper linear bias encoding.
     
     Returns:
         Dict with epoch statistics
@@ -511,12 +1090,23 @@ def pretrain_epoch(
         
         # Build graph from saved data AND get target coefficients
         try:
-            data, targets, extras = build_graph_from_saved_data(
-                run_dir, 
-                toppar_dir=toppar_dir,
-                toppar_files=toppar_files,
-                warn_missing_types=warn_missing_types
-            )
+            if use_fully_connected:
+                # Use fully-connected graph for richer training data
+                data, targets, extras = build_fully_connected_graph_for_pretraining(
+                    run_dir, 
+                    toppar_dir=toppar_dir,
+                    toppar_files=toppar_files,
+                    warn_missing_types=warn_missing_types
+                )
+            else:
+                # Use sparse graph (only edges with non-zero coefficients)
+                data, targets, extras = build_graph_from_saved_data(
+                    run_dir, 
+                    toppar_dir=toppar_dir,
+                    toppar_files=toppar_files,
+                    warn_missing_types=warn_missing_types
+                )
+            
             data = data.to(device)
             
             # Targets contain the actual bias coefficients from successful run
@@ -553,6 +1143,11 @@ def pretrain_epoch(
         
         epoch_loss += mse_loss.item()
         num_updates += 1
+        
+        # Log high losses with run information
+        if mse_loss.item() > 500.0:
+            run_name = f"{run_dir.parent.name}/{run_dir.name}"
+            print(f"  ⚠️  HIGH LOSS: Run {run_idx+1}/{len(runs)} ({run_name}): loss={mse_loss.item():.2f}")
         
         if (run_idx + 1) % 10 == 0:
             avg_loss = epoch_loss / num_updates
@@ -600,6 +1195,11 @@ def pretrain_with_runs(
     epochs: int = 20,
     learning_rate: float = 1e-3,
     device: Optional[str] = None,
+    use_best_only: bool = False,
+    use_fully_connected: bool = True,
+    filter_outliers: bool = True,
+    outlier_std_threshold: float = 3.0,
+    min_reward_threshold: Optional[float] = None,
 ):
     """Run policy pretraining with provided runs.
     
@@ -610,6 +1210,13 @@ def pretrain_with_runs(
         epochs: Number of training epochs
         learning_rate: Learning rate
         device: Device ('cuda' or 'cpu'). If None, auto-detect.
+        use_best_only: If True, filter to best run per system. If False, use all valid runs.
+        use_fully_connected: If True (default), build fully-connected graphs with all pairs
+                            within sites for richer training data and proper linear bias encoding.
+                            If False, use sparse graphs with only non-zero coefficient edges.
+        filter_outliers: If True (default), exclude runs with coefficients outside statistical range
+        outlier_std_threshold: Number of standard deviations for outlier threshold (default: 3.0)
+        min_reward_threshold: If set, exclude runs with reward below this threshold (e.g., 5.0)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -626,20 +1233,43 @@ def pretrain_with_runs(
         print("Error: No valid runs found")
         return
     
-    # Filter to keep only best run per system for behavior cloning
-    # Use reward config from workflow yaml for consistent reward calculation
-    reward_config = config.get('reward', {})
-    print(f"\nFiltering {len(runs)} runs to keep only best per system...")
-    print(f"Using reward config: {reward_config}")
-    best_runs = filter_best_runs_per_system(runs, reward_config=reward_config)
-    print(f"Filtered to {len(best_runs)} best runs for training\n")
+    # Optionally filter to keep only best run per system for behavior cloning
+    if use_best_only:
+        # Use reward config from workflow yaml for consistent reward calculation
+        reward_config = config.get('reward', {})
+        print(f"\nFiltering {len(runs)} runs to keep only best per system...")
+        print(f"Using reward config: {reward_config}")
+        best_runs = filter_best_runs_per_system(runs, reward_config=reward_config)
+        print(f"Filtered to {len(best_runs)} best runs for training\n")
+        
+        if len(best_runs) == 0:
+            print("Error: No valid runs after filtering")
+            return
+        
+        # Update runs to use filtered best runs
+        runs = best_runs
+    else:
+        print(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
     
-    if len(best_runs) == 0:
-        print("Error: No valid runs after filtering")
-        return
+    # Optionally filter runs by minimum reward threshold (applied first)
+    if min_reward_threshold is not None:
+        print(f"\nApplying reward filtering (threshold: >= {min_reward_threshold})...")
+        runs = filter_runs_by_reward(runs, min_reward=min_reward_threshold)
+        
+        if len(runs) == 0:
+            print("Error: No runs remaining after reward filtering")
+            print("Try lowering min_reward_threshold or disable reward filtering")
+            return
     
-    # Update runs to use filtered best runs
-    runs = best_runs
+    # Optionally filter outlier runs based on coefficient statistics (applied second)
+    if filter_outliers:
+        print(f"\nApplying statistical filtering (±{outlier_std_threshold}σ threshold)...")
+        runs = filter_runs_by_coefficient_range(runs, n_std=outlier_std_threshold)
+        
+        if len(runs) == 0:
+            print("Error: No runs remaining after statistical filtering")
+            print("Try increasing outlier_std_threshold or set filter_outliers=False")
+            return
     
     # Extract toppar configuration
     vocab_config = config.get('vocabulary', {})
@@ -689,8 +1319,9 @@ def pretrain_with_runs(
         mlp_out_dim=len(sample_extras['relation_names']) // 2
     ).to(device)
     
+    # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
     optimizer = optim.Adam(
-        list(encoder.parameters()) + list(policy.parameters()),
+        policy.parameters(),
         lr=learning_rate
     )
     
@@ -714,7 +1345,8 @@ def pretrain_with_runs(
             encoder, policy, optimizer, runs, reward_config, device,
             toppar_dir=toppar_dir,
             toppar_files=toppar_files,
-            warn_missing_types=warn_missing_types
+            warn_missing_types=warn_missing_types,
+            use_fully_connected=use_fully_connected
         )
         
         print(f"  MSE Loss: {stats['loss']:.4f}")
@@ -815,6 +1447,33 @@ def main():
         default=None,
         help="Device to use (default: auto-detect)",
     )
+    parser.add_argument(
+        "--use-best-only",
+        action="store_true",
+        help="If set, filter to best run per system. Otherwise use all valid runs (default: use all)",
+    )
+    parser.add_argument(
+        "--use-sparse-graphs",
+        action="store_true",
+        help="If set, use sparse graphs (only non-zero coefficient edges). By default, uses fully-connected graphs with all pairs within sites for richer training data.",
+    )
+    parser.add_argument(
+        "--no-filter-outliers",
+        action="store_true",
+        help="If set, disable statistical filtering of outlier runs. By default, runs with coefficients outside ±N standard deviations are excluded.",
+    )
+    parser.add_argument(
+        "--outlier-std-threshold",
+        type=float,
+        default=3.0,
+        help="Number of standard deviations for outlier threshold (default: 3.0). Runs with any coefficient exceeding mean ± N*std are excluded.",
+    )
+    parser.add_argument(
+        "--min-reward-threshold",
+        type=float,
+        default=None,
+        help="Minimum reward threshold for filtering runs (e.g., 5.0). If set, only runs with reward >= threshold are used for pretraining.",
+    )
     
     args = parser.parse_args()
     
@@ -841,6 +1500,11 @@ def main():
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         device=args.device,
+        use_best_only=args.use_best_only,
+        use_fully_connected=not args.use_sparse_graphs,  # Default to fully-connected
+        filter_outliers=not args.no_filter_outliers,  # Default to True (filter enabled)
+        outlier_std_threshold=args.outlier_std_threshold,
+        min_reward_threshold=args.min_reward_threshold,
     )
 
 

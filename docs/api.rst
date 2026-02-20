@@ -19,6 +19,7 @@ Graph and CB Modules
 
    mllf.cb.graph
    mllf.cb.policy
+   mllf.cb.value_net
    mllf.cb.rgcn
    mllf.cb.graph_utils
 

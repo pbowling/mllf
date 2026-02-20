@@ -48,12 +48,14 @@ def find_run_directories(base_path: Path) -> List[Path]:
     
     if combo_dirs:
         # Generated combo structure - look for run_### inside each comb_###
+        # Exclude directories with _failed in name
         for combo_dir in combo_dirs:
-            run_dirs.extend([d for d in combo_dir.glob("run_*") if d.is_dir()])
+            run_dirs.extend([d for d in combo_dir.glob("run_*") if d.is_dir() and '_failed' not in d.name.lower()])
     else:
         # MSLD run structure - look for run# at base level
+        # Exclude directories with _failed in name
         run_dirs = list(base_path.glob("run*"))
-        run_dirs = [d for d in run_dirs if d.is_dir()]
+        run_dirs = [d for d in run_dirs if d.is_dir() and '_failed' not in d.name.lower()]
     
     # Sort numerically by extracting run number
     def get_run_num(p: Path) -> int:
@@ -165,6 +167,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
                 b_vector[idx] = float(value)
     
     # Fill c matrix from cs entries (quadratic coefficients)
+    # Note: Original format stores full matrix, not just upper triangle
     for key, value in old_data.get("cs", {}).items():
         match = re.match(r'cs(\d+)s(\d+)s(\d+)s(\d+)', key)
         if match:
@@ -173,7 +176,6 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
                 c_matrix[i][j] = float(value)
-                c_matrix[j][i] = float(value)  # Symmetric
     
     # Fill x matrix from xs entries (skew coefficients)
     for key, value in old_data.get("xs", {}).items():
@@ -187,6 +189,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
                 # Note: x is typically asymmetric
     
     # Fill s matrix from ss entries (end-state coefficients)
+    # Note: Original format stores full matrix, not just upper triangle
     for key, value in old_data.get("ss", {}).items():
         match = re.match(r'ss(\d+)s(\d+)s(\d+)s(\d+)', key)
         if match:
@@ -195,7 +198,6 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
                 s_matrix[i][j] = float(value)
-                s_matrix[j][i] = float(value)  # Symmetric
     
     return {
         "b": b_vector,
@@ -231,21 +233,24 @@ def convert_to_json_serializable(data: Any) -> Any:
         return data
 
 
-def parse_output_file(output_file: Path) -> Dict[str, Any]:
+def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
     """Parse population and transition data from output file.
     
     Uses existing file_handling utilities to parse CHARMM output.
+    Assumes normal termination unless '_failed' appears in run directory name.
     
     Args:
         output_file: Path to output file
+        run_dir: Path to run directory (used to check for _failed)
         
     Returns:
         Dict with 'populations', 'transitions', 'rates', and 'terminated_normally'
     """
     content = output_file.read_text()
     
-    # Check termination status
-    terminated = terminated_normally(content)
+    # Check termination status based on directory name
+    # Assume normal termination unless _failed in path
+    terminated = '_failed' not in str(run_dir).lower()
     
     # Parse populations using existing utility
     populations = parse_single_population(content)
@@ -308,16 +313,16 @@ def detect_solvent_state(run_dir: Path) -> str:
         run_dir: Path to run directory
         
     Returns:
-        Solvent state: "solvent", "vacuum", "protein", or "unknown"
+        Solvent state: 'solv', 'gas', 'protein', or 'unknown'
     """
     path_str = str(run_dir).lower()
     
-    if "solv" in path_str or "water" in path_str:
-        return "solvent"
-    elif "vac" in path_str:
-        return "vacuum"
-    elif "protein" in path_str or "prot" in path_str:
+    if "protein" in path_str or "prot" in path_str:
         return "protein"
+    elif "vac" in path_str or "vacuum" in path_str or "gas" in path_str:
+        return "gas"
+    elif "solv" in path_str or "water" in path_str or "aq" in path_str:
+        return "solv"
     else:
         return "unknown"
 
@@ -359,7 +364,7 @@ def collect_run_data(run_dir: Path, solvent_state: Optional[str] = None) -> Tupl
     if not output_file.exists():
         raise ValueError(f"output file not found in {run_dir}")
     
-    output_results = parse_output_file(output_file)
+    output_results = parse_output_file(output_file, run_dir)
     
     # Find prep directory - check local first, then parent (for generated combos)
     prep_path = run_dir / 'prep'
@@ -428,20 +433,27 @@ bias = yaml.safe_load(bias_string)
         json.dump(output_results, f, indent=2)
     
     # Write metadata
-    # Calculate total transitions (sum of all transition counts)
+    # Calculate total transitions (sum across sites, using only HIGHEST lambda value per site)
     total_trans = 0
     for trans_dict in output_results['transitions'].values():
         if isinstance(trans_dict, dict):
-            total_trans += sum(trans_dict.values())
+            # Use only the highest lambda value for this site
+            if trans_dict:
+                max_lambda = max(trans_dict.keys(), key=lambda x: float(x))
+                total_trans += trans_dict[max_lambda]
         else:
             total_trans += trans_dict
     
-    # Count populated blocks (blocks with non-zero counts)
+    # Count populated blocks (blocks with non-zero counts at HIGHEST lambda value)
     num_populated = 0
     for block_data in output_results['populations'].values():
         if isinstance(block_data, dict) and 'counts' in block_data:
-            if sum(block_data['counts'].values()) > 0:
-                num_populated += 1
+            counts = block_data['counts']
+            if counts:
+                # Use only the highest lambda value
+                max_lambda = max(counts.keys(), key=lambda x: float(x))
+                if counts[max_lambda] > 0:
+                    num_populated += 1
     
     # Count unique sites (extract site number from site#_sub# keys)
     unique_sites = set()

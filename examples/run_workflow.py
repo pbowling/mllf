@@ -22,8 +22,11 @@ from pathlib import Path
 import sys
 import yaml
 import torch
+import torch.nn.functional as F
 import numpy as np
 import json
+import subprocess
+import time
 from typing import Dict, List
 import re
 
@@ -34,6 +37,7 @@ from mllf.cli.workflow import (
 )
 from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy
+from mllf.cb.value_net import ValueNetwork
 from mllf.cb.train_improved import compute_msld_reward_improved
 from mllf.cb.workflow_utils import (
     load_manifest,
@@ -160,7 +164,9 @@ def ensure_combo_dir_exists(combo_path: Path, config: Dict) -> Path:
 def train_epoch(
     encoder: RGCNEncoder,
     policy: EdgePolicy,
+    value_network: ValueNetwork,
     optimizer: torch.optim.Optimizer,
+    value_optimizer: torch.optim.Optimizer,
     combos: List[str],
     epoch: int,
     config: Dict,
@@ -171,22 +177,26 @@ def train_epoch(
     Args:
         encoder: RGCN node encoder.
         policy: Edge-level policy network.
+        value_network: Value network for baseline estimation.
         optimizer: Optimizer for policy parameters.
+        value_optimizer: Optimizer for value network parameters.
         combos: List of combo directory paths.
         epoch: Current epoch number.
         config: Full config dict with simulation settings.
         device: Device for computation ('cpu' or 'cuda').
     
     Returns:
-        Dict with epoch statistics (loss, avg_reward, etc.).
+        Dict with epoch statistics (loss, avg_reward, value_loss, etc.).
     """
     import subprocess
     import time
     
     policy.train()
     encoder.train()
+    value_network.train()
     
     epoch_loss = 0.0
+    epoch_value_loss = 0.0
     epoch_rewards = []
     
     # Track submitted jobs for concurrent execution
@@ -221,7 +231,7 @@ def train_epoch(
                 cached_reward_config = cached.get('reward_config', {})
                 reward_changed = (
                     cached_reward_config.get('w_P') != reward_config.get('w_P', 0.5) or
-                    cached_reward_config.get('w_T') != reward_config.get('w_T', 0.5) or
+                    cached_reward_config.get('w_T') != reward_config.get('w_T', 0.75) or
                     cached_reward_config.get('w_U') != reward_config.get('w_U', 0.3) or
                     cached_reward_config.get('gamma') != reward_config.get('gamma', 4.0) or
                     cached_reward_config.get('P_baseline') != reward_config.get('P_baseline', 500.0) or
@@ -239,7 +249,7 @@ def train_epoch(
                     reward = compute_msld_reward_improved(
                         str(epoch_dir),
                         w_P=reward_config.get('w_P', 0.5),
-                        w_T=reward_config.get('w_T', 0.5),
+                        w_T=reward_config.get('w_T', 0.75),
                         w_U=reward_config.get('w_U', 0.3),
                         gamma=reward_config.get('gamma', 4.0),
                         P_baseline=reward_config.get('P_baseline', 500.0),
@@ -262,17 +272,31 @@ def train_epoch(
                 
                 # REINFORCE update: Recompute forward pass to get fresh gradients
                 try:
-                    data, targets, extras = build_data_and_targets_from_combo(str(combo_path))
+                    solvent_state = config.get('system', {}).get('solvent_state', None)
+                    data, targets, extras = build_data_and_targets_from_combo(str(combo_path), solvent_state=solvent_state)
                     data = data.to(device)
                     
-                    # Recompute logp with gradients enabled
+                    # Get node embeddings for value network
+                    node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
+                    
+                    # Compute value network baseline
+                    predicted_value = value_network(node_embeddings)
+                    advantage = reward - predicted_value.item()
+                    
+                    # Update value network (minimize MSE between prediction and actual reward)
+                    value_loss = F.mse_loss(predicted_value, torch.tensor([reward], dtype=torch.float32, device=device))
+                    value_optimizer.zero_grad()
+                    value_loss.backward()
+                    value_optimizer.step()
+                    epoch_value_loss += value_loss.item()
+                    
+                    # Policy update: Recompute forward pass with fresh gradients
+                    # (Note: Can't reuse node_embeddings from value network update due to backward())
+                    node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
                     _, logp_new, _, _ = policy.get_actions(
                         data.x, data.edge_index, data.edge_type, data.edge_attr,
                         deterministic=False
                     )
-                    
-                    baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
-                    advantage = reward - baseline
                     
                     policy_loss = -(logp_new.sum() * advantage)
                     
@@ -298,7 +322,8 @@ def train_epoch(
         
         # 1. Build graph from RTF fragments
         try:
-            data, targets, extras = build_data_and_targets_from_combo(str(combo_path))
+            solvent_state = config.get('system', {}).get('solvent_state', None)
+            data, targets, extras = build_data_and_targets_from_combo(str(combo_path), solvent_state=solvent_state)
             data = data.to(device)
         except Exception as e:
             print(f"  Error building graph: {e}")
@@ -337,7 +362,7 @@ def train_epoch(
 #SBATCH --cpus-per-task=1
 #SBATCH -p ada6000 --gres=gpu:1 
 #SBATCH --export=ALL
-#SBATCH --time=01:00:00
+#SBATCH --time=00:10:00
 
 module load charmm/charmm/c51a1
 
@@ -497,19 +522,32 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             
             # REINFORCE update: Recompute forward pass for this combo to get fresh gradients
             try:
-                data, targets, extras = build_data_and_targets_from_combo(str(jcombo_path))
+                solvent_state = config.get('system', {}).get('solvent_state', None)
+                data, targets, extras = build_data_and_targets_from_combo(str(jcombo_path), solvent_state=solvent_state)
                 data = data.to(device)
                 
-                # Recompute actions and logp with gradients enabled
+                # Get node embeddings for value network
+                node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
+                
+                # Compute value network baseline (learned, state-dependent)
+                predicted_value = value_network(node_embeddings)
+                advantage = reward - predicted_value.item()
+                
+                # Update value network (minimize MSE between prediction and actual reward)
+                value_loss = F.mse_loss(predicted_value, torch.tensor([reward], dtype=torch.float32, device=device))
+                value_optimizer.zero_grad()
+                value_loss.backward()
+                value_optimizer.step()
+                epoch_value_loss += value_loss.item()
+                
+                # Recompute forward pass for policy update (need fresh gradients, value net updated above)
+                node_embeddings = encoder(data.x, data.edge_index, data.edge_type)
                 _, logp_new, _, _ = policy.get_actions(
                     data.x, data.edge_index, data.edge_type, data.edge_attr,
                     deterministic=False
                 )
                 
-                # REINFORCE loss with current policy
-                baseline = np.mean(epoch_rewards) if len(epoch_rewards) > 1 else 0.0
-                advantage = reward - baseline
-                
+                # REINFORCE loss with learned baseline
                 policy_loss = -(logp_new.sum() * advantage)
                 
                 # Entropy regularization
@@ -543,10 +581,12 @@ python3 msld_flat.py --vars-file {variables_path.relative_to(combo_path)} --out-
             time.sleep(10)  # Wait before checking again
     
     avg_loss = epoch_loss / len(epoch_rewards) if epoch_rewards else 0.0
+    avg_value_loss = epoch_value_loss / len(epoch_rewards) if epoch_rewards else 0.0
     avg_reward = np.mean(epoch_rewards) if epoch_rewards else 0.0
     
     return {
         'loss': avg_loss,
+        'value_loss': avg_value_loss,
         'avg_reward': avg_reward,
         'num_combos': len(combos)
     }
@@ -660,7 +700,8 @@ def main():
     # Build sample graph to get dimensions
     sample_combo = train_combos[0]
     sample_combo_path = ensure_combo_dir_exists(Path(sample_combo), config)
-    sample_data, _, sample_extras = build_data_and_targets_from_combo(str(sample_combo_path))
+    solvent_state = config.get('system', {}).get('solvent_state', None)
+    sample_data, _, sample_extras = build_data_and_targets_from_combo(str(sample_combo_path), solvent_state=solvent_state)
     
     train_config = config.get('training', {})
     encoder_config = train_config.get('encoder', {})
@@ -681,14 +722,30 @@ def main():
         mlp_out_dim=len(sample_extras['relation_names']) // 2
     ).to(device)
     
+    # Initialize value network for learned baseline
+    value_config = train_config.get('value_network', {})
+    value_network = ValueNetwork(
+        emb_dim=encoder_config.get('out_dim', 32),
+        hidden_dims=value_config.get('hidden_dims', [64, 32])
+    ).to(device)
+    
     optimizer_config = train_config.get('optimizer', {})
+    # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
     optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(policy.parameters()),
+        policy.parameters(),
         lr=optimizer_config.get('lr', 0.001)
+    )
+    
+    # Separate optimizer for value network (typically uses higher LR)
+    value_lr = value_config.get('lr', optimizer_config.get('lr', 0.001) * 10)  # Default: 10x policy LR
+    value_optimizer = torch.optim.Adam(
+        value_network.parameters(),
+        lr=value_lr
     )
     
     print(f"Encoder: {sum(p.numel() for p in encoder.parameters())} params")
     print(f"Policy: {sum(p.numel() for p in policy.parameters())} params")
+    print(f"Value Network: {sum(p.numel() for p in value_network.parameters())} params")
     
     # Step 4: Load pretrained policy or resume from checkpoint
     output_config = config.get('output', {})
@@ -699,15 +756,8 @@ def main():
     pretrain_config = config.get('pretrain', {})
     pretrain_path = pretrain_config.get('model_path', None)
     
-    if pretrain_path and Path(pretrain_path).exists():
-        print(f"\n=== Loading pretrained policy: {pretrain_path} ===")
-        pretrained = torch.load(pretrain_path, map_location=device, weights_only=False)
-        encoder.load_state_dict(pretrained['encoder_state'])
-        policy.load_state_dict(pretrained['policy_state'])
-        print(f"Loaded pretrained policy from epoch {pretrained.get('epoch', 'unknown')}")
-        if 'avg_reward' in pretrained:
-            print(f"Pretraining avg reward: {pretrained['avg_reward']:.4f}")
-    elif checkpoint_dir.exists():
+    # Check for checkpoints FIRST (priority: resume > pretrain)
+    if checkpoint_dir.exists():
         # Find the latest checkpoint
         checkpoints = sorted(checkpoint_dir.glob('checkpoint_epoch_*.pt'))
         if checkpoints:
@@ -717,8 +767,23 @@ def main():
             encoder.load_state_dict(checkpoint['encoder_state'])
             policy.load_state_dict(checkpoint['policy_state'])
             optimizer.load_state_dict(checkpoint['optimizer_state'])
+            # Load value network if present (backward compatibility)
+            if 'value_network_state' in checkpoint:
+                value_network.load_state_dict(checkpoint['value_network_state'])
+                value_optimizer.load_state_dict(checkpoint['value_optimizer_state'])
+                print(f"Loaded value network from checkpoint")
             start_epoch = checkpoint['epoch']
             print(f"Resuming from epoch {start_epoch}")
+    elif pretrain_path and Path(pretrain_path).exists():
+        # Fall back to pretrained policy if no checkpoints found
+        print(f"\n=== Loading pretrained policy: {pretrain_path} ===")
+        pretrained = torch.load(pretrain_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(pretrained['encoder_state'])
+        policy.load_state_dict(pretrained['policy_state'])
+        # Value network starts fresh (no pretraining needed)
+        print(f"Loaded pretrained policy from epoch {pretrained.get('epoch', 'unknown')}")
+        if 'avg_reward' in pretrained:
+            print(f"Pretraining avg reward: {pretrained['avg_reward']:.4f}")
     
     # Step 5: Training loop
     print("\n=== Training ===")
@@ -737,6 +802,7 @@ def main():
     all_stats = []
     current_stage_idx = 0
     current_stage_epoch = 0
+    active_archive_jobs = []  # Track background archive processes
     
     # Determine active combinations for curriculum
     if curriculum_enabled:
@@ -794,6 +860,54 @@ def main():
                     can_advance = True
                 
                 if can_advance and current_stage_idx + 1 < len(stages):
+                    # Archive completed stage if per-stage archiving is enabled
+                    archive_config = config.get('archive', {})
+                    if archive_config.get('enabled', False) and archive_config.get('per_stage', False):
+                        prev_stage_name = stages[current_stage_idx]['name']
+                        print(f"\n=== Archiving Stage {current_stage_idx + 1}: {prev_stage_name} ===")
+                        
+                        # Create stage-specific archive directory
+                        base_archive_dir = Path(archive_config.get('archive_dir', 'archives'))
+                        stage_archive_dir = base_archive_dir / f"stage_{current_stage_idx + 1}_{prev_stage_name}"
+                        stage_archive_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        # Get combination names for this stage
+                        combo_names = [combo['name'] for combo in active_train_combos]
+                        print(f"  Archiving {len(combo_names)} combinations from stage '{prev_stage_name}'")
+                        
+                        # Create bash script to archive each combination
+                        archive_script = stage_archive_dir / 'archive_stage.sh'
+                        with open(archive_script, 'w') as f:
+                            f.write("#!/bin/bash\n")
+                            f.write(f"# Archive script for stage {current_stage_idx + 1}: {prev_stage_name}\n")
+                            f.write(f"cd {Path.cwd()}\n\n")
+                            
+                            for combo_name in combo_names:
+                                combo_dir = Path(config['output']['base_dir']) / combo_name
+                                if combo_dir.exists():
+                                    tar_file = stage_archive_dir / f"{combo_name}.tar.gz"
+                                    f.write(f"echo 'Archiving {combo_name}...'\n")
+                                    f.write(f"tar -czf {tar_file} -C {combo_dir.parent} {combo_dir.name}\n")
+                                    if archive_config.get('remove_after', False):
+                                        f.write(f"rm -rf {combo_dir}\n")
+                                    f.write(f"echo '  -> {tar_file}'\n\n")
+                        
+                        # Make script executable and run in background
+                        archive_script.chmod(0o755)
+                        log_file = stage_archive_dir / 'archive.log'
+                        print(f"  Launching background archive job, logging to {log_file}")
+                        
+                        with open(log_file, 'w') as log:
+                            archive_proc = subprocess.Popen(
+                                ['bash', str(archive_script)],
+                                stdout=log,
+                                stderr=subprocess.STDOUT,
+                                cwd=Path.cwd()
+                            )
+                        
+                        active_archive_jobs.append((archive_proc, prev_stage_name, stage_archive_dir))
+                        print(f"  Archive job started (PID: {archive_proc.pid})")
+                    
                     # Advance to next stage
                     current_stage_idx += 1
                     current_stage_epoch = 1
@@ -845,13 +959,14 @@ def main():
         
         # Train on active training set
         stats = train_epoch(
-            encoder, policy, optimizer,
+            encoder, policy, value_network, optimizer, value_optimizer,
             active_train_combos, epoch, epoch_config, device
         )
         all_stats.append(stats)
         
         print(f"Epoch {epoch+1} Stats:")
         print(f"  Loss: {stats['loss']:.4f}")
+        print(f"  Value Loss: {stats['value_loss']:.4f}")
         print(f"  Avg Reward: {stats['avg_reward']:.4f}")
         
         # Save checkpoint
@@ -866,16 +981,34 @@ def main():
                     'epoch': epoch + 1,
                     'encoder_state': encoder.state_dict(),
                     'policy_state': policy.state_dict(),
+                    'value_network_state': value_network.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
+                    'value_optimizer_state': value_optimizer.state_dict(),
                     'stats': stats,
                 }, checkpoint_path)
                 print(f"  Saved checkpoint to {checkpoint_path}")
     
     print("\n=== Training Complete ===")
     
-    # Step 6: Archive combinations if requested
+    # Wait for any background archive jobs to complete
+    if active_archive_jobs:
+        print("\n=== Waiting for Background Archive Jobs ===")
+        for proc, stage_name, archive_dir in active_archive_jobs:
+            print(f"  Waiting for stage '{stage_name}' archive (PID: {proc.pid})...")
+            try:
+                proc.wait(timeout=300)  # Wait up to 5 minutes
+                if proc.returncode == 0:
+                    print(f"    ✓ Stage '{stage_name}' archived successfully")
+                else:
+                    print(f"    ✗ Stage '{stage_name}' archive failed (exit code: {proc.returncode})")
+                print(f"    Log: {archive_dir}/archive.log")
+            except subprocess.TimeoutExpired:
+                print(f"    ⚠ Stage '{stage_name}' archive still running (continuing anyway)")
+                proc.terminate()
+    
+    # Step 6: Archive combinations if requested (final archive for non-curriculum or per_stage=false)
     archive_config = config.get('archive', {})
-    if archive_config.get('enabled', False):
+    if archive_config.get('enabled', False) and not archive_config.get('per_stage', False):
         print("\n=== Archiving Combinations ===")
         from mllf.file_handling.generate_combinations import archive_combo_dirs
         import shutil
