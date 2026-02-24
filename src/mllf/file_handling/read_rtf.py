@@ -27,10 +27,11 @@ FNAME_RE = re.compile(r'site(\d+)_sub(\d+)', re.IGNORECASE)
 def parse_rtf_file(path: str) -> Dict[str, object]:
 	"""Parse a single RTF/PRES fragment file and return extracted info.
 
-	Returns a dict: {"site": int, "sub": int, "atom_types": [str], "total_charge": float}
+	Returns a dict: {"site": int, "sub": int, "atom_types": [str], "charges": [float], "total_charge": float}
 	If the filename doesn't contain site/sub, site/sub will be None.
 	"""
 	atom_types: List[str] = []
+	charges: List[float] = []
 	total_charge = 0.0
 
 	# try to extract site/sub from filename
@@ -47,7 +48,9 @@ def parse_rtf_file(path: str) -> Dict[str, object]:
 			atom_type, charge_str = mo.groups()
 			atom_types.append(atom_type)
 			try:
-				total_charge += float(charge_str)
+				charge = float(charge_str)
+				charges.append(charge)
+				total_charge += charge
 			except ValueError:
 				# ignore unparsable charges
 				continue
@@ -60,6 +63,7 @@ def parse_rtf_file(path: str) -> Dict[str, object]:
 		"site": site,
 		"sub": sub,
 		"atom_types": atom_types,
+		"charges": charges,
 		"total_charge": total_charge,
 		"filename": basename,
 		"filepath": path,

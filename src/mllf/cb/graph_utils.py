@@ -3,10 +3,178 @@
 This module is intentionally defensive: it will try to import the project's
 Graph class and fall back to handling networkx-like graph objects.
 """
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 import torch
+import os
+import warnings
 from torch_geometric.data import Data
 from .atom_vocab import get_atom_type_vocab
+
+
+def compute_deepset_embedding_for_node(
+    node_idx: int,
+    g,
+    deepset_model,
+    pdb_dir: str,
+    pdb_pattern: str = "site{site}_sub{sub}.pdb",
+    rtf_results: Optional[Dict] = None,
+    prep_dir: Optional[str] = None,
+    protein_pdb: Optional[str] = None,
+    solvent_state: Optional[str] = None,
+    aev_cutoff: float = 5.1
+):
+    """Compute DeepSet embedding for a single node/substituent.
+    
+    This implements Steps 1-3 of the 4-step pipeline:
+    1. Extract atom-level features (AEV + charge + atom_id) from PDB
+    2. Pass through shared MLP
+    3. Max-pool to get fixed-size substituent embedding
+    
+    For multi-site systems, when prep_dir is provided, this uses spatial filtering
+    to include reference substituents from other sites and protein atoms within
+    the AEV cutoff distance for accurate molecular context.
+    
+    Args:
+        node_idx: Node index in graph
+        g: Graph object with node metadata
+        deepset_model: Trained DeepSetFeatureExtractor model
+        pdb_dir: Directory containing PDB files
+        pdb_pattern: Pattern for PDB filenames (default: "site{site}_sub{sub}.pdb")
+        rtf_results: Optional dict of RTF parsed data for extracting charges
+        prep_dir: Optional prep directory for multi-site spatial filtering
+        protein_pdb: Optional protein PDB file path (for protein phase systems)
+        solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
+        aev_cutoff: Distance cutoff in Angstroms for spatial filtering (default: 5.1 Å)
+        
+    Returns:
+        torch.Tensor: [embedding_dim] substituent embedding
+    """
+    from .aev_processor import get_atom_features, get_atom_features_with_context
+    from pathlib import Path
+    
+    # Get node metadata
+    node_info = g.get_node_info(node_idx) if hasattr(g, 'get_node_info') else {}
+    site = node_info.get('site')
+    sub = node_info.get('sub')
+    
+    if site is None or sub is None:
+        raise ValueError(f"Node {node_idx} missing site or sub metadata")
+    
+    # Construct PDB paths
+    pdb_filename = pdb_pattern.format(site=site, sub=sub)
+    pdb_path = os.path.join(pdb_dir, pdb_filename)
+    
+    if not os.path.exists(pdb_path):
+        raise FileNotFoundError(f"PDB file not found: {pdb_path}")
+    
+    # Get RTF entry for charges if available
+    rtf_entry = None
+    if rtf_results is not None:
+        rtf_key = f"site{site}_sub{sub}"
+        rtf_entry = rtf_results.get(rtf_key)
+    
+    # Determine if we should use context-aware AEV computation
+    use_context = prep_dir is not None
+    
+    if use_context:
+        # Look for core.pdb in prep directory
+        prep_path = Path(prep_dir)
+        core_pdb = prep_path / "core.pdb"
+        
+        if not core_pdb.exists():
+            warnings.warn(f"core.pdb not found in {prep_dir}, falling back to single-PDB AEV computation")
+            use_context = False
+        else:
+            # Check for protein PDB if solvent_state is 'protein'
+            if protein_pdb is None and solvent_state == 'protein':
+                default_protein_pdb = prep_path / "protein.pdb"
+                if default_protein_pdb.exists():
+                    protein_pdb = str(default_protein_pdb)
+                    warnings.warn(f"Using protein.pdb from prep directory for AEV spatial filtering")
+                else:
+                    warnings.warn(
+                        f"solvent_state is 'protein' but no protein PDB found. "
+                        f"Specify protein_pdb in config or add protein.pdb to prep directory."
+                    )
+            
+            # Extract atom-level features with context (Steps 1)
+            atom_feats = get_atom_features_with_context(
+                substituent_pdb=pdb_path,
+                core_pdb=str(core_pdb),
+                protein_pdb=protein_pdb,
+                rtf_entry=rtf_entry,
+                include_charges=deepset_model.include_charge,
+                include_atom_ids=deepset_model.include_atom_id,
+                prep_dir=prep_dir,
+                aev_cutoff=aev_cutoff
+            )
+    
+    if not use_context:
+        # Extract atom-level features (Step 1) - single PDB
+        atom_feats = get_atom_features(
+            pdb_path,
+            rtf_entry=rtf_entry,
+            include_charges=deepset_model.include_charge,
+            include_atom_ids=deepset_model.include_atom_id
+        )
+    
+    # Pass through DeepSet model (Steps 2-3: MLP + max-pool)
+    with torch.no_grad():
+        embedding = deepset_model(
+            aev_tensor=atom_feats['aevs'],
+            charges=atom_feats.get('charges'),
+            atom_ids=atom_feats.get('atom_ids')
+        )
+    
+    return embedding
+
+
+def compute_deepset_embeddings_for_graph(
+    g,
+    deepset_model,
+    pdb_dir: str,
+    pdb_pattern: str = "site{site}_sub{sub}.pdb",
+    rtf_results: Optional[Dict] = None,
+    prep_dir: Optional[str] = None,
+    protein_pdb: Optional[str] = None,
+    solvent_state: Optional[str] = None,
+    aev_cutoff: float = 5.1
+) -> torch.Tensor:
+    """Compute DeepSet embeddings for all nodes in a graph.
+    
+    Args:
+        g: Graph object with node metadata
+        deepset_model: Trained DeepSetFeatureExtractor model
+        pdb_dir: Directory containing PDB files
+        pdb_pattern: Pattern for PDB filenames
+        rtf_results: Optional dict of RTF parsed data
+        prep_dir: Optional prep directory for multi-site spatial filtering
+        protein_pdb: Optional protein PDB file path (for protein phase systems)
+        solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
+        aev_cutoff: Distance cutoff in Angstroms for spatial filtering (default: 5.1 Å)
+        
+    Returns:
+        torch.Tensor: [num_nodes, embedding_dim] embeddings for all substituents
+    """
+    embeddings = []
+    
+    for node_idx in range(g.num_nodes):
+        try:
+            embedding = compute_deepset_embedding_for_node(
+                node_idx, g, deepset_model, pdb_dir, pdb_pattern, rtf_results,
+                prep_dir=prep_dir,
+                protein_pdb=protein_pdb,
+                solvent_state=solvent_state,
+                aev_cutoff=aev_cutoff
+            )
+            embeddings.append(embedding)
+        except Exception as e:
+            warnings.warn(f"Failed to compute DeepSet embedding for node {node_idx}: {e}")
+            # Use zero embedding as fallback
+            embedding_dim = deepset_model.atom_mlp[-1].out_features
+            embeddings.append(torch.zeros(embedding_dim))
+    
+    return torch.stack(embeddings, dim=0)
 
 
 def build_directed_pairs(nsubs_per_site: List[int]) -> List[Tuple[int, int]]:
@@ -48,8 +216,8 @@ def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vo
     """Create a numeric vector from node metadata.
 
     Expected keys in meta: 
-    - 'total_charge' (float)
-    - 'solvent' (str: 'solvent'/'solv' or 'protein')
+    - 'total_charge' (float) - from RTF file, summed over all atoms
+    - 'solvent' (str: 'solvent'/'solv' or 'protein') - environmental context
     - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61', 'CG2R61'])
     
     The function returns a 1-D torch.float tensor with features:
@@ -106,20 +274,45 @@ def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vo
     return torch.tensor(base_features, dtype=torch.get_default_dtype())
 
 
-def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: Optional[str] = None, toppar_files: list = None, warn_missing_types: bool = True) -> Tuple[object, dict]:
+def build_pyg_graph_from_mllf_graph(
+    g, 
+    relation_names: list = None, 
+    toppar_dir: Optional[str] = None, 
+    toppar_files: list = None, 
+    warn_missing_types: bool = True,
+    deepset_model = None,
+    pdb_dir: Optional[str] = None,
+    pdb_pattern: str = "site{site}_sub{sub}.pdb",
+    rtf_results: Optional[Dict] = None,
+    use_deepset_only: bool = False,
+    prep_dir: Optional[str] = None,
+    protein_pdb: Optional[str] = None,
+    solvent_state: Optional[str] = None,
+    aev_cutoff: float = 5.1
+) -> Tuple[object, dict]:
     """Convert a Graph-like object `g` into a PyG Data object and metadata.
 
     We expand each undirected graph edge into up to four directed relation edges,
     one per bias type. The default `relation_names` is ['linear','quadratic','skew','end'].
     
-    Node features are constructed from metadata and include:
-    - Charge, environment type (solvent/protein)
-    - Element one-hot encoding (which elements are present, e.g., C, H, N, O)
-    - Atom type one-hot encoding (which specific CHARMM types are present)
+    Node features are constructed from metadata. There are three modes:
+    
+    1. Standard mode (deepset_model=None):
+       - Charge, environment type (solvent/protein)
+       - Element count encoding (coarse chemical composition)
+       - Atom type count encoding (fine CHARMM type composition)
+       
+    2. DeepSet augmented mode (deepset_model provided, use_deepset_only=False):
+       - DeepSet substituent embedding (from 3D atomic structure + charges)
+       - Concatenated with environmental features: is_solvent, is_protein
+       - This implements Step 4 of the 4-step pipeline
+       - Note: charge is NOT duplicated since it's already in DeepSet input
+       
+    3. DeepSet only mode (deepset_model provided, use_deepset_only=True):
+       - Only DeepSet substituent embeddings
+       - No additional global features
     
     The vocabularies are loaded from CHARMM CGenFF toppar file by default.
-    This provides both coarse-grained (element) and fine-grained (atom type) chemical information
-    while being more efficient than a single large multi-hot encoding.
 
     Args:
         g: Graph object with node metadata
@@ -128,6 +321,15 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         toppar_files: List of specific toppar filenames to include.
                      Default: ['top_all36_cgenff.rtf'] (CGenFF only)
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+        deepset_model: Optional DeepSetFeatureExtractor model for 3D structural features
+        pdb_dir: Directory containing PDB files (required if deepset_model provided)
+        pdb_pattern: Pattern for PDB filenames (default: "site{site}_sub{sub}.pdb")
+        rtf_results: Optional dict of RTF parsed data for charge extraction
+        use_deepset_only: If True, only use DeepSet embeddings without global features
+        prep_dir: Optional prep directory for multi-site spatial filtering
+        protein_pdb: Optional protein PDB file path (for protein phase systems)
+        solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
+        aev_cutoff: Distance cutoff in Angstroms for spatial filtering (default: 5.1 Å)
 
     Returns (pyg_data, extras) where extras contain:
         - relation_names: List of all relation type names
@@ -135,6 +337,7 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         - base_relation_map: Dict mapping base types to (fwd, bwd) relation names
         - atom_type_vocab: Dict mapping atom type strings to feature indices
         - element_vocab: Dict mapping element symbols to feature indices
+        - deepset_dim: Dimension of DeepSet embeddings (if used)
     """
 
     if relation_names is None:
@@ -180,11 +383,47 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
                 UserWarning
             )
     
-    # collect node features with element and atom type encoding
+    # collect node features
     node_feats = []
+    deepset_embeddings = None
+    
+    # Compute DeepSet embeddings if model provided
+    if deepset_model is not None:
+        if pdb_dir is None:
+            raise ValueError("pdb_dir must be provided when using deepset_model")
+        
+        deepset_embeddings = compute_deepset_embeddings_for_graph(
+            g, deepset_model, pdb_dir, pdb_pattern, rtf_results,
+            prep_dir=prep_dir,
+            protein_pdb=protein_pdb,
+            solvent_state=solvent_state,
+            aev_cutoff=aev_cutoff
+        )
+    
+    # Build node features
     for i in range(g.num_nodes):
         meta = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
-        node_feats.append(_node_feature_from_meta(meta, atom_type_vocab, element_vocab, atom_to_element))
+        
+        if deepset_model is not None:
+            if use_deepset_only:
+                # Mode 3: Only DeepSet embeddings
+                node_feats.append(deepset_embeddings[i])
+            else:
+                # Mode 2: DeepSet + global features (charge, solvent, protein)
+                # Extract only the global state features (first 3: charge, is_solvent, is_protein)
+                charge = float(meta.get('total_charge', 0.0))
+                solvent_str = (meta.get('solvent', '') or '').lower()
+                is_solvent = 1.0 if solvent_str in ('solvent', 'solv', 'water', 'aq', 'sol') else 0.0
+                is_protein = 1.0 if solvent_str in ('protein', 'prot') else 0.0
+                global_features = torch.tensor([charge, is_solvent, is_protein], dtype=torch.get_default_dtype())
+                
+                # Concatenate DeepSet embedding with global features
+                combined = torch.cat([deepset_embeddings[i], global_features], dim=0)
+                node_feats.append(combined)
+        else:
+            # Mode 1: Standard count-based encoding
+            node_feats.append(_node_feature_from_meta(meta, atom_type_vocab, element_vocab, atom_to_element))
+    
     x = torch.stack(node_feats, dim=0)
 
     # expand edges: for each undirected (i,j) and for each bias that is allowed.
@@ -287,4 +526,12 @@ def build_pyg_graph_from_mllf_graph(g, relation_names: list = None, toppar_dir: 
         'element_vocab': element_vocab,
         'atom_to_element': atom_to_element,
     }
+    
+    # Add DeepSet info if used
+    if deepset_model is not None:
+        deepset_dim = deepset_model.atom_mlp[-1].out_features
+        extras['deepset_dim'] = deepset_dim
+        extras['use_deepset_only'] = use_deepset_only
+        extras['node_feature_dim'] = deepset_dim if use_deepset_only else deepset_dim + 3
+    
     return data, extras
