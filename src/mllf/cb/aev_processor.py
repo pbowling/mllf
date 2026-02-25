@@ -27,8 +27,32 @@ ELEMENT_TO_ID = {
 NUM_SPECIES = 11  # 10 common elements + 1 unknown
 
 
-# Initialize the computer with ANI-2x spatial grids, but with 13 species (all CGenFF elements)
+# Initialize the computer with ANI-2x spatial grids, but with 11 species
 aev_computer = AEVComputer.like_2x(num_species=NUM_SPECIES)
+
+
+def map_element_to_species_id(element: str, warn_rare: bool = True) -> int:
+    """Map element symbol to species ID with appropriate warnings.
+    
+    This is a helper function to centralize the element-to-ID mapping logic
+    and avoid code duplication throughout the module.
+    
+    Args:
+        element: Element symbol (e.g., 'C', 'H', 'Cl')
+        warn_rare: Whether to warn about rare elements (default: True)
+        
+    Returns:
+        Species ID (integer 0-10)
+    """
+    if element not in ELEMENT_TO_ID:
+        warnings.warn(f"Element {element} not in ELEMENT_TO_ID mapping, using H as fallback")
+        return ELEMENT_TO_ID['H']
+    
+    # Warn if rare element is being mapped to unknown
+    if warn_rare and element in ['Al', 'B', 'Se']:
+        warnings.warn(f"Rare element {element} mapped to 'X' (unknown) - AEV may be less accurate")
+    
+    return ELEMENT_TO_ID[element]
 
 
 def extract_charges_from_pdb(pdb_path):
@@ -85,44 +109,68 @@ def extract_charges_from_rtf_metadata(rtf_entry):
     return torch.tensor(charges, dtype=torch.float32)
 
 
-def get_substituent_aevs(pdb_path):
+def get_substituent_aevs(pdb_path, validate_with_rtf=True):
     """Compute AEVs for all atoms in a substituent PDB file.
+    
+    Uses CHARMM-format PDB parser as primary method (handles PDB files without
+    element columns), with RDKit as fallback for standard PDB files.
     
     Args:
         pdb_path: Path to substituent PDB file
+        validate_with_rtf: If True, cross-validate element identification with CGenFF
+                          atom types from RTF file (default: True)
         
     Returns:
         torch.Tensor: [num_atoms, aev_length] AEV vectors
     """
-    mol = Chem.MolFromPDBFile(pdb_path, removeHs=False)
-    if mol is None:
-        raise ValueError(f"Could not read molecule from {pdb_path}")
+    # Try CHARMM-format parsing first (handles MSLD prep directory PDB files)
+    try:
+        # Try to load RTF data for validation if requested
+        rtf_data = None
+        if validate_with_rtf:
+            from mllf.file_handling.read_rtf import parse_rtf_file
+            pdb_path_obj = Path(pdb_path)
+            rtf_path = pdb_path_obj.parent / pdb_path_obj.name.replace('_frag.pdb', '_pres.rtf')
+            if rtf_path.exists():
+                try:
+                    rtf_data = parse_rtf_file(str(rtf_path))
+                except Exception as e:
+                    warnings.warn(f"Could not parse RTF file {rtf_path} for validation: {e}")
+        
+        coords_list, elements_list = parse_pdb_file(str(pdb_path), rtf_data=rtf_data)
+        
+        if not coords_list or not elements_list:
+            raise ValueError(f"No atoms found in {pdb_path}")
+        
+        # Map elements to species IDs
+        element_ids = [map_element_to_species_id(element) for element in elements_list]
+        
+        # Convert to tensors
+        species_tensor = torch.tensor(element_ids, dtype=torch.long).unsqueeze(0)
+        coordinates_tensor = torch.tensor(coords_list, dtype=torch.float32).unsqueeze(0)
+        
+    except Exception as e:
+        # Fall back to RDKit for standard PDB files
+        warnings.warn(f"CHARMM parser failed for {pdb_path}: {e}. Trying RDKit fallback.")
+        
+        mol = Chem.MolFromPDBFile(pdb_path, removeHs=False)
+        if mol is None:
+            raise ValueError(f"Could not read molecule from {pdb_path} with either CHARMM or RDKit parser")
+        
+        # Map string elements to integer IDs
+        element_ids = [map_element_to_species_id(atom.GetSymbol()) for atom in mol.GetAtoms()]
+        
+        species_tensor = torch.tensor(element_ids, dtype=torch.long).unsqueeze(0)
+        
+        # Extract Coordinates
+        coords = [mol.GetConformer().GetAtomPosition(i) for i in range(mol.GetNumAtoms())]
+        coordinates_tensor = torch.tensor([[pos.x, pos.y, pos.z] for pos in coords], dtype=torch.float32).unsqueeze(0)
     
-    # 1. Map string elements to integer IDs
-    element_ids = []
-    for atom in mol.GetAtoms():
-        symbol = atom.GetSymbol()
-        if symbol not in ELEMENT_TO_ID:
-            warnings.warn(f"Element {symbol} not in ELEMENT_TO_ID mapping, using H as fallback")
-            element_ids.append(ELEMENT_TO_ID['H'])
-        else:
-            # Warn if rare element is being mapped to unknown
-            if symbol in ['Al', 'B', 'Se']:
-                warnings.warn(f"Rare element {symbol} mapped to 'X' (unknown) - AEV may be less accurate")
-            element_ids.append(ELEMENT_TO_ID[symbol])
-    
-    species_tensor = torch.tensor(element_ids, dtype=torch.long).unsqueeze(0)
-    
-    # 2. Extract Coordinates
-    coords = [mol.GetConformer().GetAtomPosition(i) for i in range(mol.GetNumAtoms())]
-    coordinates_tensor = torch.tensor([[pos.x, pos.y, pos.z] for pos in coords], dtype=torch.float32).unsqueeze(0)
-    
-    # 3. Compute AEVs
+    # Compute AEVs
     with torch.no_grad():
-        # Notice we pass the arguments directly as expected by the new forward() method
         aevs = aev_computer(species_tensor, coordinates_tensor)
         
-    return aevs.squeeze(0) # Shape: [Num_Atoms, AEV_Length]
+    return aevs.squeeze(0)  # Shape: [Num_Atoms, AEV_Length]
 
 
 def get_atom_features(pdb_path, rtf_entry=None, include_charges=True, include_atom_ids=True):
@@ -167,18 +215,7 @@ def get_atom_features(pdb_path, rtf_entry=None, include_charges=True, include_at
     # Extract atom IDs
     if include_atom_ids:
         mol = Chem.MolFromPDBFile(pdb_path, removeHs=False)
-        element_ids = []
-        for atom in mol.GetAtoms():
-            symbol = atom.GetSymbol()
-            if symbol not in ELEMENT_TO_ID:
-                warnings.warn(f"Element {symbol} not in ELEMENT_TO_ID mapping, using H as fallback")
-                element_ids.append(ELEMENT_TO_ID['H'])
-            else:
-                # Warn if rare element is being mapped to unknown
-                if symbol in ['Al', 'B', 'Se']:
-                    warnings.warn(f"Rare element {symbol} mapped to 'X' (unknown) - AEV may be less accurate")
-                element_ids.append(ELEMENT_TO_ID[symbol])
-        
+        element_ids = [map_element_to_species_id(atom.GetSymbol()) for atom in mol.GetAtoms()]
         result['atom_ids'] = torch.tensor(element_ids, dtype=torch.long)
     
     return result
@@ -345,16 +382,7 @@ def get_atom_features_with_context(substituent_pdb, core_pdb, protein_pdb=None,
     sub_end = sum(atom_counts)
     
     # Convert elements to species IDs
-    species_ids = []
-    for element in all_elements:
-        if element not in ELEMENT_TO_ID:
-            warnings.warn(f"Element {element} not in ELEMENT_TO_ID mapping, using H")
-            species_ids.append(ELEMENT_TO_ID['H'])
-        else:
-            # Warn if rare element is being mapped to unknown
-            if element in ['Al', 'B', 'Se']:
-                warnings.warn(f"Rare element {element} mapped to 'X' (unknown) - AEV may be less accurate")
-            species_ids.append(ELEMENT_TO_ID[element])
+    species_ids = [map_element_to_species_id(element) for element in all_elements]
     
     species_tensor = torch.tensor(species_ids, dtype=torch.long).unsqueeze(0)
     coords_tensor = combined_coords.unsqueeze(0)

@@ -14,6 +14,41 @@ from typing import Dict, Set, List, Tuple
 MASS_RE = re.compile(r'^\s*MASS\s+-?\d+\s+(\S+)\s+[\d.]+(?:\s+([A-Za-z]+))?\s*!?\s*(.*)$')
 
 
+def infer_element_from_cgenff_type(atom_type: str) -> str:
+    """Infer element from CGenFF atom type name.
+    
+    CGenFF atom types typically start with element symbol:
+    - CG2R61, CG321, etc. -> C (carbon)
+    - HGR61, HGA2, etc. -> H (hydrogen)
+    - BRGR1 -> Br (bromine)
+    - CLGR1 -> Cl (chlorine)
+    - FGR1, FGA3 -> F (fluorine)
+    - etc.
+    
+    Args:
+        atom_type: CGenFF atom type string (e.g., 'BRGR1', 'CG2R61')
+        
+    Returns:
+        Element symbol (e.g., 'Br', 'C')
+    """
+    atom_type_upper = atom_type.upper()
+    
+    # Check two-letter elements first (must come before single-letter)
+    two_letter_elements = ['BR', 'CL', 'AL', 'SE']
+    for elem in two_letter_elements:
+        if atom_type_upper.startswith(elem):
+            # Return proper capitalization
+            return elem.capitalize()
+    
+    # Check single-letter elements
+    first_char = atom_type[0].upper()
+    if first_char in ['H', 'C', 'N', 'O', 'F', 'S', 'P', 'B', 'I', 'K']:
+        return first_char
+    
+    # Unknown - return 'X'
+    return 'X'
+
+
 def parse_toppar_file(filepath: str) -> Tuple[Set[str], Set[str], Dict[str, str]]:
     """Parse a single toppar file and extract atom types and elements from MASS entries.
     

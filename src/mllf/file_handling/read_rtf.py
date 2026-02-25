@@ -29,6 +29,9 @@ def parse_rtf_file(path: str) -> Dict[str, object]:
 
 	Returns a dict: {"site": int, "sub": int, "atom_types": [str], "charges": [float], "total_charge": float}
 	If the filename doesn't contain site/sub, site/sub will be None.
+	
+	Note: Lone pairs (atom types starting with 'LP') are filtered out as they are
+	virtual sites that don't correspond to real atoms in PDB files.
 	"""
 	atom_types: List[str] = []
 	charges: List[float] = []
@@ -46,6 +49,11 @@ def parse_rtf_file(path: str) -> Dict[str, object]:
 			if not mo:
 				continue
 			atom_type, charge_str = mo.groups()
+			
+			# Skip lone pairs (virtual sites) - they don't appear in PDB files
+			if atom_type.startswith('LP'):
+				continue
+			
 			atom_types.append(atom_type)
 			try:
 				charge = float(charge_str)
