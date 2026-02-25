@@ -293,24 +293,24 @@ def build_pyg_graph_from_mllf_graph(
     """Convert a Graph-like object `g` into a PyG Data object and metadata.
 
     We expand each undirected graph edge into up to four directed relation edges,
-    one per bias type. The default `relation_names` is ['linear','quadratic','skew','end'].
+    one per bias type. The default `relation_names` is ['linear','quadratic','skw','end'].
     
-    Node features are constructed from metadata. There are three modes:
+    Node features are constructed from metadata. There are two modes:
     
     1. Standard mode (deepset_model=None):
        - Charge, environment type (solvent/protein)
        - Element count encoding (coarse chemical composition)
        - Atom type count encoding (fine CHARMM type composition)
        
-    2. DeepSet augmented mode (deepset_model provided, use_deepset_only=False):
+    2. DeepSet mode (deepset_model provided):
        - DeepSet substituent embedding (from 3D atomic structure + charges)
-       - Concatenated with environmental features: is_solvent, is_protein
-       - This implements Step 4 of the 4-step pipeline
-       - Note: charge is NOT duplicated since it's already in DeepSet input
+       - Implements Step 4 of the 4-step pipeline
+       - Spatial context (protein atoms) already encoded in AEVs
+       - Charge already included in DeepSet atom features
+       - Solvent state NOT included (constant within graph, provides no differentiation)
        
-    3. DeepSet only mode (deepset_model provided, use_deepset_only=True):
-       - Only DeepSet substituent embeddings
-       - No additional global features
+    The use_deepset_only parameter is deprecated and has no effect (DeepSet mode
+    always uses only DeepSet embeddings).
     
     The vocabularies are loaded from CHARMM CGenFF toppar file by default.
 
@@ -325,7 +325,7 @@ def build_pyg_graph_from_mllf_graph(
         pdb_dir: Directory containing PDB files (required if deepset_model provided)
         pdb_pattern: Pattern for PDB filenames (default: "site{site}_sub{sub}.pdb")
         rtf_results: Optional dict of RTF parsed data for charge extraction
-        use_deepset_only: If True, only use DeepSet embeddings without global features
+        use_deepset_only: DEPRECATED - has no effect (DeepSet mode always uses only embeddings)
         prep_dir: Optional prep directory for multi-site spatial filtering
         protein_pdb: Optional protein PDB file path (for protein phase systems)
         solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
@@ -405,23 +405,13 @@ def build_pyg_graph_from_mllf_graph(
         meta = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
         
         if deepset_model is not None:
-            if use_deepset_only:
-                # Mode 3: Only DeepSet embeddings
-                node_feats.append(deepset_embeddings[i])
-            else:
-                # Mode 2: DeepSet + global features (charge, solvent, protein)
-                # Extract only the global state features (first 3: charge, is_solvent, is_protein)
-                charge = float(meta.get('total_charge', 0.0))
-                solvent_str = (meta.get('solvent', '') or '').lower()
-                is_solvent = 1.0 if solvent_str in ('solvent', 'solv', 'water', 'aq', 'sol') else 0.0
-                is_protein = 1.0 if solvent_str in ('protein', 'prot') else 0.0
-                global_features = torch.tensor([charge, is_solvent, is_protein], dtype=torch.get_default_dtype())
-                
-                # Concatenate DeepSet embedding with global features
-                combined = torch.cat([deepset_embeddings[i], global_features], dim=0)
-                node_feats.append(combined)
+            # DeepSet mode: Use only molecular embeddings
+            # Spatial context (including protein environment) is already encoded in AEVs
+            # Charge is already included in DeepSet atom features
+            # Solvent state is constant within a graph (provides no node differentiation)
+            node_feats.append(deepset_embeddings[i])
         else:
-            # Mode 1: Standard count-based encoding
+            # Standard mode: Use count-based compositional encoding
             node_feats.append(_node_feature_from_meta(meta, atom_type_vocab, element_vocab, atom_to_element))
     
     x = torch.stack(node_feats, dim=0)
@@ -531,7 +521,7 @@ def build_pyg_graph_from_mllf_graph(
     if deepset_model is not None:
         deepset_dim = deepset_model.atom_mlp[-1].out_features
         extras['deepset_dim'] = deepset_dim
-        extras['use_deepset_only'] = use_deepset_only
-        extras['node_feature_dim'] = deepset_dim if use_deepset_only else deepset_dim + 3
+        extras['use_deepset_only'] = True  # Always True now (parameter deprecated)
+        extras['node_feature_dim'] = deepset_dim  # Only DeepSet embeddings
     
     return data, extras
