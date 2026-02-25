@@ -39,13 +39,20 @@ import numpy as np
 import re
 
 
-def parse_pdb_file(pdb_path: str) -> Tuple[List[List[float]], List[str]]:
+def parse_pdb_file(pdb_path: str, rtf_data: Optional[dict] = None) -> Tuple[List[List[float]], List[str]]:
     """Parse PDB file to extract coordinates and elements.
     
-    Handles non-standard PDB formats where atom names encode element symbols.
+    Uses a three-tier parsing strategy:
+    1. RDKit PDB parser (most robust for standard PDB formats)
+    2. Flexible whitespace parsing (for CHARMM-style non-standard formats)
+    3. Fixed-column PDB format (last resort)
+    
+    Optionally validates element identification against CGenFF atom types from RTF.
     
     Args:
         pdb_path: Path to PDB file
+        rtf_data: Optional dict from parse_rtf_file() with 'atom_types' key.
+                  If provided, elements are validated against CGenFF atom types.
         
     Returns:
         tuple: (coordinates, elements) where:
@@ -55,35 +62,155 @@ def parse_pdb_file(pdb_path: str) -> Tuple[List[List[float]], List[str]]:
     coordinates = []
     elements = []
     
+    # Get CGenFF atom types if RTF data provided
+    cgenff_atom_types = None
+    if rtf_data is not None:
+        cgenff_atom_types = rtf_data.get('atom_types', [])
+    
+    # TIER 1: Try RDKit parser first (handles standard PDB formats best)
+    try:
+        from rdkit import Chem
+        mol = Chem.MolFromPDBFile(pdb_path, removeHs=False, sanitize=False)
+        
+        if mol is not None and mol.GetNumAtoms() > 0:
+            # Successfully parsed with RDKit - extract coordinates and elements
+            conf = mol.GetConformer()
+            for atom in mol.GetAtoms():
+                atom_idx = atom.GetIdx()
+                pos = conf.GetAtomPosition(atom_idx)
+                coordinates.append([pos.x, pos.y, pos.z])
+                elements.append(atom.GetSymbol())
+            
+            # Cross-validate with CGenFF if provided
+            if cgenff_atom_types is not None:
+                from mllf.cb.atom_vocab import infer_element_from_cgenff_type
+                for atom_index, (element, cgenff_type) in enumerate(zip(elements, cgenff_atom_types)):
+                    if atom_index >= len(cgenff_atom_types):
+                        break
+                    cgenff_element = infer_element_from_cgenff_type(cgenff_type)
+                    if element.upper() != cgenff_element.upper():
+                        warnings.warn(
+                            f"Element mismatch in {pdb_path} at atom {atom_index}: "
+                            f"RDKit -> '{element}' but CGenFF type '{cgenff_type}' -> '{cgenff_element}'. "
+                            f"Using CGenFF element '{cgenff_element}'."
+                        )
+                        elements[atom_index] = cgenff_element
+            
+            return coordinates, elements
+    except Exception as e:
+        # RDKit failed - likely CHARMM-style non-standard format
+        # Fall through to manual parsing
+        pass
+    
+    # TIER 2 & 3: Manual line-by-line parsing for non-standard formats
+    atom_index = 0
+    parse_errors = []
+    
     with open(pdb_path, 'r') as f:
         for line in f:
             if not line.startswith('ATOM'):
                 continue
             
-            # Parse PDB ATOM line
-            atom_name = line[12:16].strip()
-            x = float(line[30:38])
-            y = float(line[38:46])
-            z = float(line[46:54])
+            atom_name = None
+            x = y = z = None
             
-            # Extract element from atom name (e.g., "C001", "H002", "CL01")
-            element = None
-            for two_letter in ['Cl', 'Br', 'Al', 'Se']:
-                if atom_name.upper().startswith(two_letter.upper()):
-                    element = two_letter
-                    break
+            # TIER 2: Try flexible parsing (for CHARMM-style formats)
+            try:
+                parts = line.split()
+                if len(parts) >= 6:  # Need at least: ATOM, serial, name, res, x, y, z
+                    # Find atom name (typically 3rd field after ATOM and serial)
+                    atom_name = parts[2]
+                    
+                    # Find coordinates - look for 3 consecutive floats with decimal points
+                    # This distinguishes coordinates from integer residue numbers or chain IDs
+                    # PDB coordinates always have decimal points (e.g., "10.000")
+                    coords_found = None
+                    for start_idx in range(3, len(parts) - 2):  # Need room for 3 values
+                        try:
+                            # Check that all 3 values have decimal points (are true coordinates)
+                            if '.' in parts[start_idx] and '.' in parts[start_idx + 1] and '.' in parts[start_idx + 2]:
+                                x_cand = float(parts[start_idx])
+                                y_cand = float(parts[start_idx + 1])
+                                z_cand = float(parts[start_idx + 2])
+                                # Found 3 consecutive decimal floats - these are coordinates
+                                coords_found = (x_cand, y_cand, z_cand)
+                                break
+                        except (ValueError, IndexError):
+                            continue
+                    
+                    if coords_found:
+                        x, y, z = coords_found
+            except (ValueError, IndexError):
+                pass
             
-            if element is None:
-                first_char = atom_name[0].upper()
-                if first_char in ['H', 'C', 'N', 'O', 'F', 'S', 'P', 'B', 'I']:
-                    element = first_char
+            # TIER 3: Fall back to fixed-column PDB format
+            if atom_name is None or x is None:
+                try:
+                    atom_name = line[12:16].strip()
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                except (ValueError, IndexError):
+                    pass
             
-            if element is None:
-                warnings.warn(f"Could not determine element for atom {atom_name} in {pdb_path}")
-                element = 'H'  # Default fallback
+            # If all tiers failed, log error and skip
+            if atom_name is None or x is None:
+                error_msg = f"Failed to parse PDB line in {pdb_path}: {line.strip()}"
+                parse_errors.append(error_msg)
+                warnings.warn(error_msg)
+                continue
+            
+            # Extract element from atom name (e.g., "C001", "H002", "CL01", "B085")
+            # For RCSB format, also check explicit element symbol in columns 76-77
+            element_from_column = None
+            if len(line) >= 78:
+                element_from_column = line[76:78].strip()
+                if element_from_column and element_from_column.replace(' ', '').isalpha():
+                    element = element_from_column.strip()
+                else:
+                    element_from_column = None
+            
+            # Fall back to extracting from atom name if no explicit element column
+            if not element_from_column:
+                element = None
+                for two_letter in ['Cl', 'Br', 'Al', 'Se']:
+                    if atom_name.upper().startswith(two_letter.upper()):
+                        element = two_letter
+                        break
+                
+                if element is None:
+                    first_char = atom_name[0].upper()
+                    if first_char in ['H', 'C', 'N', 'O', 'F', 'S', 'P', 'B', 'I']:
+                        element = first_char
+                
+                if element is None:
+                    warnings.warn(f"Could not determine element for atom {atom_name} in {pdb_path}")
+                    element = 'H'  # Default fallback
+            
+            # Cross-validate with CGenFF atom type if available
+            if cgenff_atom_types is not None and atom_index < len(cgenff_atom_types):
+                cgenff_type = cgenff_atom_types[atom_index]
+                # Import here to avoid circular dependency
+                from mllf.cb.atom_vocab import infer_element_from_cgenff_type
+                cgenff_element = infer_element_from_cgenff_type(cgenff_type)
+                
+                # Check for mismatch
+                if element.upper() != cgenff_element.upper():
+                    warnings.warn(
+                        f"Element mismatch in {pdb_path}: "
+                        f"PDB atom '{atom_name}' -> '{element}' but CGenFF type '{cgenff_type}' -> '{cgenff_element}'. "
+                        f"Using CGenFF element '{cgenff_element}'."
+                    )
+                    element = cgenff_element  # Trust CGenFF over PDB parsing
             
             coordinates.append([x, y, z])
             elements.append(element)
+            atom_index += 1
+    
+    # Check for critical parsing errors
+    if parse_errors and not coordinates:
+        error_msg = f"CRITICAL: Failed to parse any atoms from {pdb_path}. Errors:\n" + "\n".join(parse_errors[:5])
+        raise ValueError(error_msg)
     
     return coordinates, elements
 
