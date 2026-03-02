@@ -9,130 +9,139 @@ optimizing bias coefficients for multisite λ-dynamics simulations. Instead of h
 bias parameters, we use graph neural networks to predict optimal coefficients based on the
 molecular graph structure.
 
+**Architecture Pipeline**:
+
+The policy network uses a two-stage architecture to predict bias coefficients:
+
+1. **RGCN Encoder**: Processes the molecular graph with DeepSet embeddings (64D) as initial 
+   node features, producing refined context-aware node embeddings (32D). The RGCN learns 
+   separate transformations for different bias types, allowing it to capture bias-specific 
+   molecular interactions.
+
+2. **EdgeValueMLP Policy**: Takes pairs of RGCN-processed node embeddings and predicts 
+   bias coefficients for each edge. Uses a shared trunk with separate heads per bias type,
+   outputting Gaussian distributions (mean, std) for sampling actions.
+
+This separation allows the encoder to learn general molecular representations while the 
+policy network specializes in predicting bias-specific coefficients for individual transitions.
+
 Core Components
 ---------------
 
 Graph Representation
 ~~~~~~~~~~~~~~~~~~~~
 
-Molecular systems are represented as undirected graphs where:
+Molecular systems are represented as directed graphs where:
 
-* **Nodes** represent λ-sites (substituent positions on the molecule)
-* **Edges** represent interactions between sites with associated bias coefficients
+* **Nodes** represent individual substituents at each λ-site
+* **Edges** represent transitions between substituents with associated bias coefficients
 
-Each edge can have multiple bias types:
+For a 2-site system with 3 substituents at site 1 and 2 substituents at site 2, the graph
+contains 5 nodes total (one per substituent). Edges connect substituents within the same site,
+allowing the model to predict bias coefficients for all possible transitions.
 
-* ``linear`` (b): Per-node linear bias vector ensuring equal population of all perturbations 
-  at each site when correctly parameterized
-* ``quadratic`` (c): Pairwise interaction bias that removes barriers in alchemical space 
-  due to electrostatic interactions between sites (antisymmetric: :math:`c_{ij} = -c_{ji}`)
-* ``skew`` (x): Asymmetry correction bias that fits residuals beyond quadratic and end 
-  biases, particularly important after soft-core introduction
-* ``end`` (s): End-state bias compensating for the entropic and surface tension cost 
-  of displacing solvent and nearby molecules when substituents appear
+**Bias Types**:
+
+Each edge can have multiple bias coefficient types:
+
+* **Linear (b)**: Per-node bias ensuring equal population of all substituents at each site
+  when correctly parameterized.
+
+* **Quadratic (c)**: Pairwise interaction bias removing alchemical barriers due to 
+  electrostatic interactions between sites. Antisymmetric: :math:`c_{ij} = -c_{ji}`, 
+  meaning the forward and backward transitions have equal magnitude but opposite sign.
+
+* **Skew (x)**: Asymmetry correction fitting residuals beyond quadratic and end biases,
+  particularly important after soft-core introduction. Forward and backward transitions
+  are independent (not antisymmetric).
+
+* **End (s)**: End-state bias compensating for entropic and surface tension costs of
+  displacing solvent and nearby molecules when substituents appear. Forward and backward
+  transitions are independent (not antisymmetric).
 
 Graph Construction
 ^^^^^^^^^^^^^^^^^^
 
-Graphs are built using one of two methods:
+Graphs are constructed with **DeepSet embeddings** as the primary node features, representing
+each substituent's 3D atomic structure and chemical composition as a learned 64-dimensional
+vector. These embeddings replace manual feature engineering with neural representations
+pretrained on diverse molecular data.
 
-1. **From RTF Fragments** (preferred):
-   
-   .. code-block:: python
-   
-      from mllf.file_handling.read_rtf import parse_rtf_dir
-      from mllf.cb.graph import Graph
-      
-      rtf_results = parse_rtf_dir('combo_dir')
-      graph = Graph.from_rtf_results(rtf_results)
-      
-      # Optional: Override environment type for all nodes
-      # graph = Graph.from_rtf_results(rtf_results, solvent_override='protein')
+**DeepSet-Based Construction**:
 
-   This method reads ``site*_sub*_*_pres.rtf`` files and extracts connectivity
-   information from the RTF topology fragments.
-   
-   **Environment Type**: The environment (vacuum, solvent, or protein) can be 
-   specified via the ``solvent_override`` parameter:
-   
-   * ``'solv'`` or ``'solvent'``: Solvated/aqueous environment
-   * ``'gas'`` or ``'vacuum'``: Gas phase/vacuum environment
-   * ``'protein'``: Protein-embedded environment
-   
-   If not specified, the system attempts auto-detection from directory names
-   (e.g., ``14benz_solv`` → ``solv``). For production use, explicit configuration
-   via workflow YAML is recommended:
-   
-   .. code-block:: yaml
-   
-      system:
-        solvent_state: solv  # Explicit environment specification
+The standard construction pipeline:
 
-2. **From variables.py** (fallback):
-   
-   .. code-block:: python
-   
-      from mllf.cli.workflow import load_bias_from_variables, graph_from_bias
-      
-      bias = load_bias_from_variables('combo_dir/variables.py')
-      graph = graph_from_bias(bias)
+1. Parse RTF files to identify substituents and extract metadata (site numbers, charges, atom types)
+2. Build graph topology: one node per substituent, edges connecting substituents within each site
+3. Compute DeepSet embeddings for each node from PDB coordinates and RTF charges
+4. Store embeddings as node features for neural network input
 
-   This parses existing bias matrices from a ``variables.py`` file containing
-   a triple-quoted YAML ``bias_string``.
+The DeepSet embeddings capture rich molecular information automatically:
 
-PyTorch Geometric Conversion
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+* **Spatial structure**: Bond lengths, angles, 3D conformations from atomic coordinates
+* **Chemical composition**: Element types, functional groups, charge distributions
+* **Environmental context**: Nearby protein atoms and core structure atoms (via context-aware AEV computation)
 
-For neural network training, graphs are converted to PyTorch Geometric format:
+See :doc:`deepset_pretraining` for technical details on the 4-step pretraining pipeline
+(atom-level AEV features → autoencoder → max-pooling aggregation).
 
-.. code-block:: python
+**Environmental Context Encoding**:
 
-   from mllf.cb import graph_utils
-   
-   data, extras = graph_utils.build_pyg_graph_from_mllf_graph(graph)
+The environment type (solvent, vacuum, or protein) influences how DeepSet embeddings are computed:
 
-**Node Features**: Each node is represented by a feature vector with:
+* **Protein systems**: Nearby protein atoms are included in AEV computation, naturally encoding
+  protein-specific interactions into the molecular representation
+* **Solvent systems**: Core structure and nearby substituents from other sites provide context
+* **Vacuum systems**: Core structure and nearby substituents provide context without solvent effects
 
-* Total molecular charge (float) - sum of partial charges in the substituent
-* Binary indicators for environment type:
+This context-aware approach eliminates the need for explicit environment flags as node features—
+the environmental information is implicitly learned in the embeddings themselves.
+
+**Legacy RTF-Only Construction**:
+
+Graphs can also be built directly from RTF topology fragments without DeepSet embeddings,
+using manually engineered features (atom counts, charge, element compositions). This approach
+is maintained for backward compatibility and systems where PDB coordinates are unavailable,
+but the DeepSet-based method is strongly preferred for production use due to its superior
+representation quality.
+
+
+Neural Network Graph Format
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For neural network processing, the molecular graph (with its DeepSet node embeddings) is
+converted to PyTorch Geometric format. This conversion handles the technical details of
+edge expansion and relation type encoding for the RGCN policy network.
+
+**Node Features**:
+
+The 64-dimensional DeepSet embeddings computed during graph construction become the node
+feature matrix. Each row represents one substituent with its learned molecular representation
+already encoding all necessary information (structure, chemistry, environment). No additional
+feature engineering is required—the embeddings serve as direct input to the RGCN.
+
+**Edge Expansion**:
+
+Each undirected molecular edge is expanded into **directed relation edges** based on bias type:
+
+* **Linear bias**: Only edges FROM reference substituent (sub1) TO others
   
-  - ``is_solvent``: 1 for solvent/water environment, 0 otherwise
-  - ``is_protein``: 1 for protein environment, 0 otherwise
-  - Note: Vacuum/gas environments have both flags set to 0 (deprecated as explicit encoding)
+  - Creates one directed edge per transition (e.g., sub1→sub2, sub1→sub3)
+  - No backward edges (sub2→sub1, sub3→sub1) since linear bias is node-level
 
-* Multi-hot encoding of chemical elements present in the substituent 
-  (e.g., C, H, N, O from the periodic table)
-* Multi-hot encoding of distinct CHARMM atom types present in the substituent
-  (e.g., CG2R61, HGR61, NG2R60)
+* **Quadratic bias**: Only upper-triangle edges (i→j where i < j)
+  
+  - Creates one directed edge per undirected pair
+  - Antisymmetry enforced during coefficient mapping (forward value negated for backward)
 
-This two-level encoding provides both coarse-grained (element) and fine-grained 
-(atom type) chemical information while being more efficient than a single large 
-encoding.
+* **Skew and End biases**: Both forward AND backward edges (i→j and j→i)
+  
+  - Creates two directed edges per undirected pair
+  - Independent values for each direction (no symmetry constraint)
 
-**Vocabularies**: The vocabularies are loaded from CHARMM toppar files
-in the ``toppar/`` directory, which contain MASS entries defining atom types 
-and their corresponding elements. By default, only CGenFF is loaded:
-
-* **Element vocabulary**: 14 elements (Al, B, Br, C, Cl, F, H, I, N, O, P, S, Se, X)
-* **Atom type vocabulary**: 161 CGenFF atom types
-* **Total feature dimensions**: ``3 + 14 + 161 = 178`` for CGenFF only
-
-**Important**: Each undirected edge is expanded into **two directed edges**:
-
-* Forward relation: ``{base}_fwd`` (e.g., ``quadratic_fwd``)
-* Backward relation: ``{base}_bwd`` (e.g., ``quadratic_bwd``)
-
-This doubling is intentional and allows the model to learn directional interactions.
-During variable writing, quadratic maintains antisymmetry (:math:`c_{ij} = -c_{ji}`),
-while skew and end store both directions independently.
-
-The ``extras`` dict contains:
-
-* ``relation_names``: List mapping relation indices to names
-* ``base_relation_map``: Dict mapping base types to (forward, backward) relation names
-* ``atom_type_vocab``: Dict mapping atom type strings to feature indices
-* ``element_vocab``: Dict mapping element symbols to feature indices
-* ``atom_to_element``: Dict mapping atom types to their elements
+Each directed edge has a relation type (``linear_fwd``, ``quadratic_fwd``, ``skew_bwd``, etc.)
+that identifies which bias type and direction it represents. The RGCN learns separate
+transformation matrices for each relation type, allowing bias-specific edge processing.
 
 Policy Network Architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -146,10 +155,14 @@ for each relation type. The standard architecture uses:
 
 .. math::
 
-   \text{RGCN}: \mathbb{R}^{178} \to \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{32}
+   \text{RGCN}: \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{32}
 
-where the input dimension is 178 for CGenFF (3 scalar features + 14 elements + 161 atom types) 
-and the output produces 32-dimensional node embeddings used by the policy and value networks.
+The input to the RGCN is the **64-dimensional DeepSet embedding** for each substituent node.
+The RGCN then processes these embeddings through 3 layers of relational graph convolutions,
+where each layer learns separate transformation matrices for different bias types 
+(linear, quadratic, skew, end). The final output produces 32-dimensional node embeddings 
+used by the policy and value networks.
+
 
 Edge Policy
 ^^^^^^^^^^^
@@ -195,26 +208,6 @@ The ``EdgeValueMLP`` uses a two-stage design:
   - Standard deviation range: [~0, 7.4]
   - Provides exploration while preventing extreme outliers
   - Higher values (e.g., 3.5 → std≈33) can produce samples far beyond intended ranges
-
-**Usage Example**:
-
-.. code-block:: python
-
-   from mllf.cb.policy import EdgePolicy
-   
-   policy = EdgePolicy.from_pyg_data(
-       encoder=encoder,
-       hidden_dim=32,
-       sample_data=data,
-       mlp_hidden=64,
-       mlp_out_dim=num_bases  # e.g., 4 for linear/quadratic/skew/end
-   )
-   
-   # Sample actions (stochastic)
-   actions, logp, mean, log_std = policy.get_actions(
-       x, edge_index, edge_type, edge_attr,
-       deterministic=False
-   )
 
 The policy outputs:
 
@@ -265,37 +258,47 @@ For each combination:
 5. Update value network: minimize :math:`(V_\phi(\mathbf{s}) - R)^2`
 6. Update policy: maximize :math:`\log \pi_\theta(\mathbf{a} | \mathbf{s}) \cdot A`
 
-**Benefits**:
-
-* **Lower variance**: State-dependent baselines reduce gradient noise compared to fixed baselines
-* **Stability**: Prevents catastrophic forgetting of pretrained weights during RL training
-* **Better credit assignment**: Difficult combinations get lower baseline expectations
-
 For details on reward function components, curriculum learning, and workflow configuration, 
 see :doc:`workflow`.
 
 Variables.py Format
 ~~~~~~~~~~~~~~~~~~~
 
-The simulator reads bias coefficients from a ``variables.py`` file:
+MSLD simulation setup files read bias coefficients from ``variables.py`` files containing YAML-formatted
+bias matrices. The policy network's per-edge predictions are assembled into these matrices
+following specific composition rules for each bias type.
+
+**Matrix Format**:
+
+Bias coefficients are organized as:
+
+* **b (linear)**: 1D vector of length N (one value per substituent)
+* **c (quadratic)**: N×N antisymmetric matrix (upper triangle stored)
+* **x (skew)**: N×N full matrix (both triangles stored independently)
+* **s (end)**: N×N full matrix (both triangles stored independently)
+
+For a system with N=5 substituents (e.g., 3 at site 1, 2 at site 2), the matrices have
+shapes [5], [5×5], [5×5], and [5×5] respectively.
+
+**Example Structure**:
 
 .. code-block:: python
 
-   # Auto-generated variables.py — bias_string contains YAML for bias matrices
+   # Auto-generated variables.py
    bias_string = '''
    b:  # Per-node linear bias vector (length N)
    - 0.1
    - 0.2
    - -0.05
-   c:  # NxN quadratic bias matrix (antisymmetric: c[j][i] = -c[i][j], use only upper triangle)
+   c:  # NxN quadratic bias matrix (antisymmetric: c[j][i] = -c[i][j])
    - [0.0, 0.3, -0.1]
    - [0.0, 0.0, 0.2]
    - [0.0, 0.0, 0.0]
-   x:  # NxN skew bias matrix (NOT antisymmetric: both directions independent)
+   x:  # NxN skew bias matrix (both directions independent)
    - [0.0, 0.05, -0.02]
    - [-0.05, 0.0, 0.03]
    - [0.02, -0.03, 0.0]
-   s:  # NxN end bias matrix (NOT antisymmetric: both directions independent)
+   s:  # NxN end bias matrix (both directions independent)
    - [0.0, 0.1, -0.05]
    - [-0.1, 0.0, 0.08]
    - [0.05, -0.08, 0.0]
@@ -304,20 +307,60 @@ The simulator reads bias coefficients from a ``variables.py`` file:
 Edge-to-Matrix Mapping
 ^^^^^^^^^^^^^^^^^^^^^^
 
-The policy network predicts per-edge coefficients which are mapped to bias matrices:
+The policy network operates on directed graph edges and predicts coefficients for each
+edge-bias type combination. These per-edge predictions are assembled into simulation-ready
+matrices using bias-specific composition rules:
 
-* **Linear bias (b)**: Per-edge predictions are averaged at each node to produce the 
-  per-node linear bias vector (length N)
+**Linear Bias Composition**:
 
-* **Quadratic bias (c)**: Antisymmetric matrix where each undirected pair (i,j) uses 
-  one canonical forward value to set ``c[i][j] = v`` and ``c[j][i] = -v``
+Linear bias values are predicted for edges FROM the reference substituent (sub1 at each site)
+TO other substituents at the same site. Since linear bias is fundamentally per-node rather
+than per-edge, the individual edge predictions are averaged at each target node:
 
-* **Skew (x) and End (s) biases**: Full matrices where forward and backward directions 
-  are stored independently (NOT antisymmetric): ``x[i][j]`` and ``x[j][i]`` are separate values
+* Edge sub1→sub2 predicts value v₁₂
+* Edge sub1→sub3 predicts value v₁₃  
+* Node 2 receives: b[2] = mean(v₁₂)
+* Node 3 receives: b[3] = mean(v₁₃)
+
+This averaging provides robustness when multiple edges target the same node in complex graphs.
+
+**Quadratic Bias Composition**:
+
+Quadratic bias is antisymmetric: forward and backward transitions have equal magnitude but
+opposite sign. Only upper-triangle edges (i→j where i<j) are created in the graph. The
+predicted forward value defines both matrix entries:
+
+* Edge i→j predicts forward value v
+* Matrix stores: c[i][j] = v and c[j][i] = -v
+
+
+**Skew and End Bias Composition**:
+
+Skew and end biases are NOT antisymmetric—forward and backward transitions are physically
+independent. Both directed edges exist in the graph, and predictions are stored directly:
+
+* Edge i→j predicts forward value v_fwd
+* Edge j→i predicts backward value v_bwd
+* Matrix stores: x[i][j] = v_fwd and x[j][i] = v_bwd
+
+This allows the model to learn asymmetric transition barriers without symmetry constraints.
+
+**Matrix Assembly**:
+
+During simulation preparation:
+
+1. Policy network samples coefficients for all directed edges
+2. Edge coefficients are grouped by bias type
+3. Each bias type is assembled into its matrix format using the rules above
+4. Matrices are serialized to YAML in ``variables.py``
+5. CHARMM reads the file and applies biases during λ-dynamics simulation
 
 See Also
 --------
 
+* :doc:`file_handling` - File format documentation (RTF, PDB, bias coefficients)
+* :doc:`deepset_pretraining` - DeepSet pretraining for node embeddings
+* :doc:`cb_pretraining` - Behavior cloning from expert bias coefficients
 * :doc:`workflow` - Complete workflow from combo generation to training
 * :doc:`examples` - Running the full training workflow
 * :doc:`api` - API reference for CB modules

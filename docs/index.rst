@@ -21,8 +21,11 @@ What you'll find in these docs
 - **Background**: conceptual and mathematical background for multisite
   λ-dynamics and Adaptive Landscape Flattening (ALF)
 - **Installation**: how to install the package and dependencies
-- **Workflow System**: complete pipeline from combination generation to training
+- **File Handling**: parsers and writers for RTF, PDB, bias coefficients, and output files
+- **DeepSet Pretraining**: learned physical representations from atomic structure
+- **CB Behavior Cloning**: transfer learning from expert bias coefficients
 - **Contextual Bandit Setup**: graph neural network architecture for bias prediction
+- **Workflow System**: complete pipeline from combination generation to training
 - **Examples**: runnable training workflows with SLURM integration
 - **References**: bibliography for cited literature
 - **API**: generated API reference for the ``mllf`` package
@@ -32,9 +35,11 @@ Quick start (recommended)
 
 1. Read the **Background** section to understand the modeling approach
 2. Follow **Installation** to set up the environment
-3. Review **Workflow System** for the complete pipeline overview
-4. Check **Examples** for running the training workflow
-5. Inspect the **API** reference for integration details
+3. Review **File Handling** to understand input/output formats
+4. Review **Workflow System** for the complete pipeline overview
+5. (Optional) Read **DeepSet Pretraining** and **CB Behavior Cloning** for advanced features
+6. Check **Examples** for running the training workflow
+7. Inspect the **API** reference for integration details
 
 Contents (top-level)
 --------------------
@@ -45,8 +50,11 @@ Contents (top-level)
 
    background
    installation
+   file_handling
    workflow
    cb_setup
+   deepset_pretraining
+   cb_pretraining
    examples
    references
    api

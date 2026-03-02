@@ -171,6 +171,9 @@ See :doc:`workflow` for reward function details and experimentation workflow.
 See Also
 --------
 
+* :doc:`file_handling` - File format documentation and parsers
 * :doc:`workflow` - Complete workflow system documentation
 * :doc:`cb_setup` - Contextual bandit architecture details
+* :doc:`deepset_pretraining` - DeepSet pretraining for node embeddings
+* :doc:`cb_pretraining` - Behavior cloning from expert coefficients
 * :doc:`api` - API reference for workflow modules

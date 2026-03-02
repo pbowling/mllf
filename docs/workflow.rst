@@ -75,23 +75,6 @@ The generator creates two types of combinations:
 1. **Within-site combinations**: Multiple substituents from a single site
 2. **Cross-site combinations**: Substituents from multiple sites simultaneously
 
-Rotating Anchor Strategy
-^^^^^^^^^^^^^^^^^^^^^^^^
-
-For within-site combinations, each substituent can serve as the "anchor":
-
-* **Anchor first**: The anchor substituent is always listed first
-* **Tail sorted**: Remaining substituents are sorted numerically
-* **Minimum size**: At least 2 substituents per combination
-
-This ensures unique, ordered combinations without duplicates.
-
-For a site with 5 substituents, each acting as anchor generates combinations:
-
-* Anchor 1: ``[1,2]``, ``[1,3]``, ``[1,4]``, ``[1,5]``, ``[1,2,3]``, ``[1,2,4]``, ..., ``[1,2,3,4,5]``
-* Anchor 2: ``[2,1]``, ``[2,3]``, ``[2,4]``, ...
-* Total: 5 anchors × 15 combinations each = **75 within-site combinations**
-
 .. note::
    **Combination Size Limit**: By default, each combination is limited to at most 10 substituents 
    per site (``max_subs_per_site=10``). This prevents combinatorial explosion while still allowing 
@@ -99,65 +82,6 @@ For a site with 5 substituents, each acting as anchor generates combinations:
    at a site, the generator will create combinations like ``[1,2,...,10]``, ``[1,2,...,9,11]``, etc., 
    but not ``[1,2,...,11]``. This limit can be increased via the ``--max-subs`` command-line option 
    or the ``max_subs_per_site`` parameter in the API.
-
-Cross-Site Combinations
-^^^^^^^^^^^^^^^^^^^^^^^
-
-When multiple sites are available, the generator also creates cross-site combinations:
-
-* Takes the cartesian product of within-site selections across all sites
-* Each site must contribute at least 2 substituents
-* Results in a much larger combination space
-
-Example: With 5 subs at site1 (75 selections) and 6 subs at site2 (186 selections):
-
-* Site 1 within-site: 75 combinations
-* Site 2 within-site: 186 combinations  
-* Cross-site: 75 × 186 = **13,950 combinations**
-* Total: **14,211 combinations**
-
-Single-Site Core Augmentation
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-When generating **single-site pair combinations** (e.g., testing only site 1 pairs while
-site 2 is excluded), the core structure must include atoms from the excluded site's first
-substituent to maintain the complete molecular structure.
-
-The combination generator automatically augments ``core.rtf`` and ``core.pdb`` for
-single-site combinations:
-
-.. code-block:: text
-
-   # Example: comb_0001_site1_1__site1_2 (site2 excluded)
-   
-   # Original core.rtf:
-   RESI  LIG    -0.012
-   ATOM C001 CG2R61  -0.120335 
-   ATOM H002 HGR61    0.114301
-   BOND C001 H002
-   
-   # Augmented core.rtf (adds site2_sub1 atoms):
-   * Core augmented with atoms from excluded site's first substituent for single-site combination
-   * 
-   RESI  LIG    -0.002000   # Charge updated: -0.012 + 0.010 from site2_sub1
-   ATOM C001 CG2R61  -0.120335 
-   ATOM H002 HGR61    0.114301
-   ATOM C062 CG2R61  -0.110800  # From site2_sub1
-   ATOM H063 HGR61    0.121200   # From site2_sub1
-   BOND C001 H002
-   BOND C001 C062  # From site2_sub1
-   BOND C003 C062  # From site2_sub1
-   BOND C062 H063  # From site2_sub1
-
-This ensures that:
-
-* CHARMM simulations run successfully with proper energy landscapes
-* Single-site combinations have the correct molecular topology
-* Core structure includes all necessary atoms for simulation
-
-The augmentation is performed automatically during combination directory creation and
-only applies to single-site combinations. Cross-site combinations (involving multiple
-sites) already have complete core structures and are not modified.
 
 Lazy Directory Creation
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -305,82 +229,62 @@ Manifest files enable reproducible splits and batch operations. The full paths
 are constructed by prepending the ``out_dir`` from the configuration:
 ``{out_dir}/{combo_name}``.
 
-Graph Building
---------------
+Graph Construction
+------------------
 
-From RTF Fragments
-~~~~~~~~~~~~~~~~~~
+During training, molecular graphs are constructed from combination directories to provide 
+input for the policy network. Graphs are built from RTF topology files with DeepSet 
+embeddings as node features, representing each substituent's 3D structure and chemistry 
+as learned 64-dimensional vectors.
 
-The preferred method extracts connectivity from CHARMM topology fragments:
-
-.. code-block:: python
-
-   from mllf.file_handling.read_rtf import parse_rtf_dir
-   from mllf.cb.graph import Graph
-   
-   rtf_results = parse_rtf_dir('examples/cb/14benz_solv_5.5')
-   graph = Graph.from_rtf_results(rtf_results)
-
-RTF files (``site*_sub*_*_pres.rtf``) contain CHARMM topology patches
-defining atom connectivity for each substituent.
-
-The ``Graph`` object stores nodes (λ-sites) and edges with associated bias
-coefficients. See :doc:`cb_setup` for detailed information on graph structure,
-edge types (linear, quadratic, skew, end), and their physical meanings.
-
-From Bias Matrices
-~~~~~~~~~~~~~~~~~~
-
-Alternatively, build from existing ``variables.py``:
-
-.. code-block:: python
-
-   from mllf.cli.workflow import load_bias_from_variables, graph_from_bias
-   
-   bias = load_bias_from_variables('examples/14benz/variables.py')
-   graph = graph_from_bias(bias)
-
-This parses the YAML ``bias_string`` to extract bias matrices.
-
-PyTorch Geometric Conversion
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For neural network training, convert graphs to PyTorch Geometric format:
-
-.. code-block:: python
-
-   from mllf.cb import graph_utils
-   
-   data, extras = graph_utils.build_pyg_graph_from_mllf_graph(graph)
-
-This creates a ``Data`` object with node features, edge indices, and edge types
-suitable for GNN training. See :doc:`cb_setup` for details on node features,
-directed edge expansion, and the RGCN/policy architecture.
+For complete details on graph construction, node features, edge expansion, and the 
+RGCN/policy architecture, see :doc:`cb_setup`.
 
 Training Pipeline
 -----------------
 
-Reward and Loss Functions
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+System Configuration
+~~~~~~~~~~~~~~~~~~~~
 
-The training system uses different objective functions for pretraining (behavior cloning) and reinforcement learning (policy gradients).
+The ``system`` section specifies environment-level parameters that affect how molecular
+structures are processed during training:
 
-**Pretraining Loss (Behavior Cloning)**
+.. code-block:: yaml
 
-Pretraining uses supervised learning with Mean Squared Error (MSE) loss:
+   system:
+     solvent_state: solv  # Environment type
 
-.. math::
+**Solvent State**:
 
-   \mathcal{L}_{\text{MSE}} = \frac{1}{N} \sum_{i=1}^{N} \|\mathbf{a}_i^{\text{pred}} - \mathbf{a}_i^{\text{target}}\|^2
+Specifies the simulation environment to determine which atoms are included as context 
+during AEV computation for DeepSet embeddings:
 
-where:
+* ``solv`` or ``solvent``: Includes core structure and nearby substituents from other sites (within 5.1 Å)
+* ``gas`` or ``vacuum``: Includes core structure and nearby substituents (without solvent effects)
+* ``protein``: Includes core structure, nearby substituents, AND nearby protein atoms (within 5.1 Å)
 
-* :math:`\mathbf{a}_i^{\text{pred}}` is the policy's predicted bias coefficients for edge :math:`i`
-* :math:`\mathbf{a}_i^{\text{target}}` is the known successful bias coefficients from completed simulations
-* :math:`N` is the total number of edges in the graph
+The environment type determines what molecular context the DeepSet encoder "sees" when 
+computing atomic environment vectors. For protein systems, including nearby protein atoms 
+in the AEV computation naturally encodes protein-specific interactions into the learned 
+embeddings. See :doc:`deepset_pretraining` for technical details on context-aware AEV computation.
 
-The policy learns to **imitate successful bias coefficients** from existing simulation data.
-This provides a warm start before reinforcement learning begins.
+The solvent state is also preserved in ``graph_info.json`` for metadata tracking.
+
+**Auto-Detection** (legacy):
+
+Previously, the system attempted to auto-detect solvent state from directory names
+(e.g., ``14benz_solv`` → ``solv``). This is now deprecated in favor of explicit 
+configuration for clarity and reliability.
+
+Reward Function
+~~~~~~~~~~~~~~~
+
+**Pretraining**
+
+Before training begins, the policy can be pretrained using behavior cloning 
+(supervised learning with MSE loss) to imitate successful bias coefficients from 
+completed simulations. For complete details on pretraining loss, data organization, 
+and transfer learning strategies, see :doc:`cb_pretraining`.
 
 **Training Reward**
 
@@ -420,8 +324,8 @@ Rewards frequent transitions between substituents, with bonus for high transitio
 .. math::
 
    R_T = \begin{cases}
-   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} & \text{if all sites have } \geq \text{min\_transitions\_per\_site} \\
-   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} \times 1.5 & \text{if avg. trans/site} > 2 \times \text{min\_transitions\_per\_site} \\
+   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} & \text{if all sites have } \geq \text{min_transitions_per_site} \\
+   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} \times 1.5 & \text{if avg. trans/site} > 2 \times \text{min_transitions_per_site} \\
    0 & \text{otherwise (sites below threshold)}
    \end{cases}
 
@@ -431,7 +335,6 @@ where:
 * :math:`T_s` is the transition count for site :math:`s`
 * :math:`T_{\text{baseline}}` is the normalization constant (default: 50.0)
 * The 1.5× bonus applies when average transitions per site exceeds 20 (2× the default minimum)
-* The 1.5× bonus applies when average transitions per site exceeds 20
 
 **Uniformity Reward** :math:`R_U`:
 
@@ -526,180 +429,40 @@ pretrained weights and enables more stable learning.
 
 For architectural details on the RGCN encoder, policy network, and value network, see :doc:`cb_setup`.
 
-Pretraining from Existing Simulations
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Simulation Execution
+--------------------
 
-Before reinforcement learning, the policy can be pretrained on existing MSLD simulation 
-data using behavior cloning (supervised learning with MSE loss to imitate successful bias 
-coefficients). This provides a warm start with meaningful initializations.
+Launching Simulations
+~~~~~~~~~~~~~~~~~~~~~
 
-**Pretraining Data Sources**:
+Simulations are launched via subprocess, running CHARMM with bias coefficients 
+written to ``variables.py`` from the policy's sampled actions. The simulator 
+outputs transition counts and population distributions for reward computation.
 
-Pretraining data consists of combination directories that have already been
-simulated with known bias coefficients. These can come from:
+Output Parsing
+~~~~~~~~~~~~~~
 
-* Previous training runs
-* Manual expert tuning
-* Systematic parameter sweeps
-* Multi-system datasets (different ligands, environments, etc.)
+After simulation completes, the framework parses ``output.txt`` from the output 
+directory to extract:
 
-**Benefits**:
+* Total transitions per site :math:`T_s` for each λ-site
+* Per-substituent populations :math:`p_{s,k}` at each site
+* Coverage ratio (fraction of substituents visited)
+* Per-site concentration (maximum population fraction at each site)
 
-* **Faster convergence**: Start with reasonable bias values
-* **Improved sample efficiency**: Fewer epochs needed for good performance
-* **Transfer learning**: Leverage knowledge from related systems
-* **Robustness**: More stable early training with informed initialization
+These metrics feed directly into the reward function components described 
+in the Reward Function section above.
 
-**Data Collection**:
-
-Organize pretraining data by grouping completed runs by system/environment:
-
-.. code-block:: bash
-
-   pretraining/
-   ├── system1_solv/         # System name with environment
-   │   ├── run1/
-   │   │   ├── graph_info.json           # Graph metadata (sites, substituents, edges)
-   │   │   ├── metadata.json             # Run metadata (transitions, populations, solvent_state)
-   │   │   ├── simulation_results.json   # Detailed populations and transitions by lambda
-   │   │   └── variables.py              # Bias coefficients that were used
-   │   ├── run2/
-   │   └── ...
-   ├── system2_solv/
-   │   └── run*/
-   ├── system3_prot/
-   │   └── run*/
-   └── ...
-
-Each run directory should contain:
-
-* ``graph_info.json``: Graph structure with sites, substituents, and connectivity information
-* ``variables.py``: Bias coefficients that were used for the simulation
-* ``metadata.json``: High-level run information (total transitions, num sites/subs, solvent state, termination status)
-* ``simulation_results.json``: Detailed simulation outputs with populations and transitions organized by lambda value
-
-This structure enables multi-system pretraining by organizing runs hierarchically by system/environment.
-
-**Pretraining Configuration**:
-
-Enable pretraining in your workflow YAML:
-
-.. code-block:: yaml
-
-   pretrain:
-     data_dir: /path/to/pretraining       # Directory with existing runs
-     num_epochs: 1                         # Usually 1 epoch is sufficient
-     model_path: models/pretrained_policy.pt  # Where to save pretrained model
-   
-   training:
-     num_epochs: 50
-     load_pretrained: models/pretrained_policy.pt  # Load before training
-
-**Pretraining Process**:
-
-1. **Load existing data**: Read bias coefficients from ``variables.py`` and
-   compute rewards from lambda trajectories
-2. **Build graphs**: Construct graph representations from RTF files or info.py
-3. **Supervised learning**: Train policy to reproduce the bias coefficients
-   that led to good rewards
-4. **Save model**: Store pretrained encoder and policy weights
-
-**Running Pretraining**:
-
-.. code-block:: bash
-
-   # Step 1: Organize pretraining data
-   mkdir -p pretraining
-   cp -r previous_runs/good_combos/* pretraining/
-   
-   # Step 2: Run pretraining
-   python run_pretraining.py --config workflow_sample.yaml
-   
-   # Step 3: Use pretrained model in training
-   python run_workflow.py workflow_sample.yaml
-
-**Deterministic Rewards**:
-
-Since pretraining uses completed simulations, rewards are deterministic (not
-resampled). This means:
-
-* Multiple epochs don't improve training (data is fixed)
-* One epoch is typically sufficient to fit the pretraining data
-* The pretrained policy learns a mapping from graph structure to successful
-  bias coefficients
-
-System Configuration
-~~~~~~~~~~~~~~~~~~~~
-
-The ``system`` section specifies environment-level parameters that affect graph construction
-and node feature encoding:
-
-.. code-block:: yaml
-
-   system:
-     solvent_state: solv  # Environment type
-
-**Solvent State**:
-
-Specifies the simulation environment for proper graph metadata:
-
-* ``solv`` or ``solvent``: Solvated/aqueous environment
-* ``gas`` or ``vacuum``: Gas phase/vacuum environment
-* ``protein``: Protein-embedded environment
-
-This information is:
-
-* Embedded in graph metadata for each combination
-* Used by the encoder as contextual information
-* Preserved in ``graph_info.json`` for pretraining data reuse
-
-**Auto-Detection** (legacy):
-
-Previously, the system attempted to auto-detect solvent state from directory names
-(e.g., ``14benz_solv`` → ``solv``). This is now deprecated in favor of explicit 
-configuration for clarity and reliability.
-
-
-Full Simulation Training
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For production training:
-
-.. code-block:: python
-
-   from mllf.cli.workflow import run_simulations_and_collect
-   
-   results = run_simulations_and_collect(
-       combos=train_combos,
-       encoder=encoder,
-       policy=policy,
-       optimizer=optimizer,
-       reward_fn=reward_fn,
-       compress_after=True
-   )
-
-This performs full MD simulations after each action sampling and uses
-real simulation metrics for rewards.
+.. _Curriculum Learning:
 
 Curriculum Learning
 -------------------
 
-.. _Curriculum Learning:
-
-Overview
-~~~~~~~~
 
 **Curriculum learning** progressively trains the policy on increasingly complex
 combinations, similar to how students learn from simple to complex problems.
 Instead of training on all possible combinations at once, the policy masters
 simpler tasks before advancing to harder ones.
-
-**Benefits**:
-
-* **Faster convergence**: Start with easier combinations that provide clearer learning signals
-* **Better generalization**: Build strong foundations before tackling complex interactions
-* **Reduced catastrophic forgetting**: Gradual progression prevents pretrained weights from being destroyed
-* **Sample efficiency**: Focus computational resources on combinations appropriate for current skill level
 
 Why Curriculum Learning for MSLD
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -791,50 +554,6 @@ Each stage specifies:
 * ``max_train_combos``: Stage-specific limit on training combinations (overrides global setting)
 * ``reward_override``: Modify reward weights for this stage (e.g., emphasize transitions early)
 
-**Example - All Stages**:
-
-.. code-block:: yaml
-
-   stages:
-     # 1. WARM UP: Single-site pairs
-     - name: pairs_single_site_easy
-       min_subs: 2
-       max_subs: 2
-       min_sites: 1
-       max_sites: 1
-       epochs: 50
-     
-     # 2. MASTERY: More single-site pairs
-     - name: pairs_single_site_full
-       min_subs: 2
-       max_subs: 2
-       min_sites: 1
-       max_sites: 1
-       epochs: 50
-     
-     # 3. DENSITY: Single-site triplets
-     - name: triplets_single_site
-       min_subs: 3
-       max_subs: 3
-       min_sites: 1
-       max_sites: 1
-       epochs: 50
-     
-     # 4. EXTRAPOLATION: Multi-site learning
-     - name: pairs_two_sites
-       min_subs: 4
-       max_subs: 4
-       min_sites: 2
-       max_sites: 2
-       epochs: 50
-     
-     # 5. COMPLEXITY: Complex multi-site
-     - name: complex_two_sites
-       min_subs: 5
-       max_subs: 8
-       min_sites: 2
-       max_sites: 2
-       epochs: 50
 
 Combination Selection
 ~~~~~~~~~~~~~~~~~~~~~
@@ -846,20 +565,6 @@ For each stage, the workflow:
 1. Filters all training combinations by stage criteria (min/max subs/sites)
 2. If filtered count exceeds ``max_train_combos_per_stage``, randomly selects subset
 3. Uses reproducible random selection (seeded by ``split.seed + stage_index``)
-
-**Example**:
-
-.. code-block:: text
-
-   Stage 1: pairs_single_site_easy (2 subs, 1 site)
-   - Filtered: 75 combinations match criteria
-   - Max limit: 100 combinations
-   - Selected: All 75 combinations (under limit)
-   
-   Stage 2: triplets_single_site (3 subs, 1 site)
-   - Filtered: 200 combinations match criteria  
-   - Max limit: 100 combinations
-   - Selected: 100 random combinations (uniform sampling)
 
 **Important**: Random selection is uniform across all matching combinations.
 If a stage allows both pairs (2 subs) and triplets (3 subs) via ``min_subs: 2,
@@ -967,29 +672,9 @@ Advanced users can override reward parameters per stage:
 
 This allows fine-tuning the reward function to match stage difficulty.
 
-Best Practices
-~~~~~~~~~~~~~~
-
-* **Stage ordering**: Start simple (pairs), gradually increase complexity (triplets → multi-site)
-* **Combination limits**: 50-100 per stage; use ``max_train_combos_per_stage`` for large stages
-* **Pretraining**: Essential for curriculum success; provides foundation for stage 1
-* **Progress monitoring**: Expect reward drop at stage transitions; recovery within 10-20 epochs is normal
-* **Checkpointing**: Critical for long runs (200+ epochs); save every 5-10 epochs
-
-Troubleshooting
-~~~~~~~~~~~~~~~
-
-**Stage 1 not converging**: Check pretraining quality; increase epochs to 100 if needed
-
-**Poor post-transition performance**: Expected; reward should recover within 20 epochs. If not, add intermediate stage
-
-**Disk space**: Enable ``archive.per_stage: true`` to archive completed stages during training
 
 Checkpointing and Resume
 -------------------------
-
-Overview
-~~~~~~~~
 
 Long-running training jobs (e.g., 50 epochs) can be interrupted by SLURM time
 limits, system maintenance, or manual cancellation. The workflow implements
@@ -1020,23 +705,6 @@ Saved every ``checkpoint_freq`` epochs, containing:
 * ``optimizer_state``: Optimizer state (momentum, learning rates, etc.)
 * ``stats``: Training statistics (loss, average reward)
 
-**Purpose**: Resume entire training from a specific epoch
-
-Per-Epoch Result Checkpoints
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**Location**: ``{base_dir}/epoch_NNN/{combo_name}/epoch_results.pt``
-
-Saved after each simulation completes, containing:
-
-* ``reward``: Computed reward from simulation
-* ``actions``: Policy actions (bias coefficients)
-* ``logp``: Log probability of actions
-* ``epoch``: Epoch number
-* ``combo``: Combination name
-
-**Purpose**: Skip re-running simulations for completed combinations
-
 Automatic Resume
 ~~~~~~~~~~~~~~~~
 
@@ -1053,172 +721,8 @@ For each combination in each epoch:
 2. If found: loads cached reward/actions/logp, skips simulation
 3. If not found: runs simulation, computes reward, saves checkpoint
 
-Example
-~~~~~~~
-
-.. code-block:: bash
-
-   # Start training
-   sbatch training_job.sh
-   
-   # Training runs for epochs 1-15, then interrupted at epoch 18
-   # Latest checkpoint: checkpoint_epoch_015.pt
-   # Epochs 16-17 have partial epoch_results.pt files
-   
-   # Resume training (automatic)
-   sbatch training_job.sh
-   
-   # Output shows:
-   # === Resuming from checkpoint: .../checkpoint_epoch_015.pt ===
-   # Resuming from epoch 15
-   # 
-   # Training continues from epoch 15, skipping combinations with
-   # existing epoch_results.pt files in epochs 16-17
-
-Benefits
-~~~~~~~~
-
-**Fault Tolerance**: Training survives:
-
-* SLURM time limits
-* System maintenance windows
-* Job preemption or manual cancellation
-* Hardware failures
-
-**Efficiency**:
-
-* No wasted computation - resume exactly where interrupted
-* Per-epoch checkpoints prevent re-running completed simulations
-* Granular checkpointing minimizes lost work
-
-**Flexibility**:
-
-* Stop/start training at any time
-* Inspect checkpoints for debugging
-* Adjust non-critical config between runs
-
-File Structure Example
-~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: text
-
-   training_output/
-   ├── checkpoint_epoch_005.pt    # Training checkpoint
-   ├── checkpoint_epoch_010.pt
-   ├── checkpoint_epoch_015.pt
-   ├── epoch_001/
-   │   ├── combo_1_2/
-   │   │   ├── epoch_results.pt   # Per-epoch result
-   │   │   ├── variables.py
-   │   │   └── output/
-   │   │       ├── transitions.txt
-   │   │       └── populations.txt
-   │   └── combo_1_3/
-   │       └── ...
-   ├── epoch_002/
-   │   └── ...
-   └── ...
-
-Best Practices
-~~~~~~~~~~~~~~
-
-* **Checkpoint frequency**: Default of 5 epochs balances storage and resume granularity
-* **Disk monitoring**: Per-epoch results accumulate; cleanup old checkpoints after training
-* **Reproducibility**: Optimizer state ensures identical continuation after resume
-
-Troubleshooting
-~~~~~~~~~~~~~~~
-
-**Training doesn't resume**: Check ``save_checkpoints: true`` in YAML and verify checkpoint files exist
-
-**Out of memory**: Checkpoint device must match training device; free GPU memory if needed
-
-**Simulations not skipping**: Verify ``epoch_results.pt`` files exist with proper permissions
-
-Reward Function Experimentation
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**Pretraining Data Reuse**: Epoch checkpoints save raw simulation metrics
-(populations, transitions) alongside computed rewards. This enables testing
-different reward configurations without re-running simulations.
-
-**Use Cases**:
-
-* Hyperparameter tuning (weights, baselines, gamma)
-* Testing alternative reward formulations
-* Using existing simulations as "pretraining data"
-* Rapid iteration on reward design
-
-**Automatic Recomputation**: If you change reward parameters in
-``workflow_sample.yaml`` and resume training, cached results are automatically
-recomputed with the new configuration:
-
-.. code-block:: yaml
-
-   # Original configuration
-   reward:
-     w_P: 0.5
-     w_T: 0.75
-     gamma: 4.0
-   
-   # Change to emphasize transitions more
-   reward:
-     w_P: 0.3  # Changed
-     w_T: 0.9  # Changed
-     gamma: 4.0
-
-When training resumes, rewards are recomputed from raw metrics without
-re-running simulations.
-
-**Testing Multiple Configurations**: Use ``test_reward_configs.py`` to
-evaluate different reward configurations on completed epochs:
-
-.. code-block:: bash
-
-   # Test default configurations
-   python examples/test_reward_configs.py training_output/epoch_005
-   
-   # Test specific configuration
-   python examples/test_reward_configs.py training_output/epoch_005 \\
-       --w_P 0.7 --w_T 0.3 --gamma 15.0
-   
-   # Test multiple configurations from YAML
-   python examples/test_reward_configs.py training_output/epoch_005 \\
-       --configs reward_configs_example.yaml
-
-Output shows mean, std, min, max, and median rewards for each configuration,
-ranked by mean reward.
-
-**Example Output**:
-
-.. code-block:: text
-
-   Testing 5 reward configurations...
-   
-   Configuration: population_focused
-     Parameters: w_P=0.7, w_T=0.3, gamma=10.0
-     Mean reward: 45.2341 ± 8.1234
-     Range: [12.3456, 67.8901]
-   
-   Configuration: baseline
-     Parameters: w_P=0.5, w_T=0.75, gamma=4.0
-     Mean reward: 42.1234 ± 7.8901
-     Range: [10.2345, 65.4321]
-   
-   Summary Comparison:
-   Config                    Mean        Std        Min        Max
-   ------------------------------------------------------------------------
-   population_focused      45.2341     8.1234    12.3456    67.8901
-   baseline                42.1234     7.8901    10.2345    65.4321
-   transition_focused      38.9012     9.2345    08.1234    63.2109
-   
-   Best configuration: population_focused
-
 Archiving Combinations
 -----------------------
-
-Overview
-~~~~~~~~
 
 Combination directories can be automatically archived to save disk space using
 two strategies: **per-stage archiving** (during curriculum training) or
@@ -1258,22 +762,6 @@ This provides:
 2. Archive job launches in background (bash script with tar commands)
 3. Next stage begins immediately (simulations submit while archiving runs)
 4. After training completes, workflow waits for any remaining archive jobs
-
-**Directory Structure**:
-
-.. code-block:: text
-
-   archives/
-   ├── stage_1_pairs_single_site_easy/
-   │   ├── comb_0001_site1_1__site1_2.tar.gz
-   │   ├── comb_0002_site1_1__site1_3.tar.gz
-   │   ├── ...
-   │   └── archive.log                      # Archive job output
-   ├── stage_2_pairs_single_site_full/
-   │   ├── comb_0001_site1_1__site1_2.tar.gz
-   │   └── ...
-   └── stage_3_triplets_single_site/
-       └── ...
 
 **Configuration Example**:
 
@@ -1325,32 +813,6 @@ once after all training completes.
 2. Archives are moved to ``archive_dir`` (if different from source)
 3. Original directories are removed if ``remove_after`` is ``true``
 
-**Example**:
-
-.. code-block:: text
-
-   Before archiving:
-   generated_combos/
-   ├── comb_0001_site1_1__site1_2/
-   ├── comb_0002_site1_1__site1_3/
-   └── ...
-   
-   After archiving (remove_after=false):
-   generated_combos/
-   ├── comb_0001_site1_1__site1_2/
-   ├── comb_0002_site1_1__site1_3/
-   └── ...
-   
-   archives/
-   ├── comb_0001_site1_1__site1_2.tar.gz
-   ├── comb_0002_site1_1__site1_3.tar.gz
-   └── ...
-   
-   After archiving (remove_after=true):
-   archives/
-   ├── comb_0001_site1_1__site1_2.tar.gz
-   ├── comb_0002_site1_1__site1_3.tar.gz
-   └── ...
 
 **Configuration Example**:
 
@@ -1363,37 +825,6 @@ once after all training completes.
      remove_after: false
      archive_dir: /path/to/archives
 
-Use Cases
-~~~~~~~~~
-
-**Disk Space Management**: Large training runs can generate significant data.
-Archiving allows:
-
-* Preserving all simulation outputs for later analysis
-* Reducing active disk usage by 50-90% (typical compression ratio)
-* Organizing completed runs for long-term storage
-
-**When to Use Per-Stage Archiving**:
-
-* Long curriculum training (multiple stages over many days)
-* Limited disk space on compute clusters
-* Need to free space continuously as training progresses
-* Want stage-specific organization for analysis
-
-**When to Use Post-Training Archiving**:
-
-* Short training runs (single stage or few epochs)
-* Sufficient disk space for full training run
-* Want to keep all data accessible during training
-* Simpler workflow without background jobs
-
-**Best Practices**:
-
-* Set ``remove_after: false`` initially to verify archives are valid
-* Test extracting an archive to ensure contents are intact
-* Monitor background archive jobs via ``archive.log`` files (per-stage mode)
-* Use ``remove_after: true`` for production runs with proven archiving
-* Keep archives and checkpoints separate (archives for data, checkpoints for resume)
 
 Manual Archiving
 ~~~~~~~~~~~~~~~~
@@ -1414,73 +845,6 @@ You can also archive combinations manually:
    
    print(f"Created {len(archived)} archive files")
 
-Monitoring Per-Stage Archives
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-For per-stage archiving, monitor the background jobs:
-
-.. code-block:: bash
-
-   # Check archive logs for each stage
-   tail -f archives/stage_1_pairs_single_site_easy/archive.log
-   
-   # Training output shows archive job status
-   # === Archiving Stage 1 Combinations ===
-   #   Archiving 41 combinations to .../archives/stage_1_pairs_single_site_easy
-   #   Running archive in background (see .../archive.log)
-   #   Archive job started (PID: 12345)
-   
-   # After training completes, workflow waits for archive jobs
-   # === Waiting for Background Archive Jobs ===
-   #   Waiting for stage 'pairs_single_site_easy' archive (PID: 12345)...
-   #     ✓ Stage 'pairs_single_site_easy' archived successfully
-   #     Log: .../archives/stage_1_pairs_single_site_easy/archive.log
-
-Extracting Archives
-~~~~~~~~~~~~~~~~~~~
-
-To extract an archived combination:
-
-.. code-block:: bash
-
-   # Extract a single combination
-   tar -xzf archives/comb_0001_site1_1__site1_2.tar.gz -C .
-   
-   # Extract all archives
-   cd archives
-   for f in *.tar.gz; do tar -xzf "$f" -C ../; done
-
-Simulation Execution
---------------------
-
-Launching Simulations
-~~~~~~~~~~~~~~~~~~~~~
-
-Simulations are launched via subprocess, running CHARMM with bias coefficients 
-written to ``variables.py`` from the policy's sampled actions. The simulator 
-outputs transition counts and population distributions for reward computation.
-
-Output Parsing
-~~~~~~~~~~~~~~
-
-After simulation completes, the framework parses ``transitions.txt`` and 
-``populations.txt`` from the output directory to extract:
-
-* Total transitions per site :math:`T_s` for each λ-site
-* Per-substituent populations :math:`p_{s,k}` at each site
-* Coverage ratio (fraction of substituents visited)
-* Per-site concentration (maximum population fraction at each site)
-
-These metrics feed directly into the reward function components described 
-in the Reward and Loss Functions section above.
-
-Compression
-~~~~~~~~~~~
-
-To save disk space, the framework can compress simulation outputs (e.g., ``.dcd``, 
-``.coor``, ``.vel`` files) into ``output.tar.gz`` archives in each combination 
-directory, removing the original files. This is particularly useful for large-scale 
-training runs where trajectory files consume significant storage.
 
 Complete Workflow Example
 --------------------------
@@ -1588,56 +952,13 @@ A complete workflow configuration (``workflow_14benz.yaml``) includes:
      per_stage: true
      archive_dir: /path/to/archives
 
-For detailed explanations of each section, see the relevant subsections below.
-
-Training Loop Structure
-~~~~~~~~~~~~~~~~~~~~~~~
-
-The main training loop implements epoch-based training with concurrent SLURM job management:
-
-**High-Level Flow**:
-
-1. For each combination in training set:
-   
-   - Check if epoch already completed (cached results)
-   - Build graph from RTF fragments
-   - Sample bias coefficients from policy (stochastic)
-   - Write ``variables.py`` with sampled coefficients
-   - Submit SLURM job for simulation
-
-2. Wait for all jobs to complete (up to ``max_concurrent_jobs`` running)
-3. Parse simulation outputs (transitions, populations)
-4. Compute rewards from simulation metrics
-5. Update value network: minimize :math:`(V(s) - R)^2`
-6. Update policy: maximize :math:`\log \pi(a|s) \cdot (R - V(s))`
-7. Save checkpoints at specified intervals
-
-**Key Features**:
-
-* **Cached results**: Skip simulations if ``epoch_results.pt`` exists
-* **Concurrent jobs**: Manages SLURM queue with ``max_concurrent_jobs`` limit
-* **Resume capability**: Automatically resumes from latest checkpoint
-* **Reward recomputation**: Can update rewards with new config without re-running sims
-
-Custom Training Loop
-~~~~~~~~~~~~~~~~~~~~
-
-For custom workflows, the framework provides modular components that can be 
-composed programmatically:
-
-* ``create_combination_dirs``: Generate combination directories from RTF files
-* ``build_data_and_targets_from_combo``: Convert combinations to PyG graph representations
-* ``RGCNEncoder``: 3-layer relational GCN (e.g., [178→64→64→32])
-* ``EdgePolicy``: Shared-trunk + separate-heads architecture for bias prediction
-* ``ValueNetwork``: 3-layer MLP for advantage estimation ([32→64→32→1])
-* ``compute_reward_from_raw_metrics``: Multi-component reward function with tiered penalties
-
-These components can be initialized and trained with custom loops for specialized 
-workflows beyond the standard curriculum training pipeline. See [examples/run_workflow.py](examples/run_workflow.py) 
-for a complete implementation reference.
 
 See Also
 ~~~~~~~~
 
+* :doc:`file_handling` - File format documentation and parsers
+* :doc:`cb_setup` - CB infrastructure and policy architecture
+* :doc:`deepset_pretraining` - DeepSet pretraining for node embeddings
+* :doc:`cb_pretraining` - Behavior cloning from expert coefficients
 * :doc:`examples` - Example workflows and usage patterns
 * :doc:`api` - API reference for workflow modules
