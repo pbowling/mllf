@@ -54,9 +54,18 @@ local environment, which is then compressed by the autoencoder into 64D embeddin
 **Spatial Cutoffs**:
 
 The AEV computation is **context-aware**: atoms see neighboring atoms from:
-- The shared core of ligand (bonded neighbors within cutoff)
+
+- The shared core of the ligand (bonded neighbors within cutoff)
 - Nearby substituents from other sites (multi-site spatial filtering within 5.1 Å)
-- Protein atoms (if present in protein systems, within 5.1 Å)
+- Environment atoms within 5.1 Å, sourced from ``minimized.pdb`` when available:
+
+  * **Protein systems**: Post-minimization protein atoms within 5.1 Å of the substituent
+  * **Solvent systems**: Post-minimization water molecules within 5.1 Å of the substituent
+  * **Vacuum systems**: No additional environment atoms (core + other-site subs only)
+
+Using **energy-minimized coordinates** is preferred over pre-simulation PDB files because
+minimization resolves steric clashes and produces geometries representative of the sampled
+ensemble, leading to more accurate AEV descriptors.
 
 
 **Why AEVs for Chemistry?**
@@ -135,7 +144,9 @@ See Also
 * :doc:`cb_pretraining` - Behavior cloning from expert coefficients
 * :doc:`workflow` - Complete workflow from combo generation to training
 * ``src/mllf/cb/deepset_autoencoder.py`` - Encoder/decoder implementation
-* ``src/mllf/cb/deepset_pretraining_dataset.py`` - Dataset generation
+* ``src/mllf/cb/deepset_pretraining_dataset.py`` - Dataset generation (training data pipeline)
 * ``src/mllf/cb/train_deepset_autoencoder.py`` - Training script
-* ``src/mllf/cb/aev_processor.py`` - AEV computation
+* ``src/mllf/cb/aev_processor.py`` - AEV computation, minimized.pdb extraction
+  (``detect_minimized_pdb``, ``extract_environment_atoms_from_minimized``)
+* ``src/mllf/cb/graph_utils.py`` - RGCN training AEV pipeline (shares extraction logic)
 * ``examples/run_deepset_pretraining.py`` - Example pretraining workflow

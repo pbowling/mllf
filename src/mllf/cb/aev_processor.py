@@ -1,8 +1,10 @@
 import torch
+import numpy as np
 from torchani import AEVComputer
 from rdkit import Chem
 import warnings
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 from mllf.file_handling.read_pdb import (
     parse_pdb_file, 
@@ -239,31 +241,146 @@ def parse_pdb_coordinates_and_elements(pdb_path):
     return coords_tensor, elements
 
 
-def get_atom_features_with_context(substituent_pdb, core_pdb, protein_pdb=None, 
+def detect_minimized_pdb(prep_dir: Path) -> Optional[Path]:
+    """Detect the minimized system PDB in a prep directory.
+
+    The minimized.pdb contains the full system after energy minimization
+    (protein + core + all substituent atoms) with accurate coordinates.
+    Environment atoms are extracted from it by excluding the core and
+    substituent atoms via coordinate matching.
+
+    Args:
+        prep_dir: Path to prep directory
+
+    Returns:
+        Path to minimized.pdb, or None if not found
+    """
+    minimized_pdb = Path(prep_dir) / 'minimized.pdb'
+    return minimized_pdb if minimized_pdb.exists() else None
+
+
+def extract_environment_atoms_from_minimized(
+    minimized_pdb: Path,
+    sub_pdb: Path,
+    core_pdb: Path,
+    aev_cutoff: float = 5.1,
+    duplicate_tolerance: float = 0.5,
+    prep_dir: Optional[Path] = None,
+) -> Optional[Tuple[List, List]]:
+    """Extract environment atoms (protein or solvent) from minimized.pdb.
+
+    Removes core, target substituent, and (when ``prep_dir`` is given) all
+    other ``site*_sub*_frag.pdb`` atoms from ``minimized.pdb`` via coordinate
+    matching.  The remaining atoms are filtered to those within ``aev_cutoff``
+    of the target substituent and returned as a pre-parsed tuple ready to be
+    passed directly to :func:`get_atom_features_with_context` as
+    ``protein_pdb`` or ``solvent_context``.
+
+    This is the core extraction primitive used by both the RGCN training
+    pipeline (via :func:`graph_utils.compute_deepset_embedding_for_node`) and
+    the DeepSet pretraining pipeline.
+
+    **Why exclude ALL substituents?**  ``minimized.pdb`` contains every
+    substituent from the combination that was simulated.  Leaving other-site
+    sub atoms in the returned tuple would double-count them because
+    :func:`get_atom_features_with_context` adds those same atoms independently
+    via ``find_reference_subs_from_other_sites``.
+
+    **Why 0.5 Å tolerance?**  Energy minimization typically shifts ligand
+    heavy atoms 0.05–0.3 Å.  Protein/solvent contact atoms are ≥ 1.5 Å away,
+    so 0.5 Å safely catches moved ligand atoms without false positives.
+
+    Args:
+        minimized_pdb: Path to minimized.pdb (full system with minimized coordinates)
+        sub_pdb: Path to the substituent PDB file whose AEVs are being computed
+        core_pdb: Path to core PDB file
+        aev_cutoff: AEV spatial cutoff distance in Angstroms (default: 5.1 Å)
+        duplicate_tolerance: Max distance (Å) to consider a minimized atom as
+            matching a ligand fragment atom (default: 0.5 Å)
+        prep_dir: Optional prep directory.  When provided, ALL
+            ``site*_sub*_frag.pdb`` files found here are added to the
+            exclusion set so other-site substituent atoms are removed from the
+            returned context before it is used.
+
+    Returns:
+        ``(coords_list, elements_list)`` for environment atoms within cutoff,
+        or ``None`` if no environment atoms are found after filtering.
+    """
+    min_coords, min_elements = parse_pdb_file(str(minimized_pdb))
+    sub_coords, _ = parse_pdb_file(str(sub_pdb))
+    core_coords, _ = parse_pdb_file(str(core_pdb))
+
+    if not min_coords:
+        return None
+
+    # Build ligand exclusion set: core + target sub + all other-site subs.
+    ligand_coords = core_coords + sub_coords
+    if prep_dir is not None:
+        for other_sub in sorted(Path(prep_dir).glob('site*_sub*_frag.pdb')):
+            if other_sub.resolve() == Path(sub_pdb).resolve():
+                continue
+            other_coords, _ = parse_pdb_file(str(other_sub))
+            ligand_coords.extend(other_coords)
+
+    # Remove ligand atoms from minimized.pdb
+    env_coords, env_elements = remove_duplicate_atoms(
+        coords=min_coords,
+        elements=min_elements,
+        core_coords=ligand_coords,
+        tolerance=duplicate_tolerance,
+    )
+
+    if not env_coords:
+        return None
+
+    # Spatial filter: keep only atoms within aev_cutoff of the substituent
+    sub_arr  = np.array(sub_coords)   # [n_sub,  3]
+    env_arr  = np.array(env_coords)   # [n_env,  3]
+    diff     = env_arr[:, None, :] - sub_arr[None, :, :]  # [n_env, n_sub, 3]
+    min_dists = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)  # [n_env]
+
+    mask = min_dists <= aev_cutoff
+    if not mask.any():
+        return None
+
+    return (
+        [c for c, keep in zip(env_coords, mask) if keep],
+        [e for e, keep in zip(env_elements, mask) if keep],
+    )
+
+
+def get_atom_features_with_context(substituent_pdb, core_pdb, protein_pdb=None,
+                                   solvent_context=None,
                                    rtf_entry=None, include_charges=True, include_atom_ids=True,
                                    prep_dir=None, aev_cutoff=5.1):
     """Compute atom-level features with full molecular context.
-    
-    This function properly combines core + substituent (+ protein + nearby sites) to compute
-    accurate AEVs where each atom sees its full molecular environment.
-    
+
+    This function properly combines core + substituent (+ protein/solvent + nearby sites)
+    to compute accurate AEVs where each atom sees its full molecular environment.
+
     Critical: AEVs are environment-dependent. Substituent atoms must see their
     bonded neighbors in the core to get accurate atomic environments.
-    
-    For multi-site systems, this function automatically detects and includes substituents 
+
+    For multi-site systems, this function automatically detects and includes substituents
     from other sites if they are within the AEV spatial cutoff (default 5.1 Å for ANI-2x).
-    Similarly, protein atoms within the cutoff are included when available.
-    
+    Similarly, protein or solvent atoms within the cutoff are included when provided.
+
     Args:
         substituent_pdb: Path to substituent PDB file
-        core_pdb: Path to core PDB file  
-        protein_pdb: Optional path to protein PDB file
+        core_pdb: Path to core PDB file
+        protein_pdb: Optional path to protein PDB file, or a pre-parsed
+            ``(coords_list, elements_list)`` tuple already filtered to atoms within
+            the AEV cutoff (e.g. extracted from minimized.pdb)
+        solvent_context: Optional pre-parsed ``(coords_list, elements_list)`` tuple of
+            solvent/water atoms within the AEV cutoff (e.g. extracted from minimized.pdb
+            for a solvent-phase system).  These atoms are appended to the AEV context
+            with label ``'solvent'``.
         rtf_entry: Optional RTF metadata dict containing charges
         include_charges: Whether to extract/include charges
         include_atom_ids: Whether to include atom type IDs
         prep_dir: Optional path to prep directory for multi-site spatial filtering
         aev_cutoff: Distance cutoff in Angstroms for including nearby atoms (default: 5.1 Å)
-        
+
     Returns:
         dict with keys:
             - 'aevs': [num_sub_atoms, aev_length] AEV vectors for substituent atoms
@@ -335,7 +452,12 @@ def get_atom_features_with_context(substituent_pdb, core_pdb, protein_pdb=None,
     # Check if protein is nearby (for protein phase systems)
     include_protein = False
     if protein_pdb is not None:
-        if prep_dir is not None:
+        if isinstance(protein_pdb, tuple):
+            # Pre-parsed (coords, elements) tuple: caller has already extracted and
+            # spatially filtered the protein atoms (e.g. from minimized.pdb).
+            # Skip the find_nearby_pdbs check and include directly.
+            include_protein = True
+        elif prep_dir is not None:
             # Use spatial filtering for protein
             from mllf.file_handling.read_pdb import find_nearby_pdbs
             protein_nearby = find_nearby_pdbs(str(substituent_pdb), [str(protein_pdb)], cutoff=aev_cutoff)
@@ -351,7 +473,14 @@ def get_atom_features_with_context(substituent_pdb, core_pdb, protein_pdb=None,
     if include_protein:
         pdb_files.append(protein_pdb)
         context_labels.append('protein')
-    
+
+    # Include pre-parsed solvent context (water molecules within cutoff)
+    include_solvent = False
+    if solvent_context is not None and isinstance(solvent_context, tuple) and solvent_context[0]:
+        include_solvent = True
+        pdb_files.append(solvent_context)
+        context_labels.append('solvent')
+
     # Add substituent last so we can track its indices
     pdb_files.append(substituent_pdb)
     context_labels.append('substituent')
@@ -406,6 +535,7 @@ def get_atom_features_with_context(substituent_pdb, core_pdb, protein_pdb=None,
             'atom_counts_per_source': atom_counts,
             'reference_subs_from_other_sites': nearby_ref_info,
             'protein_included': include_protein,
+            'solvent_included': include_solvent,
             'cutoff_used': aev_cutoff
         }
     

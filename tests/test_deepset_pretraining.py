@@ -1,6 +1,7 @@
 """Tests for DeepSet pretraining components."""
 import pytest
 import torch
+import numpy as np
 import tempfile
 import json
 from pathlib import Path
@@ -20,6 +21,14 @@ from mllf.cb.deepset_pretraining_dataset import (
     extract_charges_from_rtf,
     load_system_metadata,
 )
+from mllf.cb.aev_processor import (
+    detect_minimized_pdb,
+    extract_environment_atoms_from_minimized,
+)
+# Both protein and solvent extraction use the same underlying function;
+# keep descriptive local names so test class/method bodies read clearly.
+extract_protein_atoms_from_minimized = extract_environment_atoms_from_minimized
+extract_solvent_atoms_from_minimized = extract_environment_atoms_from_minimized
 
 
 class TestDeepSetEncoder:
@@ -472,6 +481,486 @@ class TestEdgeCasesPretraining:
             out2 = pretrained(atom_features)
         
         assert torch.allclose(out1, out2)
+
+
+# ---------------------------------------------------------------------------
+# Fixture prep directories checked in under examples/cb/ – available to all
+# contributors after cloning the repository.
+# ---------------------------------------------------------------------------
+_EXAMPLES_CB    = Path(__file__).parent.parent / 'examples' / 'cb'
+_ABL_PREP       = _EXAMPLES_CB / 'protein_abl'
+_BENZ_SOLV_PREP = _EXAMPLES_CB / 'solvent_14benz'
+
+
+class TestDetectMinimizedPdb:
+    """Unit tests for detect_minimized_pdb."""
+
+    def test_returns_path_when_file_exists(self, tmp_path):
+        """Returns Path when minimized.pdb is present."""
+        (tmp_path / 'minimized.pdb').write_text('ATOM      1  CA  ALA A   1       0.000   0.000   0.000\nEND\n')
+        result = detect_minimized_pdb(tmp_path)
+        assert result == tmp_path / 'minimized.pdb'
+
+    def test_returns_none_when_absent(self, tmp_path):
+        """Returns None when minimized.pdb is not present."""
+        assert detect_minimized_pdb(tmp_path) is None
+
+    def test_detects_real_minimized_pdb(self):
+        """Finds the actual minimized.pdb in the ABL protein prep directory."""
+        result = detect_minimized_pdb(_ABL_PREP)
+        assert result is not None
+        assert result.name == 'minimized.pdb'
+        assert result.exists()
+
+
+class TestExtractProteinAtomsFromMinimized:
+    """Unit tests for extract_protein_atoms_from_minimized."""
+
+    def _write_pdb(self, path: Path, atoms):
+        """Helper: write a minimal PDB file from a list of (x, y, z, elem) tuples."""
+        lines = []
+        for i, (x, y, z, elem) in enumerate(atoms, start=1):
+            lines.append(
+                f'ATOM{i:>7}  CA  ALA A{i:>4}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}\n'
+            )
+        lines.append('END\n')
+        path.write_text(''.join(lines))
+
+    # ------------------------------------------------------------------
+    # Synthetic data tests
+    # ------------------------------------------------------------------
+
+    def test_returns_none_for_empty_minimized(self, tmp_path):
+        """Returns None when minimized.pdb has no ATOM lines."""
+        (tmp_path / 'minimized.pdb').write_text('REMARK empty\nEND\n')
+        self._write_pdb(tmp_path / 'core.pdb',   [(0.0, 0.0, 0.0, 'C')])
+        self._write_pdb(tmp_path / 'sub.pdb',    [(1.0, 0.0, 0.0, 'C')])
+        result = extract_protein_atoms_from_minimized(
+            minimized_pdb=tmp_path / 'minimized.pdb',
+            sub_pdb=tmp_path / 'sub.pdb',
+            core_pdb=tmp_path / 'core.pdb',
+        )
+        assert result is None
+
+    def test_returns_none_when_no_atoms_within_cutoff(self, tmp_path):
+        """Returns None when all protein atoms are beyond the AEV cutoff."""
+        # protein atom at 50 Å from the substituent
+        self._write_pdb(tmp_path / 'minimized.pdb', [(0.0, 0.0, 0.0, 'C'), (50.0, 0.0, 0.0, 'N')])
+        self._write_pdb(tmp_path / 'core.pdb',      [(0.0, 0.0, 0.0, 'C')])
+        self._write_pdb(tmp_path / 'sub.pdb',       [(1.0, 0.0, 0.0, 'C')])
+        result = extract_protein_atoms_from_minimized(
+            minimized_pdb=tmp_path / 'minimized.pdb',
+            sub_pdb=tmp_path / 'sub.pdb',
+            core_pdb=tmp_path / 'core.pdb',
+            aev_cutoff=5.1,
+        )
+        assert result is None
+
+    def test_ligand_atoms_excluded(self, tmp_path):
+        """Core and sub atoms from minimized.pdb are not returned."""
+        # minimized has: sub atom (1,0,0), core atom (0,0,0), protein atom (3,0,0)
+        self._write_pdb(tmp_path / 'minimized.pdb', [(0.0, 0.0, 0.0, 'C'),
+                                                      (1.0, 0.0, 0.0, 'C'),
+                                                      (3.0, 0.0, 0.0, 'N')])
+        self._write_pdb(tmp_path / 'core.pdb', [(0.0, 0.0, 0.0, 'C')])
+        self._write_pdb(tmp_path / 'sub.pdb',  [(1.0, 0.0, 0.0, 'C')])
+        coords, elements = extract_protein_atoms_from_minimized(
+            minimized_pdb=tmp_path / 'minimized.pdb',
+            sub_pdb=tmp_path / 'sub.pdb',
+            core_pdb=tmp_path / 'core.pdb',
+            aev_cutoff=5.1,
+            duplicate_tolerance=0.5,
+        )
+        # Only the protein atom (3,0,0) should survive
+        assert len(coords) == 1
+        assert abs(coords[0][0] - 3.0) < 1e-3
+        assert elements[0] == 'N'
+
+    def test_tolerance_handles_minimization_shift(self, tmp_path):
+        """Ligand atoms that moved ≤0.5 Å during minimization are still excluded."""
+        shift = 0.25  # Å – well within the 0.5 Å tolerance
+        self._write_pdb(tmp_path / 'minimized.pdb',
+                        [(shift, 0.0, 0.0, 'C'),       # core atom, slightly shifted
+                         (1.0 + shift, 0.0, 0.0, 'C'), # sub atom, slightly shifted
+                         (3.0, 0.0, 0.0, 'N')])         # protein atom, unmoved
+        self._write_pdb(tmp_path / 'core.pdb', [(0.0, 0.0, 0.0, 'C')])
+        self._write_pdb(tmp_path / 'sub.pdb',  [(1.0, 0.0, 0.0, 'C')])
+        coords, elements = extract_protein_atoms_from_minimized(
+            minimized_pdb=tmp_path / 'minimized.pdb',
+            sub_pdb=tmp_path / 'sub.pdb',
+            core_pdb=tmp_path / 'core.pdb',
+            aev_cutoff=5.1,
+            duplicate_tolerance=0.5,
+        )
+        assert len(coords) == 1
+        assert elements[0] == 'N'
+
+    def test_other_site_subs_excluded_when_prep_dir_provided(self, tmp_path):
+        """Other-site substituent atoms in minimized.pdb are excluded when prep_dir is given."""
+        # Place core + target sub + other-site sub in minimized, plus a protein atom
+        self._write_pdb(tmp_path / 'minimized.pdb',
+                        [(0.0, 0.0, 0.0, 'C'),   # core
+                         (1.0, 0.0, 0.0, 'C'),   # target sub
+                         (2.0, 0.0, 0.0, 'C'),   # other-site sub (site2_sub1)
+                         (4.0, 0.0, 0.0, 'N')])  # protein
+        self._write_pdb(tmp_path / 'core.pdb',             [(0.0, 0.0, 0.0, 'C')])
+        self._write_pdb(tmp_path / 'site1_sub1_frag.pdb',  [(1.0, 0.0, 0.0, 'C')])  # target
+        self._write_pdb(tmp_path / 'site2_sub1_frag.pdb',  [(2.0, 0.0, 0.0, 'C')])  # other site
+
+        # Without prep_dir: other-site sub atom (2,0,0) leaks into protein context
+        coords_no_dir, _ = extract_protein_atoms_from_minimized(
+            minimized_pdb=tmp_path / 'minimized.pdb',
+            sub_pdb=tmp_path / 'site1_sub1_frag.pdb',
+            core_pdb=tmp_path / 'core.pdb',
+            aev_cutoff=5.1,
+            prep_dir=None,
+        )
+        assert len(coords_no_dir) == 2  # other-site sub atom + protein atom
+
+        # With prep_dir: other-site sub atom is also excluded
+        coords_with_dir, elems_with_dir = extract_protein_atoms_from_minimized(
+            minimized_pdb=tmp_path / 'minimized.pdb',
+            sub_pdb=tmp_path / 'site1_sub1_frag.pdb',
+            core_pdb=tmp_path / 'core.pdb',
+            aev_cutoff=5.1,
+            prep_dir=tmp_path,
+        )
+        assert len(coords_with_dir) == 1   # only the protein atom survives
+        assert elems_with_dir[0] == 'N'
+
+    def test_all_returned_atoms_are_within_cutoff(self, tmp_path):
+        """Verify every returned coordinate is within aev_cutoff of the substituent."""
+        aev_cutoff = 5.1
+        # Place protein atoms at various distances from sub (at origin)
+        atoms = [
+            (0.0, 0.0, 0.0, 'C'),   # sub itself – excluded by duplicate check
+            (2.0, 0.0, 0.0, 'N'),   # 2 Å – within cutoff
+            (4.0, 0.0, 0.0, 'O'),   # 4 Å – within cutoff
+            (6.0, 0.0, 0.0, 'N'),   # 6 Å – beyond cutoff
+            (10.0, 0.0, 0.0, 'N'),  # 10 Å – beyond cutoff
+        ]
+        self._write_pdb(tmp_path / 'minimized.pdb', atoms)
+        self._write_pdb(tmp_path / 'core.pdb', [(99.0, 0.0, 0.0, 'C')])  # far away
+        self._write_pdb(tmp_path / 'sub.pdb',  [(0.0, 0.0, 0.0, 'C')])
+        coords, _ = extract_protein_atoms_from_minimized(
+            minimized_pdb=tmp_path / 'minimized.pdb',
+            sub_pdb=tmp_path / 'sub.pdb',
+            core_pdb=tmp_path / 'core.pdb',
+            aev_cutoff=aev_cutoff,
+        )
+        sub_pos = np.array([0.0, 0.0, 0.0])
+        for coord in coords:
+            dist = np.linalg.norm(np.array(coord) - sub_pos)
+            assert dist <= aev_cutoff, f'Atom at {coord} is {dist:.2f} Å from sub (> {aev_cutoff} Å cutoff)'
+
+    # ------------------------------------------------------------------
+    # Real-data tests against the ABL protein wildtype group1 run2 system
+    # ------------------------------------------------------------------
+
+    def test_real_data_returns_protein_atoms(self):
+        """Returns a non-empty result for a real protein prep directory."""
+        minimized_pdb = _ABL_PREP / 'minimized.pdb'
+        core_pdb      = _ABL_PREP / 'core.pdb'
+        sub_pdb       = _ABL_PREP / 'site1_sub1_frag.pdb'
+
+        result = extract_protein_atoms_from_minimized(
+            minimized_pdb=minimized_pdb,
+            sub_pdb=sub_pdb,
+            core_pdb=core_pdb,
+            aev_cutoff=5.1,
+            prep_dir=_ABL_PREP,
+        )
+        assert result is not None, 'Expected protein atoms within 5.1 Å of site1_sub1'
+        coords, elements = result
+        assert len(coords) > 0
+        assert len(coords) == len(elements)
+        print(f'\n  site1_sub1: {len(coords)} protein atoms within 5.1 Å')
+
+    def test_real_data_atoms_within_cutoff(self):
+        """All returned atoms are within the AEV cutoff of the substituent."""
+        from mllf.file_handling.read_pdb import parse_pdb_file as _parse
+        aev_cutoff = 5.1
+        sub_coords, _ = _parse(str(_ABL_PREP / 'site1_sub1_frag.pdb'))
+        sub_arr = np.array(sub_coords)
+
+        coords, _ = extract_protein_atoms_from_minimized(
+            minimized_pdb=_ABL_PREP / 'minimized.pdb',
+            sub_pdb=_ABL_PREP / 'site1_sub1_frag.pdb',
+            core_pdb=_ABL_PREP / 'core.pdb',
+            aev_cutoff=aev_cutoff,
+            prep_dir=_ABL_PREP,
+        )
+        prot_arr = np.array(coords)
+        # Per-atom minimum distance to any sub atom
+        min_dists = np.sqrt(((prot_arr[:, None, :] - sub_arr[None, :, :]) ** 2).sum(axis=2)).min(axis=1)
+        assert (min_dists <= aev_cutoff + 1e-6).all(), \
+            f'Max distance to sub: {min_dists.max():.3f} Å, expected ≤ {aev_cutoff} Å'
+
+    def test_real_data_no_ligand_atoms_in_result(self):
+        """Returned coordinates do not contain core or substituent atoms."""
+        from mllf.file_handling.read_pdb import parse_pdb_file as _parse
+        core_coords, _ = _parse(str(_ABL_PREP / 'core.pdb'))
+        sub_coords,  _ = _parse(str(_ABL_PREP / 'site1_sub1_frag.pdb'))
+        ligand_coords = np.array(core_coords + sub_coords)
+
+        coords, _ = extract_protein_atoms_from_minimized(
+            minimized_pdb=_ABL_PREP / 'minimized.pdb',
+            sub_pdb=_ABL_PREP / 'site1_sub1_frag.pdb',
+            core_pdb=_ABL_PREP / 'core.pdb',
+            aev_cutoff=5.1,
+            prep_dir=_ABL_PREP,
+        )
+        prot_arr = np.array(coords)
+        # Minimum distance from any returned atom to any ligand atom must be > 0.5 Å
+        min_dists = np.sqrt(
+            ((prot_arr[:, None, :] - ligand_coords[None, :, :]) ** 2).sum(axis=2)
+        ).min(axis=1)
+        too_close = (min_dists < 0.5).sum()
+        assert too_close == 0, (
+            f'{too_close} returned atoms are within 0.5 Å of a ligand atom – '
+            f'suggests ligand atoms were not excluded correctly'
+        )
+
+    def test_real_data_count_reasonable(self):
+        """Atom count is positive and plausibly protein."""
+        coords, elements = extract_protein_atoms_from_minimized(
+            minimized_pdb=_ABL_PREP / 'minimized.pdb',
+            sub_pdb=_ABL_PREP / 'site1_sub1_frag.pdb',
+            core_pdb=_ABL_PREP / 'core.pdb',
+            aev_cutoff=5.1,
+            prep_dir=_ABL_PREP,
+        )
+        # Expect at least a few heavy atoms within 5.1 Å of the ligand
+        assert len(coords) >= 5, f'Unexpectedly few protein atoms: {len(coords)}'
+        # Should not exceed the total nearby atoms included in the trimmed fixture
+        assert len(coords) <= 330, f'More atoms than the trimmed fixture contains: {len(coords)}'
+        print(f'\n  Protein context atoms within 5.1 Å: {len(coords)}')
+        print(f'  Element breakdown: { {e: elements.count(e) for e in set(elements)} }')
+
+    def test_real_data_consistent_across_subs(self):
+        """Different substituents at site1 each get a valid protein context."""
+        results = {}
+        for sub_idx in range(1, 7):  # sub1 through sub6
+            sub_pdb = _ABL_PREP / f'site1_sub{sub_idx}_frag.pdb'
+            if not sub_pdb.exists():
+                continue
+            result = extract_protein_atoms_from_minimized(
+                minimized_pdb=_ABL_PREP / 'minimized.pdb',
+                sub_pdb=sub_pdb,
+                core_pdb=_ABL_PREP / 'core.pdb',
+                aev_cutoff=5.1,
+                prep_dir=_ABL_PREP,
+            )
+            assert result is not None, f'site1_sub{sub_idx} returned None'
+            coords, _ = result
+            assert len(coords) >= 5, f'site1_sub{sub_idx}: too few protein atoms ({len(coords)})'
+            results[sub_idx] = len(coords)
+
+        print(f'\n  Protein context atom counts per substituent: {results}')
+        # All subs at the same site should get a similar number of nearby protein atoms
+        counts = list(results.values())
+        assert max(counts) - min(counts) < max(counts) * 0.5, (
+            f'Atom counts vary too widely across substituents: {results}'
+        )
+
+
+class TestExtractSolventAtomsFromMinimized:
+    """Unit tests for extract_solvent_atoms_from_minimized.
+
+    The function is a thin wrapper over extract_protein_atoms_from_minimized;
+    these tests focus on the solvent-system-specific behaviour (water molecules
+    returned, ligand atoms excluded) and real-data sanity checks.
+    """
+
+    # -----------------------------------------------------------------------
+    # Synthetic tests (in-memory PDB files)
+    # -----------------------------------------------------------------------
+
+    def _write_pdb(self, tmpdir, name, atoms):
+        """Write a minimal PDB file.  atoms = [(x,y,z,elem,resname)]"""
+        lines = []
+        for i, (x, y, z, elem, resname) in enumerate(atoms, start=1):
+            lines.append(
+                f'ATOM  {i:5d}  {elem:<4s}{resname:<4s}    1    '
+                f'{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00      SEG {elem:<2s}'
+            )
+        lines.append('END')
+        p = Path(tmpdir) / name
+        p.write_text('\n'.join(lines))
+        return p
+
+    def test_returns_none_for_empty_minimized(self):
+        """Returns None when minimized.pdb has no atoms."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            min_pdb  = self._write_pdb(tmpdir, 'minimized.pdb', [])
+            sub_pdb  = self._write_pdb(tmpdir, 'sub.pdb',  [(0, 0, 0, 'C', 'LIG')])
+            core_pdb = self._write_pdb(tmpdir, 'core.pdb', [(0, 1, 0, 'C', 'LIG')])
+            result = extract_solvent_atoms_from_minimized(
+                minimized_pdb=min_pdb,
+                sub_pdb=sub_pdb,
+                core_pdb=core_pdb,
+            )
+            assert result is None
+
+    def test_returns_none_when_no_water_within_cutoff(self):
+        """Returns None when all non-ligand atoms in minimized.pdb are beyond the cutoff."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Sub at origin, water far away
+            min_pdb = self._write_pdb(tmpdir, 'minimized.pdb', [
+                (0,  0, 0, 'C', 'LIG'),   # core atom (excluded)
+                (0, 50, 0, 'O', 'TIP3'),  # water outside cutoff
+                (0, 51, 0, 'H', 'TIP3'),
+            ])
+            sub_pdb  = self._write_pdb(tmpdir, 'sub.pdb',  [(0, 0, 0, 'C', 'LIG')])
+            core_pdb = self._write_pdb(tmpdir, 'core.pdb', [(0, 0, 0, 'C', 'LIG')])
+            result = extract_solvent_atoms_from_minimized(
+                minimized_pdb=min_pdb,
+                sub_pdb=sub_pdb,
+                core_pdb=core_pdb,
+                aev_cutoff=5.1,
+            )
+            assert result is None
+
+    def test_water_atoms_returned_within_cutoff(self):
+        """Water oxygen and hydrogens within the AEV cutoff are returned."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            min_pdb = self._write_pdb(tmpdir, 'minimized.pdb', [
+                (0, 0, 0, 'C', 'LIG'),   # core (excluded)
+                (3, 0, 0, 'O', 'TIP3'),  # water O within 5.1 Å
+                (3, 1, 0, 'H', 'TIP3'),  # water H within 5.1 Å
+                (3, -1, 0, 'H', 'TIP3'), # water H within 5.1 Å
+            ])
+            sub_pdb  = self._write_pdb(tmpdir, 'sub.pdb',  [(0, 0, 0, 'C', 'LIG')])
+            core_pdb = self._write_pdb(tmpdir, 'core.pdb', [(0, 0, 0, 'C', 'LIG')])
+            result = extract_solvent_atoms_from_minimized(
+                minimized_pdb=min_pdb,
+                sub_pdb=sub_pdb,
+                core_pdb=core_pdb,
+                aev_cutoff=5.1,
+            )
+            assert result is not None
+            coords, elements = result
+            assert len(coords) == 3
+            assert 'O' in elements
+            assert elements.count('H') == 2
+
+    def test_ligand_atoms_excluded_from_result(self):
+        """Ligand atoms (core + sub) are never returned, even when within cutoff."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            min_pdb = self._write_pdb(tmpdir, 'minimized.pdb', [
+                (0,   0, 0, 'C', 'LIG'),  # core atom: excluded
+                (0.1, 0, 0, 'C', 'LIG'),  # sub atom: excluded (tiny shift after minimisation)
+                (3,   0, 0, 'O', 'TIP3'), # water O within cutoff: kept
+            ])
+            sub_pdb  = self._write_pdb(tmpdir, 'sub.pdb',  [(0,   0, 0, 'C', 'LIG')])
+            core_pdb = self._write_pdb(tmpdir, 'core.pdb', [(0,   0, 0, 'C', 'LIG')])
+            coords, elements = extract_solvent_atoms_from_minimized(
+                minimized_pdb=min_pdb,
+                sub_pdb=sub_pdb,
+                core_pdb=core_pdb,
+                aev_cutoff=5.1,
+                duplicate_tolerance=0.5,
+            )
+            assert len(coords) == 1
+            assert elements == ['O']
+
+    # -----------------------------------------------------------------------
+    # Real-data tests (14benz solvent system)
+    # -----------------------------------------------------------------------
+
+    def test_real_data_returns_solvent_atoms(self):
+        """extract_solvent_atoms_from_minimized returns a non-empty tuple for site1_sub1."""
+        result = extract_solvent_atoms_from_minimized(
+            minimized_pdb=_BENZ_SOLV_PREP / 'minimized.pdb',
+            sub_pdb=_BENZ_SOLV_PREP / 'site1_sub1_frag.pdb',
+            core_pdb=_BENZ_SOLV_PREP / 'core.pdb',
+            aev_cutoff=5.1,
+            prep_dir=_BENZ_SOLV_PREP,
+        )
+        assert result is not None, 'Expected solvent atoms within 5.1 Å but got None'
+        coords, elements = result
+        assert len(coords) > 0
+        assert len(coords) == len(elements)
+        print(f'\n  site1_sub1: {len(coords)} solvent atoms within 5.1 Å')
+
+    def test_real_data_atoms_within_cutoff(self):
+        """All returned atoms are within 5.1 Å of site1_sub1."""
+        from mllf.file_handling.read_pdb import parse_pdb_file as _parse
+        sub_coords, _ = _parse(str(_BENZ_SOLV_PREP / 'site1_sub1_frag.pdb'))
+        result = extract_solvent_atoms_from_minimized(
+            minimized_pdb=_BENZ_SOLV_PREP / 'minimized.pdb',
+            sub_pdb=_BENZ_SOLV_PREP / 'site1_sub1_frag.pdb',
+            core_pdb=_BENZ_SOLV_PREP / 'core.pdb',
+            aev_cutoff=5.1,
+            prep_dir=_BENZ_SOLV_PREP,
+        )
+        assert result is not None
+        coords, _ = result
+        sub_arr  = np.array(sub_coords)
+        prot_arr = np.array(coords)
+        diff = prot_arr[:, None, :] - sub_arr[None, :, :]
+        min_dists = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
+        assert (min_dists <= 5.1 + 1e-6).all(), (
+            f'{(min_dists > 5.1).sum()} atom(s) beyond 5.1 Å cutoff'
+        )
+
+    def test_real_data_no_ligand_atoms_in_result(self):
+        """No returned atom is within 0.5 Å of any ligand (core or sub) atom."""
+        from mllf.file_handling.read_pdb import parse_pdb_file as _parse
+        sub_coords,  _ = _parse(str(_BENZ_SOLV_PREP / 'site1_sub1_frag.pdb'))
+        core_coords, _ = _parse(str(_BENZ_SOLV_PREP / 'core.pdb'))
+        lig_arr = np.array(sub_coords + core_coords)
+        result = extract_solvent_atoms_from_minimized(
+            minimized_pdb=_BENZ_SOLV_PREP / 'minimized.pdb',
+            sub_pdb=_BENZ_SOLV_PREP / 'site1_sub1_frag.pdb',
+            core_pdb=_BENZ_SOLV_PREP / 'core.pdb',
+            aev_cutoff=5.1,
+            prep_dir=_BENZ_SOLV_PREP,
+        )
+        assert result is not None
+        coords, _ = result
+        solv_arr = np.array(coords)
+        diff = solv_arr[:, None, :] - lig_arr[None, :, :]
+        min_dists = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
+        close = (min_dists < 0.5).sum()
+        assert close == 0, f'{close} returned atom(s) are within 0.5 Å of a ligand atom'
+
+    def test_real_data_consistent_across_subs(self):
+        """All 11 substituents in the 14benz solvent system return valid solvent contexts."""
+        results = {}
+        subs = [
+            ('site1', range(1, 7)), ('site2', range(1, 6))
+        ]
+        for site, sub_range in subs:
+            for sub_idx in sub_range:
+                sub_pdb = _BENZ_SOLV_PREP / f'{site}_sub{sub_idx}_frag.pdb'
+                if not sub_pdb.exists():
+                    continue
+                result = extract_solvent_atoms_from_minimized(
+                    minimized_pdb=_BENZ_SOLV_PREP / 'minimized.pdb',
+                    sub_pdb=sub_pdb,
+                    core_pdb=_BENZ_SOLV_PREP / 'core.pdb',
+                    aev_cutoff=5.1,
+                    prep_dir=_BENZ_SOLV_PREP,
+                )
+                key = f'{site}_sub{sub_idx}'
+                assert result is not None, f'{key} returned None'
+                coords, _ = result
+                assert len(coords) > 0, f'{key} returned empty context'
+                results[key] = len(coords)
+
+        print(f'\n  Solvent context atom counts: {results}')
+        # Every substituent should have a non-empty solvent context
+        for key, count in results.items():
+            assert count > 0, f'{key}: empty solvent context'
+        # Counts should be broadly similar across substituents at the same site
+        site1_counts = [v for k, v in results.items() if k.startswith('site1')]
+        site2_counts = [v for k, v in results.items() if k.startswith('site2')]
+        for site_counts in (site1_counts, site2_counts):
+            if len(site_counts) > 1:
+                assert max(site_counts) - min(site_counts) < max(site_counts) * 0.8, (
+                    f'Solvent atom counts vary too widely: {site_counts}'
+                )
 
 
 if __name__ == '__main__':

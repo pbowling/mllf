@@ -13,12 +13,13 @@ import warnings
 from typing import List, Tuple, Dict, Optional
 
 from mllf.cb.aev_processor import (
-    get_substituent_aevs, 
+    get_substituent_aevs,
     extract_charges_from_rtf_metadata,
-    get_atom_features_with_context
+    get_atom_features_with_context,
+    detect_minimized_pdb,
+    extract_environment_atoms_from_minimized,
 )
 from mllf.file_handling.read_rtf import parse_rtf_file
-from mllf.file_handling.read_pdb import parse_pdb_file
 
 
 def detect_core_pdb(prep_dir: Path) -> Optional[Path]:
@@ -198,15 +199,26 @@ def generate_training_data_for_system(
     if core_pdb:
         print(f"  Core PDB: {core_pdb.name}")
     
-    # For protein systems, detect protein PDB for context-aware AEVs
-    protein_pdb = None
+    # Detect minimized.pdb for all phases.  Energy-minimized coordinates are used:
+    #   protein  → extract protein context atoms within AEV cutoff
+    #   solvent  → extract solvent (water) context atoms within AEV cutoff
+    #   vacuum   → detected but not used for additional context
+    minimized_pdb = detect_minimized_pdb(prep_dir)  # type: Optional[Path]
+    if minimized_pdb:
+        print(f"  Minimized PDB: {minimized_pdb.name}")
+
+    # For protein systems, also keep a fallback standalone protein PDB path.
+    protein_pdb = None          # Path to a standalone protein PDB (fallback only)
     if solvent_state == 'protein':
-        protein_pdb = detect_protein_pdb(prep_dir)
-        if protein_pdb:
-            print(f"  Protein PDB: {protein_pdb.name}")
-            print(f"  → Using protein context for accurate AEVs")
+        if minimized_pdb:
+            print(f"  → Will extract protein context from minimized coordinates")
         else:
-            warnings.warn(f"[{system_name}] Protein state but no protein PDB found")
+            protein_pdb = detect_protein_pdb(prep_dir)
+            if protein_pdb:
+                print(f"  Protein PDB: {protein_pdb.name}")
+                print(f"  → Using protein context for accurate AEVs")
+            else:
+                warnings.warn(f"[{system_name}] Protein state but no protein PDB or minimized.pdb found")
     
     # Collect all substituent PDB files
     sub_pdbs = sorted(prep_dir.glob('site*_sub*_frag.pdb'))
@@ -230,24 +242,55 @@ def generate_training_data_for_system(
                     rtf_data = parse_rtf_file(str(rtf_path))
                 except Exception as e:
                     warnings.warn(f"[{system_name}] Could not parse RTF {rtf_path.name}: {e}")
-            
+
             # Compute AEVs with appropriate context
-            if solvent_state == 'protein' and protein_pdb and core_pdb:
-                # Use context-aware AEV computation for protein systems
-                # This includes protein atoms within cutoff for accurate environments
+            if solvent_state == 'protein' and core_pdb and (minimized_pdb or protein_pdb):
+                # Build protein context for this specific substituent.
+                # Preferred path: extract protein atoms from minimized.pdb using
+                # coordinate-based exclusion of core/sub atoms, then apply the AEV
+                # spatial cutoff.  This gives the most accurate environment because
+                # the coordinates reflect the actual minimized geometry.
+                protein_context = None  # tuple (coords, elements) or None
+
+                if minimized_pdb:
+                    try:
+                        protein_context = extract_environment_atoms_from_minimized(
+                            minimized_pdb=minimized_pdb,
+                            sub_pdb=pdb_path,
+                            core_pdb=core_pdb,
+                            aev_cutoff=aev_cutoff,
+                            prep_dir=prep_dir,
+                        )
+                        if protein_context is None:
+                            warnings.warn(
+                                f"[{system_name}] No protein atoms within {aev_cutoff} Å "
+                                f"of {pdb_path.name} in minimized.pdb"
+                            )
+                    except Exception as e:
+                        warnings.warn(
+                            f"[{system_name}] Could not extract protein context from "
+                            f"minimized.pdb for {pdb_path.name}: {e}. Falling back to "
+                            f"protein PDB if available."
+                        )
+
+                # Fallback to standalone protein PDB when minimized.pdb fails / absent
+                effective_protein_pdb = protein_context if protein_context is not None else (
+                    str(protein_pdb) if protein_pdb else None
+                )
+
                 features_dict = get_atom_features_with_context(
                     substituent_pdb=str(pdb_path),
                     core_pdb=str(core_pdb),
-                    protein_pdb=str(protein_pdb),
+                    protein_pdb=effective_protein_pdb,
                     rtf_entry=rtf_data,
                     include_charges=True,
                     include_atom_ids=False,
                     prep_dir=str(prep_dir),
-                    aev_cutoff=aev_cutoff
+                    aev_cutoff=aev_cutoff,
                 )
                 aevs = features_dict['aevs']
                 charges = features_dict.get('charges')
-                
+
                 # Print verbose context information for first substituent
                 if verbose and not first_sub_processed:
                     context_info = features_dict.get('context_info', {})
@@ -260,21 +303,119 @@ def generate_training_data_for_system(
                         print(f"      - {source}: {count} atoms")
                     print(f"    Total context atoms: {context_info.get('total_context_atoms', 0)}")
                     print(f"    Protein included: {context_info.get('protein_included', False)}")
+                    if protein_context is not None:
+                        print(f"    Protein source: minimized.pdb ({len(protein_context[0])} atoms within cutoff)")
+                    elif protein_pdb:
+                        print(f"    Protein source: {protein_pdb.name} (fallback)")
                     if context_info.get('reference_subs_from_other_sites'):
                         print(f"    Reference subs from other sites:")
                         for ref_info in context_info['reference_subs_from_other_sites']:
                             print(f"      - {ref_info['pdb']}: {ref_info['filtered_atoms']} atoms "
                                   f"(removed {ref_info['removed_duplicates']} duplicates)")
                     first_sub_processed = True
+            elif solvent_state == 'solvent' and core_pdb:
+                # Solvent path: core + other-site subs (via prep_dir) + water from
+                # minimized.pdb within AEV cutoff.
+                solvent_context = None  # type: Optional[Tuple[List, List]]
+
+                if minimized_pdb:
+                    try:
+                        solvent_context = extract_environment_atoms_from_minimized(
+                            minimized_pdb=minimized_pdb,
+                            sub_pdb=pdb_path,
+                            core_pdb=core_pdb,
+                            aev_cutoff=aev_cutoff,
+                            prep_dir=prep_dir,
+                        )
+                        if solvent_context is None:
+                            warnings.warn(
+                                f"[{system_name}] No solvent atoms within {aev_cutoff} Å "
+                                f"of {pdb_path.name} in minimized.pdb"
+                            )
+                    except Exception as e:
+                        warnings.warn(
+                            f"[{system_name}] Could not extract solvent context from "
+                            f"minimized.pdb for {pdb_path.name}: {e}"
+                        )
+
+                features_dict = get_atom_features_with_context(
+                    substituent_pdb=str(pdb_path),
+                    core_pdb=str(core_pdb),
+                    solvent_context=solvent_context,
+                    rtf_entry=rtf_data,
+                    include_charges=True,
+                    include_atom_ids=False,
+                    prep_dir=str(prep_dir),
+                    aev_cutoff=aev_cutoff,
+                )
+                aevs = features_dict['aevs']
+                charges = features_dict.get('charges')
+
+                # Print verbose context information for first substituent
+                if verbose and not first_sub_processed:
+                    context_info = features_dict.get('context_info', {})
+                    print(f"\n  [VERBOSE] AEV Context for {pdb_path.name}:")
+                    print(f"    Cutoff distance: {context_info.get('cutoff_used', aev_cutoff)} Å")
+                    print(f"    Context sources: {', '.join(context_info.get('context_sources', []))}")
+                    atom_counts = context_info.get('atom_counts_per_source', [])
+                    sources = context_info.get('context_sources', [])
+                    for source, count in zip(sources, atom_counts):
+                        print(f"      - {source}: {count} atoms")
+                    print(f"    Total context atoms: {context_info.get('total_context_atoms', 0)}")
+                    print(f"    Solvent included: {context_info.get('solvent_included', False)}")
+                    if solvent_context is not None:
+                        print(f"    Solvent source: minimized.pdb ({len(solvent_context[0])} atoms within cutoff)")
+                    else:
+                        print(f"    Solvent source: none (minimized.pdb unavailable or empty within cutoff)")
+                    if context_info.get('reference_subs_from_other_sites'):
+                        print(f"    Reference subs from other sites:")
+                        for ref_info in context_info['reference_subs_from_other_sites']:
+                            print(f"      - {ref_info['pdb']}: {ref_info['filtered_atoms']} atoms "
+                                  f"(removed {ref_info['removed_duplicates']} duplicates)")
+                    first_sub_processed = True
+
+            elif core_pdb:
+                # Vacuum/gas path: core + other-site subs (via prep_dir) — no additional
+                # environment atoms (no protein, no solvent).
+                features_dict = get_atom_features_with_context(
+                    substituent_pdb=str(pdb_path),
+                    core_pdb=str(core_pdb),
+                    rtf_entry=rtf_data,
+                    include_charges=True,
+                    include_atom_ids=False,
+                    prep_dir=str(prep_dir),
+                    aev_cutoff=aev_cutoff,
+                )
+                aevs = features_dict['aevs']
+                charges = features_dict.get('charges')
+
+                # Print verbose context information for first substituent
+                if verbose and not first_sub_processed:
+                    context_info = features_dict.get('context_info', {})
+                    print(f"\n  [VERBOSE] AEV Context for {pdb_path.name}:")
+                    print(f"    Cutoff distance: {context_info.get('cutoff_used', aev_cutoff)} Å")
+                    print(f"    Context sources: {', '.join(context_info.get('context_sources', []))}")
+                    atom_counts = context_info.get('atom_counts_per_source', [])
+                    sources = context_info.get('context_sources', [])
+                    for source, count in zip(sources, atom_counts):
+                        print(f"      - {source}: {count} atoms")
+                    print(f"    Total context atoms: {context_info.get('total_context_atoms', 0)}")
+                    if context_info.get('reference_subs_from_other_sites'):
+                        print(f"    Reference subs from other sites:")
+                        for ref_info in context_info['reference_subs_from_other_sites']:
+                            print(f"      - {ref_info['pdb']}: {ref_info['filtered_atoms']} atoms "
+                                  f"(removed {ref_info['removed_duplicates']} duplicates)")
+                    first_sub_processed = True
+
             else:
-                # For non-protein systems, use substituent-only AEVs
+                # Fallback: no core available — substituent-only AEVs
                 aevs = get_substituent_aevs(str(pdb_path))
                 charges = extract_charges_from_rtf(rtf_path, pdb_path.name) if rtf_data else None
-                
-                # Print verbose info for non-protein systems
+
+                # Print verbose info for substituent-only fallback
                 if verbose and not first_sub_processed:
                     print(f"\n  [VERBOSE] AEV Context for {pdb_path.name}:")
-                    print(f"    Mode: Substituent-only (no protein context)")
+                    print(f"    Mode: Substituent-only (no core PDB found)")
                     print(f"    Substituent atoms: {aevs.shape[0]}")
                     first_sub_processed = True
             

@@ -17,8 +17,8 @@ class TestVariablesFileFormat:
     
     @pytest.fixture
     def variables85_data(self):
-        """Load variables85.inp if it exists."""
-        inp_file = Path("/home/pbowling/mllf/examples/cb/variables85.inp")
+        """Load variables85.inp from the checked-in examples directory."""
+        inp_file = Path(__file__).parent.parent / 'examples' / 'cb' / 'variables85.inp'
         if not inp_file.exists():
             pytest.skip("variables85.inp not found")
         return parse_old(str(inp_file))

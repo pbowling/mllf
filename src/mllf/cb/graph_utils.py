@@ -49,64 +49,105 @@ def compute_deepset_embedding_for_node(
     Returns:
         torch.Tensor: [embedding_dim] substituent embedding
     """
-    from .aev_processor import get_atom_features, get_atom_features_with_context
+    from .aev_processor import (
+        get_atom_features, get_atom_features_with_context,
+        detect_minimized_pdb, extract_environment_atoms_from_minimized,
+    )
     from pathlib import Path
-    
+
     # Get node metadata
     node_info = g.get_node_info(node_idx) if hasattr(g, 'get_node_info') else {}
     site = node_info.get('site')
-    sub = node_info.get('sub')
-    
+    sub  = node_info.get('sub')
+
     if site is None or sub is None:
         raise ValueError(f"Node {node_idx} missing site or sub metadata")
-    
+
     # Construct PDB paths
     pdb_filename = pdb_pattern.format(site=site, sub=sub)
     pdb_path = os.path.join(pdb_dir, pdb_filename)
-    
+
     if not os.path.exists(pdb_path):
         raise FileNotFoundError(f"PDB file not found: {pdb_path}")
-    
+
     # Get RTF entry for charges if available
     rtf_entry = None
     if rtf_results is not None:
         rtf_key = f"site{site}_sub{sub}"
         rtf_entry = rtf_results.get(rtf_key)
-    
+
     # Determine if we should use context-aware AEV computation
     use_context = prep_dir is not None
-    
+
     if use_context:
-        # Look for core.pdb in prep directory
         prep_path = Path(prep_dir)
-        core_pdb = prep_path / "core.pdb"
-        
+        core_pdb = prep_path / 'core.pdb'
+
         if not core_pdb.exists():
             warnings.warn(f"core.pdb not found in {prep_dir}, falling back to single-PDB AEV computation")
             use_context = False
         else:
-            # Check for protein PDB if solvent_state is 'protein'
-            if protein_pdb is None and solvent_state == 'protein':
-                default_protein_pdb = prep_path / "protein.pdb"
-                if default_protein_pdb.exists():
-                    protein_pdb = str(default_protein_pdb)
-                    warnings.warn(f"Using protein.pdb from prep directory for AEV spatial filtering")
+            # ------------------------------------------------------------------
+            # Try to build environment context from minimized.pdb first.
+            # This gives the most accurate AEV context for both protein and
+            # solvent phase systems because it uses the post-minimization
+            # coordinates of the entire simulated system.
+            # ------------------------------------------------------------------
+            sub_frag_pdb = prep_path / f'site{site}_sub{sub}_frag.pdb'
+            min_pdb = detect_minimized_pdb(prep_path)
+
+            protein_context   = None  # pre-parsed tuple for protein_pdb arg
+            solvent_ctx       = None  # pre-parsed tuple for solvent_context arg
+            effective_protein = protein_pdb  # fallback path string
+
+            if min_pdb and sub_frag_pdb.exists():
+                env_ctx = extract_environment_atoms_from_minimized(
+                    minimized_pdb=min_pdb,
+                    sub_pdb=sub_frag_pdb,
+                    core_pdb=core_pdb,
+                    aev_cutoff=aev_cutoff,
+                    prep_dir=prep_path,
+                )
+                if env_ctx is not None:
+                    if solvent_state == 'protein':
+                        protein_context   = env_ctx
+                        effective_protein = protein_context
+                    elif solvent_state in ('solvent', 'solv', 'water'):
+                        solvent_ctx = env_ctx
+                    # vacuum/gas: env_ctx not used (no extra environment atoms)
+                elif solvent_state == 'protein' and protein_pdb is None:
+                    # minimized.pdb gave nothing — look for standalone protein PDB
+                    default_protein = prep_path / 'protein.pdb'
+                    if default_protein.exists():
+                        effective_protein = str(default_protein)
+                        warnings.warn("Using protein.pdb from prep directory for AEV spatial filtering")
+                    else:
+                        warnings.warn(
+                            f"solvent_state is 'protein' but no environment atoms found in "
+                            f"minimized.pdb and no protein.pdb in prep directory."
+                        )
+            elif solvent_state == 'protein' and protein_pdb is None:
+                # No minimized.pdb and no sub_frag — try standalone protein PDB
+                default_protein = prep_path / 'protein.pdb'
+                if default_protein.exists():
+                    effective_protein = str(default_protein)
+                    warnings.warn("Using protein.pdb from prep directory for AEV spatial filtering")
                 else:
                     warnings.warn(
                         f"solvent_state is 'protein' but no protein PDB found. "
                         f"Specify protein_pdb in config or add protein.pdb to prep directory."
                     )
-            
-            # Extract atom-level features with context (Steps 1)
+
             atom_feats = get_atom_features_with_context(
                 substituent_pdb=pdb_path,
                 core_pdb=str(core_pdb),
-                protein_pdb=protein_pdb,
+                protein_pdb=effective_protein,
+                solvent_context=solvent_ctx,
                 rtf_entry=rtf_entry,
                 include_charges=deepset_model.include_charge,
                 include_atom_ids=deepset_model.include_atom_id,
                 prep_dir=prep_dir,
-                aev_cutoff=aev_cutoff
+                aev_cutoff=aev_cutoff,
             )
     
     if not use_context:

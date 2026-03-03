@@ -87,15 +87,28 @@ See :doc:`deepset_pretraining` for technical details on the 4-step pretraining p
 
 **Environmental Context Encoding**:
 
-The environment type (solvent, vacuum, or protein) influences how DeepSet embeddings are computed:
+The environment type influences how DeepSet embeddings are computed. When a
+``minimized.pdb`` file is present in the prep directory, post-minimization coordinates
+are used to provide the most accurate representation of each atom's environment—the
+minimized geometry reflects the actual sampled ensemble rather than the initial placement.
 
-* **Protein systems**: Nearby protein atoms are included in AEV computation, naturally encoding
-  protein-specific interactions into the molecular representation
-* **Solvent systems**: Core structure and nearby substituents from other sites provide context
-* **Vacuum systems**: Core structure and nearby substituents provide context without solvent effects
+* **Protein systems**: All protein atoms within 5.1 Å of the substituent are extracted
+  from ``minimized.pdb`` and included in AEV computation. This encodes protein-specific
+  interactions (hydrogen bonds, hydrophobic contacts, electrostatics) directly into the
+  molecular representation. Falls back to a standalone ``protein.pdb`` if no
+  ``minimized.pdb`` is found.
 
-This context-aware approach eliminates the need for explicit environment flags as node features—
-the environmental information is implicitly learned in the embeddings themselves.
+* **Solvent systems**: Water molecules within 5.1 Å of the substituent are extracted
+  from ``minimized.pdb`` and included as solvent context, capturing the immediate
+  solvation shell. Without ``minimized.pdb``, only the core and nearby substituents
+  from other sites contribute.
+
+* **Vacuum systems**: No additional environment atoms (core + other-site substituents
+  within cutoff only). ``minimized.pdb`` is checked but not used for extra context.
+
+
+This context-aware approach eliminates the need for explicit environment flags as node
+features—the environmental information is implicitly encoded in the embeddings themselves.
 
 **Legacy RTF-Only Construction**:
 
