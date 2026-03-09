@@ -70,7 +70,9 @@ def parse_pdb_file(pdb_path: str, rtf_data: Optional[dict] = None) -> Tuple[List
     # TIER 1: Try RDKit parser first (handles standard PDB formats best)
     try:
         from rdkit import Chem
-        mol = Chem.MolFromPDBFile(pdb_path, removeHs=False, sanitize=False)
+        from rdkit.Chem.rdBase import BlockLogs
+        with BlockLogs():
+            mol = Chem.MolFromPDBFile(pdb_path, removeHs=False, sanitize=False)
         
         if mol is not None and mol.GetNumAtoms() > 0:
             # Successfully parsed with RDKit - extract coordinates and elements
@@ -159,16 +161,35 @@ def parse_pdb_file(pdb_path: str, rtf_data: Optional[dict] = None) -> Tuple[List
                 parse_errors.append(error_msg)
                 warnings.warn(error_msg)
                 continue
-            
+
+            # Skip CHARMM pseudo-atoms (lone pairs and dummy atoms).
+            # These are not real atoms and must not contribute to AEV computation.
+            #   LP*  – lone pair virtual sites (e.g. LP0A, LP0B, LP0Q)
+            #   DM*  – dummy atoms used in alchemical transformations (e.g. DM01, DM02)
+            # They have no physical element and would otherwise be defaulted to 'H',
+            # introducing spurious radial/angular terms into the AEV.
+            if atom_name.upper().startswith(('LP', 'DM')):
+                atom_index += 1
+                continue
+
             # Extract element from atom name (e.g., "C001", "H002", "CL01", "B085")
             # For RCSB format, also check explicit element symbol in columns 76-77
             element_from_column = None
             if len(line) >= 78:
-                element_from_column = line[76:78].strip()
-                if element_from_column and element_from_column.replace(' ', '').isalpha():
-                    element = element_from_column.strip()
-                else:
-                    element_from_column = None
+                raw_col = line[76:78].strip()
+                if raw_col and raw_col.replace(' ', '').isalpha():
+                    # Normalize capitalization: 'BR' -> 'Br', 'CL' -> 'Cl', 'C' -> 'C', etc.
+                    norm = raw_col.capitalize()
+                    # Validate against the known chemistry vocabulary to reject
+                    # stray characters from segment-name fields that overlap this column
+                    # (e.g. the trailing letter of a CHARMM segment such as 'LIGB').
+                    _VALID_ELEMENTS = {
+                        'H', 'C', 'N', 'O', 'F', 'S', 'P', 'B', 'I', 'K',
+                        'Cl', 'Br', 'Al', 'Se', 'Na', 'Ca', 'Mg', 'Zn', 'Fe',
+                    }
+                    if norm in _VALID_ELEMENTS:
+                        element_from_column = norm
+                        element = norm
             
             # Fall back to extracting from atom name if no explicit element column
             if not element_from_column:

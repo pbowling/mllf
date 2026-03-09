@@ -18,7 +18,7 @@ from mllf.cb.deepset_autoencoder import create_autoencoder
 
 
 class AtomFeatureDataset(Dataset):
-    """PyTorch Dataset for atom features."""
+    """PyTorch Dataset for atom features from a single system."""
     
     def __init__(self, data_path):
         """
@@ -36,6 +36,31 @@ class AtomFeatureDataset(Dataset):
     def __len__(self):
         return self.num_atoms
     
+    def __getitem__(self, idx):
+        return self.features[idx]
+
+
+class CombinedAtomFeatureDataset(Dataset):
+    """PyTorch Dataset that pools atom features from all pretraining systems."""
+
+    def __init__(self, data_paths):
+        """
+        Args:
+            data_paths: Iterable of paths to *_training_data.pt files
+        """
+        all_features = []
+        for path in data_paths:
+            data = torch.load(path, map_location='cpu')
+            all_features.append(data['features'])
+            print(f"  {data['system_name']}: {len(data['features']):,} atoms")
+
+        self.features = torch.cat(all_features, dim=0)  # [total_atoms, feature_dim]
+        self.feature_dim = self.features.shape[1]
+        print(f"Combined dataset: {len(self.features):,} atoms total, {self.feature_dim}D features")
+
+    def __len__(self):
+        return len(self.features)
+
     def __getitem__(self, idx):
         return self.features[idx]
 
@@ -203,13 +228,165 @@ def train_autoencoder(
     return training_history
 
 
+def train_combined_model(
+    data_root: Path,
+    output_dir: Path,
+    input_dim: int = 2289,
+    hidden_dim: int = 256,
+    embedding_dim: int = 64,
+    batch_size: int = 1024,
+    learning_rate: float = 1e-3,
+    num_epochs: int = 100,
+    patience: int = 10,
+    device: str = 'cpu',
+    save_interval: int = 10,
+) -> Dict:
+    """Train a single DeepSet autoencoder on all pretraining systems combined.
+
+    All *_training_data.pt files in data_root are concatenated into one dataset
+    and used to train a single shared model.  The resulting encoder weights are
+    saved to output_dir/best_encoder.pt (best validation loss) and
+    output_dir/final_encoder.pt (weights at end of training).
+
+    Args:
+        data_root: Directory containing *_training_data.pt files
+        output_dir: Directory to save the encoder and training history
+        input_dim: AEV feature dimension (default: 2289 for ANI-2x)
+        hidden_dim: Hidden layer width
+        embedding_dim: Bottleneck/embedding dimension
+        batch_size: Training batch size
+        learning_rate: Adam learning rate
+        num_epochs: Maximum training epochs
+        patience: Early-stopping patience
+        device: 'cpu' or 'cuda'
+        save_interval: Save a full checkpoint every N epochs
+
+    Returns:
+        dict with training statistics
+    """
+    data_root = Path(data_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    data_files = sorted(data_root.glob('*_training_data.pt'))
+    if not data_files:
+        raise ValueError(f"No training data files found in {data_root}")
+
+    print(f"\nLoading and combining {len(data_files)} system datasets...")
+    dataset = CombinedAtomFeatureDataset(data_files)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device == 'cuda'),
+    )
+
+    print(f"\nCreating autoencoder:")
+    print(f"  Input dim:     {input_dim}")
+    print(f"  Hidden dim:    {hidden_dim}")
+    print(f"  Embedding dim: {embedding_dim}")
+
+    model = create_autoencoder(input_dim, hidden_dim, embedding_dim).to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    print(f"\nStarting combined training:")
+    print(f"  Batch size:    {batch_size}")
+    print(f"  Learning rate: {learning_rate}")
+    print(f"  Max epochs:    {num_epochs}")
+    print(f"  Device:        {device}")
+
+    best_loss = float('inf')
+    epochs_without_improvement = 0
+    training_history: Dict = {
+        'epoch_losses': [],
+        'best_loss': None,
+        'best_epoch': None,
+        'total_time': 0,
+    }
+    start_time = time.time()
+
+    for epoch in range(num_epochs):
+        epoch_start = time.time()
+        model.train()
+        epoch_loss = 0.0
+        num_batches = 0
+
+        for batch_features in dataloader:
+            batch_features = batch_features.to(device)
+            optimizer.zero_grad()
+            output = model(batch_features)
+            loss = criterion(output['reconstruction'], batch_features)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            num_batches += 1
+
+        avg_loss = epoch_loss / num_batches
+        training_history['epoch_losses'].append(avg_loss)
+        epoch_time = time.time() - epoch_start
+
+        print(f"Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.6f} | Time: {epoch_time:.2f}s")
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            training_history['best_loss'] = best_loss
+            training_history['best_epoch'] = epoch + 1
+            epochs_without_improvement = 0
+            model.save_encoder(output_dir / 'best_encoder.pt')
+            print(f"  → New best model saved (loss: {best_loss:.6f})")
+        else:
+            epochs_without_improvement += 1
+
+        if (epoch + 1) % save_interval == 0:
+            checkpoint_path = output_dir / f'checkpoint_epoch_{epoch+1}.pt'
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+                'best_loss': best_loss,
+            }, checkpoint_path)
+            print(f"  → Checkpoint saved: {checkpoint_path.name}")
+
+        if epochs_without_improvement >= patience:
+            print(f"\nEarly stopping: no improvement for {patience} epochs")
+            break
+
+    total_time = time.time() - start_time
+    training_history['total_time'] = total_time
+
+    final_encoder_path = output_dir / 'final_encoder.pt'
+    model.save_encoder(final_encoder_path)
+
+    history_path = output_dir / 'training_history.json'
+    with open(history_path, 'w') as f:
+        json.dump(training_history, f, indent=2)
+
+    print(f"\n{'='*70}")
+    print("Combined training completed!")
+    print(f"  Total time:   {total_time/60:.2f} minutes")
+    print(f"  Best loss:    {best_loss:.6f} (epoch {training_history['best_epoch']})")
+    print(f"  Best encoder: {output_dir / 'best_encoder.pt'}")
+    print(f"  Final encoder:{final_encoder_path}")
+    print(f"{'='*70}\n")
+
+    return training_history
+
+
 def train_all_systems(
     data_root: Path,
     output_root: Path,
     **training_kwargs
 ) -> Dict[str, Dict]:
-    """Train autoencoders for all available pretraining systems.
-    
+    """Train separate autoencoders for each pretraining system.
+
+    .. deprecated::
+        Prefer :func:`train_combined_model`, which trains one shared model on
+        all systems pooled together.  This function is retained for cases where
+        per-system models are needed.
+
     Args:
         data_root: Directory containing *_training_data.pt files
         output_root: Root directory for output (creates subdirs per system)

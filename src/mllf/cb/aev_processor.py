@@ -1,3 +1,4 @@
+import re
 import torch
 import numpy as np
 from torchani import AEVComputer
@@ -227,6 +228,11 @@ def parse_pdb_coordinates_and_elements(pdb_path):
     """Parse PDB file to extract coordinates and elements.
     
     Wrapper around read_pdb.parse_pdb_file() that converts coordinates to tensor.
+    For substituent fragment PDB files (``*_frag.pdb``), automatically locates the
+    companion ``*_pres.rtf`` in the same directory and passes it as ``rtf_data`` so
+    that element symbols are cross-validated against CGenFF atom types.  This
+    corrects cases where CHARMM uses a 1-char+index atom-name scheme that is
+    ambiguous (e.g. ``B085`` for Bromine whose CGenFF type is ``BRGR1``).
     
     Args:
         pdb_path: Path to PDB file
@@ -236,9 +242,63 @@ def parse_pdb_coordinates_and_elements(pdb_path):
             - coordinates: torch.Tensor [num_atoms, 3]
             - elements: list of element symbols
     """
-    coords_list, elements = parse_pdb_file(pdb_path)
+    rtf_data = None
+    pdb_path_obj = Path(str(pdb_path))
+    if '_frag.pdb' in pdb_path_obj.name:
+        rtf_path = pdb_path_obj.parent / pdb_path_obj.name.replace('_frag.pdb', '_pres.rtf')
+        if rtf_path.exists():
+            try:
+                from mllf.file_handling.read_rtf import parse_rtf_file
+                rtf_data = parse_rtf_file(str(rtf_path))
+            except Exception:
+                pass
+
+    coords_list, elements = parse_pdb_file(str(pdb_path), rtf_data=rtf_data)
     coords_tensor = torch.tensor(coords_list, dtype=torch.float32)
     return coords_tensor, elements
+
+
+def _read_atom_names_from_pdb(pdb_path: Path) -> List[str]:
+    """Return ordered list of atom names from ATOM/HETATM records in a PDB file.
+
+    Uses fixed-column parsing (PDB cols 13–16, 0-indexed 12:16) which is
+    reliable for CHARMM-generated PDB files.  Names are normalised to
+    **uppercase** so that mixed-case frag.pdb names (e.g. ``Br0B``) match the
+    all-uppercase names written by CHARMM into minimized.pdb (``BR0B``).
+    Returns an empty list on any error so callers can fall back gracefully.
+    """
+    names: List[str] = []
+    try:
+        with open(str(pdb_path)) as fh:
+            for line in fh:
+                if line.startswith(('ATOM', 'HETATM')):
+                    names.append(line[12:16].strip().upper())
+    except Exception:
+        pass
+    return names
+
+
+_BOX_RE = re.compile(r'^\s*box\s*=\s*([0-9]+(?:\.[0-9]+)?)')
+
+
+def _read_box_from_prep_script(prep_dir: Path) -> Optional[float]:
+    """Return the cubic box length from the system's prep Python script.
+
+    Searches for a ``box = <number>`` assignment in the main prep ``.py`` file
+    (any ``.py`` other than ``alf_info.py``) in *prep_dir*.  Returns ``None``
+    if no such file or line is found, so the caller can skip MIC gracefully.
+    """
+    for py_file in sorted(prep_dir.glob('*.py')):
+        if py_file.name == 'alf_info.py':
+            continue
+        try:
+            for line in py_file.read_text().splitlines():
+                m = _BOX_RE.match(line)
+                if m:
+                    return float(m.group(1))
+        except OSError:
+            continue
+    return None
 
 
 def detect_minimized_pdb(prep_dir: Path) -> Optional[Path]:
@@ -286,9 +346,17 @@ def extract_environment_atoms_from_minimized(
     :func:`get_atom_features_with_context` adds those same atoms independently
     via ``find_reference_subs_from_other_sites``.
 
-    **Why 0.5 Å tolerance?**  Energy minimization typically shifts ligand
-    heavy atoms 0.05–0.3 Å.  Protein/solvent contact atoms are ≥ 1.5 Å away,
-    so 0.5 Å safely catches moved ligand atoms without false positives.
+    **Why use atom-name-based exclusion?**  CHARMM energy minimization can
+    shift atoms by more than the ``duplicate_tolerance`` (0.5 Å) or even
+    wrap them into a different PBC image, so coordinate-based duplicate removal
+    may silently fail for some systems. Matching by atom name (e.g. ``C102``,
+    ``N001``) is robust regardless of the coordinate frame.  The same name
+    lookup is used to resolve the substituent's reference position in the
+    minimized frame when computing the distance filter, so water/protein atoms
+    within ``aev_cutoff`` of the *actual* minimized position are always found.
+
+    **Why 0.5 Å tolerance?**  Retained as the fallback when atom-name
+    counts cannot be reconciled with ``parse_pdb_file`` output.
 
     Args:
         minimized_pdb: Path to minimized.pdb (full system with minimized coordinates)
@@ -313,30 +381,85 @@ def extract_environment_atoms_from_minimized(
     if not min_coords:
         return None
 
-    # Build ligand exclusion set: core + target sub + all other-site subs.
-    ligand_coords = core_coords + sub_coords
-    if prep_dir is not None:
-        for other_sub in sorted(Path(prep_dir).glob('site*_sub*_frag.pdb')):
-            if other_sub.resolve() == Path(sub_pdb).resolve():
-                continue
-            other_coords, _ = parse_pdb_file(str(other_sub))
-            ligand_coords.extend(other_coords)
+    # ------------------------------------------------------------------
+    # Atom-name-based ligand exclusion and coordinate resolution.
+    #
+    # frag.pdb files may carry pre-simulation coordinates that differ from
+    # minimized.pdb by > 0.5 Å (e.g. after PBC image wrapping shifts atoms
+    # by box-length increments).  Coordinate-based duplicate removal then
+    # silently fails, leaving all ligand atoms in the environment set and
+    # placing the distance-cutoff filter at the wrong position.
+    #
+    # Strategy:
+    #   1. Read atom names from minimized.pdb via fast fixed-column parsing.
+    #   2. Build a {name -> coord} map for every atom in minimized.pdb.
+    #   3. Collect all ligand atom names from core + all sub frag.pdbs.
+    #   4. Remove minimized atoms whose name is in the ligand name set.
+    #   5. Resolve the target substituent's coordinates in the minimized
+    #      frame by looking up each atom's name in the map (falling back to
+    #      the frag.pdb coordinate when the name is absent).
+    # ------------------------------------------------------------------
+    min_atom_names = _read_atom_names_from_pdb(minimized_pdb)
+    sub_atom_names = _read_atom_names_from_pdb(sub_pdb)
+    core_atom_names = _read_atom_names_from_pdb(core_pdb)
 
-    # Remove ligand atoms from minimized.pdb
-    env_coords, env_elements = remove_duplicate_atoms(
-        coords=min_coords,
-        elements=min_elements,
-        core_coords=ligand_coords,
-        tolerance=duplicate_tolerance,
+    use_name_based = (
+        len(min_atom_names) == len(min_coords)
+        and len(sub_atom_names) == len(sub_coords)
     )
+
+    if use_name_based:
+        # Build name → minimized-coord lookup
+        min_name_to_coord = {name: coord for name, coord in zip(min_atom_names, min_coords)}
+
+        # Collect all ligand atom names (core + all subs in prep_dir)
+        ligand_names: set = set(sub_atom_names) | set(core_atom_names)
+        if prep_dir is not None:
+            for other_sub in sorted(Path(prep_dir).glob('site*_sub*_frag.pdb')):
+                if other_sub.resolve() == Path(sub_pdb).resolve():
+                    continue
+                ligand_names.update(_read_atom_names_from_pdb(other_sub))
+
+        # Remove ligand atoms by name → clean environment set
+        env_coords = [c for name, c in zip(min_atom_names, min_coords) if name not in ligand_names]
+        env_elements = [e for name, e in zip(min_atom_names, min_elements) if name not in ligand_names]
+
+        # Resolve target sub positions in the minimized coordinate frame
+        sub_coords_ref = [
+            min_name_to_coord.get(name, frag_c)
+            for name, frag_c in zip(sub_atom_names, sub_coords)
+        ]
+    else:
+        # Fall back to original coordinate-matching approach
+        ligand_coords = core_coords + sub_coords
+        if prep_dir is not None:
+            for other_sub in sorted(Path(prep_dir).glob('site*_sub*_frag.pdb')):
+                if other_sub.resolve() == Path(sub_pdb).resolve():
+                    continue
+                other_coords, _ = parse_pdb_file(str(other_sub))
+                ligand_coords.extend(other_coords)
+
+        env_coords, env_elements = remove_duplicate_atoms(
+            coords=min_coords,
+            elements=min_elements,
+            core_coords=ligand_coords,
+            tolerance=duplicate_tolerance,
+        )
+        sub_coords_ref = sub_coords
 
     if not env_coords:
         return None
 
-    # Spatial filter: keep only atoms within aev_cutoff of the substituent
-    sub_arr  = np.array(sub_coords)   # [n_sub,  3]
-    env_arr  = np.array(env_coords)   # [n_env,  3]
+    # Spatial filter: keep only atoms within aev_cutoff of the substituent.
+    # Apply the minimum image convention (MIC) when a cubic box length is
+    # available so that atoms in adjacent PBC images are found correctly.
+    box_length = _read_box_from_prep_script(Path(prep_dir)) if prep_dir is not None else None
+
+    sub_arr  = np.array(sub_coords_ref)  # [n_sub,  3]
+    env_arr  = np.array(env_coords)      # [n_env,  3]
     diff     = env_arr[:, None, :] - sub_arr[None, :, :]  # [n_env, n_sub, 3]
+    if box_length is not None:
+        diff = diff - box_length * np.round(diff / box_length)
     min_dists = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)  # [n_env]
 
     mask = min_dists <= aev_cutoff

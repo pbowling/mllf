@@ -244,7 +244,7 @@ def generate_training_data_for_system(
                     warnings.warn(f"[{system_name}] Could not parse RTF {rtf_path.name}: {e}")
 
             # Compute AEVs with appropriate context
-            if solvent_state == 'protein' and core_pdb and (minimized_pdb or protein_pdb):
+            if solvent_state in ('protein', 'prot') and core_pdb and (minimized_pdb or protein_pdb):
                 # Build protein context for this specific substituent.
                 # Preferred path: extract protein atoms from minimized.pdb using
                 # coordinate-based exclusion of core/sub atoms, then apply the AEV
@@ -313,7 +313,7 @@ def generate_training_data_for_system(
                             print(f"      - {ref_info['pdb']}: {ref_info['filtered_atoms']} atoms "
                                   f"(removed {ref_info['removed_duplicates']} duplicates)")
                     first_sub_processed = True
-            elif solvent_state == 'solvent' and core_pdb:
+            elif solvent_state in ('solvent', 'water', 'solv') and core_pdb:
                 # Solvent path: core + other-site subs (via prep_dir) + water from
                 # minimized.pdb within AEV cutoff.
                 solvent_context = None  # type: Optional[Tuple[List, List]]
@@ -478,6 +478,7 @@ def generate_all_pretraining_datasets(
     pretraining_root: Path,
     output_root: Path,
     skip_systems: Optional[List[str]] = None,
+    aev_cutoff: float = 5.1,
     verbose: bool = False
 ) -> List[Dict]:
     """Generate training datasets for all pretraining systems.
@@ -486,6 +487,7 @@ def generate_all_pretraining_datasets(
         pretraining_root: Root directory containing all pretraining systems
         output_root: Root directory for output files
         skip_systems: List of system names to skip (default: ['14benz_pair_combos'])
+        aev_cutoff: AEV spatial cutoff in Angstroms (default: 5.1 Å, matches ANI-2x radial cutoff)
         verbose: If True, print detailed context information for each system
         
     Returns:
@@ -507,7 +509,11 @@ def generate_all_pretraining_datasets(
         output_path = output_root / f"{system_dir.name}_training_data.pt"
         
         try:
-            stats = generate_training_data_for_system(system_dir, output_path, verbose=verbose)
+            stats = generate_training_data_for_system(
+                system_dir, output_path,
+                aev_cutoff=aev_cutoff,
+                verbose=verbose,
+            )
             all_stats.append(stats)
         except Exception as e:
             error_msg = f"Failed to process {system_dir.name}: {e}"
