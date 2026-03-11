@@ -33,8 +33,11 @@ Usage:
         --epochs 1
 """
 import argparse
+import collections
 import math
 import random
+import re
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
@@ -1522,7 +1525,30 @@ def pretrain_with_runs(
     # Training loop
     reward_config = config.get('reward', {})
     best_loss = float('inf')
-    
+
+    # ------------------------------------------------------------------
+    # Suppress per-occurrence warnings during training and collect them
+    # for a deduplicated summary printed at the end.
+    # Warnings are grouped by category + a path-stripped message template,
+    # so "Element mismatch in /long/path/foo.pdb" and the same mismatch in
+    # every other run appear as a single entry with a total count.
+    # ------------------------------------------------------------------
+    _warning_counts  = collections.Counter()   # (category, template) -> count
+    _warning_example = {}                       # (category, template) -> full message
+    _path_re = re.compile(r'/[^\s:*?"<>|]+')
+
+    _orig_showwarning = warnings.showwarning
+
+    def _collect_warning(message, category, filename, lineno, file=None, line=None):
+        text     = str(message)
+        template = _path_re.sub('<path>', text)
+        key      = (category.__name__, template)
+        _warning_counts[key]  += 1
+        if key not in _warning_example:
+            _warning_example[key] = (text, filename, lineno)
+
+    warnings.showwarning = _collect_warning
+
     print(f"\n{'='*60}")
     print(f"Starting behavior cloning for {epochs} epochs")
     print(f"Training on {len(runs)} best runs per system")
@@ -1594,6 +1620,23 @@ def pretrain_with_runs(
     print(f"Best MSE loss: {best_loss:.4f}")
     print(f"Saved to: {output_dir}")
     print(f"{'='*60}")
+
+    # Restore original warning handler
+    warnings.showwarning = _orig_showwarning
+
+    # Print deduplicated warning summary
+    if _warning_counts:
+        print(f"\n{'='*60}")
+        print(f"Warning Summary ({sum(_warning_counts.values())} total occurrences, "
+              f"{len(_warning_counts)} unique types)")
+        print(f"{'='*60}")
+        for (cat, template), count in sorted(_warning_counts.items(),
+                                              key=lambda kv: -kv[1]):
+            example_text, ex_file, ex_line = _warning_example[(cat, template)]
+            short_file = Path(ex_file).name if ex_file else '?'
+            print(f"  [{count:5d}x] {cat} ({short_file}:{ex_line})")
+            print(f"           {template[:120]}")
+        print(f"{'='*60}")
 
 
 def main():

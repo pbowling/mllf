@@ -1,4 +1,5 @@
 import re
+import tempfile
 import torch
 import numpy as np
 from torchani import AEVComputer
@@ -301,22 +302,124 @@ def _read_box_from_prep_script(prep_dir: Path) -> Optional[float]:
     return None
 
 
-def detect_minimized_pdb(prep_dir: Path) -> Optional[Path]:
-    """Detect the minimized system PDB in a prep directory.
+def _convert_crd_to_tmp_pdb(crd_path: Path) -> Path:
+    """Convert a CHARMM extended CRD coordinate file to a temporary PDB file.
 
-    The minimized.pdb contains the full system after energy minimization
-    (protein + core + all substituent atoms) with accurate coordinates.
-    Environment atoms are extracted from it by excluding the core and
-    substituent atoms via coordinate matching.
+    Parses CHARMM EXT format and writes minimal ATOM-record PDB to a temp
+    file so it can be consumed by parse_pdb_file.
+
+    CHARMM EXT CRD column layout (1-indexed, Fortran):
+      1-10:   atom serial (I10)
+      11-20:  residue sequence number (I10)
+      21-22:  spaces (2X)
+      23-30:  residue name (A8)
+      31-32:  spaces (2X)
+      33-40:  atom name (A8)
+      41-60:  X coordinate (F20.10)
+      61-80:  Y coordinate (F20.10)
+      81-100: Z coordinate (F20.10)
+      101-102: spaces (2X)
+      103-110: segment ID (A8)
+
+    Args:
+        crd_path: Path to the CHARMM EXT .crd file.
+
+    Returns:
+        Path to a newly-created temporary PDB file.
+
+    Raises:
+        ValueError: If no atoms were successfully parsed from the file.
+    """
+    atoms = []
+    with open(crd_path, 'r') as fh:
+        for raw in fh:
+            line = raw.rstrip('\n')
+            # Skip CHARMM title / comment lines
+            if line.startswith('*'):
+                continue
+            # Skip the atom-count line (e.g. "     73018  EXT")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            if len(parts) <= 2 and parts[0].isdigit():
+                continue
+            # Need at least 100 chars to reach end of Z column
+            if len(line) < 100:
+                continue
+            try:
+                atom_no  = int(line[0:10])
+                res_no   = int(line[10:20])
+                resname  = line[22:30].strip()
+                atomname = line[32:40].strip()
+                x        = float(line[40:60])
+                y        = float(line[60:80])
+                z        = float(line[80:100])
+                segid    = line[102:110].strip() if len(line) > 110 else ''
+                # Derive single-char PDB chain from segid (PROA→A, PROB→B …)
+                chain    = segid[-1] if segid and segid[-1].isalpha() else 'A'
+                atoms.append((atom_no, res_no, resname, atomname, x, y, z, chain))
+            except (ValueError, IndexError):
+                continue
+
+    if not atoms:
+        raise ValueError(f"No atoms parsed from CRD file {crd_path}")
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.pdb', prefix='minimized_crd_', delete=False
+    )
+    try:
+        _TWO_CHAR_ELEMENTS = {'CL', 'BR', 'FE', 'MG', 'ZN', 'MN', 'NA', 'CU', 'CO', 'NI', 'SE', 'SI'}
+        for atom_no, res_no, resname, atomname, x, y, z, chain in atoms:
+            # PDB atom name: 4-char names fill cols 13-16; shorter get a leading space
+            aname_col = atomname[:4] if len(atomname) >= 4 else f' {atomname:<3}'
+            # Infer element symbol from alphabetic prefix of atom name
+            alpha = ''.join(c for c in atomname if c.isalpha())
+            if len(alpha) >= 2 and alpha[:2].upper() in _TWO_CHAR_ELEMENTS:
+                elem = alpha[:2].capitalize()
+            else:
+                elem = alpha[:1] if alpha else 'X'
+            serial  = atom_no % 100000
+            res_seq = res_no  % 10000
+            tmp.write(
+                f"ATOM  {serial:5d} {aname_col} {resname[:3]:3s} {chain}{res_seq:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2s}\n"
+            )
+        tmp.write("END\n")
+    finally:
+        tmp.close()
+
+    return Path(tmp.name)
+
+
+def detect_minimized_pdb(prep_dir: Path) -> Optional[Path]:
+    """Detect the minimized system structure in a prep directory.
+
+    Checks for ``minimized.pdb`` first.  If not found, falls back to
+    ``minimized.crd`` (CHARMM EXT format) and converts it to a temporary
+    PDB file on-the-fly.
 
     Args:
         prep_dir: Path to prep directory
 
     Returns:
-        Path to minimized.pdb, or None if not found
+        Path to minimized.pdb (or a temporary PDB converted from
+        minimized.crd), or None if neither file is found.
     """
-    minimized_pdb = Path(prep_dir) / 'minimized.pdb'
-    return minimized_pdb if minimized_pdb.exists() else None
+    prep = Path(prep_dir)
+    minimized_pdb = prep / 'minimized.pdb'
+    if minimized_pdb.exists():
+        return minimized_pdb
+
+    minimized_crd = prep / 'minimized.crd'
+    if minimized_crd.exists():
+        try:
+            tmp_pdb = _convert_crd_to_tmp_pdb(minimized_crd)
+            return tmp_pdb
+        except Exception as exc:
+            warnings.warn(f"Could not convert {minimized_crd} to PDB: {exc}")
+
+    return None
 
 
 def extract_environment_atoms_from_minimized(

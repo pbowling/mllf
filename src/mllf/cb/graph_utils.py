@@ -124,17 +124,17 @@ def compute_deepset_embedding_for_node(
                     else:
                         warnings.warn(
                             f"solvent_state is 'protein' but no environment atoms found in "
-                            f"minimized.pdb and no protein.pdb in prep directory."
+                            f"minimized structure and no protein.pdb in prep directory: {prep_dir}"
                         )
             elif solvent_state == 'protein' and protein_pdb is None:
-                # No minimized.pdb and no sub_frag — try standalone protein PDB
+                # No minimized structure and no sub_frag — try standalone protein PDB
                 default_protein = prep_path / 'protein.pdb'
                 if default_protein.exists():
                     effective_protein = str(default_protein)
-                    warnings.warn("Using protein.pdb from prep directory for AEV spatial filtering")
+                    warnings.warn(f"Using protein.pdb from prep directory for AEV spatial filtering: {prep_dir}")
                 else:
                     warnings.warn(
-                        f"solvent_state is 'protein' but no protein PDB found. "
+                        f"solvent_state is 'protein' but no protein PDB found in prep directory: {prep_dir}. "
                         f"Specify protein_pdb in config or add protein.pdb to prep directory."
                     )
 
