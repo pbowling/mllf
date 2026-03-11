@@ -23,7 +23,7 @@ def main():
         raise RuntimeError('Could not find repository root (pyproject.toml)')
 
     repo = _find_repo_root(Path(__file__))
-    examples_dir = repo / 'examples' / 'cb' / '14benz_solv_5.5'
+    examples_dir = repo / 'tests' / 'samples' / '14benz_solv_5.5'
     if not examples_dir.is_dir():
         print('Example directory not found:', examples_dir)
         return

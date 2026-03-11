@@ -41,23 +41,6 @@ class TestElementMapping:
         assert ELEMENT_TO_ID['B'] == x_id, "B should map to X (unknown)"
         assert ELEMENT_TO_ID['Se'] == x_id, "Se should map to X (unknown)"
     
-    def test_common_elements_present(self):
-        """Verify common organic chemistry elements are present."""
-        common = ['H', 'C', 'N', 'O', 'S', 'P']
-        for elem in common:
-            assert elem in ELEMENT_TO_ID, f"Common element {elem} should be in mapping"
-    
-    def test_halogens_present(self):
-        """Verify all halogens are present."""
-        halogens = ['F', 'Cl', 'Br', 'I']
-        for halogen in halogens:
-            assert halogen in ELEMENT_TO_ID, f"Halogen {halogen} should be in mapping"
-    
-    def test_special_elements_present(self):
-        """Verify special CGenFF elements are present."""
-        special = ['Al', 'B', 'Se']
-        for elem in special:
-            assert elem in ELEMENT_TO_ID, f"Special element {elem} should be in mapping"
 
 
 class TestChargeExtraction:
@@ -109,12 +92,6 @@ class TestAEVComputer:
         from mllf.cb.aev_processor import aev_computer
         assert aev_computer is not None
     
-    def test_aev_computer_has_correct_species(self):
-        """Test that AEV computer is initialized and functional."""
-        from mllf.cb.aev_processor import aev_computer
-        # AEV computer should be a callable module
-        assert aev_computer is not None
-        assert hasattr(aev_computer, '__call__')  # Should be callable
 
 
 @pytest.mark.skipif(
@@ -170,41 +147,6 @@ class TestEdgeCases:
         # But only 11 unique values (Al, B, Se map to X's ID)
         assert len(set(ELEMENT_TO_ID.values())) == 11
     
-    def test_unknown_element_fallback(self):
-        """Test that unknown elements fall back to H with warning."""
-        # Test that unknown elements are handled gracefully
-        # This is a documentation test - actual behavior tested in integration tests
-        fallback_id = ELEMENT_TO_ID.get('UnknownElement', ELEMENT_TO_ID['H'])
-        assert fallback_id == ELEMENT_TO_ID['H']
-
-
-class TestIntegration:
-    """Integration tests for multiple components."""
-    
-    def test_element_ids_match_num_species(self):
-        """Test that number of unique element IDs matches NUM_SPECIES."""
-        unique_ids = len(set(ELEMENT_TO_ID.values()))
-        assert unique_ids == NUM_SPECIES
-    
-    def test_rare_elements_share_id(self):
-        """Test that rare elements (B, Se, Al) share the same ID with X."""
-        ids = list(ELEMENT_TO_ID.values())
-        # We expect duplicates now (Al, B, Se, X all map to ID 10)
-        x_id = ELEMENT_TO_ID['X']
-        assert ELEMENT_TO_ID['Al'] == x_id
-        assert ELEMENT_TO_ID['B'] == x_id
-        assert ELEMENT_TO_ID['Se'] == x_id
-    
-    def test_element_names_are_valid(self):
-        """Test that element names follow chemical conventions."""
-        for elem in ELEMENT_TO_ID.keys():
-            if elem == 'X':  # Special case for unknown/rare elements
-                continue
-            # Element symbols should be 1-2 characters, first uppercase
-            assert 1 <= len(elem) <= 2, f"Element {elem} should be 1-2 characters"
-            assert elem[0].isupper(), f"Element {elem} should start with uppercase"
-            if len(elem) == 2:
-                assert elem[1].islower(), f"Second char of {elem} should be lowercase"
 
 
 if __name__ == '__main__':

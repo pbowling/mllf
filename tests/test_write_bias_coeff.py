@@ -10,7 +10,7 @@ def _get_example_path(filename):
 	"""Get absolute path to example file, relative to repository root."""
 	test_file = Path(__file__)
 	repo_root = test_file.parent.parent
-	return repo_root / "examples" / "cb" / filename
+	return repo_root / "tests" / "samples" / filename
 
 
 def _read_set_names(path):

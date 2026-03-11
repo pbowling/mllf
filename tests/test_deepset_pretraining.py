@@ -484,12 +484,11 @@ class TestEdgeCasesPretraining:
 
 
 # ---------------------------------------------------------------------------
-# Fixture prep directories checked in under examples/cb/ – available to all
-# contributors after cloning the repository.
+# Sample prep directories live under tests/samples/
 # ---------------------------------------------------------------------------
-_EXAMPLES_CB    = Path(__file__).parent.parent / 'examples' / 'cb'
-_ABL_PREP       = _EXAMPLES_CB / 'protein_abl'
-_BENZ_SOLV_PREP = _EXAMPLES_CB / 'solvent_14benz'
+_SAMPLES        = Path(__file__).parent / 'samples'
+_ABL_PREP       = _SAMPLES / 'protein_abl'
+_BENZ_SOLV_PREP = _SAMPLES / 'solvent_14benz'
 
 
 class TestDetectMinimizedPdb:
@@ -516,12 +515,25 @@ class TestDetectMinimizedPdb:
 class TestExtractProteinAtomsFromMinimized:
     """Unit tests for extract_protein_atoms_from_minimized."""
 
-    def _write_pdb(self, path: Path, atoms):
-        """Helper: write a minimal PDB file from a list of (x, y, z, elem) tuples."""
+    def _write_pdb(self, path: Path, atoms, atom_names=None):
+        """Helper: write a minimal PDB file from a list of (x, y, z, elem) tuples.
+
+        atom_names: optional list of 4-char atom names (one per atom).  When
+        provided, these are used verbatim so that atoms shared between files
+        (core/sub/minimized) carry consistent names, which is required for the
+        name-based ligand-exclusion logic in extract_environment_atoms_from_minimized.
+        When omitted, a default element+counter scheme is used.
+        """
         lines = []
+        elem_count: dict = {}
         for i, (x, y, z, elem) in enumerate(atoms, start=1):
+            if atom_names is not None:
+                name = atom_names[i - 1]
+            else:
+                elem_count[elem] = elem_count.get(elem, 0) + 1
+                name = f'{elem}{elem_count[elem]:02d}'
             lines.append(
-                f'ATOM{i:>7}  CA  ALA A{i:>4}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}\n'
+                f'ATOM{i:>7}  {name:<4}ALA A{i:>4}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}\n'
             )
         lines.append('END\n')
         path.write_text(''.join(lines))
@@ -558,12 +570,14 @@ class TestExtractProteinAtomsFromMinimized:
 
     def test_ligand_atoms_excluded(self, tmp_path):
         """Core and sub atoms from minimized.pdb are not returned."""
-        # minimized has: sub atom (1,0,0), core atom (0,0,0), protein atom (3,0,0)
-        self._write_pdb(tmp_path / 'minimized.pdb', [(0.0, 0.0, 0.0, 'C'),
-                                                      (1.0, 0.0, 0.0, 'C'),
-                                                      (3.0, 0.0, 0.0, 'N')])
-        self._write_pdb(tmp_path / 'core.pdb', [(0.0, 0.0, 0.0, 'C')])
-        self._write_pdb(tmp_path / 'sub.pdb',  [(1.0, 0.0, 0.0, 'C')])
+        # minimized has: core atom (0,0,0), sub atom (1,0,0), protein atom (3,0,0).
+        # Use distinct atom names so the name-based exclusion correctly identifies
+        # only the core+sub atoms as ligand and leaves the protein atom.
+        self._write_pdb(tmp_path / 'minimized.pdb',
+                        [(0.0, 0.0, 0.0, 'C'), (1.0, 0.0, 0.0, 'C'), (3.0, 0.0, 0.0, 'N')],
+                        atom_names=['COR1', 'SUB1', 'PROT'])
+        self._write_pdb(tmp_path / 'core.pdb', [(0.0, 0.0, 0.0, 'C')], atom_names=['COR1'])
+        self._write_pdb(tmp_path / 'sub.pdb',  [(1.0, 0.0, 0.0, 'C')], atom_names=['SUB1'])
         coords, elements = extract_protein_atoms_from_minimized(
             minimized_pdb=tmp_path / 'minimized.pdb',
             sub_pdb=tmp_path / 'sub.pdb',
@@ -578,13 +592,16 @@ class TestExtractProteinAtomsFromMinimized:
 
     def test_tolerance_handles_minimization_shift(self, tmp_path):
         """Ligand atoms that moved ≤0.5 Å during minimization are still excluded."""
+        # Name-based exclusion is shift-independent; the tolerance parameter only
+        # applies to the coordinate-matching fallback path.
         shift = 0.25  # Å – well within the 0.5 Å tolerance
         self._write_pdb(tmp_path / 'minimized.pdb',
                         [(shift, 0.0, 0.0, 'C'),       # core atom, slightly shifted
                          (1.0 + shift, 0.0, 0.0, 'C'), # sub atom, slightly shifted
-                         (3.0, 0.0, 0.0, 'N')])         # protein atom, unmoved
-        self._write_pdb(tmp_path / 'core.pdb', [(0.0, 0.0, 0.0, 'C')])
-        self._write_pdb(tmp_path / 'sub.pdb',  [(1.0, 0.0, 0.0, 'C')])
+                         (3.0, 0.0, 0.0, 'N')],        # protein atom, unmoved
+                        atom_names=['COR1', 'SUB1', 'PROT'])
+        self._write_pdb(tmp_path / 'core.pdb', [(0.0, 0.0, 0.0, 'C')], atom_names=['COR1'])
+        self._write_pdb(tmp_path / 'sub.pdb',  [(1.0, 0.0, 0.0, 'C')], atom_names=['SUB1'])
         coords, elements = extract_protein_atoms_from_minimized(
             minimized_pdb=tmp_path / 'minimized.pdb',
             sub_pdb=tmp_path / 'sub.pdb',
@@ -597,15 +614,17 @@ class TestExtractProteinAtomsFromMinimized:
 
     def test_other_site_subs_excluded_when_prep_dir_provided(self, tmp_path):
         """Other-site substituent atoms in minimized.pdb are excluded when prep_dir is given."""
-        # Place core + target sub + other-site sub in minimized, plus a protein atom
+        # Place core + target sub + other-site sub in minimized, plus a protein atom.
+        # Use distinct atom names so the name-based exclusion can tell them apart.
         self._write_pdb(tmp_path / 'minimized.pdb',
                         [(0.0, 0.0, 0.0, 'C'),   # core
                          (1.0, 0.0, 0.0, 'C'),   # target sub
                          (2.0, 0.0, 0.0, 'C'),   # other-site sub (site2_sub1)
-                         (4.0, 0.0, 0.0, 'N')])  # protein
-        self._write_pdb(tmp_path / 'core.pdb',             [(0.0, 0.0, 0.0, 'C')])
-        self._write_pdb(tmp_path / 'site1_sub1_frag.pdb',  [(1.0, 0.0, 0.0, 'C')])  # target
-        self._write_pdb(tmp_path / 'site2_sub1_frag.pdb',  [(2.0, 0.0, 0.0, 'C')])  # other site
+                         (4.0, 0.0, 0.0, 'N')],  # protein
+                        atom_names=['COR1', 'S1S1', 'S2S1', 'PROT'])
+        self._write_pdb(tmp_path / 'core.pdb',             [(0.0, 0.0, 0.0, 'C')], atom_names=['COR1'])
+        self._write_pdb(tmp_path / 'site1_sub1_frag.pdb',  [(1.0, 0.0, 0.0, 'C')], atom_names=['S1S1'])  # target
+        self._write_pdb(tmp_path / 'site2_sub1_frag.pdb',  [(2.0, 0.0, 0.0, 'C')], atom_names=['S2S1'])  # other site
 
         # Without prep_dir: other-site sub atom (2,0,0) leaks into protein context
         coords_no_dir, _ = extract_protein_atoms_from_minimized(
@@ -631,17 +650,19 @@ class TestExtractProteinAtomsFromMinimized:
     def test_all_returned_atoms_are_within_cutoff(self, tmp_path):
         """Verify every returned coordinate is within aev_cutoff of the substituent."""
         aev_cutoff = 5.1
-        # Place protein atoms at various distances from sub (at origin)
+        # Place protein atoms at various distances from sub (at origin).
+        # Name the sub atom distinctly so it is excluded by name-based logic.
         atoms = [
-            (0.0, 0.0, 0.0, 'C'),   # sub itself – excluded by duplicate check
+            (0.0, 0.0, 0.0, 'C'),   # sub itself – excluded by name
             (2.0, 0.0, 0.0, 'N'),   # 2 Å – within cutoff
             (4.0, 0.0, 0.0, 'O'),   # 4 Å – within cutoff
             (6.0, 0.0, 0.0, 'N'),   # 6 Å – beyond cutoff
             (10.0, 0.0, 0.0, 'N'),  # 10 Å – beyond cutoff
         ]
-        self._write_pdb(tmp_path / 'minimized.pdb', atoms)
-        self._write_pdb(tmp_path / 'core.pdb', [(99.0, 0.0, 0.0, 'C')])  # far away
-        self._write_pdb(tmp_path / 'sub.pdb',  [(0.0, 0.0, 0.0, 'C')])
+        self._write_pdb(tmp_path / 'minimized.pdb', atoms,
+                        atom_names=['SUB1', 'PRO1', 'PRO2', 'PRO3', 'PRO4'])
+        self._write_pdb(tmp_path / 'core.pdb', [(99.0, 0.0, 0.0, 'C')], atom_names=['COR1'])  # far away
+        self._write_pdb(tmp_path / 'sub.pdb',  [(0.0, 0.0, 0.0, 'C')], atom_names=['SUB1'])
         coords, _ = extract_protein_atoms_from_minimized(
             minimized_pdb=tmp_path / 'minimized.pdb',
             sub_pdb=tmp_path / 'sub.pdb',
@@ -961,6 +982,154 @@ class TestExtractSolventAtomsFromMinimized:
                 assert max(site_counts) - min(site_counts) < max(site_counts) * 0.8, (
                     f'Solvent atom counts vary too widely: {site_counts}'
                 )
+
+
+from mllf.cb.train_deepset_autoencoder import CombinedAtomFeatureDataset, train_autoencoder, train_combined_model
+
+
+class TestCombinedAtomFeatureDataset:
+    """Test CombinedAtomFeatureDataset which pools multiple .pt files."""
+
+    def _make_pt_file(self, tmp_path, name: str, num_atoms: int, feature_dim: int = 2289):
+        """Write a minimal _training_data.pt file."""
+        features = torch.randn(num_atoms, feature_dim)
+        path = tmp_path / f'{name}_training_data.pt'
+        torch.save({'features': features, 'system_name': name,
+                    'feature_dim': feature_dim}, path)
+        return path, features
+
+    def test_total_atoms_is_sum(self, tmp_path):
+        """Total dataset length equals sum of all individual file atom counts."""
+        p1, f1 = self._make_pt_file(tmp_path, 'sys1', 40)
+        p2, f2 = self._make_pt_file(tmp_path, 'sys2', 60)
+        ds = CombinedAtomFeatureDataset([p1, p2])
+        assert len(ds) == 100
+
+    def test_feature_dim_preserved(self, tmp_path):
+        """Feature dimension is correctly inferred from the concatenated tensor."""
+        p1, _ = self._make_pt_file(tmp_path, 'sys1', 20, feature_dim=128)
+        p2, _ = self._make_pt_file(tmp_path, 'sys2', 30, feature_dim=128)
+        ds = CombinedAtomFeatureDataset([p1, p2])
+        assert ds.feature_dim == 128
+
+    def test_getitem_returns_correct_shape(self, tmp_path):
+        """Individual items have the expected feature vector shape."""
+        p1, _ = self._make_pt_file(tmp_path, 'a', 10, feature_dim=64)
+        ds = CombinedAtomFeatureDataset([p1])
+        item = ds[5]
+        assert item.shape == (64,)
+
+    def test_single_file_equivalent_to_atom_feature_dataset(self, tmp_path):
+        """Single-file combined dataset is item-for-item identical to AtomFeatureDataset."""
+        from mllf.cb.train_deepset_autoencoder import AtomFeatureDataset
+        features = torch.randn(25, 2289)
+        path = tmp_path / 'solo_training_data.pt'
+        torch.save({'features': features, 'system_name': 'solo',
+                    'feature_dim': 2289, 'num_atoms': 25}, path)
+        combined = CombinedAtomFeatureDataset([path])
+        single = AtomFeatureDataset(str(path))
+        assert len(combined) == len(single)
+        for i in range(len(single)):
+            assert torch.allclose(combined[i], single[i])
+
+
+class TestTrainAutoencoder:
+    """Test the autoencoder training loop."""
+
+    def _make_pt_file(self, path, num_atoms: int = 64, feature_dim: int = 32):
+        features = torch.randn(num_atoms, feature_dim)
+        torch.save({'features': features, 'system_name': 'test',
+                    'feature_dim': feature_dim, 'num_atoms': num_atoms}, path)
+
+    def test_train_saves_encoder_files(self, tmp_path):
+        """train_autoencoder produces best_encoder.pt and final_encoder.pt."""
+        data_path = tmp_path / 'data_training_data.pt'
+        self._make_pt_file(data_path, num_atoms=64, feature_dim=8)
+        history = train_autoencoder(
+            train_data_path=data_path,
+            output_dir=tmp_path / 'model',
+            input_dim=8,
+            hidden_dim=16,
+            embedding_dim=4,
+            batch_size=32,
+            learning_rate=1e-3,
+            num_epochs=2,
+            patience=10,
+        )
+        assert (tmp_path / 'model' / 'best_encoder.pt').exists()
+        assert (tmp_path / 'model' / 'final_encoder.pt').exists()
+        assert 'epoch_losses' in history
+        assert len(history['epoch_losses']) == 2
+
+    def test_train_early_stopping(self, tmp_path):
+        """train_autoencoder stops early when loss does not improve."""
+        data_path = tmp_path / 'data_training_data.pt'
+        self._make_pt_file(data_path, num_atoms=64, feature_dim=8)
+        # patience=1 means stop after 2 epochs without improvement
+        history = train_autoencoder(
+            train_data_path=data_path,
+            output_dir=tmp_path / 'model_es',
+            input_dim=8,
+            hidden_dim=16,
+            embedding_dim=4,
+            batch_size=64,
+            learning_rate=0.0,   # zero lr → loss never improves
+            num_epochs=20,
+            patience=1,
+        )
+        assert len(history['epoch_losses']) < 20
+
+    def test_train_combined_model_saves_encoder(self, tmp_path):
+        """train_combined_model pools multiple files and saves best_encoder.pt."""
+        for name in ('sysA', 'sysB'):
+            features = torch.randn(30, 8)
+            path = tmp_path / f'{name}_training_data.pt'
+            torch.save({'features': features, 'system_name': name,
+                        'feature_dim': 8}, path)
+        history = train_combined_model(
+            data_root=tmp_path,
+            output_dir=tmp_path / 'combined_model',
+            input_dim=8,
+            hidden_dim=16,
+            embedding_dim=4,
+            batch_size=32,
+            learning_rate=1e-3,
+            num_epochs=2,
+            patience=10,
+        )
+        assert (tmp_path / 'combined_model' / 'best_encoder.pt').exists()
+        assert len(history['epoch_losses']) == 2
+
+
+class TestPretrainedDeepSetCompatibility:
+    """Test PretrainedDeepSet drop-in compatibility attributes for graph_utils."""
+
+    def _make_pretrained(self, tmp_path, embedding_dim=64):
+        ae = DeepSetAutoencoder(input_dim=2289, hidden_dim=128, embedding_dim=embedding_dim)
+        path = tmp_path / 'enc.pt'
+        ae.save_encoder(str(path))
+        return PretrainedDeepSet(str(path))
+
+    def test_include_charge_is_true(self, tmp_path):
+        """include_charge attribute signals that charges are part of the input."""
+        model = self._make_pretrained(tmp_path)
+        assert model.include_charge is True
+
+    def test_include_atom_id_is_false(self, tmp_path):
+        """Autoencoder was trained without atom-type one-hots; flag must be False."""
+        model = self._make_pretrained(tmp_path)
+        assert model.include_atom_id is False
+
+    def test_atom_mlp_proxy_out_features(self, tmp_path):
+        """atom_mlp[-1].out_features reports the correct embedding dimension."""
+        model = self._make_pretrained(tmp_path, embedding_dim=32)
+        assert model.atom_mlp[-1].out_features == 32
+
+    def test_atom_mlp_proxy_embedding_dim_matches(self, tmp_path):
+        """atom_mlp proxy out_features equals the stored embedding_dim."""
+        for dim in (16, 64, 128):
+            model = self._make_pretrained(tmp_path, embedding_dim=dim)
+            assert model.atom_mlp[-1].out_features == model.embedding_dim
 
 
 if __name__ == '__main__':

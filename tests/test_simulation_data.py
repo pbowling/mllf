@@ -10,7 +10,7 @@ def load_example():
 	# Find the repository root and construct path to example file
 	test_file = Path(__file__)
 	repo_root = test_file.parent.parent
-	p = repo_root / "examples" / "cb" / "14benz_solv_5.5" / "output.txt"
+	p = repo_root / "tests" / "samples" / "14benz_solv_5.5" / "output.txt"
 	
 	with open(p, "r", encoding="utf-8", errors="ignore") as fh:
 		return fh.read()

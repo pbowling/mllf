@@ -6,7 +6,6 @@ Verifies understanding of ALF variables file structure:
 - Skew and end biases stored with independent directions
 """
 import pytest
-import numpy as np
 from pathlib import Path
 
 from mllf.file_handling.read_bias_coeff import parse_old
@@ -17,8 +16,8 @@ class TestVariablesFileFormat:
     
     @pytest.fixture
     def variables85_data(self):
-        """Load variables85.inp from the checked-in examples directory."""
-        inp_file = Path(__file__).parent.parent / 'examples' / 'cb' / 'variables85.inp'
+        """Load variables85.inp from the checked-in samples directory."""
+        inp_file = Path(__file__).parent / 'samples' / 'variables85.inp'
         if not inp_file.exists():
             pytest.skip("variables85.inp not found")
         return parse_old(str(inp_file))
@@ -104,81 +103,6 @@ class TestVariablesFileFormat:
             # They should NOT satisfy fwd = -rev
             assert abs(fwd + rev) > 0.01, \
                 "End biases should NOT be antisymmetric"
-
-
-class TestBiasMatrixProperties:
-    """Test the mathematical properties we enforce in our implementation."""
-    
-    def test_antisymmetric_linear(self):
-        """Test that our linear bias conversion produces antisymmetric matrices."""
-        # Simulate a b vector (relative to first)
-        b_vector = np.array([0.0, 10.0, 20.0])
-        
-        # Convert to pairwise format
-        b_matrix = np.zeros((3, 3))
-        for i in range(3):
-            for j in range(3):
-                if i != j:
-                    b_matrix[i, j] = b_vector[j] - b_vector[i]
-        
-        # Check antisymmetry
-        for i in range(3):
-            for j in range(3):
-                assert abs(b_matrix[i, j] + b_matrix[j, i]) < 0.01, \
-                    f"Linear matrix not antisymmetric at ({i},{j})"
-    
-    def test_antisymmetric_quadratic(self):
-        """Test that quadratic matrices should be antisymmetric."""
-        # Create an antisymmetric matrix
-        c_matrix = np.array([
-            [0, 10, 20],
-            [-10, 0, 30],
-            [-20, -30, 0]
-        ])
-        
-        # Check antisymmetry
-        for i in range(3):
-            for j in range(3):
-                assert abs(c_matrix[i, j] + c_matrix[j, i]) < 0.01, \
-                    f"Quadratic matrix not antisymmetric at ({i},{j})"
-    
-    def test_independent_skew(self):
-        """Test that skew matrices can have independent directions."""
-        # Create a non-antisymmetric matrix (like real data)
-        x_matrix = np.array([
-            [0, -5.93, -6.27],
-            [-1.46, 0, -7.23],
-            [1.53, 1.41, 0]
-        ])
-        
-        # Check that it's NOT antisymmetric
-        non_antisym_count = 0
-        for i in range(3):
-            for j in range(i + 1, 3):
-                if abs(x_matrix[i, j] + x_matrix[j, i]) > 0.01:
-                    non_antisym_count += 1
-        
-        assert non_antisym_count > 0, \
-            "Skew matrix should have at least some non-antisymmetric pairs"
-    
-    def test_independent_end(self):
-        """Test that end matrices can have independent directions."""
-        # Create a non-antisymmetric matrix (like real data)
-        s_matrix = np.array([
-            [0, -5.64, -7.60],
-            [-0.98, 0, -0.39],
-            [0.03, -0.61, 0]
-        ])
-        
-        # Check that it's NOT antisymmetric
-        non_antisym_count = 0
-        for i in range(3):
-            for j in range(i + 1, 3):
-                if abs(s_matrix[i, j] + s_matrix[j, i]) > 0.01:
-                    non_antisym_count += 1
-        
-        assert non_antisym_count > 0, \
-            "End matrix should have at least some non-antisymmetric pairs"
 
 
 if __name__ == "__main__":

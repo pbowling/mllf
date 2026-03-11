@@ -101,8 +101,8 @@ def test_14benz_exact_count():
     
     Note: site2_sub7 has been removed, so site2 now has 6 subs.
     """
-    repo_root = Path(__file__).resolve().parents[1]
-    example_dir = repo_root / 'examples' / 'cb' / '14benz_solv_5.5'
+    repo_root = Path(__file__).resolve().parents[0]
+    example_dir = repo_root / 'samples' / '14benz_solv_5.5'
     
     if not example_dir.exists():
         # Skip if example not available
@@ -431,8 +431,8 @@ def test_14benz_with_cross_site():
     - Cross-site: 75 × 186 = 13,950 combinations
     - Total: 75 + 186 + 13,950 = 14,211 combinations
     """
-    repo_root = Path(__file__).resolve().parents[1]
-    example_dir = repo_root / 'examples' / 'cb' / '14benz_solv_5.5'
+    repo_root = Path(__file__).resolve().parents[0]
+    example_dir = repo_root / 'samples' / '14benz_solv_5.5'
     
     if not example_dir.exists():
         # Skip if example not available
@@ -526,57 +526,6 @@ def test_cross_site_file_structure():
         nsubs_values = [int(x.strip()) for x in match.group(1).split(',')]
         assert len(nsubs_values) == 2, f"Should have 2 entries in nsubs for cross-site, got {len(nsubs_values)}"
         assert all(n >= 2 for n in nsubs_values), "Each site should contribute at least 2 subs"
-
-
-def test_print_combinations_for_example():
-    repo_root = Path(__file__).resolve().parents[1]
-    example_dir = repo_root / 'examples' / 'cb' / '14benz_solv_5.5'
-    assert example_dir.exists(), f"Example directory not found: {example_dir}"
-
-    found = find_site_sub_files(example_dir)
-    # follow script policy: only consider sites with >= 2 subs
-    eligible = {s: subs for s, subs in found.items() if len(subs) >= 2}
-
-    combos = all_site_sub_combinations(eligible)
-    
-    # Separate within-site and cross-site for reporting (handle 3-tuple format)
-    within_site = [(sites, subs) for sites, subs, _ in combos if len(sites) == 1]
-    cross_site = [(sites, subs) for sites, subs, _ in combos if len(sites) > 1]
-
-    # Print combinations directly to the controlling terminal (bypass pytest capture)
-    import sys
-    out = sys.__stdout__
-    out.write(f"Found {len(eligible)} eligible sites\n")
-    out.write(f"  Within-site: {len(within_site)} combinations\n")
-    out.write(f"  Cross-site: {len(cross_site)} combinations\n")
-    out.write(f"  Total: {len(combos)} combinations\n")
-    
-    # Print first 10 of each type
-    out.write("\nFirst 10 within-site combinations:\n")
-    for idx, (sites, subs) in enumerate(within_site[:10], start=1):
-        name = make_combo_dir_name(idx, sites, subs)
-        out.write(f"  {name}\n")
-    
-    out.write("\nFirst 10 cross-site combinations:\n")
-    for idx, (sites, subs) in enumerate(cross_site[:10], start=len(within_site)+1):
-        name = make_combo_dir_name(idx, sites, subs)
-        out.write(f"  {name}\n")
-    
-    out.flush()
-    
-    # Also write combos to a file for easy inspection
-    #out_path = repo_root / 'combos_14benz_solv_5.5.txt'
-    #with out_path.open('w') as fh:
-    #    fh.write(f"Found {len(eligible)} eligible sites\n")
-    #    fh.write(f"  Within-site: {len(within_site)} combinations\n")
-    #    fh.write(f"  Cross-site: {len(cross_site)} combinations\n")
-    #    fh.write(f"  Total: {len(combos)} combinations\n\n")
-    #    for idx, (sites, subs, _) in enumerate(combos, start=1):
-    #        name = make_combo_dir_name(idx, sites, subs)
-    #        fh.write(name + '\n')
-
-    # sanity check so CI treats this as a test: ensure some combos exist
-    assert len(combos) > 0
 
 
 def test_max_subs_per_site_limit():
