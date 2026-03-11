@@ -7,16 +7,32 @@
 #SBATCH --export=ALL
 #SBATCH --time=15:00:00  # 15 hours for large pretraining datasets
 
-# SLURM script for running policy pretraining with statistical filtering
+# SLURM script for running CB policy pretraining on collected MSLD simulation data.
 #
-# This script runs pretraining on all collected simulation data with
-# automatic outlier filtering to exclude runs with abnormal coefficient values.
+# Uses the full DeepSet → max-pool → RGCN pipeline by default:
+#   - Loads the pretrained DeepSet encoder from pretraining/deepset_pretraining_output/
+#   - Replaces standard atom-type node features with 64-dim AEV-based embeddings
+#   - Trains the RGCN+EdgePolicy on behavior-cloning MSE loss
+#
+# Automatic outlier filtering excludes runs with abnormal coefficient values.
 #
 # Usage:
 #   sbatch pretrain_with_filtering.sh
 #
-# Or with custom parameters:
-#   sbatch --export=ALL,OUTLIER_THRESHOLD=2.5,NO_FILTER=false pretrain_with_filtering.sh
+# With custom parameters:
+#   sbatch --export=ALL,OUTLIER_THRESHOLD=2.5,EPOCHS=100 pretrain_with_filtering.sh
+#
+# To use stratified negative sampling (keeps all positive + 25% of each neg bucket by default):
+#   sbatch --export=ALL,STRATIFIED_FRACTION=0.25 pretrain_with_filtering.sh
+#
+# To disable stratified sampling and fall back to reward threshold filtering:
+#   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=0 pretrain_with_filtering.sh
+#
+# To disable DeepSet (standard atom-type features):
+#   sbatch --export=ALL,DEEPSET_ENCODER=none pretrain_with_filtering.sh
+#
+# To use a different encoder checkpoint:
+#   sbatch --export=ALL,DEEPSET_ENCODER=/path/to/best_encoder.pt pretrain_with_filtering.sh
 
 set -e  # Exit on error
 
@@ -39,8 +55,18 @@ echo "Working directory: $(pwd)"
 echo "Conda environment: $CONDA_DEFAULT_ENV"
 echo ""
 
-# Configuration
-CONFIG_FILE="${CONFIG_FILE:-workflow_pretrain.yaml}"
+# Locate workflow_pretrain.yaml regardless of submission directory
+# (works whether sbatch is run from mllf/ or examples/)
+if [ -z "$CONFIG_FILE" ]; then
+    if [ -f "workflow_pretrain.yaml" ]; then
+        CONFIG_FILE="workflow_pretrain.yaml"
+    elif [ -f "examples/workflow_pretrain.yaml" ]; then
+        CONFIG_FILE="examples/workflow_pretrain.yaml"
+    else
+        echo "Error: workflow_pretrain.yaml not found. Set CONFIG_FILE explicitly."
+        exit 1
+    fi
+fi
 OUTPUT_DIR="${OUTPUT_DIR:-models/pretraining}"
 EPOCHS="${EPOCHS:-50}"
 LEARNING_RATE="${LEARNING_RATE:-0.001}"
@@ -48,6 +74,9 @@ OUTLIER_THRESHOLD="${OUTLIER_THRESHOLD:-3.0}"
 REWARD_THRESHOLD="${REWARD_THRESHOLD:-0}"
 NO_FILTER="${NO_FILTER:-false}"
 USE_BEST_ONLY="${USE_BEST_ONLY:-false}"
+STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.25}"
+DEEPSET_ENCODER="${DEEPSET_ENCODER:-pretraining/deepset_pretraining_output/trained_models/best_encoder.pt}"
+EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -58,6 +87,19 @@ echo "  Outlier threshold: ${OUTLIER_THRESHOLD}σ"
 echo "  Reward threshold: >= $REWARD_THRESHOLD"
 echo "  Filtering enabled: $([ "$NO_FILTER" = "false" ] && echo "yes" || echo "no")"
 echo "  Use best only: $([ "$USE_BEST_ONLY" = "true" ] && echo "yes" || echo "no")"
+if [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
+    echo "  Stratified negative sampling: ${STRATIFIED_FRACTION} (fraction per bucket)"
+else
+    echo "  Stratified negative sampling: DISABLED"
+fi
+if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ] && [ -f "$DEEPSET_ENCODER" ]; then
+    echo "  DeepSet encoder: $DEEPSET_ENCODER"
+else
+    echo "  DeepSet encoder: DISABLED (standard atom-type node features)"
+fi
+if [ -n "$EXCLUDE_DATASETS" ]; then
+    echo "  Excluded datasets: $EXCLUDE_DATASETS"
+fi
 echo ""
 
 # Find pretraining directory
@@ -87,6 +129,25 @@ pretrain_dirs=""
 for dataset_dir in $PRETRAIN_DIR/*/; do
     if [ -d "$dataset_dir" ]; then
         dataset_name=$(basename "$dataset_dir")
+
+        # Skip the DeepSet pretraining output directory — it holds encoder weights,
+        # not MSLD simulation runs, so it is not valid input for CB pretraining.
+        if [ "$dataset_name" = "deepset_pretraining_output" ]; then
+            continue
+        fi
+
+        # Skip any datasets listed in EXCLUDE_DATASETS (space-separated names)
+        skip_dataset=false
+        for excl in $EXCLUDE_DATASETS; do
+            if [ "$dataset_name" = "$excl" ]; then
+                skip_dataset=true
+                break
+            fi
+        done
+        if [ "$skip_dataset" = "true" ]; then
+            echo "  - $dataset_name: EXCLUDED"
+            continue
+        fi
         
         # Check if this has combo subdirectories (like 14benz_pair_combos)
         has_combos=false
@@ -158,7 +219,10 @@ else
 fi
 
 # Add reward filtering
-if [ -n "$REWARD_THRESHOLD" ]; then
+if [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
+    CMD="$CMD --stratified-negative-fraction $STRATIFIED_FRACTION"
+    echo "Stratified negative sampling: ENABLED (${STRATIFIED_FRACTION} per bucket)"
+elif [ -n "$REWARD_THRESHOLD" ]; then
     CMD="$CMD --min-reward-threshold $REWARD_THRESHOLD"
     echo "Reward filtering: ENABLED (>= $REWARD_THRESHOLD)"
 else
@@ -171,6 +235,17 @@ if [ "$USE_BEST_ONLY" = "true" ]; then
     echo "Training mode: Best run per system only"
 else
     echo "Training mode: All valid runs"
+fi
+
+# Add DeepSet encoder if available
+if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ] && [ -f "$DEEPSET_ENCODER" ]; then
+    CMD="$CMD --deepset-encoder $DEEPSET_ENCODER"
+    echo "DeepSet encoder: ENABLED ($DEEPSET_ENCODER)"
+else
+    echo "DeepSet encoder: DISABLED"
+    if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ]; then
+        echo "  Warning: DEEPSET_ENCODER path not found: $DEEPSET_ENCODER"
+    fi
 fi
 
 echo ""
@@ -199,11 +274,14 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "Output saved to: $OUTPUT_DIR"
     echo ""
     echo "Next steps:"
-    echo "1. Check pretrain_status.out for filtering statistics"
-    echo "2. Update your workflow config to use pretrained model:"
+    echo "1. Check pretrain_status.out for filtering statistics and per-run losses"
+    echo "2. Update your workflow config to use the pretrained policy:"
     echo "   pretrain:"
     echo "     model_path: $OUTPUT_DIR/best_policy.pt"
-    echo "3. Run training workflow"
+    echo "3. If DeepSet was enabled, also set the encoder path in your workflow config:"
+    echo "   deepset:"
+    echo "     encoder_path: $DEEPSET_ENCODER"
+    echo "4. Run the training workflow"
 else
     echo "✗ Pretraining failed with exit code $EXIT_CODE"
     echo "Check pretrain_status.out for error details"

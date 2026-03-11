@@ -33,6 +33,8 @@ Usage:
         --epochs 1
 """
 import argparse
+import math
+import random
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
@@ -70,7 +72,10 @@ def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=Non
     )
 
 
-def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None, warn_missing_types=True):
+def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None,
+                                                 warn_missing_types=True, deepset_model=None,
+                                                 pdb_dir=None, prep_dir=None, solvent_state=None,
+                                                 pdb_pattern='site{site}_sub{sub}_frag.pdb'):
     """Build fully-connected PyG graph for pretraining from saved variables.py.
     
     Unlike the standard graph builder which only creates edges for non-zero coefficients,
@@ -94,6 +99,12 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
+        deepset_model: Optional PretrainedDeepSet model for 3D structural node features.
+            When provided, node features are DeepSet embeddings instead of atom-type encodings.
+        pdb_dir: Directory containing _frag.pdb files (required when deepset_model is provided).
+        prep_dir: Prep directory for MIC/context-aware AEV computation (usually same as pdb_dir).
+        solvent_state: Environment type ('gas'/'vacuum', 'protein', 'solvent'/'water').
+        pdb_pattern: Filename pattern for substituent PDB files (default: site{site}_sub{sub}_frag.pdb).
     
     Returns:
         Tuple of (data, targets, extras) where:
@@ -120,10 +131,23 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     from mllf.cb.graph import Graph
     g = Graph.from_graph_info(graph_info)
     
-    # Build node features
+    # Build node features (standard or DeepSet embedding mode)
+    # When using DeepSet, load RTF results from the prep directory so that
+    # partial charges are available for AEV feature construction.
+    rtf_results = None
+    if deepset_model is not None and pdb_dir is not None:
+        from mllf.file_handling.read_rtf import parse_rtf_dir
+        rtf_results = parse_rtf_dir(pdb_dir)
+
     data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
-        g, toppar_dir=toppar_dir, toppar_files=toppar_files, 
-        warn_missing_types=warn_missing_types
+        g, toppar_dir=toppar_dir, toppar_files=toppar_files,
+        warn_missing_types=warn_missing_types,
+        deepset_model=deepset_model,
+        pdb_dir=pdb_dir,
+        pdb_pattern=pdb_pattern,
+        rtf_results=rtf_results,
+        prep_dir=prep_dir,
+        solvent_state=solvent_state,
     )
     
     # Extract site structure
@@ -1048,6 +1072,122 @@ def filter_runs_by_reward(
     return filtered_runs
 
 
+def sample_runs_stratified_negative(
+    runs: List[Dict],
+    fraction_per_bucket: float = 0.25,
+    seed: int = 42,
+) -> List[Dict]:
+    """Keep all positive-reward runs and randomly sample a fraction of each
+    negative-reward bucket.
+
+    Buckets (left-exclusive, right-inclusive except the last):
+        (-inf, -50], (-50, -40], (-40, -30], (-30, -20], (-20, -10], (-10, 0)
+
+    All runs with reward >= 0 are always kept in full.
+    Runs whose reward cannot be computed are excluded.
+
+    Args:
+        runs: List of run dicts from load_pretraining_runs.
+        fraction_per_bucket: Fraction of each negative bucket to sample (default: 0.25).
+            Must be in (0, 1]. A value of 1.0 keeps all runs in each bucket.
+        seed: Random seed for reproducibility (default: 42).
+
+    Returns:
+        Filtered + sampled list of runs.
+    """
+    # Upper bounds for negative buckets; the implicit lower bound of the first
+    # bucket is -inf.  For a reward r < 0 we assign it to the first bucket
+    # whose upper bound satisfies r <= upper_bound.
+    BUCKET_UPPER_BOUNDS = [-50, -40, -30, -20, -10, 0]
+
+    print(f"\n{'='*80}")
+    print(f"Stratified Negative Sampling  (fraction_per_bucket={fraction_per_bucket:.0%})")
+    print(f"{'='*80}")
+
+    # Compute reward for every run -----------------------------------------
+    scored: List[tuple] = []  # (reward, run_dict)
+    n_error = 0
+    for run in runs:
+        try:
+            run_dir = Path(run['run_dir'])
+
+            sim_results_path = run_dir / "simulation_results.json"
+            if not sim_results_path.exists():
+                n_error += 1
+                continue
+            with open(sim_results_path) as f:
+                sim_results = json.load(f)
+
+            graph_info_path = run_dir / "graph_info.json"
+            if not graph_info_path.exists():
+                n_error += 1
+                continue
+            with open(graph_info_path) as f:
+                graph_info = json.load(f)
+
+            sites = graph_info.get('sites', {})
+            if not sites:
+                n_error += 1
+                continue
+
+            site_counts: Dict = {}
+            for block_data in sites.values():
+                s = block_data['site']
+                site_counts[s] = site_counts.get(s, 0) + 1
+            num_sites = len(site_counts)
+            nsubs_per_site = [site_counts[s] for s in sorted(site_counts)]
+
+            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
+            scored.append((reward, run))
+        except Exception:
+            n_error += 1
+
+    print(f"  Total runs scored: {len(scored):,}")
+    if n_error:
+        print(f"  Skipped (scoring error): {n_error:,}")
+
+    # Separate positive runs (kept in full) and bucket negative ones ---------
+    positive_runs = [r for rew, r in scored if rew >= 0]
+    buckets: Dict[int, List[Dict]] = {i: [] for i in range(len(BUCKET_UPPER_BOUNDS))}
+    for rew, r in scored:
+        if rew >= 0:
+            continue
+        for i, hi in enumerate(BUCKET_UPPER_BOUNDS):
+            if rew <= hi:
+                buckets[i].append(r)
+                break
+
+    # Build bucket labels for display
+    bucket_labels = []
+    prev = "-inf"
+    for hi in BUCKET_UPPER_BOUNDS:
+        bucket_labels.append(f"({prev}, {hi}]" if hi < 0 else f"({prev}, {hi})")
+        prev = str(hi)
+
+    # Sample from each bucket -----------------------------------------------
+    rng = random.Random(seed)
+    sampled_negative: List[Dict] = []
+    print(f"\n  {'Bucket':<18} {'Available':>10} {'Sampled':>9}")
+    print(f"  {'-'*18} {'-'*10} {'-'*9}")
+    for i, label in enumerate(bucket_labels):
+        available = buckets[i]
+        n_avail = len(available)
+        n_sample = max(1, int(math.ceil(n_avail * fraction_per_bucket))) if n_avail > 0 else 0
+        if n_avail <= n_sample:
+            selected = available
+        else:
+            selected = rng.sample(available, n_sample)
+        sampled_negative.extend(selected)
+        print(f"  {label:<18} {n_avail:>10,} {len(selected):>9,}")
+
+    result = positive_runs + sampled_negative
+    print(f"\n  Positive (kept all):   {len(positive_runs):>7,}")
+    print(f"  Negative (sampled):    {len(sampled_negative):>7,}")
+    print(f"  Total after sampling:  {len(result):>7,}")
+    print(f"{'='*80}\n")
+    return result
+
+
 def pretrain_epoch(
     encoder: nn.Module,
     policy: nn.Module,
@@ -1059,6 +1199,7 @@ def pretrain_epoch(
     toppar_files=None,
     warn_missing_types=True,
     use_fully_connected=True,
+    deepset_model=None,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -1075,6 +1216,9 @@ def pretrain_epoch(
         use_fully_connected: If True, use fully-connected graph with all pairs within sites.
                             If False, use sparse graph with only non-zero coefficient edges.
                             Fully-connected provides more training data and proper linear bias encoding.
+        deepset_model: Optional PretrainedDeepSet model. When provided, node features are
+                      64-dim DeepSet embeddings computed from 3D atomic structure + AEVs
+                      instead of standard atom-type encodings.
     
     Returns:
         Dict with epoch statistics
@@ -1087,16 +1231,33 @@ def pretrain_epoch(
     
     for run_idx, run in enumerate(runs):
         run_dir = run["run_dir"]
+
+        # Resolve prep directory for DeepSet AEV computation
+        pdb_dir = None
+        prep_dir = None
+        solvent_state = None
+        if deepset_model is not None:
+            source_dir = run.get("source_dir")
+            if source_dir:
+                candidate = Path(source_dir) / "prep"
+                if candidate.is_dir():
+                    pdb_dir = str(candidate)
+                    prep_dir = pdb_dir
+            solvent_state = run.get("metadata", {}).get("solvent_state")
         
         # Build graph from saved data AND get target coefficients
         try:
             if use_fully_connected:
                 # Use fully-connected graph for richer training data
                 data, targets, extras = build_fully_connected_graph_for_pretraining(
-                    run_dir, 
+                    run_dir,
                     toppar_dir=toppar_dir,
                     toppar_files=toppar_files,
-                    warn_missing_types=warn_missing_types
+                    warn_missing_types=warn_missing_types,
+                    deepset_model=deepset_model,
+                    pdb_dir=pdb_dir,
+                    prep_dir=prep_dir,
+                    solvent_state=solvent_state,
                 )
             else:
                 # Use sparse graph (only edges with non-zero coefficients)
@@ -1200,6 +1361,8 @@ def pretrain_with_runs(
     filter_outliers: bool = True,
     outlier_std_threshold: float = 3.0,
     min_reward_threshold: Optional[float] = None,
+    stratified_negative_fraction: Optional[float] = None,
+    deepset_model=None,
 ):
     """Run policy pretraining with provided runs.
     
@@ -1217,6 +1380,13 @@ def pretrain_with_runs(
         filter_outliers: If True (default), exclude runs with coefficients outside statistical range
         outlier_std_threshold: Number of standard deviations for outlier threshold (default: 3.0)
         min_reward_threshold: If set, exclude runs with reward below this threshold (e.g., 5.0)
+        stratified_negative_fraction: If set, keep all positive-reward runs and randomly
+                            sample this fraction from each negative-reward bucket
+                            ((-inf,-50], (-50,-40], ..., (-10,0)).  Applied instead of
+                            min_reward_threshold when both are specified.
+        deepset_model: Optional PretrainedDeepSet for 3D atomic node features. When provided,
+                      the RGCN in_dim is set to deepset_model.embedding_dim (64) rather than
+                      the standard atom-type encoding dimension.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1251,8 +1421,17 @@ def pretrain_with_runs(
     else:
         print(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
     
-    # Optionally filter runs by minimum reward threshold (applied first)
-    if min_reward_threshold is not None:
+    # Stratified negative sampling (takes precedence over min_reward_threshold)
+    if stratified_negative_fraction is not None:
+        print(f"\nApplying stratified negative sampling (fraction_per_bucket={stratified_negative_fraction:.0%})...")
+        runs = sample_runs_stratified_negative(runs, fraction_per_bucket=stratified_negative_fraction)
+
+        if len(runs) == 0:
+            print("Error: No runs remaining after stratified negative sampling")
+            return
+
+    # Optionally filter runs by minimum reward threshold (applied when stratified sampling not used)
+    elif min_reward_threshold is not None:
         print(f"\nApplying reward filtering (threshold: >= {min_reward_threshold})...")
         runs = filter_runs_by_reward(runs, min_reward=min_reward_threshold)
         
@@ -1277,7 +1456,8 @@ def pretrain_with_runs(
     toppar_files = vocab_config.get('toppar_files')
     warn_missing_types = vocab_config.get('warn_missing_types', True)
     
-    # Get a sample run to build model architecture (find one with edges)
+    # Get a sample run to infer graph structure (num_relations, relation_names)
+    # Node feature dim is taken from deepset_model.embedding_dim when available.
     sample_data = None
     sample_extras = None
     for run in runs:
@@ -1298,6 +1478,16 @@ def pretrain_with_runs(
     if sample_data is None:
         print("Error: Could not find a valid graph with edges")
         return
+
+    # When using DeepSet, node features are embedding_dim-dimensional regardless
+    # of what the standard graph builder returns.
+    node_feat_dim = (
+        deepset_model.embedding_dim if deepset_model is not None
+        else sample_data.x.size(1)
+    )
+    if deepset_model is not None:
+        print(f"\nDeepSet mode: node features = {node_feat_dim}-dim embeddings "
+              f"(replaced standard {sample_data.x.size(1)}-dim atom-type encoding)")
     
     # Create model using config (same as workflow)
     train_config = config.get('training', {})
@@ -1305,7 +1495,7 @@ def pretrain_with_runs(
     policy_config = train_config.get('policy', {})
     
     encoder = RGCNEncoder(
-        in_dim=sample_data.x.size(1),
+        in_dim=node_feat_dim,
         hidden_dims=encoder_config.get('hidden_dims', [64, 64]),
         out_dim=encoder_config.get('out_dim', 32),
         num_relations=sample_data.edge_type.max().item() + 1
@@ -1346,7 +1536,8 @@ def pretrain_with_runs(
             toppar_dir=toppar_dir,
             toppar_files=toppar_files,
             warn_missing_types=warn_missing_types,
-            use_fully_connected=use_fully_connected
+            use_fully_connected=use_fully_connected,
+            deepset_model=deepset_model,
         )
         
         print(f"  MSE Loss: {stats['loss']:.4f}")
@@ -1385,7 +1576,7 @@ def pretrain_with_runs(
     
     # Save metadata
     metadata = {
-        'node_feat_dim': sample_data.x.size(1),
+        'node_feat_dim': node_feat_dim,
         'num_relations': sample_data.edge_type.max().item() + 1,
         'encoder_config': encoder_config,
         'policy_config': policy_config,
@@ -1472,7 +1663,25 @@ def main():
         "--min-reward-threshold",
         type=float,
         default=None,
-        help="Minimum reward threshold for filtering runs (e.g., 5.0). If set, only runs with reward >= threshold are used for pretraining.",
+        help="Minimum reward threshold for filtering runs (e.g., 5.0). If set, only runs with reward >= threshold are used for pretraining. Ignored when --stratified-negative-fraction is set.",
+    )
+    parser.add_argument(
+        "--stratified-negative-fraction",
+        type=float,
+        default=None,
+        metavar="F",
+        help="If set, keep all positive-reward runs and randomly sample this fraction of each "
+             "negative-reward bucket: (-inf,-50], (-50,-40], (-40,-30], (-30,-20], (-20,-10], (-10,0). "
+             "E.g. 0.25 samples 25%% of each bucket. "
+             "When specified, --min-reward-threshold is ignored. Default: disabled.",
+    )
+    parser.add_argument(
+        "--deepset-encoder",
+        type=str,
+        default=None,
+        help="Path to a pretrained DeepSet encoder checkpoint (best_encoder.pt). "
+             "When provided, node features are replaced by 64-dim DeepSet embeddings "
+             "computed from 3D atomic structure + AEVs (the full DeepSet → max-pool → RGCN pipeline).",
     )
     
     args = parser.parse_args()
@@ -1480,6 +1689,13 @@ def main():
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Load pretrained DeepSet encoder if specified
+    deepset_model = None
+    if args.deepset_encoder:
+        from mllf.cb.deepset_autoencoder import load_pretrained_deepset
+        print(f"\nLoading pretrained DeepSet encoder from {args.deepset_encoder}...")
+        deepset_model = load_pretrained_deepset(args.deepset_encoder, freeze_weights=True)
     
     # Combine runs from all pretraining directories
     all_runs = []
@@ -1505,6 +1721,8 @@ def main():
         filter_outliers=not args.no_filter_outliers,  # Default to True (filter enabled)
         outlier_std_threshold=args.outlier_std_threshold,
         min_reward_threshold=args.min_reward_threshold,
+        stratified_negative_fraction=args.stratified_negative_fraction,
+        deepset_model=deepset_model,
     )
 
 

@@ -53,5 +53,13 @@ reward:
   # Legacy parameters (for backward compatibility)
   lambda_entropy: 0.01
 
+# Atom type vocabulary configuration
+vocabulary:
+  toppar_dir: null              # None uses package default (toppar/)
+  toppar_files:                 # Explicit list to ensure consistent vocab size
+    - top_all36_cgenff.rtf      # Standard CGenFF types (CG2R61, HGA1, etc.)
+    - custom_ligand_types.rtf    # Custom/MSLD-style types (e.g. Luis benchmark systems)
+  warn_missing_types: true      # Warn when sub RTF contains unknown atom types
+
 # Note: Other sections (split, run_sims, output, etc.) are not used during pretraining
 # Pretraining only needs the model architecture and reward function parameters

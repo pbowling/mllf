@@ -133,6 +133,21 @@ class DeepSetAutoencoder(nn.Module):
         print(f"Encoder saved to {path}")
 
 
+class _LastLayerProxy:
+    """Minimal proxy exposing .out_features for compatibility with DeepSetFeatureExtractor."""
+    def __init__(self, out_features: int):
+        self.out_features = out_features
+
+
+class _AtomMlpProxy:
+    """Proxy for atom_mlp[-1] access pattern used by graph_utils embedding-dim detection."""
+    def __init__(self, out_features: int):
+        self._last = _LastLayerProxy(out_features)
+
+    def __getitem__(self, idx):
+        return self._last
+
+
 class PretrainedDeepSet(nn.Module):
     """Pretrained DeepSet with max-pooling for RGCN integration.
     
@@ -141,6 +156,11 @@ class PretrainedDeepSet(nn.Module):
     - Adds torch.max(dim=0) pooling
     - Optionally freezes weights
     - Ready to plug into RGCN as node feature generator
+
+    The class implements the same interface as DeepSetFeatureExtractor so it can
+    be used as a drop-in replacement in graph_utils.build_pyg_graph_from_mllf_graph.
+    The autoencoder was trained with include_charges=True and include_atom_ids=False,
+    so input_dim = aev_length + 1 (charge).
     """
     
     def __init__(self, encoder_path, freeze_weights=True):
@@ -167,26 +187,44 @@ class PretrainedDeepSet(nn.Module):
             self.frozen = True
         else:
             self.frozen = False
+
+        # DeepSetFeatureExtractor compatibility attributes
+        # The autoencoder was trained with charges included and no atom-type one-hots.
+        self.include_charge = True
+        self.include_atom_id = False
+        # atom_mlp[-1].out_features used by graph_utils for fallback zero embeddings
+        self.atom_mlp = _AtomMlpProxy(self.embedding_dim)
         
         print(f"Loaded pretrained DeepSet from {encoder_path}")
         print(f"  Input dim: {self.input_dim}")
         print(f"  Embedding dim: {self.embedding_dim}")
         print(f"  Frozen: {self.frozen}")
     
-    def forward(self, atom_features):
-        """
-        Args:
-            atom_features: [num_atoms, input_dim] atom features (AEV + charge)
-            
+    def forward(self, atom_features=None, *, aev_tensor=None, charges=None, atom_ids=None):
+        """Forward pass — accepts both native and DeepSetFeatureExtractor calling conventions.
+
+        Native convention (original):
+            forward(atom_features)  — [num_atoms, input_dim] pre-concatenated tensor
+
+        DeepSetFeatureExtractor convention (for graph_utils compatibility):
+            forward(aev_tensor=..., charges=...)  — separate AEV and charge tensors
+
         Returns:
             [embedding_dim] pooled node embedding
         """
-        # Encode individual atoms
-        atom_embeddings = self.encoder(atom_features)  # [num_atoms, embedding_dim]
-        
-        # Max-pool across atoms
+        if atom_features is None:
+            if aev_tensor is None:
+                raise ValueError("Either atom_features or aev_tensor must be provided")
+            parts = [aev_tensor]
+            if self.include_charge and charges is not None:
+                if charges.dim() == 1:
+                    charges = charges.unsqueeze(1)
+                parts.append(charges)
+            atom_features = torch.cat(parts, dim=-1)
+
+        # Encode individual atoms then max-pool
+        atom_embeddings = self.encoder(atom_features)      # [num_atoms, embedding_dim]
         pooled_embedding, _ = torch.max(atom_embeddings, dim=0)  # [embedding_dim]
-        
         return pooled_embedding
     
     def unfreeze(self):

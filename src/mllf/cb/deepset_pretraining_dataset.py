@@ -151,6 +151,18 @@ def load_system_metadata(system_dir: Path) -> Dict:
                 if protein_pdb:
                     print(f"  Detected protein PDB: {protein_pdb.name}")
             
+            # Load active_subs_ordered from graph_info.json (present for systems
+            # whose prep is a master prep shared across groups, e.g. luis_systems).
+            active_subs_ordered = None
+            graph_info_path = run_dir / 'graph_info.json'
+            if graph_info_path.exists():
+                try:
+                    with open(graph_info_path) as _gf:
+                        _gi = json.load(_gf)
+                    active_subs_ordered = _gi.get('active_subs_ordered')
+                except Exception:
+                    pass
+
             return {
                 'system_name': system_dir.name,
                 'solvent_state': solvent_state,
@@ -158,6 +170,7 @@ def load_system_metadata(system_dir: Path) -> Dict:
                 'protein_pdb': protein_pdb,
                 'num_sites': metadata.get('num_sites', 1),
                 'num_substituents': metadata.get('num_substituents', 0),
+                'active_subs_ordered': active_subs_ordered,
             }
         except Exception as e:
             warnings.warn(f"Error reading metadata from {run_dir}: {e}")
@@ -221,7 +234,25 @@ def generate_training_data_for_system(
                 warnings.warn(f"[{system_name}] Protein state but no protein PDB or minimized.pdb found")
     
     # Collect all substituent PDB files
-    sub_pdbs = sorted(prep_dir.glob('site*_sub*_frag.pdb'))
+    # Collect substituent PDB files in sequential bias order.
+    # If active_subs_ordered is provided (master-prep systems), resolve each
+    # master sub name to its _frag.pdb path.  Otherwise fall back to a glob
+    # which works for conventional preps that already contain only active subs.
+    active_subs_ordered = metadata.get('active_subs_ordered')
+    if active_subs_ordered:
+        sub_pdbs = []
+        for site_label in sorted(active_subs_ordered.keys(),
+                                  key=lambda s: int(s.replace('site', ''))):
+            for master_sub in active_subs_ordered[site_label]:
+                frag = prep_dir / f"{master_sub}_frag.pdb"
+                if frag.exists():
+                    sub_pdbs.append(frag)
+                else:
+                    warnings.warn(
+                        f"[{system_name}] Active sub frag PDB not found: {frag.name}"
+                    )
+    else:
+        sub_pdbs = sorted(prep_dir.glob('site*_sub*_frag.pdb'))
     if not sub_pdbs:
         raise ValueError(f"No substituent PDB files found in {prep_dir}")
     
@@ -507,7 +538,22 @@ def generate_all_pretraining_datasets(
     
     for system_dir in sorted(system_dirs):
         output_path = output_root / f"{system_dir.name}_training_data.pt"
-        
+
+        if output_path.exists():
+            print(f"  Skipping {system_dir.name} (dataset already exists)")
+            # Load minimal stats from existing file for the summary
+            try:
+                import torch as _torch
+                existing = _torch.load(output_path, weights_only=False)
+                all_stats.append({
+                    'system_name': system_dir.name,
+                    'total_atoms': existing['features'].shape[0] if 'features' in existing else 0,
+                    'num_substituents': existing.get('num_substituents', 0),
+                })
+            except Exception:
+                pass
+            continue
+
         try:
             stats = generate_training_data_for_system(
                 system_dir, output_path,

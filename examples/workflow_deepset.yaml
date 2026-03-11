@@ -40,14 +40,15 @@ deepset:
   hidden_dim: 256               # Hidden dimension in shared MLP
   
   # Node feature mode
-  use_deepset_only: false       # If false, concatenate environmental features (solvent, protein)
-                                # Node features: 64 (DeepSet) + 2 (environmental) = 66D
-                                # If true, only use DeepSet embeddings (64D)
+  use_deepset_only: false       # DEPRECATED: Always uses only DeepSet embeddings (64D)
+                                # Spatial context (protein atoms) encoded in AEVs
+                                # Environmental features (solvent state) not needed (constant within graph)
 
 # Atom type vocabulary configuration (for optional count-based features)
 vocabulary:
   toppar_dir: null              # None uses package default (toppar/)
-  toppar_files: null            # None uses all .rtf and .str files
+  toppar_files: null            # None uses all .rtf and .str files in toppar_dir
+                                # (includes top_all36_cgenff.rtf + custom_ligand_types.rtf)
   warn_missing_types: true      # Warn when sub RTF contains unknown atom types
 
 # Training configuration
