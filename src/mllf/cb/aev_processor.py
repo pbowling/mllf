@@ -16,7 +16,7 @@ from mllf.file_handling.read_pdb import (
 
 # Element to species ID mapping for common elements + unknown
 # Rare CGenFF elements (B, Se, Al) mapped to 'X' (unknown) to reduce AEV dimensions
-# This reduces AEV from 3120D (13 species) to 1920D (11 species)
+# This reduces AEV from 3120D (13 species) to 2288D (11 species)
 ELEMENT_TO_ID = {
     # Common organic and drug-like elements (IDs 0-9)
     'H': 0, 'C': 1, 'N': 2, 'O': 3, 'F': 4, 

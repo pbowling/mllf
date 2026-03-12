@@ -30,8 +30,8 @@ pretrain:
 # DeepSet configuration (Steps 1-3 of pipeline)
 deepset:
   # Step 1: Atom-level feature extraction
-  aev_length: 1920              # ANI-2x AEV dimension
-  num_atom_types: 13            # CGenFF elements (H, C, N, O, F, S, Cl, Br, I, P, Al, B, Se)
+  aev_length: 2288              # ANI-2x AEV dimension (AEVComputer.like_2x with 11 species)
+  num_atom_types: 11            # Species IDs used in AEV (H, C, N, O, F, S, Cl, Br, I, P, X/rare)
   include_charge: true          # Include atomic partial charges from RTF files
   include_atom_id: true         # Include atom type IDs (0-12 for 13 elements)
   

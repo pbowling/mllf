@@ -16,7 +16,7 @@ This script implements the full training loop:
 Usage:
   python examples/run_workflow.py [config.yaml]
 
-If no config is provided, uses examples/workflow_sample.yaml by default.
+If no config is provided, uses examples/workflow_14benz.yaml by default.
 """
 from pathlib import Path
 import sys

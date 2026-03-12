@@ -23,7 +23,7 @@ Quick Start
 .. code-block:: bash
 
    cd examples
-   python run_workflow.py workflow_sample.yaml
+   python run_workflow.py workflow_14benz.yaml
 
 This will:
 
@@ -36,7 +36,7 @@ This will:
 Configuration
 ~~~~~~~~~~~~~
 
-Edit ``examples/workflow_sample.yaml`` to customize paths and basic settings:
+Edit ``examples/workflow_14benz.yaml`` to customize paths and basic settings:
 
 .. code-block:: yaml
 
@@ -74,10 +74,10 @@ To pretrain from existing simulations:
    cp -r previous_runs/good_combos/* pretraining/
    
    # Run pretraining
-   python run_pretraining.py --config workflow_sample.yaml
+   python run_deepset_pretraining.py --pretraining-dir pretraining --output-dir models --steps all
    
    # Use pretrained model in main training
-   python run_workflow.py workflow_sample.yaml
+   python run_workflow.py workflow_deepset.yaml
 
 See :doc:`workflow` for detailed pretraining configuration, data organization, 
 and benefits.
@@ -113,7 +113,7 @@ For production training on a cluster:
 The training script:
 
 - Activates the conda environment
-- Runs ``python -u run_workflow.py workflow_sample.yaml``
+- Runs ``python -u run_workflow.py workflow_14benz.yaml``
 - Submits MSLD simulations as separate SLURM jobs
 - Manages up to 30 concurrent simulation jobs
 - Writes progress to ``training_status.out``
@@ -141,7 +141,7 @@ Customizing the Workflow
 To adapt for your system:
 
 1. **Prepare fragments**: Create ``siteN_subM_pres.rtf`` files for your sites/substituents
-2. **Update config**: Edit ``workflow_sample.yaml`` with your paths and ``system.solvent_state``
+2. **Update config**: Edit ``workflow_14benz.yaml`` (or ``workflow_deepset.yaml`` for the DeepSet pipeline) with your paths and ``system.solvent_state``
 3. **Modify simulation script**: Adapt ``msld_flat.py`` for your force field and protocol
 4. **Run training**: Execute ``python run_workflow.py your_config.yaml``
 

@@ -1,16 +1,17 @@
 # Pretraining configuration for MSLD policy (Behavior Cloning)
 # This config is used for supervised pretraining on collected simulation data
 # Trains policy to predict bias coefficients from best runs using MSE loss
-# After pretraining, use workflow_sample.yaml with pretrain.model_path set
+# After pretraining, use workflow_14benz.yaml or workflow_deepset.yaml with pretrain.model_path set
 
 # Training configuration (must match your main workflow config)
 # Architecture: Bias-type embeddings + separate heads for forced specialization
 # - Shared trunk: 1 layer (lightweight)
 # - Bias-type embeddings: Learnable 16-dim vectors providing unique context per head
 # - Separate heads: Deep 3-layer networks receiving [trunk_out, bias_embedding]
-# - Output scaling: [Linear ±79, Quadratic ±163, Skew ±11, End ±7]
-# - Exploration: log_std max = 2.0 (std up to ~7.4)  
-# - Action clipping: Enforces scaling limits × 1.05
+# - Output scaling: tanh clamped to [Linear ±305, Quadratic ±520, Skew ±85, End ±30]
+#   (based on full 20K+ run scan: linear max 277, quadratic max 470, skew max 77, end max 27)
+# - Exploration: log_std max = 2.0 (std up to ~7.4)
+# - Action clipping: bias_clip = 1000.0 (safety net above tanh bounds)
 # mlp_out_dim is automatically computed from relation_names (typically 4: quadratic, skew, end, linear)
 training:
   encoder:
@@ -21,7 +22,8 @@ training:
     # mlp_out_dim: 4        # Auto-computed: number of bias types (quadratic, skew, end, linear)
   optimizer:
     lr: 0.001
-  bias_clip: 1000.0         # Safety net (policy clips to [±83, ±171, ±11.6, ±7.4] per bias type)
+  bias_clip: 1000.0         # Safety net applied when writing variables.py at inference time;
+                            # clips all coefficients to ±1000 (well above tanh bounds of ±305/±520/±85/±30)
 
 # Reward configuration (improved reward function with graduated transition penalties)
 reward:

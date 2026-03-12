@@ -135,13 +135,12 @@ class EdgePolicy(nn.Module):
         mean = out[:, :D]
         log_std = out[:, D: D + D]
         
-        # Scale mean outputs to expected bias coefficient range using tanh
-        # Different scaling factors per bias type: [linear, quadratic, skew, end]
-        # Based on filtered pretraining statistics (803 runs after reward + 2.5σ filtering):
-        # Linear: ±61.4 (95th percentile=51.16), Quadratic: ±70.5 (95th=58.74)
-        # Skew: ±6.6 (95th=5.48), End: ±3.6 (95th=2.98)
-        # Each factor provides 95th percentile + 20% headroom for safety
-        scale_factors = torch.tensor([61.4, 70.5, 6.6, 3.6], device=mean.device)
+        # Scale mean outputs to expected bias coefficient range using tanh.
+        # Factors set to cover the empirical maximum across ALL pretraining runs
+        # (20K+ run full scan: linear max 277, quadratic max 470, skew max 77, end max 27)
+        # with ~10% headroom.  Previous bounds (±72/±72/±16.5/±8) were derived from
+        # a small biased sample and clipped 17.5% of linear and 34.4% of quadratic targets.
+        scale_factors = torch.tensor([305.0, 520.0, 85.0, 30.0], device=mean.device)
         mean = torch.tanh(mean) * scale_factors.unsqueeze(0)
         
         # Clamp log_std to prevent extreme standard deviations that can cause NaN

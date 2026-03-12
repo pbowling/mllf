@@ -2,7 +2,7 @@
 #SBATCH --job-name=mllf_pretrain
 #SBATCH --output=pretrain_status.out
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=4
 #SBATCH -p cpu
 #SBATCH --export=ALL
 #SBATCH --time=15:00:00  # 15 hours for large pretraining datasets
@@ -72,11 +72,12 @@ EPOCHS="${EPOCHS:-50}"
 LEARNING_RATE="${LEARNING_RATE:-0.001}"
 OUTLIER_THRESHOLD="${OUTLIER_THRESHOLD:-3.0}"
 REWARD_THRESHOLD="${REWARD_THRESHOLD:-0}"
-NO_FILTER="${NO_FILTER:-false}"
+NO_FILTER="${NO_FILTER:-true}"
 USE_BEST_ONLY="${USE_BEST_ONLY:-false}"
 STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.25}"
 DEEPSET_ENCODER="${DEEPSET_ENCODER:-pretraining/deepset_pretraining_output/trained_models/best_encoder.pt}"
 EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos}"
+NUM_WORKERS="${NUM_WORKERS:-${SLURM_CPUS_PER_TASK:-1}}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -100,6 +101,7 @@ fi
 if [ -n "$EXCLUDE_DATASETS" ]; then
     echo "  Excluded datasets: $EXCLUDE_DATASETS"
 fi
+echo "  Parallel workers: $NUM_WORKERS"
 echo ""
 
 # Find pretraining directory
@@ -247,6 +249,10 @@ else
         echo "  Warning: DEEPSET_ENCODER path not found: $DEEPSET_ENCODER"
     fi
 fi
+
+# Add parallel workers
+CMD="$CMD --num-workers $NUM_WORKERS"
+echo "Parallel graph pre-build workers: $NUM_WORKERS"
 
 echo ""
 echo "Command:"

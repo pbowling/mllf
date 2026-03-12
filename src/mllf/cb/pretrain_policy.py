@@ -37,7 +37,9 @@ import collections
 import math
 import random
 import re
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
@@ -203,7 +205,20 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     c_matrix = np.array(bias_data['c'], dtype=float)
     x_matrix = np.array(bias_data['x'], dtype=float)
     s_matrix = np.array(bias_data['s'], dtype=float)
-    
+
+    # Sanity-check: bias matrix size must match the node count from graph_info.
+    # A mismatch means the run was simulated with a different number of active
+    # substituents than graph_info.json records (e.g. cmet runs with 6 active
+    # subs but graph_info listing 11).  These runs cannot be used because we
+    # cannot reliably map node indices to bias-matrix rows.
+    n_nodes = sum(nsubs_per_site)
+    if len(b_vector) != n_nodes:
+        raise ValueError(
+            f"Bias matrix size ({len(b_vector)}) does not match node count "
+            f"from nsubs_per_site ({n_nodes} = {nsubs_per_site}). "
+            f"Run has inconsistent graph_info / variables data."
+        )
+
     # Build directed pairs for ALL substituents within each site
     from mllf.cb.graph_utils import build_directed_pairs
     pairs = build_directed_pairs(nsubs_per_site)
@@ -1203,6 +1218,7 @@ def pretrain_epoch(
     warn_missing_types=True,
     use_fully_connected=True,
     deepset_model=None,
+    graph_cache: Optional[List] = None,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -1235,55 +1251,60 @@ def pretrain_epoch(
     for run_idx, run in enumerate(runs):
         run_dir = run["run_dir"]
 
-        # Resolve prep directory for DeepSet AEV computation
-        pdb_dir = None
-        prep_dir = None
-        solvent_state = None
-        if deepset_model is not None:
-            source_dir = run.get("source_dir")
-            if source_dir:
-                candidate = Path(source_dir) / "prep"
-                if candidate.is_dir():
-                    pdb_dir = str(candidate)
-                    prep_dir = pdb_dir
-            solvent_state = run.get("metadata", {}).get("solvent_state")
-        
-        # Build graph from saved data AND get target coefficients
-        try:
-            if use_fully_connected:
-                # Use fully-connected graph for richer training data
-                data, targets, extras = build_fully_connected_graph_for_pretraining(
-                    run_dir,
-                    toppar_dir=toppar_dir,
-                    toppar_files=toppar_files,
-                    warn_missing_types=warn_missing_types,
-                    deepset_model=deepset_model,
-                    pdb_dir=pdb_dir,
-                    prep_dir=prep_dir,
-                    solvent_state=solvent_state,
-                )
-            else:
-                # Use sparse graph (only edges with non-zero coefficients)
-                data, targets, extras = build_graph_from_saved_data(
-                    run_dir, 
-                    toppar_dir=toppar_dir,
-                    toppar_files=toppar_files,
-                    warn_missing_types=warn_missing_types
-                )
-            
-            data = data.to(device)
-            
-            # Targets contain the actual bias coefficients from successful run
-            if targets is None or len(targets) == 0:
-                print(f"  Warning: No target coefficients for {run_dir.name}, skipping")
+        if graph_cache is not None:
+            # Use pre-built cached graph — skip all file I/O and AEV computation
+            cached = graph_cache[run_idx]
+            if cached is None:
                 continue
-            
-            # Convert targets list to tensor
-            targets = torch.tensor(targets, dtype=torch.float32, device=device)
-            
-        except Exception as e:
-            print(f"  Error building graph for {run_dir.name}: {e}")
-            continue
+            data_cpu, targets_list = cached
+            data    = data_cpu.to(device)
+            targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
+        else:
+            # Resolve prep directory for DeepSet AEV computation
+            pdb_dir = None
+            prep_dir = None
+            solvent_state = None
+            if deepset_model is not None:
+                source_dir = run.get("source_dir")
+                if source_dir:
+                    candidate = Path(source_dir) / "prep"
+                    if candidate.is_dir():
+                        pdb_dir = str(candidate)
+                        prep_dir = pdb_dir
+                solvent_state = run.get("metadata", {}).get("solvent_state")
+
+            # Build graph from saved data AND get target coefficients
+            try:
+                if use_fully_connected:
+                    data, targets, extras = build_fully_connected_graph_for_pretraining(
+                        run_dir,
+                        toppar_dir=toppar_dir,
+                        toppar_files=toppar_files,
+                        warn_missing_types=warn_missing_types,
+                        deepset_model=deepset_model,
+                        pdb_dir=pdb_dir,
+                        prep_dir=prep_dir,
+                        solvent_state=solvent_state,
+                    )
+                else:
+                    data, targets, extras = build_graph_from_saved_data(
+                        run_dir,
+                        toppar_dir=toppar_dir,
+                        toppar_files=toppar_files,
+                        warn_missing_types=warn_missing_types
+                    )
+
+                data = data.to(device)
+
+                if targets is None or len(targets) == 0:
+                    print(f"  Warning: No target coefficients for {run_dir.name}, skipping")
+                    continue
+
+                targets = torch.tensor(targets, dtype=torch.float32, device=device)
+
+            except Exception as e:
+                print(f"  Error building graph for {run_dir.name}: {e}")
+                continue
         
         # Get predicted coefficients from policy (deterministic mean)
         _, _, predicted_means, _ = policy.get_actions(
@@ -1291,8 +1312,18 @@ def pretrain_epoch(
             deterministic=True  # Use mean predictions, not sampled
         )
         
-        # Behavior Cloning: MSE loss between predicted and target coefficients
-        mse_loss = nn.functional.mse_loss(predicted_means, targets)
+        # Behavior Cloning: masked MSE — only backpropagate through the
+        # active coefficient for each edge (the one non-zero target element).
+        # The full-MSE approach (naive targets=[coeff,0,0,0]) pushes ALL heads
+        # toward 0 on 75% of edges, creating gradient conflicts that prevent
+        # the model from learning the true non-zero coefficient values.
+        active_mask = targets.abs() > 1e-8            # [E, 4], one True per row
+        if active_mask.any():
+            mse_loss = nn.functional.mse_loss(
+                predicted_means[active_mask], targets[active_mask]
+            )
+        else:
+            mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         # Check for NaN/inf
         if torch.isnan(mse_loss) or torch.isinf(mse_loss):
@@ -1366,6 +1397,7 @@ def pretrain_with_runs(
     min_reward_threshold: Optional[float] = None,
     stratified_negative_fraction: Optional[float] = None,
     deepset_model=None,
+    num_workers: int = 1,
 ):
     """Run policy pretraining with provided runs.
     
@@ -1390,6 +1422,9 @@ def pretrain_with_runs(
         deepset_model: Optional PretrainedDeepSet for 3D atomic node features. When provided,
                       the RGCN in_dim is set to deepset_model.embedding_dim (64) rather than
                       the standard atom-type encoding dimension.
+        num_workers: Number of parallel workers for graph pre-building (default: 1).
+                     Set > 1 to build graphs in parallel before epoch 1; all subsequent
+                     epochs reuse the cache with zero graph-building overhead.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1517,11 +1552,17 @@ def pretrain_with_runs(
         policy.parameters(),
         lr=learning_rate
     )
-    
+    # Cosine annealing LR schedule: decays smoothly from lr → lr/100 over all epochs.
+    # Prevents the optimizer from escaping good basins found in early epochs.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=learning_rate / 100.0
+    )
+
     print(f"\nModel architecture:")
     print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())} params")
     print(f"  Policy: {sum(p.numel() for p in policy.parameters())} params")
-    
+    print(f"  LR schedule: cosine annealing, {learning_rate} → {learning_rate/100:.6f} over {epochs} epochs")
+
     # Training loop
     reward_config = config.get('reward', {})
     best_loss = float('inf')
@@ -1535,6 +1576,7 @@ def pretrain_with_runs(
     # ------------------------------------------------------------------
     _warning_counts  = collections.Counter()   # (category, template) -> count
     _warning_example = {}                       # (category, template) -> full message
+    _warning_lock    = threading.Lock()          # thread-safe updates during parallel build
     _path_re = re.compile(r'/[^\s:*?"<>|]+')
 
     _orig_showwarning = warnings.showwarning
@@ -1543,20 +1585,82 @@ def pretrain_with_runs(
         text     = str(message)
         template = _path_re.sub('<path>', text)
         key      = (category.__name__, template)
-        _warning_counts[key]  += 1
-        if key not in _warning_example:
-            _warning_example[key] = (text, filename, lineno)
+        with _warning_lock:
+            _warning_counts[key]  += 1
+            if key not in _warning_example:
+                _warning_example[key] = (text, filename, lineno)
 
     warnings.showwarning = _collect_warning
 
+    # ------------------------------------------------------------------
+    # Pre-build all graphs once and cache them.
+    # Graph building (file IO + AEV computation) dominates epoch time;
+    # caching eliminates it from epochs 2 onward.  With num_workers > 1
+    # the initial build is also parallelised across CPU threads.
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    worker_str = f"{num_workers} workers" if num_workers > 1 else "1 worker (serial)"
+    print(f"Pre-building {len(runs)} graphs ({worker_str})...")
+    print(f"{'='*60}")
+
+    def _build_one(idx_run):
+        idx, run = idx_run
+        _run_dir = run["run_dir"]
+        _pdb_dir = _prep_dir = _solvent = None
+        if deepset_model is not None:
+            _src = run.get("source_dir")
+            if _src:
+                _cand = Path(_src) / "prep"
+                if _cand.is_dir():
+                    _pdb_dir = _prep_dir = str(_cand)
+            _solvent = run.get("metadata", {}).get("solvent_state")
+        try:
+            if use_fully_connected:
+                _data, _tgts, _ = build_fully_connected_graph_for_pretraining(
+                    _run_dir,
+                    toppar_dir=toppar_dir, toppar_files=toppar_files,
+                    warn_missing_types=warn_missing_types,
+                    deepset_model=deepset_model,
+                    pdb_dir=_pdb_dir, prep_dir=_prep_dir, solvent_state=_solvent,
+                )
+            else:
+                _data, _tgts, _ = build_graph_from_saved_data(
+                    _run_dir, toppar_dir=toppar_dir, toppar_files=toppar_files,
+                    warn_missing_types=warn_missing_types,
+                )
+            if _tgts is None or len(_tgts) == 0:
+                return idx, None, "no_targets"
+            return idx, (_data.cpu(), _tgts), None
+        except Exception as exc:
+            return idx, None, str(exc)
+
+    graph_cache = [None] * len(runs)
+    n_ok = n_fail = 0
+    with ThreadPoolExecutor(max_workers=num_workers) as _pool:
+        _futs = {_pool.submit(_build_one, (i, r)): i for i, r in enumerate(runs)}
+        for _fut in as_completed(_futs):
+            _idx, _item, _err = _fut.result()
+            if _err:
+                if _err != "no_targets":
+                    print(f"  Error building graph for {runs[_idx]['run_dir'].name}: {_err}")
+                n_fail += 1
+            else:
+                graph_cache[_idx] = _item
+                n_ok += 1
+            done = n_ok + n_fail
+            if done % 500 == 0 or done == len(runs):
+                print(f"  {done}/{len(runs)} graphs built ({n_fail} failed)...")
+
+    print(f"Graph cache ready: {n_ok} built, {n_fail} skipped")
+
     print(f"\n{'='*60}")
     print(f"Starting behavior cloning for {epochs} epochs")
-    print(f"Training on {len(runs)} best runs per system")
+    print(f"Training on {len(runs)} runs ({n_ok} with valid graphs)")
     print(f"{'='*60}\n")
-    
+
     for epoch in range(epochs):
         print(f"Epoch {epoch+1}/{epochs}")
-        
+
         stats = pretrain_epoch(
             encoder, policy, optimizer, runs, reward_config, device,
             toppar_dir=toppar_dir,
@@ -1564,10 +1668,15 @@ def pretrain_with_runs(
             warn_missing_types=warn_missing_types,
             use_fully_connected=use_fully_connected,
             deepset_model=deepset_model,
+            graph_cache=graph_cache,
         )
         
         print(f"  MSE Loss: {stats['loss']:.4f}")
         print(f"  Runs processed: {stats['num_runs']}")
+        print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+
+        # Step LR scheduler after each epoch
+        scheduler.step()
         
         # Save best model (lowest loss)
         if stats['loss'] < best_loss:
@@ -1588,6 +1697,7 @@ def pretrain_with_runs(
             'encoder_state': encoder.state_dict(),
             'policy_state': policy.state_dict(),
             'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
             'epoch': epoch + 1,
             'stats': stats,
         }, checkpoint_path)
@@ -1726,7 +1836,15 @@ def main():
              "When provided, node features are replaced by 64-dim DeepSet embeddings "
              "computed from 3D atomic structure + AEVs (the full DeepSet → max-pool → RGCN pipeline).",
     )
-    
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel CPU workers for graph pre-building (default: 1). "
+             "Set to the number of available CPUs (e.g. --cpus-per-task value in SLURM). "
+             "All epochs after the first reuse the cached graphs at no extra cost.",
+    )
+
     args = parser.parse_args()
     
     # Load config
@@ -1766,6 +1884,7 @@ def main():
         min_reward_threshold=args.min_reward_threshold,
         stratified_negative_fraction=args.stratified_negative_fraction,
         deepset_model=deepset_model,
+        num_workers=args.num_workers,
     )
 
 

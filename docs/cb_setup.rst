@@ -378,4 +378,5 @@ See Also
 * :doc:`examples` - Running the full training workflow
 * :doc:`api` - API reference for CB modules
 * ``examples/run_workflow.py`` - Full training implementation
-* ``examples/workflow_sample.yaml`` - Configuration file template
+* ``examples/workflow_14benz.yaml`` - Configuration file template (standard pipeline)
+* ``examples/workflow_deepset.yaml`` - Configuration file template (DeepSet pipeline)

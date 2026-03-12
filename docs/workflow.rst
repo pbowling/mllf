@@ -23,14 +23,14 @@ The workflow is driven by a YAML configuration file:
 
 .. code-block:: bash
 
-   python -m mllf.cli.workflow --config examples/workflow_sample.yaml
+   python -m mllf.cli.workflow --config examples/workflow_14benz.yaml
 
 Or using the convenience wrapper:
 
 .. code-block:: bash
 
    cd examples
-   python run_workflow.py  # Uses workflow_sample.yaml by default
+   python run_workflow.py workflow_14benz.yaml
    python run_workflow.py my_config.yaml  # Use custom config
 
 Configuration Format
@@ -857,7 +857,7 @@ The main training workflow is implemented in ``examples/run_workflow.py``:
 .. code-block:: bash
 
    cd examples
-   python run_workflow.py workflow_sample.yaml
+   python run_workflow.py workflow_14benz.yaml
 
 This executes:
 
