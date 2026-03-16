@@ -9,7 +9,7 @@
 
 # SLURM script for running CB policy pretraining on collected MSLD simulation data.
 #
-# Uses the full DeepSet → max-pool → RGCN pipeline by default:
+# Uses the full DeepSet → sum-pool → RGCN pipeline by default:
 #   - Loads the pretrained DeepSet encoder from pretraining/deepset_pretraining_output/
 #   - Replaces standard atom-type node features with 64-dim AEV-based embeddings
 #   - Trains the RGCN+EdgePolicy on behavior-cloning MSE loss
@@ -33,6 +33,16 @@
 #
 # To use a different encoder checkpoint:
 #   sbatch --export=ALL,DEEPSET_ENCODER=/path/to/best_encoder.pt pretrain_with_filtering.sh
+#
+# Default excluded datasets (EXCLUDE_DATASETS):
+#   14benz_pair_combos  - combo structure handled separately; exclude from normal scan
+#   luis_cdk2_*         - all 4 groups have zero positive-reward runs (max <= -7), genuinely poor sampling
+#   luis_ptp1b_{protein,solvent}_group1 - max -14, no positive runs, large datasets (220 runs each)
+#   p38_protein_groupA/B/C - max -1.66 to -21.6, zero positive runs across all protein groups
+#   mup1_solvent_group2 - max -2.86, zero positive runs
+#   luis_p38_protein_group2 - max -8.01, zero positive runs
+#   (Systems that only hit the completeness gate, max=-0.01, are left in as their
+#    coefficients were partially effective and the data may still be informative.)
 
 set -e  # Exit on error
 
@@ -76,8 +86,8 @@ NO_FILTER="${NO_FILTER:-true}"
 USE_BEST_ONLY="${USE_BEST_ONLY:-false}"
 STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.25}"
 DEEPSET_ENCODER="${DEEPSET_ENCODER:-pretraining/deepset_pretraining_output/trained_models/best_encoder.pt}"
-EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos}"
-NUM_WORKERS="${NUM_WORKERS:-${SLURM_CPUS_PER_TASK:-1}}"
+EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos luis_cdk2_protein_group1 luis_cdk2_protein_group2 luis_cdk2_solvent_group1 luis_cdk2_solvent_group2 luis_ptp1b_protein_group1 luis_ptp1b_solvent_group1 p38_protein_groupA p38_protein_groupB p38_protein_groupC mup1_solvent_group2 luis_p38_protein_group2}"
+PATIENCE="${PATIENCE:-10}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -101,7 +111,7 @@ fi
 if [ -n "$EXCLUDE_DATASETS" ]; then
     echo "  Excluded datasets: $EXCLUDE_DATASETS"
 fi
-echo "  Parallel workers: $NUM_WORKERS"
+echo "  Early stopping patience: $PATIENCE epochs"
 echo ""
 
 # Find pretraining directory
@@ -250,9 +260,9 @@ else
     fi
 fi
 
-# Add parallel workers
-CMD="$CMD --num-workers $NUM_WORKERS"
-echo "Parallel graph pre-build workers: $NUM_WORKERS"
+# Add early stopping patience
+CMD="$CMD --patience $PATIENCE"
+echo "Early stopping patience: $PATIENCE epochs"
 
 echo ""
 echo "Command:"

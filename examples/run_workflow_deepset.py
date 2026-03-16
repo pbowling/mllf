@@ -6,7 +6,7 @@ with DeepSet embeddings providing richer node features for the RGCN encoder.
 The 4-step DeepSet pipeline integrates as follows:
   1. Atom-Level Physical Representation: Extract AEVs, charges, and atom IDs from PDB files
   2. Shared MLP: Process atom features through DeepSet feature extractor  
-  3. Permutation-Invariant Pooling: Max-pool to get substituent embeddings (64D)
+  3. Permutation-Invariant Pooling: Sum-pool to get substituent embeddings (64D)
   4. These embeddings become RGCN node features (replacing count-based features)
 
 The training workflow:
@@ -42,7 +42,7 @@ from typing import Dict, List
 from mllf.file_handling.generate_combinations import create_combination_dirs, create_single_combination_dir
 from mllf.file_handling.read_rtf import parse_rtf_dir
 from mllf.cb.graph import Graph
-from mllf.cb.deepset import DeepSetFeatureExtractor
+from mllf.cb.deepset_autoencoder import load_pretrained_deepset
 from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy
 from mllf.cb.value_net import ValueNetwork
@@ -134,7 +134,7 @@ def ensure_combo_dir_exists(combo_path: Path, config: Dict) -> Path:
 
 def build_graph_and_data_with_deepset(
     combo_dir: str,
-    deepset_model: DeepSetFeatureExtractor,
+    deepset_model,
     config: Dict,
     device: str = 'cpu'
 ):
@@ -230,7 +230,7 @@ def train_epoch(
     value_network: ValueNetwork,
     optimizer: torch.optim.Optimizer,
     value_optimizer: torch.optim.Optimizer,
-    deepset_model: DeepSetFeatureExtractor,
+    deepset_model,
     combos: List[str],
     epoch: int,
     config: Dict,
@@ -554,16 +554,16 @@ def main():
     sample_combo = train_combos[0]
     sample_combo_path = ensure_combo_dir_exists(Path(sample_combo), config)
     
-    # Initialize DeepSet model (for computing node embeddings)
+    # Load pretrained DeepSet encoder (sum-pool, frozen weights from autoencoder pretraining)
     deepset_config = config.get('deepset', {})
-    deepset_model = DeepSetFeatureExtractor(
-        aev_length=deepset_config.get('aev_length', 2288),
-        num_atom_types=deepset_config.get('num_atom_types', 11),
-        embedding_dim=deepset_config.get('embedding_dim', 64),
-        hidden_dim=deepset_config.get('hidden_dim', 256),
-        include_charge=deepset_config.get('include_charge', True),
-        include_atom_id=deepset_config.get('include_atom_id', True)
-    ).to(device)
+    encoder_path = deepset_config.get('encoder_path')
+    if not encoder_path or not Path(encoder_path).exists():
+        raise ValueError(
+            f"deepset.encoder_path must be set in config and point to best_encoder.pt. "
+            f"Got: {encoder_path}"
+        )
+    print(f"\nLoading pretrained DeepSet encoder from {encoder_path}...")
+    deepset_model = load_pretrained_deepset(encoder_path, freeze_weights=True).to(device)
     
     # Build sample graph to infer dimensions
     sample_g, sample_data, sample_extras = build_graph_and_data_with_deepset(
@@ -577,7 +577,7 @@ def main():
     
     # RGCN Encoder (processes DeepSet node embeddings)
     encoder = RGCNEncoder(
-        in_dim=sample_data.x.size(1),  # 66D = 64 (DeepSet) + 2 (environmental)
+        in_dim=sample_data.x.size(1),  # 66D = 64 (DeepSet sum-pool) + 2 (environmental)
         hidden_dims=encoder_config.get('hidden_dims', [64, 64]),
         out_dim=encoder_config.get('out_dim', 32),
         num_relations=sample_data.edge_type.max().item() + 1
@@ -640,13 +640,15 @@ def main():
     elif pretrain_path and Path(pretrain_path).exists():
         print(f"Loading pretrained policy from {pretrain_path}")
         checkpoint = torch.load(pretrain_path, map_location=device)
-        # Pretrained checkpoint should have the same structure
-        if 'encoder_state_dict' in checkpoint:
-            encoder.load_state_dict(checkpoint['encoder_state_dict'])
-        if 'policy_state_dict' in checkpoint:
-            policy.load_state_dict(checkpoint['policy_state_dict'])
-        if 'deepset_state_dict' in checkpoint:
-            deepset_model.load_state_dict(checkpoint['deepset_state_dict'])
+        # Pretrain checkpoint uses 'encoder_state'/'policy_state' keys.
+        # DeepSet is already loaded from deepset.encoder_path above (frozen
+        # during pretraining, not stored in best_policy.pt).
+        if 'encoder_state' in checkpoint:
+            encoder.load_state_dict(checkpoint['encoder_state'])
+            print("  Loaded encoder weights from pretrain checkpoint")
+        if 'policy_state' in checkpoint:
+            policy.load_state_dict(checkpoint['policy_state'])
+            print("  Loaded policy weights from pretrain checkpoint")
     
     # Step 5: Training loop
     print("\n=== Training ===")

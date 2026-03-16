@@ -87,7 +87,7 @@ class DeepSetAutoencoder(nn.Module):
     
     After training:
     1. Sever the decoder
-    2. Add max-pooling to the encoder
+    2. Add sum-pooling to the encoder
     3. Use as node embeddings in RGCN
     """
     
@@ -149,11 +149,11 @@ class _AtomMlpProxy:
 
 
 class PretrainedDeepSet(nn.Module):
-    """Pretrained DeepSet with max-pooling for RGCN integration.
+    """Pretrained DeepSet with sum-pooling for RGCN integration.
     
     This is Step 4 of the pretraining process:
     - Loads the trained encoder
-    - Adds torch.max(dim=0) pooling
+    - Adds torch.sum(dim=0) pooling
     - Optionally freezes weights
     - Ready to plug into RGCN as node feature generator
 
@@ -222,9 +222,9 @@ class PretrainedDeepSet(nn.Module):
                 parts.append(charges)
             atom_features = torch.cat(parts, dim=-1)
 
-        # Encode individual atoms then max-pool
+        # Encode individual atoms then sum-pool
         atom_embeddings = self.encoder(atom_features)      # [num_atoms, embedding_dim]
-        pooled_embedding, _ = torch.max(atom_embeddings, dim=0)  # [embedding_dim]
+        pooled_embedding = torch.sum(atom_embeddings, dim=0)  # [embedding_dim]
         return pooled_embedding
     
     def unfreeze(self):

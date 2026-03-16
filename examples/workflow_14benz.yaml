@@ -20,7 +20,11 @@ split:
   seed: 42
 
 pretrain:
-  model_path: /home/pbowling/mllf/examples/models/pretraining/best_policy.pt
+  model_path: /home/pbowling/mllf/models/pretraining/best_policy.pt
+
+# DeepSet encoder configuration (pretrained, frozen during RL training)
+deepset:
+  encoder_path: /home/pbowling/mllf/pretraining/deepset_pretraining_output/trained_models/best_encoder.pt
 
 # Curriculum learning configuration (progressive training complexity)
 curriculum:

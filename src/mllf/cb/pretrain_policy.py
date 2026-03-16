@@ -39,7 +39,6 @@ import random
 import re
 import threading
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
@@ -1319,34 +1318,34 @@ def pretrain_epoch(
         # the model from learning the true non-zero coefficient values.
         active_mask = targets.abs() > 1e-8            # [E, 4], one True per row
         if active_mask.any():
-            mse_loss = nn.functional.mse_loss(
+            run_loss = nn.functional.mse_loss(
                 predicted_means[active_mask], targets[active_mask]
             )
         else:
-            mse_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            run_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         # Check for NaN/inf
-        if torch.isnan(mse_loss) or torch.isinf(mse_loss):
+        if torch.isnan(run_loss) or torch.isinf(run_loss):
             print(f"  Warning: NaN/inf loss for {run['run_dir'].name}, skipping")
             continue
         
         # Update
         optimizer.zero_grad()
-        mse_loss.backward()
+        run_loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
         optimizer.step()
         
-        epoch_loss += mse_loss.item()
+        epoch_loss += run_loss.item()
         num_updates += 1
         
         # Log high losses with run information
-        if mse_loss.item() > 500.0:
+        if run_loss.item() > 500.0:
             run_name = f"{run_dir.parent.name}/{run_dir.name}"
-            print(f"  ⚠️  HIGH LOSS: Run {run_idx+1}/{len(runs)} ({run_name}): loss={mse_loss.item():.2f}")
+            print(f"  ⚠️  HIGH LOSS: Run {run_idx+1}/{len(runs)} ({run_name}): loss={run_loss.item():.2f}")
         
         if (run_idx + 1) % 10 == 0:
             avg_loss = epoch_loss / num_updates
-            print(f"  Run {run_idx+1}/{len(runs)}: mse_loss={mse_loss.item():.4f}, avg_loss={avg_loss:.4f}")
+            print(f"  Run {run_idx+1}/{len(runs)}: loss={run_loss.item():.4f}, avg_loss={avg_loss:.4f}")
     
     avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
     
@@ -1397,7 +1396,7 @@ def pretrain_with_runs(
     min_reward_threshold: Optional[float] = None,
     stratified_negative_fraction: Optional[float] = None,
     deepset_model=None,
-    num_workers: int = 1,
+    patience: int = 10,
 ):
     """Run policy pretraining with provided runs.
     
@@ -1422,9 +1421,8 @@ def pretrain_with_runs(
         deepset_model: Optional PretrainedDeepSet for 3D atomic node features. When provided,
                       the RGCN in_dim is set to deepset_model.embedding_dim (64) rather than
                       the standard atom-type encoding dimension.
-        num_workers: Number of parallel workers for graph pre-building (default: 1).
-                     Set > 1 to build graphs in parallel before epoch 1; all subsequent
-                     epochs reuse the cache with zero graph-building overhead.
+        patience: Early stopping patience (default: 10). Training stops if the MSE loss
+                  does not improve for this many consecutive epochs.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1562,10 +1560,13 @@ def pretrain_with_runs(
     print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())} params")
     print(f"  Policy: {sum(p.numel() for p in policy.parameters())} params")
     print(f"  LR schedule: cosine annealing, {learning_rate} → {learning_rate/100:.6f} over {epochs} epochs")
+    print(f"  Early stopping patience: {patience} epochs")
+    print(f"  Graph caching: all {len(runs)} graphs pre-built once, reused across all epochs")
 
     # Training loop
     reward_config = config.get('reward', {})
     best_loss = float('inf')
+    epochs_without_improvement = 0
 
     # ------------------------------------------------------------------
     # Suppress per-occurrence warnings during training and collect them
@@ -1593,18 +1594,21 @@ def pretrain_with_runs(
     warnings.showwarning = _collect_warning
 
     # ------------------------------------------------------------------
-    # Pre-build all graphs once and cache them.
-    # Graph building (file IO + AEV computation) dominates epoch time;
-    # caching eliminates it from epochs 2 onward.  With num_workers > 1
-    # the initial build is also parallelised across CPU threads.
+    # Pre-build all graphs once (serially) and cache them.
+    # Graph building (file IO + AEV computation) dominates per-epoch time;
+    # caching eliminates it from epochs 2 onward — the primary benefit.
+    # Building in parallel via ThreadPoolExecutor was benchmarked and found
+    # to be no faster: AEV computation is CPU-bound and PyTorch already
+    # saturates all available cores per build, so multiple workers just
+    # contend for the same threads.
     # ------------------------------------------------------------------
     print(f"\n{'='*60}")
-    worker_str = f"{num_workers} workers" if num_workers > 1 else "1 worker (serial)"
-    print(f"Pre-building {len(runs)} graphs ({worker_str})...")
+    print(f"Pre-building {len(runs)} graphs (serial)...")
     print(f"{'='*60}")
 
-    def _build_one(idx_run):
-        idx, run = idx_run
+    graph_cache = [None] * len(runs)
+    n_ok = n_fail = 0
+    for idx, run in enumerate(runs):
         _run_dir = run["run_dir"]
         _pdb_dir = _prep_dir = _solvent = None
         if deepset_model is not None:
@@ -1629,27 +1633,16 @@ def pretrain_with_runs(
                     warn_missing_types=warn_missing_types,
                 )
             if _tgts is None or len(_tgts) == 0:
-                return idx, None, "no_targets"
-            return idx, (_data.cpu(), _tgts), None
-        except Exception as exc:
-            return idx, None, str(exc)
-
-    graph_cache = [None] * len(runs)
-    n_ok = n_fail = 0
-    with ThreadPoolExecutor(max_workers=num_workers) as _pool:
-        _futs = {_pool.submit(_build_one, (i, r)): i for i, r in enumerate(runs)}
-        for _fut in as_completed(_futs):
-            _idx, _item, _err = _fut.result()
-            if _err:
-                if _err != "no_targets":
-                    print(f"  Error building graph for {runs[_idx]['run_dir'].name}: {_err}")
                 n_fail += 1
             else:
-                graph_cache[_idx] = _item
+                graph_cache[idx] = (_data.cpu(), _tgts)
                 n_ok += 1
-            done = n_ok + n_fail
-            if done % 500 == 0 or done == len(runs):
-                print(f"  {done}/{len(runs)} graphs built ({n_fail} failed)...")
+        except Exception as exc:
+            print(f"  Error building graph for {_run_dir.name}: {exc}")
+            n_fail += 1
+        done = n_ok + n_fail
+        if done % 500 == 0 or done == len(runs):
+            print(f"  {done}/{len(runs)} graphs built ({n_fail} failed)...")
 
     print(f"Graph cache ready: {n_ok} built, {n_fail} skipped")
 
@@ -1681,6 +1674,7 @@ def pretrain_with_runs(
         # Save best model (lowest loss)
         if stats['loss'] < best_loss:
             best_loss = stats['loss']
+            epochs_without_improvement = 0
             
             best_path = output_dir / "best_policy.pt"
             torch.save({
@@ -1690,6 +1684,8 @@ def pretrain_with_runs(
                 'loss': stats['loss'],
             }, best_path)
             print(f"  Saved best model (loss: {best_loss:.4f})")
+        else:
+            epochs_without_improvement += 1
         
         # Save checkpoint
         checkpoint_path = output_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
@@ -1701,6 +1697,11 @@ def pretrain_with_runs(
             'epoch': epoch + 1,
             'stats': stats,
         }, checkpoint_path)
+
+        # Early stopping
+        if epochs_without_improvement >= patience:
+            print(f"\nEarly stopping: no improvement for {patience} epochs (best loss: {best_loss:.4f})")
+            break
     
     # Save final model
     final_path = output_dir / "final_policy.pt"
@@ -1837,12 +1838,11 @@ def main():
              "computed from 3D atomic structure + AEVs (the full DeepSet → max-pool → RGCN pipeline).",
     )
     parser.add_argument(
-        "--num-workers",
+        "--patience",
         type=int,
-        default=1,
-        help="Number of parallel CPU workers for graph pre-building (default: 1). "
-             "Set to the number of available CPUs (e.g. --cpus-per-task value in SLURM). "
-             "All epochs after the first reuse the cached graphs at no extra cost.",
+        default=10,
+        help="Early stopping patience (default: 10). Training stops if the MSE loss does "
+             "not improve for this many consecutive epochs.",
     )
 
     args = parser.parse_args()
@@ -1884,7 +1884,7 @@ def main():
         min_reward_threshold=args.min_reward_threshold,
         stratified_negative_fraction=args.stratified_negative_fraction,
         deepset_model=deepset_model,
-        num_workers=args.num_workers,
+        patience=args.patience,
     )
 
 
