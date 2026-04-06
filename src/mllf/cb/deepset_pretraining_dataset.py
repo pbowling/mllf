@@ -123,12 +123,18 @@ def load_system_metadata(system_dir: Path) -> Dict:
             with open(metadata_path) as f:
                 metadata = json.load(f)
             
-            # Get prep directory from source_run_dir
+            # Get prep directory: try source_run_dir first, fall back to local copy
             source_run_dir = Path(metadata['source_run_dir'])
             prep_dir = source_run_dir / 'prep'
-            
+
             if not prep_dir.exists():
-                continue
+                # Fall back to locally copied prep (populated by copy_prep_to_local.py
+                # or collect_new_systems.sh) when the source tree is unavailable.
+                local_prep = system_dir / 'prep'
+                if local_prep.exists():
+                    prep_dir = local_prep
+                else:
+                    continue
             
             # Determine solvent state
             solvent_state = metadata.get('solvent_state', 'unknown')

@@ -76,6 +76,153 @@ def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=Non
     )
 
 
+# ── per-system graph cache helpers ──────────────────────────────────────────
+
+def _build_graph_structure(prep_dir: str, graph_info_path: Path,
+                           toppar_dir, toppar_files, warn_missing_types,
+                           deepset_model, solvent_state) -> tuple:
+    """Build the *structure-only* part of a pretraining graph (node features + edges).
+
+    This is the expensive step (DeepSet AEV computation).  All runs that share
+    the same prep directory will produce an identical structure, so we call this
+    once per prep_dir and reuse the result for every run in that group.
+
+    Returns (data_structure, extras, nsubs_per_site) where data_structure holds
+    node features, edge_index, edge_type, edge_attr but NO target-specific data.
+    """
+    import json
+    from torch_geometric.data import Data
+    from mllf.cb import graph_utils
+    from mllf.cb.graph import Graph
+    from mllf.cb.graph_utils import build_directed_pairs
+
+    with open(graph_info_path) as f:
+        graph_info = json.load(f)
+
+    g = Graph.from_graph_info(graph_info)
+
+    rtf_results = None
+    if deepset_model is not None and prep_dir is not None:
+        from mllf.file_handling.read_rtf import parse_rtf_dir
+        rtf_results = parse_rtf_dir(prep_dir)
+
+    data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
+        g, toppar_dir=toppar_dir, toppar_files=toppar_files,
+        warn_missing_types=warn_missing_types,
+        deepset_model=deepset_model,
+        pdb_dir=prep_dir,
+        pdb_pattern='site{site}_sub{sub}_frag.pdb',
+        rtf_results=rtf_results,
+        prep_dir=prep_dir,
+        solvent_state=solvent_state,
+    )
+
+    nsubs_per_site = graph_info.get('nsubs_per_site', [])
+    if not nsubs_per_site:
+        from collections import defaultdict
+        site_counts = defaultdict(int)
+        for _, node_info in graph_info.get('sites', {}).items():
+            s = node_info.get('site')
+            if s is not None:
+                site_counts[s] += 1
+        if site_counts:
+            nsubs_per_site = [site_counts[s] for s in sorted(site_counts)]
+        else:
+            raise ValueError(f"Could not determine nsubs_per_site from {graph_info_path}")
+
+    relation_names   = extras['relation_names']
+    base_relation_map = extras['base_relation_map']
+    rel_to_idx       = extras['relation_map']
+    pairs = build_directed_pairs(nsubs_per_site)
+
+    src_list, dst_list, edge_type_list, edge_attr_list = [], [], [], []
+    for (i, j) in pairs:
+        for bias in ['linear', 'quadratic', 'skew', 'end']:
+            fwd_name, bwd_name = base_relation_map[bias]
+            rel_name = fwd_name if i < j else bwd_name
+            rel_idx  = rel_to_idx[rel_name]
+            src_list.append(i)
+            dst_list.append(j)
+            edge_type_list.append(rel_idx)
+            k = len(relation_names)
+            one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
+            one_hot[rel_idx] = 1.0
+            edge_attr_list.append(one_hot)
+
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    edge_type  = torch.tensor(edge_type_list, dtype=torch.long)
+    edge_attr  = (torch.stack(edge_attr_list, dim=0) if edge_attr_list
+                  else torch.zeros((0, len(relation_names)), dtype=torch.get_default_dtype()))
+
+    data = Data(
+        x=data_sparse.x,
+        edge_index=edge_index,
+        edge_type=edge_type,
+        edge_attr=edge_attr,
+    )
+    return data.cpu(), extras, nsubs_per_site, pairs
+
+
+def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
+    """Extract bias-coefficient targets from a single run's variables.py.
+
+    This is cheap (pure Python, no AEV computation).  Call once per run after
+    the shared graph structure has been built via ``_build_graph_structure``.
+
+    Returns a list of [linear, quadratic, skew, end] targets (one per directed
+    edge), or None if the variables file cannot be parsed, is missing, or the
+    bias matrix size does not match nsubs_per_site.
+    """
+    import yaml
+    try:
+        variables_path = Path(run_dir) / 'variables.py'
+        if not variables_path.exists():
+            return None
+        content = variables_path.read_text()
+
+        # Find the YAML block — try all quoting styles; track the matching closer
+        yaml_start = -1
+        close_delim = None
+        for open_d, close_d in (('bias_string = """', '"""'),
+                                 ('bias_string="""',   '"""'),
+                                 ("bias_string = '''", "'''"),
+                                 ("bias_string='''",   "'''")):
+            pos = content.find(open_d)
+            if pos != -1:
+                yaml_start = pos + len(open_d)
+                close_delim = close_d
+                break
+        if yaml_start == -1:
+            return None
+
+        yaml_end = content.find(close_delim, yaml_start)
+        if yaml_end == -1:
+            return None
+
+        bias_data = yaml.safe_load(content[yaml_start:yaml_end])
+        b_list = bias_data['b']
+        b_vector = np.array(b_list[0] if isinstance(b_list[0], list) else b_list, dtype=float)
+        n_nodes = sum(nsubs_per_site)
+        if len(b_vector) != n_nodes:
+            return None  # size mismatch — incompatible run
+        c_matrix = np.array(bias_data['c'], dtype=float)
+        x_matrix = np.array(bias_data['x'], dtype=float)
+        s_matrix = np.array(bias_data['s'], dtype=float)
+        targets = []
+        for (i, j) in pairs:
+            linear    = float(b_vector[j] - b_vector[i])
+            quadratic = float(c_matrix[i, j]) if i < j else -float(c_matrix[j, i])
+            skew      = float(x_matrix[i, j])
+            end       = float(s_matrix[i, j])
+            targets.append([linear,    0.0, 0.0, 0.0])
+            targets.append([0.0, quadratic, 0.0, 0.0])
+            targets.append([0.0,       0.0, skew, 0.0])
+            targets.append([0.0,       0.0, 0.0,  end])
+        return targets
+    except Exception:
+        return None
+
+
 def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None,
                                                  warn_missing_types=True, deepset_model=None,
                                                  pdb_dir=None, prep_dir=None, solvent_state=None,
@@ -1089,6 +1236,93 @@ def filter_runs_by_reward(
     return filtered_runs
 
 
+def filter_runs_by_min_transitions(
+    runs: List[Dict],
+    min_transitions: int = 3,
+) -> List[Dict]:
+    """Filter runs by minimum transitions on the worst site.
+
+    Reads the ``transitions`` dict from each run's ``simulation_results.json``
+    and keeps only runs where *every* site has at least ``min_transitions``
+    transitions at the highest lambda value recorded.
+
+    This is a direct data-quality criterion that avoids the reward formula
+    entirely — a run with 3 transitions on every site is always kept regardless
+    of what any penalty coefficients compute to.
+
+    Args:
+        runs: List of run dicts from load_pretraining_runs
+        min_transitions: Minimum transitions required on every site (default: 3)
+
+    Returns:
+        Filtered list of runs where all sites meet the threshold
+    """
+    import json
+
+    print(f"\n{'='*80}")
+    print(f"Transition Filtering (min transitions per site: >= {min_transitions})")
+    print(f"{'='*80}")
+
+    filtered_runs = []
+    excluded_runs = []   # (system, run, min_t, reason)
+    n_errors = 0
+
+    for run in runs:
+        try:
+            run_dir = Path(run['run_dir'])
+            sim_path = run_dir / "simulation_results.json"
+            if not sim_path.exists():
+                n_errors += 1
+                excluded_runs.append((run_dir.parent.name, run_dir.name, None, "no sim_results"))
+                continue
+
+            sim = json.loads(sim_path.read_text())
+            trans_dict = sim.get("transitions", {})
+            if not trans_dict:
+                # No transition data at all — treat as 0 transitions
+                excluded_runs.append((run_dir.parent.name, run_dir.name, 0, "no transitions"))
+                continue
+
+            # Per-site count at the highest lambda value
+            per_site = []
+            for site_id in sorted(trans_dict.keys(), key=int):
+                site_data = trans_dict[site_id]
+                if isinstance(site_data, dict) and site_data:
+                    max_lam = max(site_data.keys(), key=float)
+                    per_site.append(int(site_data[max_lam]))
+                else:
+                    per_site.append(0)
+
+            worst = min(per_site) if per_site else 0
+
+            if worst >= min_transitions:
+                filtered_runs.append(run)
+            else:
+                excluded_runs.append((run_dir.parent.name, run_dir.name, worst, "below threshold"))
+
+        except Exception as exc:
+            n_errors += 1
+            excluded_runs.append((run_dir.parent.name, run_dir.name, None, f"error: {exc}"))
+
+    print(f"  Total runs : {len(runs)}")
+    print(f"  Kept       : {len(filtered_runs)} ({100*len(filtered_runs)/max(len(runs),1):.1f}%)")
+    print(f"  Excluded   : {len(excluded_runs)} ({100*len(excluded_runs)/max(len(runs),1):.1f}%)")
+    if n_errors:
+        print(f"  Errors     : {n_errors}")
+
+    # Histogram of worst-site transition counts in excluded runs
+    excl_counts = [t for _, _, t, _ in excluded_runs if isinstance(t, int)]
+    if excl_counts:
+        from collections import Counter
+        hist = Counter(excl_counts)
+        print(f"  Excluded by worst-site transition count:")
+        for k in sorted(hist):
+            print(f"    {k:3d} transitions: {hist[k]} runs")
+
+    print(f"{'='*80}\n")
+    return filtered_runs
+
+
 def sample_runs_stratified_negative(
     runs: List[Dict],
     fraction_per_bucket: float = 0.25,
@@ -1270,6 +1504,12 @@ def pretrain_epoch(
                     if candidate.is_dir():
                         pdb_dir = str(candidate)
                         prep_dir = pdb_dir
+                # Fallback: prep may be at the combo level (parent of run_dir)
+                if pdb_dir is None:
+                    candidate = run_dir.parent / "prep"
+                    if candidate.is_dir():
+                        pdb_dir = str(candidate)
+                        prep_dir = pdb_dir
                 solvent_state = run.get("metadata", {}).get("solvent_state")
 
             # Build graph from saved data AND get target coefficients
@@ -1394,6 +1634,7 @@ def pretrain_with_runs(
     filter_outliers: bool = True,
     outlier_std_threshold: float = 3.0,
     min_reward_threshold: Optional[float] = None,
+    min_transitions: Optional[int] = None,
     stratified_negative_fraction: Optional[float] = None,
     deepset_model=None,
     patience: int = 10,
@@ -1457,8 +1698,18 @@ def pretrain_with_runs(
     else:
         print(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
     
+    # Transition-count filter takes highest precedence — direct data quality criterion
+    if min_transitions is not None:
+        print(f"\nApplying transition filtering (min per site: >= {min_transitions})...")
+        runs = filter_runs_by_min_transitions(runs, min_transitions=min_transitions)
+
+        if len(runs) == 0:
+            print("Error: No runs remaining after transition filtering")
+            print("Try lowering --min-transitions")
+            return
+
     # Stratified negative sampling (takes precedence over min_reward_threshold)
-    if stratified_negative_fraction is not None:
+    elif stratified_negative_fraction is not None:
         print(f"\nApplying stratified negative sampling (fraction_per_bucket={stratified_negative_fraction:.0%})...")
         runs = sample_runs_stratified_negative(runs, fraction_per_bucket=stratified_negative_fraction)
 
@@ -1607,42 +1858,100 @@ def pretrain_with_runs(
     print(f"{'='*60}")
 
     graph_cache = [None] * len(runs)
-    n_ok = n_fail = 0
+
+    # Group run indices by their resolved prep_dir so the expensive graph
+    # structure (DeepSet AEVs + topology) is built once per unique structure.
+    # All runs in the same dataset/combo dir share the same prep/ and thus
+    # produce identical node features; only the target coefficients differ.
+    from collections import defaultdict as _dd
+    groups = _dd(list)   # group_key -> [(global_idx, run)]
     for idx, run in enumerate(runs):
         _run_dir = run["run_dir"]
-        _pdb_dir = _prep_dir = _solvent = None
         if deepset_model is not None:
-            _src = run.get("source_dir")
-            if _src:
-                _cand = Path(_src) / "prep"
-                if _cand.is_dir():
-                    _pdb_dir = _prep_dir = str(_cand)
-            _solvent = run.get("metadata", {}).get("solvent_state")
-        try:
-            if use_fully_connected:
-                _data, _tgts, _ = build_fully_connected_graph_for_pretraining(
-                    _run_dir,
+            # Check local prep first (most reliable — always present after copy_prep_to_local.py).
+            # This ensures all runs in the same pretraining system directory share one
+            # graph-structure build regardless of whether external source paths exist.
+            _pdir = None
+            _local = Path(_run_dir).parent / "prep"
+            if _local.is_dir():
+                _pdir = str(_local)
+            if _pdir is None:
+                # Fall back to source_dir/prep (e.g. combo comb_*/prep)
+                _src = run.get("source_dir")
+                if _src:
+                    _cand = Path(_src) / "prep"
+                    if _cand.is_dir():
+                        _pdir = str(_cand)
+            group_key = _pdir if _pdir else str(_run_dir)
+        else:
+            group_key = str(_run_dir)   # no sharing without DeepSet
+        groups[group_key].append((idx, run))
+
+    n_unique = len(groups)
+    n_ok = n_fail = 0
+    done = 0
+    print(f"  {len(runs)} runs => {n_unique} unique graph structures")
+
+    for struct_num, (group_key, group_runs) in enumerate(groups.items(), 1):
+        first_run_dir = group_runs[0][1]["run_dir"]
+        gi_path = first_run_dir / "graph_info.json"
+        if not gi_path.exists():
+            for gidx, _ in group_runs:
+                n_fail += 1
+                done += 1
+            continue
+
+        prep_for_build = (group_key
+                          if (deepset_model is not None and group_key != str(first_run_dir))
+                          else None)
+        _solvent = group_runs[0][1].get("metadata", {}).get("solvent_state")
+
+        if use_fully_connected:
+            try:
+                struct_data, _extras, _nsubs, _pairs = _build_graph_structure(
+                    prep_for_build, gi_path,
                     toppar_dir=toppar_dir, toppar_files=toppar_files,
                     warn_missing_types=warn_missing_types,
                     deepset_model=deepset_model,
-                    pdb_dir=_pdb_dir, prep_dir=_prep_dir, solvent_state=_solvent,
+                    solvent_state=_solvent,
                 )
-            else:
-                _data, _tgts, _ = build_graph_from_saved_data(
-                    _run_dir, toppar_dir=toppar_dir, toppar_files=toppar_files,
-                    warn_missing_types=warn_missing_types,
-                )
-            if _tgts is None or len(_tgts) == 0:
-                n_fail += 1
-            else:
-                graph_cache[idx] = (_data.cpu(), _tgts)
-                n_ok += 1
-        except Exception as exc:
-            print(f"  Error building graph for {_run_dir.name}: {exc}")
-            n_fail += 1
-        done = n_ok + n_fail
-        if done % 500 == 0 or done == len(runs):
-            print(f"  {done}/{len(runs)} graphs built ({n_fail} failed)...")
+            except Exception as exc:
+                print(f"  Error building structure {struct_num}/{n_unique} "
+                      f"({Path(group_key).name}): {exc}")
+                n_fail += len(group_runs)
+                done   += len(group_runs)
+                continue
+
+            for gidx, run in group_runs:
+                _tgts = _extract_targets_from_variables(
+                    run["run_dir"], _nsubs, _pairs)
+                if _tgts:
+                    graph_cache[gidx] = (struct_data, _tgts)
+                    n_ok += 1
+                else:
+                    n_fail += 1
+                done += 1
+                if done % 500 == 0 or done == len(runs):
+                    print(f"  {done}/{len(runs)} runs cached "
+                          f"({struct_num}/{n_unique} structures, {n_fail} failed)...")
+        else:
+            for gidx, run in group_runs:
+                try:
+                    _data, _tgts, _ = build_graph_from_saved_data(
+                        run["run_dir"], toppar_dir=toppar_dir, toppar_files=toppar_files,
+                        warn_missing_types=warn_missing_types,
+                    )
+                    if _tgts is None or len(_tgts) == 0:
+                        n_fail += 1
+                    else:
+                        graph_cache[gidx] = (_data.cpu(), _tgts)
+                        n_ok += 1
+                except Exception as exc:
+                    print(f"  Error building graph for {run['run_dir'].name}: {exc}")
+                    n_fail += 1
+                done += 1
+                if done % 500 == 0 or done == len(runs):
+                    print(f"  {done}/{len(runs)} graphs built ({n_fail} failed)...")
 
     print(f"Graph cache ready: {n_ok} built, {n_fail} skipped")
 
@@ -1814,6 +2123,16 @@ def main():
         help="Number of standard deviations for outlier threshold (default: 3.0). Runs with any coefficient exceeding mean ± N*std are excluded.",
     )
     parser.add_argument(
+        "--min-transitions",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Keep only runs where every site has >= N transitions at the highest lambda "
+             "value (e.g. --min-transitions 3). Uses the raw transition counts from "
+             "simulation_results.json — no reward formula involved. Takes precedence over "
+             "--min-reward-threshold and --stratified-negative-fraction when set.",
+    )
+    parser.add_argument(
         "--min-reward-threshold",
         type=float,
         default=None,
@@ -1882,6 +2201,7 @@ def main():
         filter_outliers=not args.no_filter_outliers,  # Default to True (filter enabled)
         outlier_std_threshold=args.outlier_std_threshold,
         min_reward_threshold=args.min_reward_threshold,
+        min_transitions=args.min_transitions,
         stratified_negative_fraction=args.stratified_negative_fraction,
         deepset_model=deepset_model,
         patience=args.patience,

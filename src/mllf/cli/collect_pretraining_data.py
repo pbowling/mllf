@@ -455,7 +455,11 @@ def detect_solvent_state(run_dir: Path) -> str:
         return "unknown"
 
 
-def collect_run_data(run_dir: Path, solvent_state: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+def collect_run_data(
+    run_dir: Path,
+    solvent_state: Optional[str] = None,
+    nsubs_per_site_override: Optional[List[int]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """Collect all data from a single run directory.
     
     Handles two directory structures:
@@ -465,6 +469,9 @@ def collect_run_data(run_dir: Path, solvent_state: Optional[str] = None) -> Tupl
     Args:
         run_dir: Path to run directory
         solvent_state: Optional solvent state override (if None, auto-detect)
+        nsubs_per_site_override: If provided, use this nsubs_per_site instead of
+            the value read from alf_info.py.  Needed when prep/ is a full-system
+            prep but only a subset of substituents are active (e.g. combo runs).
         
     Returns:
         Tuple of (bias_data, output_results, graph_info)
@@ -518,7 +525,12 @@ def collect_run_data(run_dir: Path, solvent_state: Optional[str] = None) -> Tupl
     # (lams1s1 = position 1, lams1s2 = position 2, …).
     # For master preps that list ALL subs, parse_active_subs_from_inp falls back
     # to sequential numbering (site1_sub1, site1_sub2, …).
-    nsubs_per_site = bias_data.get('_nsubs_per_site') or []
+    # nsubs_per_site_override takes priority (e.g. combo runs where prep/ is full-system).
+    if nsubs_per_site_override is not None:
+        nsubs_per_site = nsubs_per_site_override
+        bias_data['_nsubs_per_site'] = nsubs_per_site_override
+    else:
+        nsubs_per_site = bias_data.get('_nsubs_per_site') or []
     active_subs_ordered = parse_active_subs_from_inp(prep_path, nsubs_per_site)
 
     # Re-key graph_info['sites']:
@@ -541,7 +553,8 @@ def create_pretraining_entry(
     run_dir: Path,
     output_dir: Path,
     combo_name: Optional[str] = None,
-    solvent_state: Optional[str] = None
+    solvent_state: Optional[str] = None,
+    nsubs_per_site_override: Optional[List[int]] = None,
 ) -> Path:
     """Create a pretraining directory entry from a run directory.
     
@@ -558,7 +571,9 @@ def create_pretraining_entry(
         combo_name = run_dir.name
     
     # Collect data
-    bias_data, output_results, graph_info = collect_run_data(run_dir, solvent_state)
+    bias_data, output_results, graph_info = collect_run_data(
+        run_dir, solvent_state, nsubs_per_site_override=nsubs_per_site_override
+    )
     
     # Extract topology metadata before writing YAML (not stored in variables.py)
     nsubs_per_site = bias_data.pop('_nsubs_per_site', None)

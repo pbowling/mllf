@@ -175,12 +175,14 @@ class EdgePolicy(nn.Module):
             actions = dist.rsample()
             logp_per = dist.log_prob(actions)
             
-            # CRITICAL: Clip sampled actions to intended ranges per bias type
-            # Without this, exploration noise (std up to ~7.4) can produce extreme outliers
-            # Scale factors: [linear=61.4, quadratic=70.5, skew=6.6, end=3.6]
-            scale_factors = torch.tensor([61.4, 70.5, 6.6, 3.6], device=actions.device)
-            # Add small margin (5%) to allow slight overshoot during exploration
-            clip_limits = scale_factors * 1.05
+            # CRITICAL: Clip sampled actions to intended ranges per bias type.
+            # Limits match the tanh scale factors in forward_edges so the full
+            # dynamic range of the policy is reachable during exploration.
+            # Previous values [61.4, 70.5, 6.6, 3.6] were from an older version
+            # of the code and were far below the tanh scales [305, 520, 85, 30],
+            # causing skew and end outputs to saturate permanently at the clip ceiling.
+            # 5% margin allows slight overshoot without hard clamping.
+            clip_limits = torch.tensor([305.0, 520.0, 85.0, 30.0], device=actions.device) * 1.05
             actions = torch.clamp(actions, -clip_limits.unsqueeze(0), clip_limits.unsqueeze(0))
 
         # sum logp across output dims to get per-edge scalar logp
@@ -189,6 +191,44 @@ class EdgePolicy(nn.Module):
         if actions.shape[-1] == 1:
             actions = actions.squeeze(-1)
         return actions, logp, mean, log_std
+
+    def evaluate_logp(
+        self,
+        x,
+        edge_index,
+        edge_type,
+        edge_feat: Optional[torch.Tensor],
+        saved_actions: torch.Tensor,
+    ):
+        """Evaluate log π_θ(saved_actions | x) under current policy parameters.
+
+        Used for on-policy REINFORCE: the actions that were actually submitted to
+        the simulation are treated as fixed (no gradient through them), while the
+        distribution parameters (mean, log_std) retain gradients so that the policy
+        update correctly reinforces or suppresses the actions that led to the reward.
+
+        Args:
+            saved_actions: Tensor [E] or [E, D] — actions from the simulation run
+                (i.e., the clipped actions stored in epoch_results.pt).
+
+        Returns:
+            logp: [E] scalar log-prob per edge summed over output dims.
+            log_std: [E, D] current log_std (for entropy regularisation caller).
+        """
+        node_emb = self.forward_node_embeddings(x, edge_index, edge_type)
+        mean, log_std = self.forward_edges(node_emb, edge_index, edge_feat)
+        if mean.dim() == 1:
+            mean = mean.unsqueeze(-1)
+        if log_std.dim() == 1:
+            log_std = log_std.unsqueeze(-1)
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mean, std)
+        # saved_actions treated as a fixed constant — no gradient through them
+        a = saved_actions.detach().to(mean.device)
+        if a.dim() == 1:
+            a = a.unsqueeze(-1)
+        logp = dist.log_prob(a).sum(dim=-1)
+        return logp, log_std
 
     @classmethod
     def from_pyg_data(cls, encoder: nn.Module, emb_dim: int, data, mlp_hidden: int = 64, mlp_out_dim: int = 1):
