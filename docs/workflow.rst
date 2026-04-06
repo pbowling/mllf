@@ -30,8 +30,8 @@ Or using the convenience wrapper:
 .. code-block:: bash
 
    cd examples
-   python run_workflow.py workflow_14benz.yaml
-   python run_workflow.py my_config.yaml  # Use custom config
+   python run_workflow_deepset.py workflow_14benz.yaml
+   python run_workflow_deepset.py my_config.yaml  # Use custom config
 
 Configuration Format
 ~~~~~~~~~~~~~~~~~~~~
@@ -852,12 +852,12 @@ Complete Workflow Example
 Full Pipeline Script
 ~~~~~~~~~~~~~~~~~~~~
 
-The main training workflow is implemented in ``examples/run_workflow.py``:
+The main training workflow is implemented in ``examples/run_workflow_deepset.py``:
 
 .. code-block:: bash
 
    cd examples
-   python run_workflow.py workflow_14benz.yaml
+   python run_workflow_deepset.py workflow_14benz.yaml
 
 This executes:
 

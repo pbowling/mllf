@@ -25,19 +25,44 @@ coefficients to different molecular transition types.
 
 **Training Objective**:
 
-The model minimizes the mean squared error between predicted and expert bias coefficients
-across all graph edges and bias types:
+The model minimizes a **masked** mean squared error that backpropagates only through the
+active coefficient for each edge. Because each directed edge carries exactly one non-zero
+bias type (e.g., a ``linear_fwd`` edge has a non-zero linear target but zero quadratic,
+skew, and end targets), naively averaging over all four outputs would produce a gradient
+signal dominated by pushing inactive heads toward zero. The masked loss avoids this:
 
 .. math::
 
-   \mathcal{L}_{\text{BC}} = \frac{1}{|E|} \sum_{(i,j) \in E} \sum_{k} \| a_{ij}^{(k)} - \hat{a}_{ij}^{(k)} \|^2
+   \mathcal{L}_{\text{BC}} = \frac{1}{|\mathcal{A}|} \sum_{(i,j,k) \in \mathcal{A}} \| a_{ij}^{(k)} - \hat{a}_{ij}^{(k)} \|^2
 
 where:
+
+- :math:`\mathcal{A} = \{(i,j,k) : |a_{ij}^{(k)}| > \epsilon\}` is the set of active (non-zero) target entries
 - :math:`E` is the set of directed edges in the graph
 - :math:`k \in \{\text{linear, quadratic, skew, end}\}` are bias types
 - :math:`a_{ij}^{(k)}` is the expert coefficient
 - :math:`\hat{a}_{ij}^{(k)}` is the predicted coefficient
+- :math:`\epsilon = 10^{-8}` is a small threshold to identify non-zero targets
 
+
+**Graph Caching**:
+
+Before training begins, all pretraining graphs are built once and stored in an in-memory
+cache. Each subsequent epoch iterates over the cached graphs instead of re-parsing RTF
+files and recomputing DeepSet embeddings on every pass. This is the dominant source of
+training speedup: for example, the current dataset of ~25,000 runs spans only ~250
+unique graph structures (many runs share the same prep directory). The AEV computation
+runs ~250 times (~8 minutes) rather than ~25,000 times (~14 hours) as it would
+without structure sharing. Rebuilding on every epoch would cost hundreds of hours over
+a full training run.
+
+**Learning Rate Schedule**:
+
+A cosine annealing schedule decays the learning rate from the initial value down to
+``lr / 100`` over the full number of training epochs. This allows the optimizer to make
+large updates early in training while converging smoothly at the end, and helps avoid
+escape from a good minimum once one is found. The current learning rate is printed
+after each epoch and saved in the checkpoint.
 
 **Training Outputs**:
 
@@ -98,12 +123,21 @@ the ``pretraining/`` directory structure:
 .. code-block:: text
 
    pretraining/
-   ├── 14benz_solv/
+   ├── 14benz_solv/            # Per-run prep (each run carries its own prep/)
    │   ├── run1/
    │   │   ├── prep/
    │   │   │   ├── core.pdb
    │   │   │   ├── site1_sub1_pres.rtf
    │   │   │   └── ...
+   │   │   └── variables.py  # Expert coefficients
+   │   ├── run2/
+   │   └── ...
+   ├── 123benz_solvent_group1/ # Shared prep (all runs share a single prep/)
+   │   ├── prep/
+   │   │   ├── core.pdb
+   │   │   ├── site1_sub1_pres.rtf
+   │   │   └── ...
+   │   ├── run1/
    │   │   └── variables.py  # Expert coefficients
    │   ├── run2/
    │   └── ...
@@ -136,8 +170,10 @@ The ``pretrain_with_filtering.sh`` script scans all subdirectories and collects:
 
 Each run directory must contain:
 
-* ``prep/`` subdirectory with RTF files
 * ``variables.py`` with bias coefficients (b, c, x, s matrices)
+* ``prep/`` with RTF/PDB files — either as a subdirectory of the run directory
+  (per-run prep) or as a shared ``prep/`` in the parent system directory (takes
+  priority when both exist)
 * Optional: ``metadata.json`` with reward/performance data
 
 **Dataset Format** (internal):

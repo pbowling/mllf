@@ -14,8 +14,8 @@ see :doc:`workflow`.
 Main Training Workflow
 ----------------------
 
-The primary example is ``examples/run_workflow.py``, which implements the
-complete training pipeline.
+The primary example is ``examples/run_workflow_deepset.py``, which implements the
+complete training pipeline using pretrained DeepSet embeddings.
 
 Quick Start
 ~~~~~~~~~~~
@@ -23,9 +23,7 @@ Quick Start
 .. code-block:: bash
 
    cd examples
-   python run_workflow.py workflow_14benz.yaml
-
-This will:
+   python run_workflow_deepset.py workflow_14benz.yaml
 
 - Generate combinations from the 14benz system
 - Split into train/val/test sets (70/15/15)
@@ -77,7 +75,7 @@ To pretrain from existing simulations:
    python run_deepset_pretraining.py --pretraining-dir pretraining --output-dir models --steps all
    
    # Use pretrained model in main training
-   python run_workflow.py workflow_deepset.yaml
+   python run_workflow_deepset.py workflow_14benz.yaml
 
 See :doc:`workflow` for detailed pretraining configuration, data organization, 
 and benefits.
@@ -113,7 +111,7 @@ For production training on a cluster:
 The training script:
 
 - Activates the conda environment
-- Runs ``python -u run_workflow.py workflow_14benz.yaml``
+- Runs ``python -u run_workflow_deepset.py workflow_14benz.yaml``
 - Submits MSLD simulations as separate SLURM jobs
 - Manages up to 30 concurrent simulation jobs
 - Writes progress to ``training_status.out``
@@ -141,9 +139,10 @@ Customizing the Workflow
 To adapt for your system:
 
 1. **Prepare fragments**: Create ``siteN_subM_pres.rtf`` files for your sites/substituents
-2. **Update config**: Edit ``workflow_14benz.yaml`` (or ``workflow_deepset.yaml`` for the DeepSet pipeline) with your paths and ``system.solvent_state``
+2. **Update config**: Edit ``workflow_14benz.yaml`` with your paths and ``system.solvent_state``
+   (see ``workflow_deepset.yaml`` for an alternate template)
 3. **Modify simulation script**: Adapt ``msld_flat.py`` for your force field and protocol
-4. **Run training**: Execute ``python run_workflow.py your_config.yaml``
+4. **Run training**: Execute ``python run_workflow_deepset.py your_config.yaml``
 
 See :doc:`workflow` for configuration options and :doc:`cb_setup` for architecture details.
 

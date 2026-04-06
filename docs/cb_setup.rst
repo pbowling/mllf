@@ -83,7 +83,7 @@ The DeepSet embeddings capture rich molecular information automatically:
 * **Environmental context**: Nearby protein atoms and core structure atoms (via context-aware AEV computation)
 
 See :doc:`deepset_pretraining` for technical details on the 4-step pretraining pipeline
-(atom-level AEV features → autoencoder → max-pooling aggregation).
+(atom-level AEV features → autoencoder → sum-pooling aggregation).
 
 **Environmental Context Encoding**:
 
@@ -171,10 +171,15 @@ for each relation type. The standard architecture uses:
    \text{RGCN}: \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{32}
 
 The input to the RGCN is the **64-dimensional DeepSet embedding** for each substituent node.
-The RGCN then processes these embeddings through 3 layers of relational graph convolutions,
-where each layer learns separate transformation matrices for different bias types 
-(linear, quadratic, skew, end). The final output produces 32-dimensional node embeddings 
-used by the policy and value networks.
+A **LayerNorm** layer is applied to these embeddings before the first convolution. This
+normalises the per-feature mean and variance across nodes, stabilising training when
+sum-pool magnitudes vary with substituent atom count (5–50 atoms). The learnable γ/β
+parameters preserve size-related information after normalisation.
+
+The RGCN then processes the normalised embeddings through 3 layers of relational graph
+convolutions, where each layer learns separate transformation matrices for different bias
+types (linear, quadratic, skew, end). The final output produces 32-dimensional node
+embeddings used by the policy and value networks.
 
 
 Edge Policy
@@ -211,10 +216,10 @@ The ``EdgeValueMLP`` uses a two-stage design:
 
 * **Output Scaling**: Mean predictions use bias-specific scale factors via ``tanh(mean) * scale_factors``
   
-  - **Linear**: ±61.4, **Quadratic**: ±70.5, **Skew**: ±6.6, **End**: ±3.6
-  - Derived from analysis of 5,332 coefficients across 52 pretraining systems (95th percentile + 20% margin)
-  - Actions clipped to 1.05× scale factors during sampling: [±64.5, ±74.0, ±6.9, ±3.8]
-  - Ensures bias magnitudes are in physically meaningful ranges based on empirical data
+  - **Linear**: ±305, **Quadratic**: ±520, **Skew**: ±85, **End**: ±30
+  - Derived from a full scan of 20,000+ pretraining runs with margin above the empirical maximum
+  - Covers the full observed range: linear max 235, quadratic max 470, skew max 77, end max 27
+  - Earlier bounds (±61–±70) were derived from a small biased sample and clipped ~17–34% of targets
 
 * **Enhanced Exploration**: Log standard deviation clamped to [-20, 2.0]
   
@@ -377,6 +382,6 @@ See Also
 * :doc:`workflow` - Complete workflow from combo generation to training
 * :doc:`examples` - Running the full training workflow
 * :doc:`api` - API reference for CB modules
-* ``examples/run_workflow.py`` - Full training implementation
-* ``examples/workflow_14benz.yaml`` - Configuration file template (standard pipeline)
-* ``examples/workflow_deepset.yaml`` - Configuration file template (DeepSet pipeline)
+* ``examples/run_workflow_deepset.py`` - Full training implementation (DeepSet + pretrained weights)
+* ``examples/workflow_14benz.yaml`` - Configuration file for the 14benz system
+* ``examples/workflow_deepset.yaml`` - Alternate configuration file template

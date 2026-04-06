@@ -101,13 +101,21 @@ where :math:`\mathbf{x}_i` is the input atom feature and :math:`\hat{\mathbf{x}}
 Step 4: DeepSet Aggregation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The trained encoder is combined with max-pooling to create permutation-invariant
+The trained encoder is combined with sum-pooling to create permutation-invariant
 substituent embeddings.
 
-The **max-pooling** operation ensures:
+The **sum-pooling** operation ensures:
 - Permutation invariance: atom ordering doesn't matter
 - Variable-size handling: works for any number of atoms
-- Information preservation: captures the "most relevant" features across atoms in the substituent
+- Extensivity: summing over atoms naturally scales with substituent size, reflecting
+  that free energy contributions are extensive properties
+
+The RGCN encoder applies **LayerNorm** to the 64D sum-pool embeddings before the first
+graph convolution layer. This normalises the input distribution across features and
+prevents gradient instability caused by the sum-pool magnitude varying with atom count
+(typically 5–50 atoms per substituent). LayerNorm's learnable γ/β parameters preserve
+size-related information while removing the mean-shift and scale differences that would
+otherwise destabilise training.
 
 Using Pretrained Models
 -----------------------
