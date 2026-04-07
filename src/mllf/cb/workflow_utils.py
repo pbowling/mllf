@@ -7,10 +7,12 @@ This module contains reusable functions for:
 
 Note: For manifest loading, use mllf.cli.workflow.load_manifest()
 """
+import math
 from pathlib import Path
 from typing import List, Dict, Optional
 import json
 import re
+import torch
 
 # Re-export load_manifest from cli.workflow for convenience
 from mllf.cli.workflow import load_manifest
@@ -120,26 +122,29 @@ def check_simulation_success(output_file: Path) -> bool:
 
 
 def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
-    """Parse raw populations and transitions from simulation output.
+    """Parse raw populations, transitions, and per-pair DDG data from simulation output.
     
     This is a convenience wrapper that extracts aggregate metrics
-    (total populations per block, total transitions per site) as lists
-    for use in reward computation. For full parsed data, use
-    mllf.cli.sim.parse_simulation_results() instead.
+    (total populations per block, total transitions per site, per-pair DDG presence)
+    for use in reward computation and per-pair credit assignment.
     
     Args:
         output_file: Path to simulation output file.
     
     Returns:
-        Dict with 'populations' and 'transitions' lists. Returns empty
-        lists if parsing fails.
+        Dict with:
+          'populations': list of population counts per block at highest lambda
+          'transitions': list of transition counts per site at highest lambda
+          'ddg_pairs': dict mapping "blk_i_blk_j" → float|None at highest lambda
+                       (None = NaN = no crossings between that pair)
     """
     from mllf.file_handling.read_output import (
         parse_single_population,
-        parse_transitions_and_rates
+        parse_transitions_and_rates,
+        parse_single_ddg,
     )
     
-    raw_metrics = {'populations': [], 'transitions': []}
+    raw_metrics = {'populations': [], 'transitions': [], 'ddg_pairs': {}}
     
     try:
         with open(output_file, 'r') as f:
@@ -147,6 +152,7 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         
         population_data = parse_single_population(output_text)
         transitions_data, _ = parse_transitions_and_rates(output_text)
+        ddg_data = parse_single_ddg(output_text)
         
         # Extract populations per block - use only HIGHEST lambda value (0.990)
         for block_id, block_info in population_data.items():
@@ -166,7 +172,55 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
                 raw_metrics['transitions'].append(trans_dict[max_lambda])
             else:
                 raw_metrics['transitions'].append(0)
+
+        # Store per-pair DDG with string keys ("blk_i_blk_j") for serialisation
+        raw_metrics['ddg_pairs'] = {
+            f"{lo}_{hi}": val for (lo, hi), val in ddg_data.items()
+        }
     except Exception:
         pass
     
     return raw_metrics
+
+
+def build_edge_weights(
+    edge_index: torch.Tensor,
+    ddg_pairs: dict,
+    no_transition_weight: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-edge weight tensor derived from per-pair DDG transition data.
+
+    Edges whose substituent pair had no observed lambda-space transitions
+    (NaN DDG → None in ddg_pairs) get *no_transition_weight*; edges where
+    transitions were observed get 1.0.  When *ddg_pairs* is empty (data not
+    available for this run) every edge gets 1.0 so the loss is unchanged.
+
+    Block ID mapping: block_id = node_idx + 2 (block 1 = reference).
+
+    Args:
+        edge_index: [2, E] node-index tensor.
+        ddg_pairs: dict from simulation_results 'ddg_pairs': {"blk_i_blk_j": float|None}.
+        no_transition_weight: weight for no-transition pairs (default 0.2).
+        device: target torch device.
+
+    Returns:
+        Float tensor of shape [E].
+    """
+    if not ddg_pairs:
+        return torch.ones(edge_index.size(1), device=device)
+
+    weights: list = []
+    for k in range(edge_index.size(1)):
+        src = int(edge_index[0, k].item())
+        dst = int(edge_index[1, k].item())
+        lo = min(src + 2, dst + 2)
+        hi = max(src + 2, dst + 2)
+        entry = ddg_pairs.get(f"{lo}_{hi}", "missing")
+        # None      → NaN or Inf (no usable crossings) → down-weight
+        # finite float → transitions observed            → full weight
+        # "missing" → no DDG data at all                → full weight (don't penalise old data)
+        no_crossing = entry is None or (isinstance(entry, float) and math.isinf(entry))
+        weights.append(no_transition_weight if no_crossing else 1.0)
+
+    return torch.tensor(weights, dtype=torch.float32, device=device)

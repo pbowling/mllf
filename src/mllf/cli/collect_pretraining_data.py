@@ -22,7 +22,8 @@ from mllf.file_handling.read_rtf import parse_rtf_dir
 from mllf.file_handling.read_output import (
     parse_single_population,
     parse_transitions_and_rates,
-    terminated_normally
+    terminated_normally,
+    parse_single_ddg,
 )
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
 
@@ -287,13 +288,107 @@ def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
     # Parse transitions and rates using existing utility  
     transitions, rates = parse_transitions_and_rates(content)
     
+    # Parse per-pair DDG data (NaN = no transitions between that pair)
+    ddg_raw = parse_single_ddg(content)
+
     # Convert to JSON-serializable format (handles tuple/float keys)
     return {
         'populations': convert_to_json_serializable(populations),
         'transitions': convert_to_json_serializable(transitions),
         'rates': convert_to_json_serializable(rates),
-        'terminated_normally': terminated
+        'terminated_normally': terminated,
+        'ddg_pairs': {f"{lo}_{hi}": val for (lo, hi), val in ddg_raw.items()},
     }
+
+
+def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[int, int]:
+    """Add per-pair DDG data to existing simulation_results.json files.
+
+    For each pretraining run under pretraining_root that has a
+    simulation_results.json but no 'ddg_pairs' key, reads the source
+    CHARMM output file (resolved from metadata.json's source_run_dir)
+    and adds the per-pair DDG presence information.
+
+    A pair whose DDG is NaN (None in the result) had no lambda-space
+    transitions and therefore no reliable bias estimate; a finite value
+    means transitions occurred.
+
+    Args:
+        pretraining_root: Root directory containing pretraining subdirectories.
+        dry_run: If True, report what would be done without modifying files.
+
+    Returns:
+        (n_updated, n_skipped) counts.
+    """
+    n_updated = 0
+    n_skipped = 0
+
+    sim_results_files = sorted(pretraining_root.rglob('simulation_results.json'))
+    print(f"Found {len(sim_results_files)} simulation_results.json files under {pretraining_root}")
+
+    for sim_path in sim_results_files:
+        run_dir = sim_path.parent
+
+        with open(sim_path) as f:
+            sim_results = json.load(f)
+
+        if 'ddg_pairs' in sim_results:
+            n_skipped += 1
+            continue
+
+        metadata_path = run_dir / 'metadata.json'
+        if not metadata_path.exists():
+            print(f"  Warning: No metadata.json in {run_dir.name}, skipping")
+            n_skipped += 1
+            continue
+
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+
+        source_run_dir = metadata.get('source_run_dir')
+        if not source_run_dir:
+            print(f"  Warning: No source_run_dir in {run_dir.name} metadata, skipping")
+            n_skipped += 1
+            continue
+
+        source_path = Path(source_run_dir)
+        output_file: Optional[Path] = None
+        for candidate in (source_path / 'output.out', source_path / 'output'):
+            if candidate.exists():
+                output_file = candidate
+                break
+
+        if output_file is None:
+            print(f"  Warning: No output file in source {source_run_dir}, skipping")
+            n_skipped += 1
+            continue
+
+        try:
+            ddg_raw = parse_single_ddg(output_file.read_text())
+        except Exception as exc:
+            print(f"  Warning: Could not parse DDG for {run_dir.name}: {exc}")
+            n_skipped += 1
+            continue
+
+        ddg_serialized: Dict[str, Optional[float]] = {
+            f"{lo}_{hi}": val for (lo, hi), val in ddg_raw.items()
+        }
+
+        n_transitions = sum(1 for v in ddg_serialized.values() if v is not None)
+        if dry_run:
+            print(
+                f"  Would update {run_dir.name}: "
+                f"{n_transitions}/{len(ddg_serialized)} pairs with transitions"
+            )
+        else:
+            sim_results['ddg_pairs'] = ddg_serialized
+            with open(sim_path, 'w') as f:
+                json.dump(sim_results, f, indent=2)
+
+        n_updated += 1
+
+    print(f"\nBackfill summary: {n_updated} updated, {n_skipped} skipped")
+    return n_updated, n_skipped
 
 
 def extract_graph_info(source_prep: Path, solvent_state: str = "unknown") -> Dict[str, Any]:
@@ -686,14 +781,16 @@ Examples:
     parser.add_argument(
         'base_path',
         type=Path,
-        help='Base directory containing run# subdirectories'
+        nargs='?',
+        help='Base directory containing run# subdirectories (not required with --backfill-ddg)'
     )
-    
+
     parser.add_argument(
         '--output-dir', '-o',
         type=Path,
-        required=True,
-        help='Output directory for pretraining data'
+        required=False,
+        default=None,
+        help='Output directory for pretraining data (not required with --backfill-ddg)'
     )
     
     parser.add_argument(
@@ -718,9 +815,36 @@ Examples:
         action='store_true',
         help='Show what would be done without actually processing files'
     )
-    
+
+    parser.add_argument(
+        '--backfill-ddg',
+        metavar='PRETRAINING_ROOT',
+        type=Path,
+        default=None,
+        help=(
+            'Backfill per-pair DDG data into existing simulation_results.json files '
+            'under PRETRAINING_ROOT.  Reads source output files via metadata.json '
+            'source_run_dir.  Pass --dry-run to preview without writing.'
+        ),
+    )
+
     args = parser.parse_args()
-    
+
+    # --- Backfill mode: mutually exclusive with normal collection mode ---
+    if args.backfill_ddg is not None:
+        root = args.backfill_ddg.resolve()
+        if not root.exists():
+            print(f"Error: Backfill root does not exist: {root}")
+            return 1
+        backfill_ddg_pairs(root, dry_run=args.dry_run)
+        return 0
+
+    # Normal collection mode — base_path and --output-dir are required
+    if args.base_path is None:
+        parser.error("base_path is required unless --backfill-ddg is specified")
+    if args.output_dir is None:
+        parser.error("--output-dir is required unless --backfill-ddg is specified")
+
     base_path = args.base_path.resolve()
     if not base_path.exists():
         print(f"Error: Base path does not exist: {base_path}")

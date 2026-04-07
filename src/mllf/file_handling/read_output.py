@@ -1,5 +1,6 @@
+import math
 import re
-from typing import Dict, Tuple, List
+from typing import Dict, Optional, Tuple, List
 
 
 def terminated_normally(text: str) -> bool:
@@ -180,8 +181,85 @@ def parse_transitions_and_rates(text: str) -> Tuple[Dict[int, Dict[float, int]],
     return transitions, rates
 
 
+def parse_single_ddg(text: str) -> Dict[Tuple[int, int], Optional[float]]:
+    """Parse SINGLE DDG table to discover which substituent pairs had transitions.
+
+    For each unordered pair (blk_i, blk_j) with blk_i < blk_j, returns the biased
+    free-energy difference at the highest lambda cutoff (rightmost bias column), or
+    None where the output contained 'NaN' (no crossings occurred at that bias level).
+
+    This is more granular than SINGLE TRANSITIONS, which only counts total crossings
+    per site: a site with 5 transitions may have 4 between subs 2↔4 and 1 between
+    2↔3, while 3↔4 never crossed at all.  The DDG NaN pattern captures that directly.
+
+    Block IDs start at 2 in CHARMM MSLD output (block 1 = reference).
+    For a sequential 0-based node index i, block_id = i + 2.
+
+    Args:
+        text: Full text of a CHARMM MSLD output file.
+
+    Returns:
+        Dict mapping (blk_i, blk_j) → float|None where blk_i < blk_j.
+        float : biased DDG at highest lambda (pair had multiple crossings).
+        None  : NaN or Inf in output (no usable crossings — either zero, or
+                only one transition so no round-trip free energy estimate).
+        Empty dict if no SINGLE DDG section is found.
+    """
+    result: Dict[Tuple[int, int], Optional[float]] = {}
+    lines = text.splitlines()
+
+    # Detect number of lambda columns from the DDG header line.
+    # Format: "BLK(I)..BLK(J).....> 0.950 ....> 0.990 .....> 0.950 ....> 0.990"
+    # Columns alternate: [nobias_λ1, nobias_λ2, bias_λ1, bias_λ2]
+    # We want only the bias half — last n_lambda_cols values after the 2 block IDs.
+    n_lambda_cols = 2  # default: assume 0.95 and 0.99
+    blk_hdr_re = re.compile(r"BLK\(I\).*BLK\(J\)")
+    lambda_re = re.compile(r">\s*(\d+\.\d+)")
+    for ln in lines:
+        if blk_hdr_re.search(ln):
+            found = lambda_re.findall(ln)
+            if found:
+                n_lambda_cols = len(found) // 2  # half nobias, half bias
+            break
+
+    ddg_re = re.compile(r"SINGLE DDG>\s+(\d+)\s+(\d+)\s+(.*)")
+    for ln in lines:
+        m = ddg_re.search(ln)
+        if not m:
+            continue
+        blk_i = int(m.group(1))
+        blk_j = int(m.group(2))
+        raw = m.group(3).strip().split()
+
+        # Parse values — convert 'NaN' and Inf to None.
+        # Inf means only one crossing (no round-trip), so DDG is undefined;
+        # treat it the same as NaN (no usable crossing data).
+        vals: List[Optional[float]] = []
+        for v in raw:
+            if v.lower() == 'nan':
+                vals.append(None)
+            else:
+                try:
+                    fval = float(v)
+                    vals.append(None if math.isinf(fval) else fval)
+                except ValueError:
+                    vals.append(None)
+
+        # Bias columns are the last n_lambda_cols values
+        bias_vals = vals[-n_lambda_cols:] if len(vals) >= n_lambda_cols else vals
+        # Use the highest-lambda bias column (last element = 0.990 by default)
+        highest_bias = bias_vals[-1] if bias_vals else None
+
+        # Store with blk_i < blk_j (upper triangle, matching output ordering)
+        lo, hi = (blk_i, blk_j) if blk_i < blk_j else (blk_j, blk_i)
+        result[(lo, hi)] = highest_bias
+
+    return result
+
+
 __all__ = [
     "terminated_normally",
     "parse_single_population",
     "parse_transitions_and_rates",
+    "parse_single_ddg",
 ]

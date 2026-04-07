@@ -1439,6 +1439,9 @@ def sample_runs_stratified_negative(
     return result
 
 
+from mllf.cb.workflow_utils import build_edge_weights as _build_edge_weights  # noqa: E402
+
+
 def pretrain_epoch(
     encoder: nn.Module,
     policy: nn.Module,
@@ -1452,6 +1455,7 @@ def pretrain_epoch(
     use_fully_connected=True,
     deepset_model=None,
     graph_cache: Optional[List] = None,
+    ddg_no_transition_weight: float = 0.2,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -1551,16 +1555,20 @@ def pretrain_epoch(
             deterministic=True  # Use mean predictions, not sampled
         )
         
-        # Behavior Cloning: masked MSE — only backpropagate through the
-        # active coefficient for each edge (the one non-zero target element).
-        # The full-MSE approach (naive targets=[coeff,0,0,0]) pushes ALL heads
-        # toward 0 on 75% of edges, creating gradient conflicts that prevent
-        # the model from learning the true non-zero coefficient values.
+        # Behavior Cloning: weighted & masked MSE.
+        # active_mask selects the one non-zero target per edge.
+        # edge_weights (from DDG data) down-weight edges whose substituent pair
+        # had no observed transitions (unreliable bias targets).
         active_mask = targets.abs() > 1e-8            # [E, 4], one True per row
         if active_mask.any():
-            run_loss = nn.functional.mse_loss(
-                predicted_means[active_mask], targets[active_mask]
-            )
+            ddg_pairs = run.get('sim_results', {}).get('ddg_pairs', {})
+            edge_weights = _build_edge_weights(
+                data.edge_index, ddg_pairs, ddg_no_transition_weight, device
+            )  # [E]
+            # Expand weights to match [E, 4] targets shape then select active
+            weights_2d = edge_weights.unsqueeze(1).expand_as(targets)  # [E, 4]
+            sq_err = (predicted_means - targets) ** 2                  # [E, 4]
+            run_loss = (sq_err * weights_2d)[active_mask].mean()
         else:
             run_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
@@ -1638,6 +1646,7 @@ def pretrain_with_runs(
     stratified_negative_fraction: Optional[float] = None,
     deepset_model=None,
     patience: int = 10,
+    ddg_no_transition_weight: float = 0.2,
 ):
     """Run policy pretraining with provided runs.
     
@@ -1971,6 +1980,7 @@ def pretrain_with_runs(
             use_fully_connected=use_fully_connected,
             deepset_model=deepset_model,
             graph_cache=graph_cache,
+            ddg_no_transition_weight=ddg_no_transition_weight,
         )
         
         print(f"  MSE Loss: {stats['loss']:.4f}")
@@ -2163,12 +2173,29 @@ def main():
         help="Early stopping patience (default: 10). Training stops if the MSE loss does "
              "not improve for this many consecutive epochs.",
     )
+    parser.add_argument(
+        "--ddg-no-transition-weight",
+        type=float,
+        default=None,
+        metavar="W",
+        help="Weight (0–1) applied to edges whose substituent pair had no observed "
+             "lambda-space transitions (NaN or Inf DDG). Default: read from config "
+             "reward.ddg_no_transition_weight, falling back to 0.2.",
+    )
 
     args = parser.parse_args()
     
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # ddg_no_transition_weight: CLI flag takes precedence, then config, then hardcoded default
+    reward_cfg = config.get('reward', {})
+    ddg_no_transition_weight = (
+        args.ddg_no_transition_weight
+        if args.ddg_no_transition_weight is not None
+        else reward_cfg.get('ddg_no_transition_weight', 0.2)
+    )
 
     # Load pretrained DeepSet encoder if specified
     deepset_model = None
@@ -2205,6 +2232,7 @@ def main():
         stratified_negative_fraction=args.stratified_negative_fraction,
         deepset_model=deepset_model,
         patience=args.patience,
+        ddg_no_transition_weight=ddg_no_transition_weight,
     )
 
 
