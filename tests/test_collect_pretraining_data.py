@@ -446,3 +446,220 @@ class TestFilterBestRunsPerSystem:
     def test_empty_input_returns_empty(self):
         """Empty run list → empty result (no crash)."""
         assert filter_best_runs_per_system([]) == []
+
+
+# ---------------------------------------------------------------------------
+# TestBuildEdgeWeights
+# ---------------------------------------------------------------------------
+
+class TestBuildEdgeWeights:
+    """Tests for build_edge_weights in mllf.cb.workflow_utils."""
+
+    def setup_method(self):
+        from mllf.cb.workflow_utils import build_edge_weights
+        self.build_edge_weights = build_edge_weights
+        self.device = torch.device('cpu')
+
+    def _edge_index(self, edges):
+        """Build a [2, E] tensor from a list of (src, dst) tuples."""
+        return torch.tensor(edges, dtype=torch.long).T
+
+    def test_empty_ddg_pairs_returns_all_ones(self):
+        """When ddg_pairs is empty, every edge gets weight 1.0."""
+        ei = self._edge_index([(0, 1), (1, 0), (0, 2)])
+        w = self.build_edge_weights(ei, {}, 0.2, self.device)
+        assert w.shape == (3,)
+        assert torch.all(w == 1.0)
+
+    def test_none_entry_gets_no_transition_weight(self):
+        """Pair with None in ddg_pairs (NaN DDG) receives no_transition_weight."""
+        # node 0 → block 2, node 1 → block 3; key "2_3"
+        ei = self._edge_index([(0, 1)])
+        w = self.build_edge_weights(ei, {"2_3": None}, 0.2, self.device)
+        assert torch.isclose(w[0], torch.tensor(0.2))
+
+    def test_finite_entry_gets_full_weight(self):
+        """Pair with a finite float (transitions observed) receives weight 1.0."""
+        ei = self._edge_index([(0, 1)])
+        w = self.build_edge_weights(ei, {"2_3": -1.23}, 0.2, self.device)
+        assert torch.isclose(w[0], torch.tensor(1.0))
+
+    def test_missing_key_treated_as_full_weight(self):
+        """Pair absent from ddg_pairs (old data) receives weight 1.0."""
+        ei = self._edge_index([(0, 1)])
+        # no "2_3" key in dict
+        w = self.build_edge_weights(ei, {"3_4": None}, 0.2, self.device)
+        assert torch.isclose(w[0], torch.tensor(1.0))
+
+    def test_direction_independent(self):
+        """Edge (1, 0) and (0, 1) should produce the same weight (lo/hi normalised)."""
+        ddg = {"2_3": None}
+        w_fwd = self.build_edge_weights(self._edge_index([(0, 1)]), ddg, 0.3, self.device)
+        w_rev = self.build_edge_weights(self._edge_index([(1, 0)]), ddg, 0.3, self.device)
+        assert torch.isclose(w_fwd[0], w_rev[0])
+
+    def test_mixed_edges(self):
+        """Multiple edges with different ddg_pairs entries are weighted correctly."""
+        # node 0→blk2, node 1→blk3, node 2→blk4
+        ddg = {"2_3": None, "2_4": -0.5}
+        ei = self._edge_index([(0, 1), (0, 2), (1, 2)])
+        w = self.build_edge_weights(ei, ddg, 0.1, self.device)
+        assert torch.isclose(w[0], torch.tensor(0.1))   # 2_3 → None
+        assert torch.isclose(w[1], torch.tensor(1.0))   # 2_4 → finite
+        assert torch.isclose(w[2], torch.tensor(1.0))   # 3_4 → missing → 1.0
+
+    def test_custom_no_transition_weight(self):
+        """Respects the caller-supplied no_transition_weight."""
+        ei = self._edge_index([(0, 1)])
+        w = self.build_edge_weights(ei, {"2_3": None}, 0.5, self.device)
+        assert torch.isclose(w[0], torch.tensor(0.5))
+
+    def test_output_dtype_float32(self):
+        """Output tensor has dtype float32."""
+        ei = self._edge_index([(0, 1)])
+        w = self.build_edge_weights(ei, {}, 0.2, self.device)
+        assert w.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# TestParseSimulationMetrics
+# ---------------------------------------------------------------------------
+
+class TestParseSimulationMetrics:
+    """Tests for parse_simulation_metrics in mllf.cb.workflow_utils."""
+
+    def setup_method(self):
+        from mllf.cb.workflow_utils import parse_simulation_metrics
+        self.parse_simulation_metrics = parse_simulation_metrics
+
+    def test_returns_ddg_pairs_key(self, tmp_path):
+        """Result dict always contains 'ddg_pairs' key."""
+        # Write a minimal output file with no DDG content
+        f = tmp_path / 'output.out'
+        f.write_text('nothing here\n')
+        result = self.parse_simulation_metrics(f)
+        assert 'ddg_pairs' in result
+
+    def test_ddg_pairs_empty_for_no_section(self, tmp_path):
+        """ddg_pairs is empty dict when output has no SINGLE DDG section."""
+        f = tmp_path / 'output.out'
+        f.write_text('nothing here\n')
+        result = self.parse_simulation_metrics(f)
+        assert result['ddg_pairs'] == {}
+
+    def test_ddg_pairs_populated_from_real_sample(self):
+        """ddg_pairs from the sample file contains the expected pairs."""
+        sample = Path(__file__).parent / 'samples' / '14benz_solv_5.5' / 'output.txt'
+        if not sample.exists():
+            pytest.skip('Sample output file not found')
+        result = self.parse_simulation_metrics(sample)
+        assert 'ddg_pairs' in result
+        # Sample file has NaN/Inf for all pairs → all None
+        assert len(result['ddg_pairs']) > 0
+        assert all(v is None for v in result['ddg_pairs'].values())
+
+    def test_ddg_pairs_keys_are_strings(self, tmp_path):
+        """ddg_pairs keys follow "lo_hi" string format (JSON-serialisable)."""
+        sample = Path(__file__).parent / 'samples' / '14benz_solv_5.5' / 'output.txt'
+        if not sample.exists():
+            pytest.skip('Sample output file not found')
+        result = self.parse_simulation_metrics(sample)
+        for key in result['ddg_pairs']:
+            assert isinstance(key, str)
+            parts = key.split('_')
+            assert len(parts) == 2
+            assert all(p.isdigit() for p in parts)
+
+
+# ---------------------------------------------------------------------------
+# TestBackfillDdgPairs
+# ---------------------------------------------------------------------------
+
+class TestBackfillDdgPairs:
+    """Tests for backfill_ddg_pairs in mllf.cli.collect_pretraining_data."""
+
+    def setup_method(self):
+        from mllf.cli.collect_pretraining_data import backfill_ddg_pairs
+        self.backfill_ddg_pairs = backfill_ddg_pairs
+
+    def _make_run(self, root: Path, name: str, source_output: str,
+                  already_has_ddg: bool = False) -> Path:
+        """Create a pretraining run dir with metadata.json + simulation_results.json."""
+        run_dir = root / name
+        run_dir.mkdir(parents=True)
+        source_dir = root / f'{name}_source'
+        source_dir.mkdir(parents=True)
+        (source_dir / 'output.out').write_text(source_output)
+
+        sim = {'populations': [], 'transitions': [], 'terminated_normally': True}
+        if already_has_ddg:
+            sim['ddg_pairs'] = {}
+        (run_dir / 'simulation_results.json').write_text(json.dumps(sim))
+
+        metadata = {'source_run_dir': str(source_dir)}
+        (run_dir / 'metadata.json').write_text(json.dumps(metadata))
+        return run_dir
+
+    def _simple_ddg_output(self):
+        """Minimal CHARMM output with a SINGLE DDG block (all NaN)."""
+        return (
+            "             BLK(I)..BLK(J).....> 0.950 ....> 0.990 .....> 0.950 ....> 0.990\n"
+            "SINGLE DDG>       2      3         NaN         NaN         NaN         NaN\n"
+        )
+
+    def test_updates_runs_without_ddg_pairs(self, tmp_path):
+        """Runs missing 'ddg_pairs' in simulation_results.json are updated."""
+        self._make_run(tmp_path, 'run1', self._simple_ddg_output())
+        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
+        assert n_updated == 1
+        assert n_skipped == 0
+        sim = json.loads((tmp_path / 'run1' / 'simulation_results.json').read_text())
+        assert 'ddg_pairs' in sim
+
+    def test_skips_runs_already_having_ddg_pairs(self, tmp_path):
+        """Runs that already have 'ddg_pairs' are not reprocessed."""
+        self._make_run(tmp_path, 'run1', self._simple_ddg_output(), already_has_ddg=True)
+        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
+        assert n_updated == 0
+        assert n_skipped == 1
+
+    def test_dry_run_does_not_modify_files(self, tmp_path):
+        """With dry_run=True, simulation_results.json is not modified."""
+        self._make_run(tmp_path, 'run1', self._simple_ddg_output())
+        original = (tmp_path / 'run1' / 'simulation_results.json').read_text()
+        self.backfill_ddg_pairs(tmp_path, dry_run=True)
+        after = (tmp_path / 'run1' / 'simulation_results.json').read_text()
+        assert original == after
+
+    def test_skips_run_without_metadata(self, tmp_path):
+        """A run directory with no metadata.json is counted as skipped."""
+        run_dir = tmp_path / 'run1'
+        run_dir.mkdir()
+        sim = {'populations': [], 'transitions': []}
+        (run_dir / 'simulation_results.json').write_text(json.dumps(sim))
+        # No metadata.json
+        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
+        assert n_updated == 0
+        assert n_skipped >= 1
+
+    def test_ddg_values_in_updated_file(self, tmp_path):
+        """After backfill, ddg_pairs keys follow 'lo_hi' format."""
+        self._make_run(tmp_path, 'run1', self._simple_ddg_output())
+        self.backfill_ddg_pairs(tmp_path)
+        sim = json.loads((tmp_path / 'run1' / 'simulation_results.json').read_text())
+        ddg = sim['ddg_pairs']
+        assert isinstance(ddg, dict)
+        # NaN → None round-trips through JSON as null
+        for key, val in ddg.items():
+            parts = key.split('_')
+            assert len(parts) == 2 and all(p.isdigit() for p in parts)
+            assert val is None  # NaN DDG → None
+
+    def test_mixed_runs_updated_and_skipped(self, tmp_path):
+        """Correctly counts updated vs skipped in a mixed batch."""
+        self._make_run(tmp_path, 'run1', self._simple_ddg_output())
+        self._make_run(tmp_path, 'run2', self._simple_ddg_output(), already_has_ddg=True)
+        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
+        assert n_updated == 1
+        assert n_skipped == 1
+

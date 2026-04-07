@@ -23,26 +23,46 @@ The policy network learns to predict expert bias coefficients through supervised
 on the filtered dataset. This process mimics how expert systems (ALF or converged CB) assign
 coefficients to different molecular transition types.
 
+.. _Training Objective:
+
 **Training Objective**:
 
-The model minimizes a **masked** mean squared error that backpropagates only through the
-active coefficient for each edge. Because each directed edge carries exactly one non-zero
-bias type (e.g., a ``linear_fwd`` edge has a non-zero linear target but zero quadratic,
-skew, and end targets), naively averaging over all four outputs would produce a gradient
-signal dominated by pushing inactive heads toward zero. The masked loss avoids this:
+The model minimizes a **weighted, masked** mean squared error. Two mechanisms focus
+the gradient signal on the most informative edges:
+
+1. **Masking** — backpropagation runs only through the *active* (non-zero) target for
+   each edge. Because each directed edge carries exactly one non-zero bias type (e.g., a
+   ``linear_fwd`` edge has a non-zero linear target but zero quadratic, skew, and end
+   targets), naively averaging over all four outputs would produce a gradient signal
+   dominated by pushing inactive heads toward zero. The mask avoids this.
+
+2. **ΔΔG-based edge weighting** — in MSLD, the biased relative free-energy difference
+   :math:`\Delta\Delta G_{i \to j}` between two substituents *i* and *j* is estimated from
+   round-trip λ-space crossings during the simulation. When no crossings occurred for a
+   pair, CHARMM reports ``NaN`` (zero crossings) or ``±Infinity`` (one-direction only,
+   so no round-trip estimate is possible) in the SINGLE DDG output block. Edges
+   corresponding to such pairs are down-weighted by ``ddg_no_transition_weight``
+   (default 0.2) because, without observed transitions, the recorded bias targets for that
+   pair reflect extrapolation rather than sampled behaviour and are therefore less reliable
+   as expert demonstrations. Edges where transitions *were* observed — and a finite
+   :math:`\Delta\Delta G_{i \to j}` was computed — receive weight 1.0.
 
 .. math::
 
-   \mathcal{L}_{\text{BC}} = \frac{1}{|\mathcal{A}|} \sum_{(i,j,k) \in \mathcal{A}} \| a_{ij}^{(k)} - \hat{a}_{ij}^{(k)} \|^2
+   \mathcal{L}_{\text{BC}} = \frac{1}{|\mathcal{A}|} \sum_{(i,j,k) \in \mathcal{A}} w_{ij} \cdot \| a_{ij}^{(k)} - \hat{a}_{ij}^{(k)} \|^2
 
 where:
 
 - :math:`\mathcal{A} = \{(i,j,k) : |a_{ij}^{(k)}| > \epsilon\}` is the set of active (non-zero) target entries
-- :math:`E` is the set of directed edges in the graph
 - :math:`k \in \{\text{linear, quadratic, skew, end}\}` are bias types
 - :math:`a_{ij}^{(k)}` is the expert coefficient
 - :math:`\hat{a}_{ij}^{(k)}` is the predicted coefficient
+- :math:`w_{ij} \in \{w_{\text{no-trans}},\, 1.0\}` is the per-edge weight derived from whether :math:`\Delta\Delta G_{i \to j}` was observable
 - :math:`\epsilon = 10^{-8}` is a small threshold to identify non-zero targets
+
+When ``ddg_pairs`` data is absent from a run's ``simulation_results.json`` (e.g. for
+older pretraining data collected before this feature), all edges default to weight
+1.0 so the loss is unchanged for those runs.
 
 
 **Graph Caching**:
@@ -248,11 +268,30 @@ The filtering statistics reported during pretraining help assess data quality an
 decisions about threshold settings. Excluding too few runs may include noisy data, while
 excluding too many reduces the effective dataset size and risks overfitting.
 
+**4. ΔΔG-Based Edge Down-Weighting**
+
+Rather than excluding runs outright, edges whose substituent pairs had no observed
+λ-space transitions — and therefore no computable :math:`\Delta\Delta G_{i \to j}` (relative
+free-energy difference between substituents *i* and *j*) — are down-weighted during loss
+computation (see `Training Objective`_ above). This is controlled by the
+``ddg_no_transition_weight`` parameter (default 0.2).
+
+Set it in the ``reward`` section of your YAML config:
+
+.. code-block:: yaml
+
+   reward:
+     ddg_no_transition_weight: 0.2   # 0 = ignore no-transition edges; 1 = treat equally
+
+Or override per run with the CLI flag ``--ddg-no-transition-weight W``.
+A value of 1.0 reverts to the original unweighted masked MSE. Lower values (e.g. 0.1)
+more aggressively suppress learning from unreliable pairs.
+
 
 See Also
 --------
 
-* :doc:`file_handling` - Bias coefficient file formats and variables.py structure
+* :doc:`file_handling` - Bias coefficient file formats, ``parse_single_ddg`` reference
 * :doc:`deepset_pretraining` - Pretrained DeepSet node embeddings
 * :doc:`cb_setup` - CB infrastructure and policy architecture
 * :doc:`workflow` - Complete CB training workflow
@@ -260,3 +299,4 @@ See Also
 * ``examples/pretrain_with_filtering.sh`` - Pretraining SLURM script
 * ``src/mllf/cb/pretrain_policy.py`` - Behavior cloning implementation
 * ``src/mllf/cb/policy.py`` - Policy network architecture
+* ``src/mllf/cb/workflow_utils.py`` - ``build_edge_weights``, ``parse_simulation_metrics``

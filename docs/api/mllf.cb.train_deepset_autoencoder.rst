@@ -10,10 +10,12 @@
    
       train_all_systems
       train_autoencoder
+      train_combined_model
    
    .. rubric:: Classes
 
    .. autosummary::
    
       AtomFeatureDataset
+      CombinedAtomFeatureDataset
    

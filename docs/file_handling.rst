@@ -207,7 +207,9 @@ bias matrices (b, c, x, s). These files are read by the MSLD simulator.
 Simulation Output Parsing
 --------------------------
 
-Parse MSLD simulation output to extract population counts, transitions, and transition rates.
+Parse MSLD simulation output to extract population counts, transitions, transition rates,
+and per-pair relative free-energy differences (:math:`\Delta\Delta G_{i \to j}`) between
+substituents.
 
 **Basic Usage**:
 
@@ -216,7 +218,8 @@ Parse MSLD simulation output to extract population counts, transitions, and tran
    from mllf.file_handling.read_output import (
        terminated_normally,
        parse_single_population,
-       parse_transitions_and_rates
+       parse_transitions_and_rates,
+       parse_single_ddg,
    )
    
    # Read simulation output
@@ -239,6 +242,12 @@ Parse MSLD simulation output to extract population counts, transitions, and tran
    transitions, rates = parse_transitions_and_rates(output_text)
    # transitions: {site: {lambda: count}}
    # rates: {site: {lambda: rate}}
+   
+   # Parse per-pair biased ΔΔG (relative free-energy difference between substituents)
+   ddg = parse_single_ddg(output_text)
+   # {(2, 3): -1.23, (2, 4): None, (3, 4): None, ...}
+   # float : ΔΔG_{i→j} at highest λ — round-trip transitions observed
+   # None  : NaN or ±Inf in output — no round-trip crossings, ΔΔG undefined
 
 **Output Format Examples**:
 
@@ -265,6 +274,28 @@ Transition rates:
 
    SINGLE TRANS RATES>   1    0.196   0.190
    SINGLE TRANS RATES>   2    0.158   0.154
+
+ΔΔG table (biased relative free-energy difference :math:`\Delta\Delta G_{i \to j}` per substituent pair):
+
+.. code-block:: text
+
+                BLK(I)..BLK(J).....> 0.950 ....> 0.990 .....> 0.950 ....> 0.990
+   SINGLE DDG>       2      3   -Infinity   -Infinity   -Infinity   -Infinity
+   SINGLE DDG>       2      4         NaN         NaN         NaN         NaN
+   SINGLE DDG>       3      4    Infinity    Infinity    Infinity    Infinity
+
+Columns are: ``nobias_λ1, nobias_λ2, bias_λ1, bias_λ2``.
+``parse_single_ddg`` returns the last bias column (highest λ, e.g. 0.990) per pair as
+the :math:`\Delta\Delta G_{i \to j}` estimate — the biased relative free-energy difference
+between substituents *i* and *j* at that λ cutoff.
+``NaN`` means zero crossings between that pair; ``±Infinity`` means only one crossing
+direction occurred (no round-trip estimate). Both are returned as ``None`` because no
+:math:`\Delta\Delta G` can be computed without at least one complete round-trip transition.
+A finite value means round-trip transitions were observed and the :math:`\Delta\Delta G`
+estimate is considered reliable.
+
+Block IDs start at 2 in CHARMM MSLD output (block 1 = reference). For a 0-based node
+index ``i``, ``block_id = i + 2``.
 
 **Dynamic Lambda Detection**:
 
