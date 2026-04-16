@@ -657,11 +657,11 @@ def compute_reward_from_sim_results(
     w_T: float = 0.75,
     w_U: float = 0.3,
     gamma: float = 4.0,
-    P_baseline: float = 500.0,  # Updated to higher_rewards_v1 config
-    T_baseline: float = 50.0,   # Updated to higher_rewards_v1 config
+    P_baseline: float = 500.0,
+    T_baseline: float = 50.0,
     min_transitions_per_site: int = 10,
     min_coverage_ratio: float = 0.5,
-    entropy_bonus: float = 8.0,  # Updated to higher_rewards_v1 config
+    entropy_bonus: float = 8.0,
     concentration_penalty_threshold: float = 0.8,
 ) -> float:
     """Compute reward from simulation results dict using improved reward logic.
@@ -686,7 +686,9 @@ def compute_reward_from_sim_results(
         sim_results: Dict with 'populations' and 'transitions' keys
         num_sites: Number of sites in the system
         nsubs_per_site: List of number of substituents per site
-        w_P, w_T, w_U: Reward weights for populations, transitions, and uniformity
+        w_P, w_T: Reward weights for populations and transitions
+        w_U: Accepted for API compatibility but unused in current formula;
+             coverage is handled by the quadratic coverage_factor multiplier.
         gamma: Scaling factor for rewards (used in coverage/concentration penalties)
         P_baseline: Normalization baseline for populations
         T_baseline: Normalization baseline for transitions
@@ -780,25 +782,11 @@ def compute_reward_from_sim_results(
     elif sites_below_threshold == 1:
         penalties -= base_penalty
     
-    # 2. Coverage requirement (minimum % of substituents visited)
+    # 2. Coverage requirement
+    # NOTE: adaptive coverage penalty removed — replaced by coverage_factor below
     num_populated = np.count_nonzero(pop_array)
     total_subs = sum(nsubs_per_site)
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
-    
-    # Adaptive coverage requirement: scales with system size to encourage visiting multiple subs
-    # Formula: min_subs = 1 + 0.5*(total-1)
-    # Examples: 2 subs→1.5 (75%), 3 subs→2.0 (67%), 4 subs→2.5 (62.5%), 6 subs→3.5 (58%)
-    min_subs_required = 1.0 + 0.5 * (total_subs - 1) if total_subs > 1 else 0.5
-    adaptive_min_coverage = min_subs_required / total_subs if total_subs > 0 else 0.0
-    
-    # NO DOUBLE JEOPARDY: Don't penalize coverage if transitions are too low for reliable statistics
-    # Coverage is only meaningful when there are enough transitions to have statistical confidence
-    # Only apply coverage penalty if transitions are at or above the success threshold
-    if coverage_ratio < adaptive_min_coverage and min_transitions_across_sites >= min_transitions_per_site:
-        # System has sufficient transitions but poor coverage - penalize the sampling inefficiency
-        deficit = adaptive_min_coverage - coverage_ratio
-        penalty_scale = np.sqrt(total_subs) if total_subs > 1 else 1.0
-        penalties -= gamma * 20.0 * deficit / penalty_scale
     
     # 3. Concentration penalty (per-site check)
     pop_idx = 0
@@ -820,30 +808,18 @@ def compute_reward_from_sim_results(
     # Low-transition runs have unreliable population distributions
     confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
     
-    # R_P: Population balance (coefficient of variation - lower is better/more uniform)
-    pop_probs = pop_array / total_pop  # Needed for entropy calculation below
+    # R_P: Population balance
+    pop_probs = pop_array / total_pop  # needed for entropy below
     nonzero_pops = pop_array[pop_array > 0]
     
     R_P = 0.0
     if len(nonzero_pops) > 1:
-        # Require meaningful coverage: at least 2 subs per site on average
-        # If we have 8 subs total and only 2 are visited (one per site), that's degenerate
-        min_meaningful_coverage = max(2, num_sites * 1.5)  # At least 1.5 subs per site
+        min_meaningful_coverage = max(2, num_sites * 1.5)
         
         if len(nonzero_pops) >= min_meaningful_coverage:
-            # Use coefficient of variation (std/mean) for balance
-            pop_mean = np.mean(nonzero_pops)
-            pop_std = np.std(nonzero_pops)
-            cv = pop_std / pop_mean if pop_mean > 0 else 1.0
-            
-            # Balance factor: exp(-cv) ranges from ~0.37 (CV=1) to 1.0 (CV=0)
-            balance_factor = np.exp(-cv)
-            
-            # Normalized population reward (only count non-zero populations)
+            # balance_factor removed: R_entropy captures within-visited uniformity
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-            
-            # Apply Confidence Factor to scale R_P by data reliability
-            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
+            R_P = w_P * total_pop_normalized * confidence_factor
         else:
             # Insufficient coverage: minimal reward proportional to coverage
             R_P = w_P * 0.01 * coverage_ratio * confidence_factor
@@ -857,9 +833,6 @@ def compute_reward_from_sim_results(
     else:
         R_T = 0.0  # No transition reward if some sites below threshold (Tier 1 or 2)
     
-    # R_U: Coverage uniformity reward (matching train_improved.py)
-    R_U = w_U * coverage_ratio
-    
     # R_entropy: Shannon entropy bonus for uniform distributions
     entropy = -np.sum(pop_probs * np.log(pop_probs + 1e-10))
     max_entropy = np.log(len(pop_probs))
@@ -867,19 +840,13 @@ def compute_reward_from_sim_results(
     R_entropy = entropy_bonus * normalized_entropy
     
     # ========== PENALTY CLAMPING ==========
-    # Prevent gradient explosion by capping maximum negative penalty
-    # Increased from 50 to 60 to preserve gradient information with multi-site systems
     max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
     
-    # Completeness gate: if any substituent was never visited, replace the positive
-    # reward components with -0.01 so the total is always negative. Penalties are
-    # still added to preserve gradient signal (worse behaviour = more negative).
-    if num_populated < total_subs:
-        reward = -0.01 + penalties
-    else:
-        reward = R_P + R_T + R_U + R_entropy + penalties
+    # coverage_factor: smooth quadratic multiplier replacing hard completeness gate
+    coverage_factor = (num_populated / total_subs) ** 2 if total_subs > 0 else 0.0
+    reward = coverage_factor * (R_P + R_T + R_entropy) + penalties
 
     return reward
 
@@ -1325,11 +1292,15 @@ def filter_runs_by_min_transitions(
 
 def sample_runs_stratified_negative(
     runs: List[Dict],
-    fraction_per_bucket: float = 0.25,
+    fraction_per_bucket: float = 0.55,
     seed: int = 42,
 ) -> List[Dict]:
-    """Keep all positive-reward runs and randomly sample a fraction of each
-    negative-reward bucket.
+    """Keep all positive-reward runs and sample negative-reward buckets with a
+    quadratic ramp: the worst bucket ((-inf, -50]) keeps 0% and the best
+    negative bucket ((-10, 0)) keeps ``fraction_per_bucket``.  Intermediate
+    buckets follow a squared schedule (fraction = max × (i / (N-1))²), which
+    concentrates sampling on near-zero runs whose coefficients were almost
+    correct.
 
     Buckets (left-exclusive, right-inclusive except the last):
         (-inf, -50], (-50, -40], (-40, -30], (-30, -20], (-20, -10], (-10, 0)
@@ -1339,8 +1310,8 @@ def sample_runs_stratified_negative(
 
     Args:
         runs: List of run dicts from load_pretraining_runs.
-        fraction_per_bucket: Fraction of each negative bucket to sample (default: 0.25).
-            Must be in (0, 1]. A value of 1.0 keeps all runs in each bucket.
+        fraction_per_bucket: Maximum sampling fraction applied to the best negative
+            bucket ((-10, 0)).  Worst bucket gets 0%.  Default: 0.55.
         seed: Random seed for reproducibility (default: 42).
 
     Returns:
@@ -1352,7 +1323,7 @@ def sample_runs_stratified_negative(
     BUCKET_UPPER_BOUNDS = [-50, -40, -30, -20, -10, 0]
 
     print(f"\n{'='*80}")
-    print(f"Stratified Negative Sampling  (fraction_per_bucket={fraction_per_bucket:.0%})")
+    print(f"Stratified Negative Sampling  (max_fraction={fraction_per_bucket:.0%}, quadratic ramp)")
     print(f"{'='*80}")
 
     # Compute reward for every run -----------------------------------------
@@ -1415,31 +1386,62 @@ def sample_runs_stratified_negative(
         bucket_labels.append(f"({prev}, {hi}]" if hi < 0 else f"({prev}, {hi})")
         prev = str(hi)
 
-    # Sample from each bucket -----------------------------------------------
+    # Sample from each bucket with quadratic ramp --------------------------------
+    # bucket 0 (worst, (-inf,-50]) → fraction 0.0
+    # bucket N-1 (best, (-10,0))   → fraction fraction_per_bucket
+    # Intermediate buckets: fraction = max × (i / (N-1))²
+    n_buckets = len(BUCKET_UPPER_BOUNDS)
     rng = random.Random(seed)
     sampled_negative: List[Dict] = []
-    print(f"\n  {'Bucket':<18} {'Available':>10} {'Sampled':>9}")
-    print(f"  {'-'*18} {'-'*10} {'-'*9}")
+    print(f"\n  {'Bucket':<18} {'Fraction':>8} {'Available':>10} {'Sampled':>9}")
+    print(f"  {'-'*18} {'-'*8} {'-'*10} {'-'*9}")
     for i, label in enumerate(bucket_labels):
         available = buckets[i]
         n_avail = len(available)
-        n_sample = max(1, int(math.ceil(n_avail * fraction_per_bucket))) if n_avail > 0 else 0
+        # Quadratic ramp: bucket 0 → 0%, bucket (n_buckets-1) → fraction_per_bucket
+        bucket_frac = fraction_per_bucket * (i / max(n_buckets - 1, 1)) ** 2
+        n_sample = max(1, int(math.ceil(n_avail * bucket_frac))) if (n_avail > 0 and bucket_frac > 0) else 0
         if n_avail <= n_sample:
             selected = available
         else:
-            selected = rng.sample(available, n_sample)
+            selected = rng.sample(available, n_sample) if n_sample > 0 else []
         sampled_negative.extend(selected)
-        print(f"  {label:<18} {n_avail:>10,} {len(selected):>9,}")
+        print(f"  {label:<18} {bucket_frac:>7.0%} {n_avail:>10,} {len(selected):>9,}")
 
     result = positive_runs + sampled_negative
+
+    # Positive bucket breakdown for visibility
+    POS_BUCKET_UPPER_BOUNDS = [10, 20, 30, 40, 50, math.inf]
+    pos_buckets: Dict[int, int] = {i: 0 for i in range(len(POS_BUCKET_UPPER_BOUNDS))}
+    for rew, _ in scored:
+        if rew < 0:
+            continue
+        for i, hi in enumerate(POS_BUCKET_UPPER_BOUNDS):
+            if rew <= hi:
+                pos_buckets[i] += 1
+                break
+    pos_labels = []
+    prev_p = "0"
+    for hi in POS_BUCKET_UPPER_BOUNDS:
+        if hi == math.inf:
+            pos_labels.append(f"({prev_p}, +inf)")
+        else:
+            pos_labels.append(f"[{prev_p}, {hi}]")
+        prev_p = str(int(hi)) if hi != math.inf else str(int(POS_BUCKET_UPPER_BOUNDS[-2]))
+
     print(f"\n  Positive (kept all):   {len(positive_runs):>7,}")
-    print(f"  Negative (sampled):    {len(sampled_negative):>7,}")
+    print(f"  {'Bucket':<18} {'Count':>10}")
+    print(f"  {'-'*18} {'-'*10}")
+    for i, label in enumerate(pos_labels):
+        print(f"  {label:<18} {pos_buckets[i]:>10,}")
+
+    print(f"\n  Negative (sampled):    {len(sampled_negative):>7,}")
     print(f"  Total after sampling:  {len(result):>7,}")
     print(f"{'='*80}\n")
     return result
 
 
-from mllf.cb.workflow_utils import build_edge_weights as _build_edge_weights  # noqa: E402
+
 
 
 def pretrain_epoch(
@@ -1455,7 +1457,8 @@ def pretrain_epoch(
     use_fully_connected=True,
     deepset_model=None,
     graph_cache: Optional[List] = None,
-    ddg_no_transition_weight: float = 0.2,
+    groups: Optional[Dict] = None,
+    reward_weighted: bool = False,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -1464,7 +1467,7 @@ def pretrain_epoch(
         policy: Edge policy
         optimizer: Optimizer
         runs: List of pretraining run dicts (should be best runs only)
-        reward_config: Reward function configuration (unused in BC)
+        reward_config: Reward function configuration (used for reward-weighted loss)
         device: Device for computation
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include
@@ -1475,17 +1478,87 @@ def pretrain_epoch(
         deepset_model: Optional PretrainedDeepSet model. When provided, node features are
                       64-dim DeepSet embeddings computed from 3D atomic structure + AEVs
                       instead of standard atom-type encodings.
+        reward_weighted: If True, weight each run's MSE loss by its pre-computed normalised
+                        reward (stored in run["_bc_reward"]).  Zero-weight runs are skipped.
     
     Returns:
         Dict with epoch statistics
     """
     policy.train()
     encoder.train()
-    
+
+    # Build normalised reward weights (mean = 1.0) so the learning rate is unchanged.
+    # Weights are pre-computed by pretrain_with_runs and stored in run["_bc_reward"].
+    if reward_weighted:
+        raw_w = [max(0.0, run.get("_bc_reward", 0.0)) for run in runs]
+        total_w = sum(raw_w)
+        if total_w > 1e-10:
+            n_runs = len(runs)
+            norm_weights = [w * n_runs / total_w for w in raw_w]  # mean weight == 1.0
+        else:
+            reward_weighted = False  # all rewards zero — fall back to uniform
+            norm_weights = None
+    else:
+        norm_weights = None
+
     epoch_loss = 0.0
     num_updates = 0
-    
+
+    if groups is not None and graph_cache is not None:
+        # ── Per-graph gradient accumulation (one optimizer step per unique graph structure) ───
+        # All runs sharing the same prep_dir produce identical RGCN inputs; accumulating their
+        # gradients before stepping gives the RGCN the mean signal across the coefficient
+        # distribution for that graph rather than contradictory sequential updates.
+        for group_key, group_indices in groups.items():
+            valid = [
+                (i, norm_weights[i] if norm_weights is not None else 1.0)
+                for i in group_indices
+                if (norm_weights is None or norm_weights[i] >= 1e-8)
+                and graph_cache[i] is not None
+            ]
+            if not valid:
+                continue
+            n_valid = len(valid)
+            optimizer.zero_grad()
+            group_loss = 0.0
+            for run_idx, rw in valid:
+                data_cpu, targets_list = graph_cache[run_idx]
+                data = data_cpu.to(device)
+                targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
+                _, _, predicted_means, _ = policy.get_actions(
+                    data.x, data.edge_index, data.edge_type, data.edge_attr,
+                    deterministic=True,
+                )
+                active_mask = targets.abs() > 1e-8
+                if not active_mask.any():
+                    continue
+                # Normalise per bias-type so all 4 output dimensions contribute equally
+                # regardless of their raw magnitude range (quadratic ~520 vs end ~30).
+                bc_scales = policy.scale_factors[:targets.shape[-1]].unsqueeze(0)
+                sq_err = ((predicted_means - targets) / bc_scales) ** 2
+                # Divide by group size so the effective loss = per-run mean (not sum)
+                run_loss = sq_err[active_mask].mean() * rw / n_valid
+                if torch.isnan(run_loss) or torch.isinf(run_loss):
+                    continue
+                run_loss.backward()
+                group_loss += run_loss.item()
+            if group_loss > 0.0:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += group_loss
+                num_updates += 1
+            else:
+                optimizer.zero_grad()  # release any partially accumulated gradients
+        avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
+        return {'loss': avg_loss, 'num_runs': num_updates}
+
+    # ── Legacy per-run updates (backward-compatible; used when graph_cache is None) ─────────
     for run_idx, run in enumerate(runs):
+        # Skip zero-weight runs before any I/O or forward pass
+        rw = norm_weights[run_idx] if norm_weights is not None else 1.0
+        if rw < 1e-8:
+            continue
+
         run_dir = run["run_dir"]
 
         if graph_cache is not None:
@@ -1555,20 +1628,14 @@ def pretrain_epoch(
             deterministic=True  # Use mean predictions, not sampled
         )
         
-        # Behavior Cloning: weighted & masked MSE.
+        # Behavior Cloning: masked MSE.
         # active_mask selects the one non-zero target per edge.
-        # edge_weights (from DDG data) down-weight edges whose substituent pair
-        # had no observed transitions (unreliable bias targets).
         active_mask = targets.abs() > 1e-8            # [E, 4], one True per row
         if active_mask.any():
-            ddg_pairs = run.get('sim_results', {}).get('ddg_pairs', {})
-            edge_weights = _build_edge_weights(
-                data.edge_index, ddg_pairs, ddg_no_transition_weight, device
-            )  # [E]
-            # Expand weights to match [E, 4] targets shape then select active
-            weights_2d = edge_weights.unsqueeze(1).expand_as(targets)  # [E, 4]
-            sq_err = (predicted_means - targets) ** 2                  # [E, 4]
-            run_loss = (sq_err * weights_2d)[active_mask].mean()
+            # Normalise per bias-type so all 4 output dimensions contribute equally.
+            bc_scales = policy.scale_factors[:targets.shape[-1]].unsqueeze(0)
+            sq_err = ((predicted_means - targets) / bc_scales) ** 2  # [E, 4]
+            run_loss = sq_err[active_mask].mean() * rw  # scale by reward weight
         else:
             run_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
@@ -1601,6 +1668,167 @@ def pretrain_epoch(
         'loss': avg_loss,
         'num_runs': num_updates,
     }
+
+
+def _extract_highest_lambda_counts(populations) -> list:
+    """Convert simulation_results.json populations dict to a flat list of raw counts.
+
+    ``simulation_results.json`` stores populations as a dict::
+
+        {"2": {"counts": {"0.95": N, "0.99": M}, "site": S}, ...}
+
+    Each block's counts sub-dict holds MSLD population counts sampled at
+    different lambda values (e.g. 0.95 and 0.99).  These are **not** averaged
+    or normalised — only the single highest-lambda count is used (e.g. 0.99
+    when both 0.95 and 0.99 are present), since it is the most physically
+    meaningful value and the values at different lambdas are incommensurable.
+
+    Returns a list indexed by node_idx where::
+
+        result[node_idx] = highest-lambda population count for block (node_idx + 2)
+
+    (MSLD block_offset=2 convention: block 1 is the reference.)
+
+    If *populations* is already a list it is returned unchanged.
+    """
+    if not populations:
+        return []
+    if isinstance(populations, list):
+        return populations
+    block_offset = 2
+    try:
+        max_node = max(int(k) - block_offset for k in populations.keys())
+    except (ValueError, TypeError):
+        return []
+    result = [0] * (max_node + 1)
+    for block_id_str, block_info in populations.items():
+        try:
+            node_idx = int(block_id_str) - block_offset
+        except ValueError:
+            continue
+        if node_idx < 0:
+            continue
+        counts = block_info.get('counts', {}) if isinstance(block_info, dict) else {}
+        if counts:
+            # Take only the highest-lambda value — do not average across lambdas.
+            max_lambda = max(counts.keys(), key=lambda x: float(x))
+            result[node_idx] = counts[max_lambda]
+    return result
+
+
+def warmup_q_network(
+    runs: List[Dict],
+    policy: nn.Module,
+    q_network: nn.Module,
+    q_optimizer: optim.Optimizer,
+    epochs: int,
+    device: torch.device,
+    graph_cache: List,
+    epoch_groups: Dict[str, List[int]],
+) -> List[Dict]:
+    """Train QNetwork on historical pair rewards with the policy frozen.
+
+    For each unique graph structure (group), accumulates MSE loss between
+    the Q-network's per-edge predictions and the pair rewards computed from
+    each run's simulation_results.json, then takes one gradient step per group.
+
+    The Q-network learns to predict ``R_pair(i,j)`` from the same 200D edge
+    representation used by the actor: ``[P1_src, P2_src, P1_dst, P2_dst, edge_type]``.
+
+    Args:
+        runs: Pretraining run dicts (must contain ``sim_results`` with ``ddg_pairs``
+              and ``populations`` keys populated by ``backfill_ddg_pairs``).
+        policy: Frozen EdgePolicy (P2 RGCN + P3 MLP) used only for building edge inputs.
+        q_network: QNetwork to train.
+        q_optimizer: Optimizer for q_network.
+        epochs: Number of warmup epochs.
+        device: Compute device.
+        graph_cache: Pre-built graph cache from pretrain_with_runs.
+        epoch_groups: Mapping group_key → [run_idx, ...] from pretrain_with_runs.
+
+    Returns:
+        List of per-epoch statistics dicts with key ``'q_loss'``.
+    """
+    import torch.nn.functional as F
+    from mllf.cb.workflow_utils import compute_pair_reward
+
+    # Freeze policy — Q warmup must not update RGCN or MLP weights
+    policy.requires_grad_(False)
+    q_network.train()
+
+    print(f"\n{'='*60}")
+    print(f"Q-network warmup ({epochs} epochs)")
+    print(f"{'='*60}")
+
+    history: List[Dict] = []
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        num_updates = 0
+
+        for group_key, group_indices in epoch_groups.items():
+            # Only use runs that have pair reward data AND a valid cached graph
+            valid = []
+            for run_idx in group_indices:
+                if graph_cache[run_idx] is None:
+                    continue
+                sim = runs[run_idx].get('sim_results', {})
+                ddg_pairs = sim.get('ddg_pairs', {})
+                populations = _extract_highest_lambda_counts(sim.get('populations', []))
+                if not ddg_pairs or not populations:
+                    continue
+                valid.append((run_idx, ddg_pairs, populations))
+
+            if not valid:
+                continue
+
+            n_valid = len(valid)
+            q_optimizer.zero_grad()
+            group_loss = 0.0
+
+            for run_idx, ddg_pairs, populations in valid:
+                data_cpu, _ = graph_cache[run_idx]
+                data = data_cpu.to(device)
+
+                # Build edge inputs and sample actions from frozen policy
+                with torch.no_grad():
+                    p2_emb = policy.encoder(data.x, data.edge_index, data.edge_type)
+                    p1_for_skip = data.x if policy.p1_dim > 0 else None
+                    edge_inp = policy.edge_inputs(
+                        p2_emb, data.edge_index, data.edge_attr, p1_for_skip
+                    )
+                    # Sample actions (bias coefficients) so Q sees Q(s, a)
+                    actions, _, _, _ = policy.get_actions(
+                        data.x, data.edge_index, data.edge_type, data.edge_attr
+                    )
+
+                # Per-edge pair reward from this run's simulation
+                r_pair = compute_pair_reward(
+                    data.edge_index, ddg_pairs, populations
+                ).to(device)  # [E]
+
+                q_pred = q_network(edge_inp, actions)  # [E]
+                loss = F.mse_loss(q_pred, r_pair) / n_valid
+
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    loss.backward()
+                    group_loss += loss.item()
+
+            if group_loss > 0.0:
+                torch.nn.utils.clip_grad_norm_(q_network.parameters(), max_norm=1.0)
+                q_optimizer.step()
+                total_loss += group_loss
+                num_updates += 1
+            else:
+                q_optimizer.zero_grad()
+
+        avg_loss = total_loss / num_updates if num_updates > 0 else 0.0
+        history.append({'epoch': epoch, 'q_loss': avg_loss})
+        print(f"  Q epoch {epoch}/{epochs}: loss={avg_loss:.6f}")
+
+    # Unfreeze policy after warmup
+    policy.requires_grad_(True)
+    return history
 
 
 def pretrain(
@@ -1646,7 +1874,10 @@ def pretrain_with_runs(
     stratified_negative_fraction: Optional[float] = None,
     deepset_model=None,
     patience: int = 10,
-    ddg_no_transition_weight: float = 0.2,
+    reward_weighted: bool = False,
+    freeze_encoder_after: Optional[int] = None,
+    q_epochs: int = 0,
+    q_lr: float = 1e-3,
 ):
     """Run policy pretraining with provided runs.
     
@@ -1673,6 +1904,9 @@ def pretrain_with_runs(
                       the standard atom-type encoding dimension.
         patience: Early stopping patience (default: 10). Training stops if the MSE loss
                   does not improve for this many consecutive epochs.
+        reward_weighted: If True, weight each run's MSE loss by its reward (clamped >= 0
+                        and normalised so the mean weight = 1.0).  High-reward runs drive
+                        more of the gradient signal; zero-reward runs are skipped entirely.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1719,7 +1953,7 @@ def pretrain_with_runs(
 
     # Stratified negative sampling (takes precedence over min_reward_threshold)
     elif stratified_negative_fraction is not None:
-        print(f"\nApplying stratified negative sampling (fraction_per_bucket={stratified_negative_fraction:.0%})...")
+        print(f"\nApplying stratified negative sampling (max_fraction={stratified_negative_fraction:.0%}, quadratic ramp)...")
         runs = sample_runs_stratified_negative(runs, fraction_per_bucket=stratified_negative_fraction)
 
         if len(runs) == 0:
@@ -1802,7 +2036,8 @@ def pretrain_with_runs(
         emb_dim=encoder_config.get('out_dim', 32),
         data=sample_data,
         mlp_hidden=policy_config.get('mlp_hidden', 64),
-        mlp_out_dim=len(sample_extras['relation_names']) // 2
+        mlp_out_dim=len(sample_extras['relation_names']) // 2,
+        p1_dim=node_feat_dim,  # skip connection — must match run_workflow_deepset.py
     ).to(device)
     
     # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
@@ -1815,6 +2050,18 @@ def pretrain_with_runs(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=learning_rate / 100.0
     )
+    # MLP-only optimizer/scheduler — activated when encoder is frozen
+    _mlp_n = (epochs - freeze_encoder_after) if freeze_encoder_after is not None else epochs
+    if freeze_encoder_after is not None:
+        mlp_optimizer = optim.Adam(policy.edge_mlp.parameters(), lr=learning_rate)
+        mlp_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            mlp_optimizer, T_max=max(_mlp_n, 1), eta_min=learning_rate / 100.0
+        )
+    else:
+        mlp_optimizer = None
+        mlp_scheduler = None
+    active_opt = optimizer
+    active_sched = scheduler
 
     print(f"\nModel architecture:")
     print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())} params")
@@ -1963,38 +2210,94 @@ def pretrain_with_runs(
                     print(f"  {done}/{len(runs)} graphs built ({n_fail} failed)...")
 
     print(f"Graph cache ready: {n_ok} built, {n_fail} skipped")
+    # Map group_key → list of run indices for per-graph gradient accumulation
+    epoch_groups = {k: [i for (i, _) in v] for k, v in groups.items()}
+
+    # Pre-compute per-run rewards for reward-weighted loss.
+    # Stored as run["_bc_reward"] = max(0, reward) so pretrain_epoch can normalise.
+    if reward_weighted:
+        _VALID_RC = {
+            "w_P", "w_T", "w_U", "gamma", "P_baseline", "T_baseline",
+            "min_transitions_per_site", "min_coverage_ratio",
+            "entropy_bonus", "concentration_penalty_threshold",
+        }
+        filtered_rc = {k: v for k, v in reward_config.items() if k in _VALID_RC}
+        print("\nPre-computing rewards for reward-weighted loss...")
+        n_pos_w = 0
+        total_pos_w = 0.0
+        for run in runs:
+            try:
+                run_dir = Path(run["run_dir"])
+                with open(run_dir / "graph_info.json") as _f:
+                    gi = json.load(_f)
+                sites = gi.get("sites", {})
+                site_cnts: Dict[int, int] = {}
+                for bd in sites.values():
+                    s = bd["site"]
+                    site_cnts[s] = site_cnts.get(s, 0) + 1
+                nsubs_per_site = [site_cnts[s] for s in sorted(site_cnts)]
+                r = compute_reward_from_sim_results(
+                    run["sim_results"], len(site_cnts), nsubs_per_site, **filtered_rc
+                )
+                run["_bc_reward"] = max(0.0, r)
+                if r > 0:
+                    n_pos_w += 1
+                    total_pos_w += r
+            except Exception:
+                run["_bc_reward"] = 0.0
+        print(f"  Positive-reward runs: {n_pos_w}/{len(runs)}  "
+              f"(total positive reward mass: {total_pos_w:.2f})")
+        if n_pos_w == 0:
+            print("  Warning: all rewards zero or negative — disabling reward weighting.")
+            reward_weighted = False
 
     print(f"\n{'='*60}")
     print(f"Starting behavior cloning for {epochs} epochs")
     print(f"Training on {len(runs)} runs ({n_ok} with valid graphs)")
+    if reward_weighted:
+        print("Reward-weighted loss: ENABLED")
     print(f"{'='*60}\n")
 
     for epoch in range(epochs):
+        # ── Phase transition: freeze RGCN encoder and switch to MLP-only optimizer ─────────
+        if (
+            freeze_encoder_after is not None
+            and epoch == freeze_encoder_after
+            and mlp_optimizer is not None
+        ):
+            encoder.requires_grad_(False)
+            active_opt = mlp_optimizer
+            active_sched = mlp_scheduler
+            best_loss = float('inf')         # reset so MLP-only phase tracks its own best
+            epochs_without_improvement = 0
+            print(f"\nEpoch {epoch+1}: RGCN encoder frozen — switching to MLP-only optimizer")
+
         print(f"Epoch {epoch+1}/{epochs}")
 
         stats = pretrain_epoch(
-            encoder, policy, optimizer, runs, reward_config, device,
+            encoder, policy, active_opt, runs, reward_config, device,
             toppar_dir=toppar_dir,
             toppar_files=toppar_files,
             warn_missing_types=warn_missing_types,
             use_fully_connected=use_fully_connected,
             deepset_model=deepset_model,
             graph_cache=graph_cache,
-            ddg_no_transition_weight=ddg_no_transition_weight,
+            groups=epoch_groups,
+            reward_weighted=reward_weighted,
         )
-        
+
         print(f"  MSE Loss: {stats['loss']:.4f}")
         print(f"  Runs processed: {stats['num_runs']}")
-        print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+        print(f"  LR: {active_sched.get_last_lr()[0]:.6f}")
 
         # Step LR scheduler after each epoch
-        scheduler.step()
-        
+        active_sched.step()
+
         # Save best model (lowest loss)
         if stats['loss'] < best_loss:
             best_loss = stats['loss']
             epochs_without_improvement = 0
-            
+
             best_path = output_dir / "best_policy.pt"
             torch.save({
                 'encoder_state': encoder.state_dict(),
@@ -2005,14 +2308,14 @@ def pretrain_with_runs(
             print(f"  Saved best model (loss: {best_loss:.4f})")
         else:
             epochs_without_improvement += 1
-        
+
         # Save checkpoint
         checkpoint_path = output_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
         torch.save({
             'encoder_state': encoder.state_dict(),
             'policy_state': policy.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-            'scheduler_state': scheduler.state_dict(),
+            'optimizer_state': active_opt.state_dict(),
+            'scheduler_state': active_sched.state_dict(),
             'epoch': epoch + 1,
             'stats': stats,
         }, checkpoint_path)
@@ -2050,6 +2353,35 @@ def pretrain_with_runs(
     print(f"Best MSE loss: {best_loss:.4f}")
     print(f"Saved to: {output_dir}")
     print(f"{'='*60}")
+
+    # ── Q-network warmup (optional) ──────────────────────────────────────────────────────────
+    if q_epochs > 0:
+        from mllf.cb.value_net import QNetwork
+        q_in_dim = policy.edge_mlp.trunk[0].in_features
+        q_action_dim = policy.mlp_out_dim  # 4 bias types: linear, quadratic, skew, end
+        q_network = QNetwork(in_dim=q_in_dim, action_dim=q_action_dim, hidden_dims=[64, 32]).to(device)
+        q_optimizer = optim.Adam(q_network.parameters(), lr=q_lr)
+
+        q_history = warmup_q_network(
+            runs=runs,
+            policy=policy,
+            q_network=q_network,
+            q_optimizer=q_optimizer,
+            epochs=q_epochs,
+            device=device,
+            graph_cache=graph_cache,
+            epoch_groups=epoch_groups,
+        )
+
+        q_path = output_dir / "pretrained_q.pt"
+        torch.save({
+            'q_state': q_network.state_dict(),
+            'q_in_dim': q_in_dim,
+            'q_hidden_dims': [64, 32],
+            'q_action_dim': q_action_dim,
+            'q_history': q_history,
+        }, q_path)
+        print(f"Q-network checkpoint saved to {q_path}")
 
     # Restore original warning handler
     warnings.showwarning = _orig_showwarning
@@ -2089,8 +2421,8 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default="examples/workflow_sample.yaml",
-        help="Config file (same format as workflow_sample.yaml)",
+        default="examples/workflow_pretrain.yaml",
+        help="Config file (same format as workflow_pretrain.yaml)",
     )
     parser.add_argument(
         "--epochs",
@@ -2153,18 +2485,18 @@ def main():
         type=float,
         default=None,
         metavar="F",
-        help="If set, keep all positive-reward runs and randomly sample this fraction of each "
-             "negative-reward bucket: (-inf,-50], (-50,-40], (-40,-30], (-30,-20], (-20,-10], (-10,0). "
-             "E.g. 0.25 samples 25%% of each bucket. "
+        help="If set, keep all positive-reward runs and sample negative-reward buckets with a "
+             "quadratic ramp: worst bucket (-inf,-50] keeps 0%%, best bucket (-10,0) keeps this fraction. "
+             "E.g. 0.55 ramps from 0%% to 55%% (quadratic schedule). "
              "When specified, --min-reward-threshold is ignored. Default: disabled.",
     )
     parser.add_argument(
         "--deepset-encoder",
         type=str,
         default=None,
-        help="Path to a pretrained DeepSet encoder checkpoint (best_encoder.pt). "
-             "When provided, node features are replaced by 64-dim DeepSet embeddings "
-             "computed from 3D atomic structure + AEVs (the full DeepSet → max-pool → RGCN pipeline).",
+        help="Path to a pretrained AtomBondGNN encoder checkpoint (best_encoder.pt). "
+             "When provided, node features are replaced by 64-dim embeddings "
+             "computed from 3D atomic structure + AEVs via GINConv + GlobalAttentionPool.",
     )
     parser.add_argument(
         "--patience",
@@ -2174,35 +2506,53 @@ def main():
              "not improve for this many consecutive epochs.",
     )
     parser.add_argument(
-        "--ddg-no-transition-weight",
-        type=float,
-        default=None,
-        metavar="W",
-        help="Weight (0–1) applied to edges whose substituent pair had no observed "
-             "lambda-space transitions (NaN or Inf DDG). Default: read from config "
-             "reward.ddg_no_transition_weight, falling back to 0.2.",
+        "--reward-weighted",
+        action="store_true",
+        default=False,
+        help="Weight each run's MSE loss by its reward (clamped >= 0, normalised so the mean "
+             "weight = 1.0). High-reward runs contribute proportionally more gradient signal; "
+             "zero/negative-reward runs are skipped. Useful when the training set contains "
+             "many low-quality runs that compress the predicted coefficient range.",
     )
-
+    parser.add_argument(
+        "--freeze-encoder-after",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Freeze the RGCN encoder after N BC epochs and fine-tune only the EdgeValueMLP "
+             "for the remaining epochs. If not set, encoder and MLP are trained jointly for "
+             "all epochs.",
+    )
+    parser.add_argument(
+        "--q-epochs",
+        type=int,
+        default=0,
+        help="Number of Q-network warmup epochs after behavior cloning (default: 0 = disabled). "
+             "Trains QNetwork on historical pair rewards with the policy frozen.",
+    )
+    parser.add_argument(
+        "--q-lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for Q-network warmup (default: 1e-3).",
+    )
     args = parser.parse_args()
     
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
-    # ddg_no_transition_weight: CLI flag takes precedence, then config, then hardcoded default
-    reward_cfg = config.get('reward', {})
-    ddg_no_transition_weight = (
-        args.ddg_no_transition_weight
-        if args.ddg_no_transition_weight is not None
-        else reward_cfg.get('ddg_no_transition_weight', 0.2)
-    )
-
     # Load pretrained DeepSet encoder if specified
     deepset_model = None
     if args.deepset_encoder:
-        from mllf.cb.deepset_autoencoder import load_pretrained_deepset
-        print(f"\nLoading pretrained DeepSet encoder from {args.deepset_encoder}...")
-        deepset_model = load_pretrained_deepset(args.deepset_encoder, freeze_weights=True)
+        from mllf.cb.deepset_autoencoder import load_pretrained_deepset, load_pretrained_atombondgnn
+        _ckpt_peek = torch.load(args.deepset_encoder, weights_only=False, map_location='cpu')
+        if _ckpt_peek.get('model_class') == 'AtomBondGNN':
+            print(f"\nLoading pretrained AtomBondGNN encoder from {args.deepset_encoder}...")
+            deepset_model = load_pretrained_atombondgnn(args.deepset_encoder, freeze_weights=True)
+        else:
+            print(f"\nLoading pretrained DeepSet encoder from {args.deepset_encoder}...")
+            deepset_model = load_pretrained_deepset(args.deepset_encoder, freeze_weights=True)
     
     # Combine runs from all pretraining directories
     all_runs = []
@@ -2232,7 +2582,10 @@ def main():
         stratified_negative_fraction=args.stratified_negative_fraction,
         deepset_model=deepset_model,
         patience=args.patience,
-        ddg_no_transition_weight=ddg_no_transition_weight,
+        reward_weighted=args.reward_weighted,
+        freeze_encoder_after=args.freeze_encoder_after,
+        q_epochs=args.q_epochs,
+        q_lr=args.q_lr,
     )
 
 

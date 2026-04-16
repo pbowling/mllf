@@ -18,6 +18,7 @@ from mllf.cb.aev_processor import (
     get_atom_features_with_context,
     detect_minimized_pdb,
     extract_environment_atoms_from_minimized,
+    get_bond_edge_index_from_pdb,
 )
 from mllf.file_handling.read_rtf import parse_rtf_file
 
@@ -109,8 +110,9 @@ def load_system_metadata(system_dir: Path) -> Dict:
             - 'num_sites': Number of sites
             - 'num_substituents': Number of substituents per site
     """
-    # Find first run directory with valid metadata
-    run_dirs = sorted(system_dir.glob('run*'))
+    # Find first run directory with valid metadata.
+    # Accept both 'run*' (most systems) and 'n_run*' (combo directories).
+    run_dirs = sorted(list(system_dir.glob('run*')) + list(system_dir.glob('n_run*')))
     if not run_dirs:
         raise ValueError(f"No run directories found in {system_dir}")
     
@@ -183,6 +185,47 @@ def load_system_metadata(system_dir: Path) -> Dict:
             continue
     
     raise ValueError(f"Could not load valid metadata from {system_dir}")
+
+
+def _collect_leaf_system_dirs(top_dirs: List[Path]) -> List[Tuple[Path, str]]:
+    """Expand collection directories into (system_dir, unique_output_name) pairs.
+
+    A *collection* directory is one that contains no ``run*`` / ``n_run*``
+    entries itself but whose children each have a ``prep/`` directory or their
+    own ``run*`` / ``n_run*`` entries.  Examples: ``14benz_combos``,
+    ``14benz_triplet_combos``, ``14benz_quad_combos_v2``.
+
+    Leaf systems are returned as-is.  Collection directories are expanded so
+    each child becomes a (path, unique_name) entry where ``unique_name`` is
+    ``<parent>__<child>`` to avoid output-file collisions.
+
+    Args:
+        top_dirs: Top-level candidate directories (after skip-list filtering).
+
+    Returns:
+        List of (system_dir, unique_name) tuples ready for dataset generation.
+    """
+    result: List[Tuple[Path, str]] = []
+    for d in top_dirs:
+        run_entries = list(d.glob('run*')) + list(d.glob('n_run*'))
+        if run_entries:
+            # Leaf system — has its own run directories.
+            result.append((d, d.name))
+        else:
+            children = sorted(c for c in d.iterdir() if c.is_dir())
+            is_collection = any(
+                (c / 'prep').exists()
+                or list(c.glob('run*'))
+                or list(c.glob('n_run*'))
+                for c in children
+            )
+            if is_collection:
+                for child in children:
+                    result.append((child, f"{d.name}__{child.name}"))
+            else:
+                # Not a recognisable collection; pass through so it fails clearly.
+                result.append((d, d.name))
+    return result
 
 
 def generate_training_data_for_system(
@@ -532,27 +575,31 @@ def generate_all_pretraining_datasets(
     """
     if skip_systems is None:
         skip_systems = ['14benz_pair_combos', '1_analysis_scripts']
-    
-    # Find all system directories
-    system_dirs = [d for d in pretraining_root.iterdir() 
-                   if d.is_dir() and d.name not in skip_systems]
-    
-    print(f"Found {len(system_dirs)} pretraining systems to process")
-    
+
+    # Find all top-level system directories, then expand any collection dirs.
+    top_dirs = sorted(
+        d for d in pretraining_root.iterdir()
+        if d.is_dir() and d.name not in skip_systems
+    )
+    leaf_systems = _collect_leaf_system_dirs(top_dirs)
+
+    print(f"Found {len(leaf_systems)} pretraining systems to process "
+          f"(from {len(top_dirs)} top-level directories)")
+
     all_stats = []
     errors = []
-    
-    for system_dir in sorted(system_dirs):
-        output_path = output_root / f"{system_dir.name}_training_data.pt"
+
+    for system_dir, unique_name in leaf_systems:
+        output_path = output_root / f"{unique_name}_training_data.pt"
 
         if output_path.exists():
-            print(f"  Skipping {system_dir.name} (dataset already exists)")
+            print(f"  Skipping {unique_name} (dataset already exists)")
             # Load minimal stats from existing file for the summary
             try:
                 import torch as _torch
                 existing = _torch.load(output_path, weights_only=False)
                 all_stats.append({
-                    'system_name': system_dir.name,
+                    'system_name': unique_name,
                     'total_atoms': existing['features'].shape[0] if 'features' in existing else 0,
                     'num_substituents': existing.get('num_substituents', 0),
                 })
@@ -568,14 +615,14 @@ def generate_all_pretraining_datasets(
             )
             all_stats.append(stats)
         except Exception as e:
-            error_msg = f"Failed to process {system_dir.name}: {e}"
+            error_msg = f"Failed to process {unique_name}: {e}"
             warnings.warn(error_msg)
             errors.append(error_msg)
             continue
     
     # Print summary
     print(f"\n{'='*70}")
-    print(f"SUMMARY: Successfully processed {len(all_stats)}/{len(system_dirs)} systems")
+    print(f"SUMMARY: Successfully processed {len(all_stats)}/{len(leaf_systems)} systems")
     if errors:
         print(f"\nErrors encountered ({len(errors)}):")
         for error in errors:
@@ -583,4 +630,331 @@ def generate_all_pretraining_datasets(
     
     print(f"\nTotal atoms across all systems: {sum(s['total_atoms'] for s in all_stats):,}")
     
+    return all_stats
+
+
+# ---------------------------------------------------------------------------
+# Bond-topology-aware dataset generation (for AtomBondGNN pretraining)
+# ---------------------------------------------------------------------------
+
+def generate_bond_training_data_for_system(
+    system_dir: Path,
+    output_path: Path,
+    aev_cutoff: float = 5.1,
+    verbose: bool = False,
+) -> Dict:
+    """Generate per-substituent bond-topology training data for AtomBondGNN pretraining.
+
+    Each substituent is stored as a dict containing its AEV tensor, partial
+    charges, integer atom-type IDs, and a bidirectional bond edge index.  The
+    on-disk format is a list of such dicts (keyed ``'substituents'``) rather
+    than one flat tensor, because substituents have variable atom counts and
+    individual bond graphs.
+
+    Args:
+        system_dir: Path to pretraining system directory.
+        output_path: Where to save the dataset (.pt file).
+        aev_cutoff: AEV spatial cutoff distance in Angstroms (default: 5.1 Å).
+        verbose: Print per-substituent context information for the first sub.
+
+    Returns:
+        Statistics dict with keys: system_name, num_substituents, total_atoms,
+        aev_length, output_path.
+    """
+    system_name = system_dir.name
+    print(f"\nProcessing (bond) {system_name}...")
+
+    metadata = load_system_metadata(system_dir)
+    prep_dir = metadata['prep_dir']
+    solvent_state = metadata['solvent_state']
+    print(f"  Prep directory: {prep_dir}")
+    print(f"  Solvent state: {solvent_state}")
+
+    core_pdb = detect_core_pdb(prep_dir)
+    minimized_pdb = detect_minimized_pdb(prep_dir)
+    if minimized_pdb:
+        print(f"  Minimized PDB: {minimized_pdb.name}")
+
+    protein_pdb = None
+    if solvent_state == 'protein' and not minimized_pdb:
+        protein_pdb = detect_protein_pdb(prep_dir)
+
+    # Collect substituent PDB files
+    active_subs_ordered = metadata.get('active_subs_ordered')
+    if active_subs_ordered:
+        sub_pdbs = []
+        for site_label in sorted(active_subs_ordered.keys(),
+                                  key=lambda s: int(s.replace('site', ''))):
+            for master_sub in active_subs_ordered[site_label]:
+                frag = prep_dir / f"{master_sub}_frag.pdb"
+                if frag.exists():
+                    sub_pdbs.append(frag)
+                else:
+                    warnings.warn(f"[{system_name}] Active sub frag PDB not found: {frag.name}")
+    else:
+        sub_pdbs = sorted(prep_dir.glob('site*_sub*_frag.pdb'))
+
+    if not sub_pdbs:
+        raise ValueError(f"No substituent PDB files found in {prep_dir}")
+
+    print(f"  Found {len(sub_pdbs)} substituent PDB files")
+
+    all_substituents: List[Dict] = []
+    total_atoms = 0
+    first_sub_processed = False
+
+    for pdb_path in sub_pdbs:
+        try:
+            # Parse RTF for charges + bond fallback
+            rtf_path = pdb_path.parent / pdb_path.name.replace('_frag.pdb', '_pres.rtf')
+            rtf_data = None
+            if rtf_path.exists():
+                try:
+                    rtf_data = parse_rtf_file(str(rtf_path))
+                except Exception as e:
+                    warnings.warn(f"[{system_name}] Could not parse RTF {rtf_path.name}: {e}")
+
+            # ── Context-aware AEV computation (identical branch logic to
+            #    generate_training_data_for_system, but with include_atom_ids=True) ──
+
+            if solvent_state in ('protein', 'prot') and core_pdb and (minimized_pdb or protein_pdb):
+                protein_context = None
+                if minimized_pdb:
+                    try:
+                        protein_context = extract_environment_atoms_from_minimized(
+                            minimized_pdb=minimized_pdb,
+                            sub_pdb=pdb_path,
+                            core_pdb=core_pdb,
+                            aev_cutoff=aev_cutoff,
+                            prep_dir=prep_dir,
+                        )
+                    except Exception as e:
+                        warnings.warn(
+                            f"[{system_name}] Could not extract protein context for "
+                            f"{pdb_path.name}: {e}"
+                        )
+                effective_protein_pdb = protein_context if protein_context is not None else (
+                    str(protein_pdb) if protein_pdb else None
+                )
+                features_dict = get_atom_features_with_context(
+                    substituent_pdb=str(pdb_path),
+                    core_pdb=str(core_pdb),
+                    protein_pdb=effective_protein_pdb,
+                    rtf_entry=rtf_data,
+                    include_charges=True,
+                    include_atom_ids=True,
+                    prep_dir=str(prep_dir),
+                    aev_cutoff=aev_cutoff,
+                )
+
+            elif solvent_state in ('solvent', 'water', 'solv') and core_pdb:
+                solvent_context = None
+                if minimized_pdb:
+                    try:
+                        solvent_context = extract_environment_atoms_from_minimized(
+                            minimized_pdb=minimized_pdb,
+                            sub_pdb=pdb_path,
+                            core_pdb=core_pdb,
+                            aev_cutoff=aev_cutoff,
+                            prep_dir=prep_dir,
+                        )
+                    except Exception as e:
+                        warnings.warn(
+                            f"[{system_name}] Could not extract solvent context for "
+                            f"{pdb_path.name}: {e}"
+                        )
+                features_dict = get_atom_features_with_context(
+                    substituent_pdb=str(pdb_path),
+                    core_pdb=str(core_pdb),
+                    solvent_context=solvent_context,
+                    rtf_entry=rtf_data,
+                    include_charges=True,
+                    include_atom_ids=True,
+                    prep_dir=str(prep_dir),
+                    aev_cutoff=aev_cutoff,
+                )
+
+            elif core_pdb:
+                features_dict = get_atom_features_with_context(
+                    substituent_pdb=str(pdb_path),
+                    core_pdb=str(core_pdb),
+                    rtf_entry=rtf_data,
+                    include_charges=True,
+                    include_atom_ids=True,
+                    prep_dir=str(prep_dir),
+                    aev_cutoff=aev_cutoff,
+                )
+
+            else:
+                # Substituent-only fallback
+                aevs_only = get_substituent_aevs(str(pdb_path))
+                charges_only = (
+                    extract_charges_from_rtf_metadata(rtf_data)
+                    if rtf_data else None
+                )
+                features_dict = {
+                    'aevs': aevs_only,
+                    'charges': charges_only,
+                    'atom_ids': None,
+                }
+
+            if verbose and not first_sub_processed:
+                ctx = features_dict.get('context_info', {})
+                print(f"\n  [VERBOSE] Bond dataset AEV context for {pdb_path.name}:")
+                print(f"    Context sources: {', '.join(ctx.get('context_sources', []))}")
+                print(f"    Total context atoms: {ctx.get('total_context_atoms', 0)}")
+                first_sub_processed = True
+
+            aevs = features_dict['aevs']           # [N, 2288]
+            charges = features_dict.get('charges')  # [N] or None
+            atom_ids = features_dict.get('atom_ids')  # [N] int or None
+
+            num_atoms = aevs.shape[0]
+
+            if charges is None:
+                warnings.warn(
+                    f"[{system_name}] No charges for {pdb_path.name}, using zeros"
+                )
+                charges = torch.zeros(num_atoms, dtype=torch.float32)
+            if len(charges) != num_atoms:
+                warnings.warn(
+                    f"[{system_name}] Charge count mismatch for {pdb_path.name}: "
+                    f"{len(charges)} vs {num_atoms} atoms. Using zeros."
+                )
+                charges = torch.zeros(num_atoms, dtype=torch.float32)
+
+            if atom_ids is None:
+                warnings.warn(
+                    f"[{system_name}] No atom_ids for {pdb_path.name}, using zeros"
+                )
+                atom_ids = torch.zeros(num_atoms, dtype=torch.long)
+
+            # Bond topology (RDKit primary; RTF BOND section fallback)
+            rtf_bonds = rtf_data.get('bonds', []) if rtf_data else []
+            bond_edge_index, bond_edge_attr = get_bond_edge_index_from_pdb(
+                str(pdb_path), rtf_bonds=rtf_bonds
+            )
+
+            all_substituents.append({
+                'aev': aevs,                         # [N, 2288]
+                'charges': charges,                  # [N]
+                'atom_ids': atom_ids,                # [N] int64
+                'bond_edge_index': bond_edge_index,  # [2, 2E]
+                'bond_edge_attr': bond_edge_attr,    # [2E, 1]
+                'pdb_name': pdb_path.name,
+            })
+            total_atoms += num_atoms
+
+        except Exception as e:
+            warnings.warn(f"[{system_name}] Error processing {pdb_path.name}: {e}")
+            continue
+
+    if not all_substituents:
+        raise ValueError(f"No valid substituents generated for {system_dir.name}")
+
+    aev_length = all_substituents[0]['aev'].shape[1]
+    print(f"  Generated {len(all_substituents)} substituents, {total_atoms} total atoms")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'dataset_type': 'bond_topology',
+        'substituents': all_substituents,
+        'system_name': metadata['system_name'],
+        'solvent_state': metadata['solvent_state'],
+        'num_substituents': len(all_substituents),
+        'total_atoms': total_atoms,
+        'aev_length': aev_length,
+    }, output_path)
+
+    print(f"  Saved to {output_path}")
+    return {
+        'system_name': metadata['system_name'],
+        'num_substituents': len(all_substituents),
+        'total_atoms': total_atoms,
+        'aev_length': aev_length,
+        'output_path': str(output_path),
+    }
+
+
+def generate_all_bond_pretraining_datasets(
+    pretraining_root: Path,
+    output_root: Path,
+    skip_systems: Optional[List[str]] = None,
+    aev_cutoff: float = 5.1,
+    verbose: bool = False,
+) -> List[Dict]:
+    """Generate bond-topology training datasets for all pretraining systems.
+
+    Mirrors :func:`generate_all_pretraining_datasets` but calls
+    :func:`generate_bond_training_data_for_system` so that each saved file
+    contains per-substituent bond graphs required by :class:`AtomBondGNN`.
+
+    Args:
+        pretraining_root: Root directory containing all pretraining systems.
+        output_root: Root directory for output files (datasets stored here).
+        skip_systems: System directory names to skip.
+        aev_cutoff: AEV spatial cutoff in Angstroms (default: 5.1 Å).
+        verbose: Print verbose AEV context info for first substituent per system.
+
+    Returns:
+        List of statistics dicts for each processed system.
+    """
+    if skip_systems is None:
+        skip_systems = ['1_analysis_scripts']
+
+    # Find all top-level system directories, then expand any collection dirs.
+    top_dirs = sorted(
+        d for d in pretraining_root.iterdir()
+        if d.is_dir() and d.name not in skip_systems
+    )
+    leaf_systems = _collect_leaf_system_dirs(top_dirs)
+
+    print(f"Found {len(leaf_systems)} pretraining systems to process "
+          f"(from {len(top_dirs)} top-level directories, bond topology mode)")
+
+    all_stats: List[Dict] = []
+    errors: List[str] = []
+
+    for system_dir, unique_name in leaf_systems:
+        output_path = output_root / f"{unique_name}_training_data.pt"
+
+        if output_path.exists():
+            print(f"  Skipping {unique_name} (dataset already exists)")
+            try:
+                import torch as _torch
+                existing = _torch.load(output_path, weights_only=False)
+                all_stats.append({
+                    'system_name': unique_name,
+                    'num_substituents': existing.get('num_substituents', 0),
+                    'total_atoms': existing.get('total_atoms', 0),
+                })
+            except Exception:
+                pass
+            continue
+
+        try:
+            stats = generate_bond_training_data_for_system(
+                system_dir, output_path,
+                aev_cutoff=aev_cutoff,
+                verbose=verbose,
+            )
+            all_stats.append(stats)
+        except Exception as e:
+            error_msg = f"Failed to process {unique_name}: {e}"
+            warnings.warn(error_msg)
+            errors.append(error_msg)
+            continue
+
+    print(f"\n{'='*70}")
+    print(f"SUMMARY: Successfully processed {len(all_stats)}/{len(leaf_systems)} systems")
+    if errors:
+        print(f"\nErrors encountered ({len(errors)}):")
+        for err in errors:
+            print(f"  - {err}")
+
+    total_subs = sum(s.get('num_substituents', 0) for s in all_stats)
+    total_atoms = sum(s.get('total_atoms', 0) for s in all_stats)
+    print(f"\nTotal substituents: {total_subs:,}")
+    print(f"Total atoms across all systems: {total_atoms:,}")
+
     return all_stats

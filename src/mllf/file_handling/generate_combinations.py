@@ -72,7 +72,7 @@ import warnings
 from pathlib import Path
 from shutil import copy2
 from shutil import make_archive
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 SITE_SUB_RE = re.compile(r"site(\d+)_sub(\d+)_([A-Za-z0-9_-]+)\.([A-Za-z0-9]+)$", re.IGNORECASE)
@@ -238,7 +238,8 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]], max_
     return combos
 
 
-def make_combo_dir_name(counter: int, sites: List[int], subs: List[int]) -> str:
+def make_combo_dir_name(counter: int, sites: List[int], subs: List[int],
+                        subs_per_site_counts: Optional[Tuple[int, ...]] = None) -> str:
     """Generate a directory name for a combination.
 
     Args:
@@ -246,6 +247,8 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int]) -> str:
         sites: List of site IDs in this combination.
         subs: List of substituent IDs in this combination.
           For cross-site combos, subs are ordered by site.
+        subs_per_site_counts: Tuple of sub counts per site for cross-site combos.
+          E.g. (6, 4) means first 6 subs belong to sites[0], next 4 to sites[1].
 
     Returns:
         Directory name like:
@@ -260,19 +263,16 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int]) -> str:
         for sub in subs:
             parts.append(f"site{s}_{sub}")
     else:
-        # Cross-site combination: distribute subs across sites
-        # Need to figure out which subs belong to which site
-        # For now, assume subs are evenly distributed or use simple split
-        # This is a heuristic - the actual mapping is stored in mapping.json
-        
-        # Simple strategy: divide subs among sites as evenly as possible
-        subs_per_site = len(subs) // len(sites)
-        remainder = len(subs) % len(sites)
-        
+        # Cross-site combination: distribute subs across sites using actual counts
         idx = 0
         for i, site in enumerate(sites):
-            # Give extra sub to first 'remainder' sites
-            count = subs_per_site + (1 if i < remainder else 0)
+            if subs_per_site_counts is not None:
+                count = subs_per_site_counts[i]
+            else:
+                # Fallback: even split (legacy behavior)
+                subs_per_site = len(subs) // len(sites)
+                remainder = len(subs) % len(sites)
+                count = subs_per_site + (1 if i < remainder else 0)
             for _ in range(count):
                 if idx < len(subs):
                     parts.append(f"site{site}_{subs[idx]}")
@@ -348,7 +348,7 @@ def list_possible_combinations(input_dir: Path, out_dir: Path, max_subs_per_site
             sites, subs = combo_data[0], combo_data[1]
             subs_per_site_counts = None
         
-        name = make_combo_dir_name(cnt, sites, subs)
+        name = make_combo_dir_name(cnt, sites, subs, subs_per_site_counts)
         combo_path = out_dir / name
         
         combo_list.append({
@@ -746,7 +746,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
             sites, subs = combo_data[0], combo_data[1]
             subs_per_site_counts = None
             
-        name = make_combo_dir_name(cnt, sites, subs)
+        name = make_combo_dir_name(cnt, sites, subs, subs_per_site_counts)
         combo_path = out_dir / name
         cnt += 1
         mapping = []

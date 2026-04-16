@@ -224,3 +224,64 @@ def build_edge_weights(
         weights.append(no_transition_weight if no_crossing else 1.0)
 
     return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
+def compute_pair_reward(
+    edge_index: torch.Tensor,
+    ddg_pairs: dict,
+    populations: list,
+    block_offset: int = 2,
+) -> torch.Tensor:
+    """Compute per-edge reward tensor for per-pair credit assignment.
+
+    Reward is assigned at the *pair* level and is therefore identical for all
+    directed edges that share the same (src, dst) node pair.  In the MSLD
+    graph a substituent pair can contribute up to 8 edges — 4 bias-coefficient
+    types (linear, quadratic, skew, end) × 2 directions (i→j and j→i) because
+    the potential energy surface is not symmetric.
+
+    Per-pair reward:
+      - ``-1.0``   if DDG is None / NaN / Inf (no lambda-space crossings observed)
+      - ``+1.0 + minority_fraction``  if DDG is a finite float (transitions observed)
+        where ``minority_fraction = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)``
+        ranges in [0.0, 0.5]: rewards combinations where sampling is balanced.
+
+    Args:
+        edge_index: [2, E] node-index tensor.
+        ddg_pairs: dict from simulation_results 'ddg_pairs':
+                   keys ``"blk_lo_blk_hi"`` → float | None.
+        populations: list of raw highest-lambda population counts per block
+                     (produced by ``_extract_highest_lambda_counts``).  Each
+                     entry is the single count at the largest lambda observed
+                     for that block — the counts at different lambdas are NOT
+                     combined or normalised.
+                     Block ID = node_idx + block_offset (default 2, matching
+                     MSLD convention where block 1 is the reference ligand).
+        block_offset: integer offset from node index to block ID (default 2).
+
+    Returns:
+        Float tensor of shape [E] with per-edge reward values.
+    """
+    num_edges = edge_index.size(1)
+    rewards = torch.zeros(num_edges, dtype=torch.float32)
+
+    for k in range(num_edges):
+        src = int(edge_index[0, k].item())
+        dst = int(edge_index[1, k].item())
+        lo = min(src + block_offset, dst + block_offset)
+        hi = max(src + block_offset, dst + block_offset)
+        entry = ddg_pairs.get(f"{lo}_{hi}")
+
+        no_crossing = (
+            entry is None
+            or (isinstance(entry, float) and (math.isinf(entry) or math.isnan(entry)))
+        )
+        if no_crossing:
+            rewards[k] = -1.0
+        else:
+            pop_i = populations[src] if src < len(populations) else 0
+            pop_j = populations[dst] if dst < len(populations) else 0
+            minority_frac = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)
+            rewards[k] = 1.0 + minority_frac
+
+    return rewards

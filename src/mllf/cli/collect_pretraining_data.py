@@ -529,6 +529,37 @@ def parse_active_subs_from_inp(
     return _sequential(nsubs_per_site)
 
 
+def _parse_nsubs_from_mapping(mapping_path: Path) -> Optional[List[int]]:
+    """Derive nsubs_per_site from a generated-combo mapping.json file.
+
+    mapping.json records how master subs were renumbered for the combo's prep.
+    The maximum new_sub per new_site gives the number of active subs for that
+    site (assuming sequential 1-based renumbering).
+
+    Args:
+        mapping_path: Path to the combo-level mapping.json.
+
+    Returns:
+        nsubs_per_site list, or None if the file cannot be parsed.
+    """
+    try:
+        with open(mapping_path) as fh:
+            entries = json.load(fh)
+        subs_per_site: Dict[int, int] = {}
+        for entry in entries:
+            site = entry.get('new_site')
+            sub  = entry.get('new_sub')
+            if site is None or sub is None:
+                continue
+            if site not in subs_per_site or sub > subs_per_site[site]:
+                subs_per_site[site] = sub
+        if not subs_per_site:
+            return None
+        return [subs_per_site[s] for s in sorted(subs_per_site)]
+    except Exception:
+        return None
+
+
 def detect_solvent_state(run_dir: Path) -> str:
     """Detect solvent state from directory path.
     
@@ -621,6 +652,15 @@ def collect_run_data(
     # For master preps that list ALL subs, parse_active_subs_from_inp falls back
     # to sequential numbering (site1_sub1, site1_sub2, …).
     # nsubs_per_site_override takes priority (e.g. combo runs where prep/ is full-system).
+    #
+    # Auto-detect from mapping.json for generated-combo runs: alf_info.py in the
+    # combo prep stores the FULL system nsubs, but mapping.json records the actual
+    # active subs for this specific combo.
+    if nsubs_per_site_override is None:
+        mapping_path = run_dir.parent / 'mapping.json'
+        if mapping_path.exists():
+            nsubs_per_site_override = _parse_nsubs_from_mapping(mapping_path)
+
     if nsubs_per_site_override is not None:
         nsubs_per_site = nsubs_per_site_override
         bias_data['_nsubs_per_site'] = nsubs_per_site_override
@@ -640,6 +680,7 @@ def collect_run_data(
             graph_info['sites'][seq_key] = entry
 
     graph_info['active_subs_ordered'] = active_subs_ordered
+    graph_info['nsubs_per_site'] = nsubs_per_site
 
     return bias_data, output_results, graph_info
 
@@ -650,7 +691,8 @@ def create_pretraining_entry(
     combo_name: Optional[str] = None,
     solvent_state: Optional[str] = None,
     nsubs_per_site_override: Optional[List[int]] = None,
-) -> Path:
+    min_transitions: int = 0,
+) -> Optional[Path]:
     """Create a pretraining directory entry from a run directory.
     
     Args:
@@ -658,9 +700,10 @@ def create_pretraining_entry(
         output_dir: Output directory for pretraining data
         combo_name: Optional name for the combination (default: run directory name)
         solvent_state: Optional solvent state override (if None, auto-detect)
+        min_transitions: Skip runs with fewer total transitions than this threshold.
         
     Returns:
-        Path to created pretraining entry directory
+        Path to created pretraining entry directory, or None if skipped.
     """
     if combo_name is None:
         combo_name = run_dir.name
@@ -672,7 +715,23 @@ def create_pretraining_entry(
     
     # Extract topology metadata before writing YAML (not stored in variables.py)
     nsubs_per_site = bias_data.pop('_nsubs_per_site', None)
-    
+
+    # Calculate total transitions (sum across sites, using only HIGHEST lambda value per site)
+    total_trans = 0
+    for trans_dict in output_results['transitions'].values():
+        if isinstance(trans_dict, dict):
+            # Use only the highest lambda value for this site
+            if trans_dict:
+                max_lambda = max(trans_dict.keys(), key=lambda x: float(x))
+                total_trans += trans_dict[max_lambda]
+        else:
+            total_trans += trans_dict
+
+    # Apply minimum-transitions filter before touching the filesystem
+    if total_trans < min_transitions:
+        print(f"  Skipping {combo_name}: {total_trans} transitions < {min_transitions}")
+        return None
+
     # Create output directory
     entry_dir = output_dir / combo_name
     entry_dir.mkdir(parents=True, exist_ok=True)
@@ -698,18 +757,6 @@ bias = yaml.safe_load(bias_string)
     # Write output results to JSON
     with open(entry_dir / 'simulation_results.json', 'w') as f:
         json.dump(output_results, f, indent=2)
-    
-    # Write metadata
-    # Calculate total transitions (sum across sites, using only HIGHEST lambda value per site)
-    total_trans = 0
-    for trans_dict in output_results['transitions'].values():
-        if isinstance(trans_dict, dict):
-            # Use only the highest lambda value for this site
-            if trans_dict:
-                max_lambda = max(trans_dict.keys(), key=lambda x: float(x))
-                total_trans += trans_dict[max_lambda]
-        else:
-            total_trans += trans_dict
     
     # Count populated blocks (blocks with non-zero counts at HIGHEST lambda value)
     num_populated = 0
@@ -811,6 +858,14 @@ Examples:
     )
     
     parser.add_argument(
+        '--min-transitions',
+        type=int,
+        default=0,
+        metavar='N',
+        help='Skip runs with fewer than N total transitions (default: 0 = keep all)'
+    )
+
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Show what would be done without actually processing files'
@@ -865,6 +920,7 @@ Examples:
     
     # Process each run directory
     success_count = 0
+    skipped_count = 0
     error_count = 0
     
     for i, run_dir in enumerate(run_dirs, start=1):
@@ -887,28 +943,47 @@ Examples:
             print(f"  Would create: {args.output_dir / combo_name}")
             try:
                 bias_data, output_results, graph_info = collect_run_data(run_dir, args.solvent_state)
-                print(f"  Bias keys: {list(bias_data.keys())}")
-                print(f"  Populations: {len(output_results['populations'])} sites")
-                if output_results['transitions']:
-                    print(f"  Transition pairs: {len(output_results['transitions'])}")
-                print(f"  Terminated normally: {output_results['terminated_normally']}")
-                print(f"  Solvent state: {graph_info['solvent_state']}")
-                print(f"  Sites found: {len(graph_info['sites'])}")
+                # Compute dry-run transition count
+                dry_trans = 0
+                for trans_dict in output_results['transitions'].values():
+                    if isinstance(trans_dict, dict):
+                        if trans_dict:
+                            max_lam = max(trans_dict.keys(), key=lambda x: float(x))
+                            dry_trans += trans_dict[max_lam]
+                    else:
+                        dry_trans += trans_dict
+                if dry_trans < args.min_transitions:
+                    print(f"  Would skip: {dry_trans} transitions < {args.min_transitions}")
+                else:
+                    print(f"  Bias keys: {list(bias_data.keys())}")
+                    print(f"  Populations: {len(output_results['populations'])} sites")
+                    if output_results['transitions']:
+                        print(f"  Transition pairs: {len(output_results['transitions'])}")
+                    print(f"  Total transitions (highest λ): {dry_trans}")
+                    print(f"  Terminated normally: {output_results['terminated_normally']}")
+                    print(f"  Solvent state: {graph_info['solvent_state']}")
+                    print(f"  Sites found: {len(graph_info['sites'])}")
                 success_count += 1
             except Exception as e:
                 print(f"  Error: {e}")
                 error_count += 1
         else:
             try:
-                entry_dir = create_pretraining_entry(run_dir, args.output_dir, combo_name, args.solvent_state)
-                print(f"  ✓ Created: {entry_dir}")
-                success_count += 1
+                entry_dir = create_pretraining_entry(
+                    run_dir, args.output_dir, combo_name, args.solvent_state,
+                    min_transitions=args.min_transitions,
+                )
+                if entry_dir is None:
+                    skipped_count += 1
+                else:
+                    print(f"  ✓ Created: {entry_dir}")
+                    success_count += 1
             except Exception as e:
                 print(f"  ✗ Error: {e}")
                 error_count += 1
     
     print(f"\n{'='*60}")
-    print(f"Summary: {success_count} successful, {error_count} errors")
+    print(f"Summary: {success_count} successful, {skipped_count} skipped (< {args.min_transitions} transitions), {error_count} errors")
     
     if not args.dry_run and success_count > 0:
         print(f"Pretraining data written to: {args.output_dir.resolve()}")

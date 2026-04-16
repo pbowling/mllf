@@ -88,3 +88,54 @@ class ValueNetwork(nn.Module):
         with torch.no_grad():
             value = self.forward(node_embeddings, batch)
             return value.item() if value.numel() == 1 else value.cpu().numpy()
+
+
+class QNetwork(nn.Module):
+    """Per-edge Q(s, a) critic for per-pair credit assignment.
+
+    Estimates Q(s, a) from the edge state representation *and* the actions
+    (bias coefficients) sampled by the actor for that edge.  Concatenating
+    the action lets the critic directly grade what the actor did, rather than
+    only evaluating the structural context.
+
+        Q_input = [edge_state (in_dim), action (action_dim)]
+        A_pair  = R_pair - Q(edge_state, action).detach()
+
+    Args:
+        in_dim: Edge state dimension (typically 2*(p2_dim + p1_dim) + edge_feat_dim).
+        action_dim: Number of bias coefficient dimensions output by the actor
+            (default: 4 — linear, quadratic, skew, end).
+        hidden_dims: Hidden layer sizes (default: [64, 32]).
+    """
+
+    def __init__(self, in_dim: int, action_dim: int = 4, hidden_dims: list = None):
+        super().__init__()
+
+        self.action_dim = action_dim
+
+        if hidden_dims is None:
+            hidden_dims = [64, 32]
+
+        layers = []
+        in_d = in_dim + action_dim          # state + action concatenated
+        for h in hidden_dims:
+            layers.extend([nn.Linear(in_d, h), nn.ReLU()])
+            in_d = h
+        layers.append(nn.Linear(in_d, 1))
+
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, edge_inputs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """Predict per-edge Q(s, a) values.
+
+        Args:
+            edge_inputs: [E, in_dim] edge state representations.
+            actions: [E] or [E, action_dim] bias coefficients sampled by the actor.
+
+        Returns:
+            q_values: [E] per-edge Q-value predictions.
+        """
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(-1)          # [E, 1] if single-dim action
+        qa = torch.cat([edge_inputs, actions], dim=-1)   # [E, in_dim + action_dim]
+        return self.mlp(qa).squeeze(-1)

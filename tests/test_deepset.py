@@ -329,5 +329,142 @@ class TestDeepSetWithNumSpecies:
         assert embedding.shape == torch.Size([64])
 
 
+class TestAtomBondGNN:
+    """Tests for AtomBondGNN — bond-topology-aware substituent encoder."""
+
+    def _model(self, embedding_dim=64, hidden_dim=64, **kw):
+        from mllf.cb.deepset import AtomBondGNN
+        return AtomBondGNN(
+            aev_length=64,       # small for fast tests
+            num_atom_types=11,
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            **kw,
+        )
+
+    def test_initialization(self):
+        model = self._model()
+        assert model.embedding_dim == 64
+        assert model.include_charge is True
+        assert model.include_atom_id is True
+        assert hasattr(model, 'gin1') and hasattr(model, 'gin2')
+        assert hasattr(model, 'pool')
+
+    def test_atom_mlp_shim_out_features(self):
+        """atom_mlp[-1].out_features must equal embedding_dim for graph_utils compat."""
+        model = self._model(embedding_dim=32)
+        assert model.atom_mlp[-1].out_features == 32
+
+    def test_output_shape_with_edges(self):
+        """Forward with explicit bond edges returns [embedding_dim]."""
+        model = self._model(embedding_dim=32)
+        N = 6
+        aevs = torch.randn(N, 64)
+        charges = torch.randn(N)
+        atom_ids = torch.randint(0, 11, (N,))
+        # bidirectional bond edges
+        edge_index = torch.tensor([[0, 1, 1, 2, 2, 0], [1, 0, 2, 1, 0, 2]], dtype=torch.long)
+
+        with torch.no_grad():
+            emb = model(aevs, charges, atom_ids, bond_edge_index=edge_index)
+
+        assert emb.shape == torch.Size([32])
+        assert not torch.isnan(emb).any()
+
+    def test_output_shape_no_edges(self):
+        """Forward without bond edges falls back to self-loops, still returns [embedding_dim]."""
+        model = self._model(embedding_dim=32)
+        N = 5
+        aevs = torch.randn(N, 64)
+        charges = torch.randn(N)
+        atom_ids = torch.randint(0, 11, (N,))
+
+        with torch.no_grad():
+            emb = model(aevs, charges, atom_ids, bond_edge_index=None)
+
+        assert emb.shape == torch.Size([32])
+        assert not torch.isnan(emb).any()
+
+    def test_output_shape_single_atom(self):
+        """Single-atom substituent should still produce valid embedding."""
+        model = self._model(embedding_dim=32)
+        aevs = torch.randn(1, 64)
+        charges = torch.randn(1)
+        atom_ids = torch.randint(0, 11, (1,))
+
+        with torch.no_grad():
+            emb = model(aevs, charges, atom_ids)
+
+        assert emb.shape == torch.Size([32])
+
+    def test_missing_charges_raises(self):
+        model = self._model(include_charge=True)
+        aevs = torch.randn(4, 64)
+        atom_ids = torch.randint(0, 11, (4,))
+        with pytest.raises(ValueError, match="charges must be provided"):
+            model(aevs, charges=None, atom_ids=atom_ids)
+
+    def test_missing_atom_ids_raises(self):
+        model = self._model(include_atom_id=True)
+        aevs = torch.randn(4, 64)
+        charges = torch.randn(4)
+        with pytest.raises(ValueError, match="atom_ids must be provided"):
+            model(aevs, charges=charges, atom_ids=None)
+
+    def test_no_charge_no_id(self):
+        """Model with both flags False should accept AEVs only."""
+        from mllf.cb.deepset import AtomBondGNN
+        model = AtomBondGNN(
+            aev_length=64, num_atom_types=11, embedding_dim=32,
+            hidden_dim=64, include_charge=False, include_atom_id=False
+        )
+        aevs = torch.randn(4, 64)
+        with torch.no_grad():
+            emb = model(aevs)
+        assert emb.shape == torch.Size([32])
+
+    def test_gradient_flow(self):
+        """Gradients should flow back through GINConv and input_proj."""
+        model = self._model(embedding_dim=32, hidden_dim=64)
+        N = 4
+        aevs = torch.randn(N, 64, requires_grad=True)
+        charges = torch.randn(N)
+        atom_ids = torch.randint(0, 11, (N,))
+
+        emb = model(aevs, charges, atom_ids)
+        emb.sum().backward()
+
+        assert aevs.grad is not None
+        assert not torch.isnan(aevs.grad).any()
+
+    def test_bond_edge_attr_accepted_but_unused(self):
+        """bond_edge_attr should be accepted without error (GINConv ignores it)."""
+        model = self._model(embedding_dim=32)
+        N = 4
+        aevs = torch.randn(N, 64)
+        charges = torch.randn(N)
+        atom_ids = torch.randint(0, 11, (N,))
+        edge_index = torch.tensor([[0, 1, 1, 0], [1, 0, 2, 2]], dtype=torch.long)
+        edge_attr = torch.ones(4, 1)  # bond-type weights — not consumed
+
+        with torch.no_grad():
+            emb = model(aevs, charges, atom_ids,
+                       bond_edge_index=edge_index, bond_edge_attr=edge_attr)
+        assert emb.shape == torch.Size([32])
+
+    def test_variable_atom_counts(self):
+        """Embedding dimension should be constant regardless of atom count."""
+        model = self._model(embedding_dim=32)
+        model.eval()
+
+        for N in [1, 3, 10, 25]:
+            aevs = torch.randn(N, 64)
+            charges = torch.randn(N)
+            atom_ids = torch.randint(0, 11, (N,))
+            with torch.no_grad():
+                emb = model(aevs, charges, atom_ids)
+            assert emb.shape == torch.Size([32]), f"Failed for N={N}"
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

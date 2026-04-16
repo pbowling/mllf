@@ -159,14 +159,27 @@ def compute_deepset_embedding_for_node(
             include_atom_ids=deepset_model.include_atom_id
         )
     
-    # Pass through DeepSet model (Steps 2-3: MLP + max-pool)
+    # Pass through DeepSet / AtomBondGNN model (Steps 2-3: MLP + pool)
+    from .deepset import AtomBondGNN as _AtomBondGNN
     with torch.no_grad():
-        embedding = deepset_model(
-            aev_tensor=atom_feats['aevs'],
-            charges=atom_feats.get('charges'),
-            atom_ids=atom_feats.get('atom_ids')
-        )
-    
+        if isinstance(deepset_model, _AtomBondGNN):
+            from .aev_processor import get_bond_edge_index_from_pdb
+            rtf_bonds = rtf_entry.get('bonds') if rtf_entry else None
+            bond_ei, bond_ea = get_bond_edge_index_from_pdb(pdb_path, rtf_bonds=rtf_bonds)
+            embedding = deepset_model(
+                aev_tensor=atom_feats['aevs'],
+                charges=atom_feats.get('charges'),
+                atom_ids=atom_feats.get('atom_ids'),
+                bond_edge_index=bond_ei,
+                bond_edge_attr=bond_ea,
+            )
+        else:
+            embedding = deepset_model(
+                aev_tensor=atom_feats['aevs'],
+                charges=atom_feats.get('charges'),
+                atom_ids=atom_feats.get('atom_ids')
+            )
+
     return embedding
 
 
@@ -212,7 +225,12 @@ def compute_deepset_embeddings_for_graph(
         except Exception as e:
             warnings.warn(f"Failed to compute DeepSet embedding for node {node_idx}: {e}")
             # Use zero embedding as fallback
-            embedding_dim = deepset_model.atom_mlp[-1].out_features
+            if hasattr(deepset_model, 'atom_mlp'):
+                embedding_dim = deepset_model.atom_mlp[-1].out_features
+            elif hasattr(deepset_model, 'embedding_dim'):
+                embedding_dim = deepset_model.embedding_dim
+            else:
+                embedding_dim = 64
             embeddings.append(torch.zeros(embedding_dim))
     
     return torch.stack(embeddings, dim=0)

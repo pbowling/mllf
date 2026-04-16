@@ -70,7 +70,7 @@ def parse_pdb_file(pdb_path: str, rtf_data: Optional[dict] = None) -> Tuple[List
     # TIER 1: Try RDKit parser first (handles standard PDB formats best)
     try:
         from rdkit import Chem
-        from rdkit.Chem.rdBase import BlockLogs
+        from rdkit.rdBase import BlockLogs
         with BlockLogs():
             mol = Chem.MolFromPDBFile(pdb_path, removeHs=False, sanitize=False)
         

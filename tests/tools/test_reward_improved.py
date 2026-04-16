@@ -21,34 +21,38 @@ from typing import Dict, List, Tuple
 
 def compute_improved_reward_from_json(
     run_dir: Path,
-    w_P: float = 0.4,
-    w_T: float = 0.4,
-    w_U: float = 0.2,
-    gamma: float = 5.0,
-    P_baseline: float = 1000.0,
-    T_baseline: float = 100.0,
+    w_P: float = 0.5,
+    w_T: float = 0.75,
+    w_U: float = 0.3,
+    gamma: float = 4.0,
+    P_baseline: float = 500.0,
+    T_baseline: float = 50.0,
     min_transitions_per_site: int = 10,
     min_coverage_ratio: float = 0.5,
-    entropy_bonus: float = 5.0,
+    entropy_bonus: float = 8.0,
     concentration_penalty_threshold: float = 0.8,
     verbose: bool = False
 ) -> Tuple[float, Dict]:
     """Compute improved reward from pretraining JSON data.
+
+    Mirrors the production reward logic in train_improved.compute_msld_reward_improved:
+      - coverage_factor = (nonzero_count / total_subs) ** 2 (quadratic multiplier)
+      - R = coverage_factor * (R_P + R_T + R_entropy) + penalties
+      - No balance_factor on R_P (removed in production)
+      - No separate R_U additive term (coverage handled by coverage_factor)
     
     Args:
         run_dir: Path to run directory with JSON files
-        w_P: Weight for population term (default: 0.4)
-        w_T: Weight for transition term (default: 0.4)
-        w_U: Weight for uniformity term (default: 0.2)
-        gamma: Base penalty coefficient (default: 5.0)
-        P_baseline: Population normalization baseline (default: 1000.0)
-        T_baseline: Transition normalization baseline (default: 100.0)
+        w_P: Weight for population term (default: 0.5)
+        w_T: Weight for transition term (default: 0.75)
+        w_U: Weight for uniformity term (unused; kept for config compat)
+        gamma: Base penalty coefficient (default: 4.0)
+        P_baseline: Population normalization baseline (default: 500.0)
+        T_baseline: Transition normalization baseline (default: 50.0)
         min_transitions_per_site: Minimum transitions per site (default: 10)
         min_coverage_ratio: Minimum coverage fraction (default: 0.5)
-        entropy_bonus: Entropy bonus coefficient (default: 5.0)
+        entropy_bonus: Entropy bonus coefficient (default: 8.0)
         concentration_penalty_threshold: Threshold for concentration penalty (default: 0.8)
-        min_coverage_ratio: Minimum coverage fraction (default: 0.5)
-        entropy_bonus: Entropy bonus coefficient (default: 5.0)
         verbose: Print detailed breakdown
     
     Returns:
@@ -162,26 +166,9 @@ def compute_improved_reward_from_json(
         penalties -= base_penalty
         penalty_messages.append(f"1 site below threshold: -{base_penalty:.1f}")
     
-    # Check 2: Minimum coverage with adaptive requirement
-    # Use adaptive formula: min_subs = 1 + 0.5*(total-1) with sqrt normalization
-    # This prevents discrete jumps when going from 2→3 subs
-    min_subs_required = 1.0 + 0.5 * (total_subs - 1) if total_subs > 1 else 0.5
-    adaptive_min_coverage = min_subs_required / total_subs if total_subs > 0 else 0.0
-    
+    # Coverage: handled by coverage_factor quadratic multiplier at end (no hard threshold penalty)
     nonzero_count = np.sum(pop_array > 0)
     coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
-    
-    # NO DOUBLE JEOPARDY: Don't penalize coverage if transitions are too low for reliable statistics
-    # Coverage is only meaningful when there are enough transitions to have statistical confidence
-    # Only apply coverage penalty if transitions are at or above the success threshold
-    if coverage_ratio < adaptive_min_coverage and min_transitions_across_sites >= min_transitions_per_site:
-        # System has sufficient transitions but poor coverage - penalize the sampling inefficiency
-        deficit = adaptive_min_coverage - coverage_ratio
-        penalty_scale = np.sqrt(total_subs) if total_subs > 1 else 1.0
-        penalties -= gamma * 20.0 * deficit / penalty_scale
-        penalty_messages.append(f"Coverage {coverage_ratio:.2%} below adaptive minimum {adaptive_min_coverage:.0%} (need {min_subs_required:.1f}/{total_subs} subs)")
-    elif coverage_ratio < adaptive_min_coverage and min_transitions_across_sites < min_transitions_per_site:
-        penalty_messages.append(f"Coverage {coverage_ratio:.2%} below minimum, but transitions too low for reliable statistics ({min_transitions_across_sites}/{min_transitions_per_site}), no double penalty")
     
     # Check 3: Detect single-dominant-population per site
     # Extract actual substituents per site from graph_info.json
@@ -244,23 +231,12 @@ def compute_improved_reward_from_json(
         min_meaningful_coverage = max(2, total_sites * 1.5)  # At least 1.5 subs per site
         
         if len(nonzero_pops) > 1 and len(nonzero_pops) >= min_meaningful_coverage:
-            # Use coefficient of variation (std/mean) for balance
-            pop_mean = np.mean(nonzero_pops)
-            pop_std = np.std(nonzero_pops)
-            cv = pop_std / pop_mean if pop_mean > 0 else 1.0
-            
-            # Balance factor: exp(-cv) ranges from ~0.37 (CV=1) to 1.0 (CV=0)
-            balance_factor = np.exp(-cv)
-            
             # Normalized population reward (only count non-zero populations)
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-            
-            # Apply confidence factor to prevent rewarding low-transition runs
-            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
+            R_P = w_P * total_pop_normalized * confidence_factor
         else:
             # Insufficient coverage: minimal reward proportional to coverage
             R_P = w_P * 0.01 * coverage_ratio * confidence_factor
-            balance_factor = 0.01
     
     # R_T: Transition reward (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
     R_T = 0.0
@@ -271,9 +247,6 @@ def compute_improved_reward_from_json(
         avg_trans_per_site = total_trans / total_sites if total_sites > 0 else 0
         if avg_trans_per_site > min_transitions_per_site * 2:
             R_T *= 1.5  # 50% bonus for high transition counts
-    
-    # R_U: Coverage uniformity reward
-    R_U = w_U * coverage_ratio
     
     # R_entropy: Shannon entropy bonus
     R_entropy = 0.0
@@ -289,29 +262,29 @@ def compute_improved_reward_from_json(
     
     # ========== PENALTY CLAMPING ==========
     # Prevent gradient explosion by capping maximum negative penalty
-    # Increased from 50 to 60 to preserve gradient information with multi-site systems
     max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
     
-    # Final reward
-    R = R_P + R_T + R_U + R_entropy + penalties
+    # coverage_factor: smooth quadratic multiplier — full credit at 100% coverage,
+    # proportional partial credit below (e.g. 2/3 → 0.44×, 1/3 → 0.11×).
+    coverage_factor = (nonzero_count / total_subs) ** 2 if total_subs > 0 else 0.0
+    R = coverage_factor * (R_P + R_T + R_entropy) + penalties
     
     # Metrics for analysis
     metrics = {
         'reward': R,
         'R_P': R_P,
         'R_T': R_T,
-        'R_U': R_U,
         'R_entropy': R_entropy,
         'penalties': penalties,
+        'coverage_factor': coverage_factor,
         'total_subs': total_subs,
         'nonzero_subs': int(nonzero_count),
         'coverage': coverage_ratio,
         'total_transitions': sum(site_transitions.values()),
         'min_site_transitions': min_site_trans,
         'max_concentration': max_concentration,
-        'balance_factor': balance_factor,
         'entropy_score': entropy_score,
         'sites_below_threshold': sites_below_threshold,
         'confidence_factor': confidence_factor,
@@ -319,7 +292,8 @@ def compute_improved_reward_from_json(
     }
     
     if verbose:
-        print(f"  R_P={R_P:.2f} R_T={R_T:.2f} R_U={R_U:.2f} R_entropy={R_entropy:.2f} penalties={penalties:.2f}")
+        print(f"  R_P={R_P:.2f} R_T={R_T:.2f} R_entropy={R_entropy:.2f} "
+              f"coverage_factor={coverage_factor:.2f} penalties={penalties:.2f} total={R:.2f}")
         print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.0%}), "
               f"Transitions: {list(site_transitions.values())}, Max conc: {max_concentration:.0%}")
         print(f"  Confidence: {confidence_factor:.2f}")

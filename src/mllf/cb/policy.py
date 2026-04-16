@@ -97,32 +97,52 @@ class EdgeValueMLP(nn.Module):
 
 
 class EdgePolicy(nn.Module):
-    def __init__(self, encoder: nn.Module, emb_dim: int, edge_feat_dim: int = 0, mlp_hidden: int = 64, mlp_out_dim: int = 4):
+    def __init__(self, encoder: nn.Module, emb_dim: int, edge_feat_dim: int = 0,
+                 mlp_hidden: int = 64, mlp_out_dim: int = 4, p1_dim: int = 0):
         super().__init__()
         self.encoder = encoder
-        # input to edge-mlp is concat([emb_u, emb_v, edge_feat])
-        # mlp_out_dim controls how many coefficients per directed edge (bias types)
-        # The MLP uses separate heads for each bias type
         self.mlp_out_dim = int(mlp_out_dim)
-        self.edge_mlp = EdgeValueMLP(2 * emb_dim + edge_feat_dim, mlp_hidden, num_bias_types=self.mlp_out_dim)
+        self.p1_dim = int(p1_dim)
+        # Input to edge-mlp: [P1_src, P2_src, P1_dst, P2_dst, edge_feat] when p1_dim>0
+        # otherwise: [P2_src, P2_dst, edge_feat] (backward-compatible)
+        in_dim = 2 * (emb_dim + p1_dim) + edge_feat_dim
+        self.edge_mlp = EdgeValueMLP(in_dim, mlp_hidden, num_bias_types=self.mlp_out_dim)
+        # Scale factors for the 4 MSLD bias types: [linear, quadratic, skew, end].
+        # Empirical max across 20K+ pretraining runs with ~10% headroom.
+        # Registered as non-persistent so they are NOT saved in state_dict
+        # (they are constants, not learned state).
+        self.register_buffer(
+            'scale_factors',
+            torch.tensor([305.0, 520.0, 85.0, 30.0]),
+            persistent=False,
+        )
 
     def forward_node_embeddings(self, x, edge_index, edge_type):
         return self.encoder(x, edge_index, edge_type)
 
-    def edge_inputs(self, node_emb: torch.Tensor, edge_index: torch.LongTensor, edge_feat: Optional[torch.Tensor] = None):
+    def edge_inputs(self, node_emb: torch.Tensor, edge_index: torch.LongTensor,
+                    edge_feat: Optional[torch.Tensor] = None,
+                    p1_emb: Optional[torch.Tensor] = None):
+        """Build per-edge input tensor.
+
+        When p1_emb is provided (skip connection), concatenates
+        [P1_src, P2_src, P1_dst, P2_dst, edge_feat]; otherwise [P2_src, P2_dst, edge_feat].
+        """
         # edge_index: [2, E]
         src = edge_index[0]
         dst = edge_index[1]
-        u = node_emb[src]
-        v = node_emb[dst]
-        if edge_feat is None:
-            inp = torch.cat([u, v], dim=-1)
+        if p1_emb is not None:
+            parts = [p1_emb[src], node_emb[src], p1_emb[dst], node_emb[dst]]
         else:
-            inp = torch.cat([u, v, edge_feat], dim=-1)
-        return inp
+            parts = [node_emb[src], node_emb[dst]]
+        if edge_feat is not None:
+            parts.append(edge_feat)
+        return torch.cat(parts, dim=-1)
 
-    def forward_edges(self, node_emb: torch.Tensor, edge_index: torch.LongTensor, edge_feat: Optional[torch.Tensor] = None):
-        inp = self.edge_inputs(node_emb, edge_index, edge_feat)
+    def forward_edges(self, node_emb: torch.Tensor, edge_index: torch.LongTensor,
+                      edge_feat: Optional[torch.Tensor] = None,
+                      p1_emb: Optional[torch.Tensor] = None):
+        inp = self.edge_inputs(node_emb, edge_index, edge_feat, p1_emb)
         out = self.edge_mlp(inp)  # [E, 2*D]
         # ensure 2D
         if out.dim() == 1:
@@ -138,10 +158,8 @@ class EdgePolicy(nn.Module):
         # Scale mean outputs to expected bias coefficient range using tanh.
         # Factors set to cover the empirical maximum across ALL pretraining runs
         # (20K+ run full scan: linear max 277, quadratic max 470, skew max 77, end max 27)
-        # with ~10% headroom.  Previous bounds (±72/±72/±16.5/±8) were derived from
-        # a small biased sample and clipped 17.5% of linear and 34.4% of quadratic targets.
-        scale_factors = torch.tensor([305.0, 520.0, 85.0, 30.0], device=mean.device)
-        mean = torch.tanh(mean) * scale_factors.unsqueeze(0)
+        # with ~10% headroom.
+        mean = torch.tanh(mean) * self.scale_factors.unsqueeze(0)
         
         # Clamp log_std to prevent extreme standard deviations that can cause NaN
         # exp(-20) ≈ 2e-9, exp(2.0) ≈ 7.4 — provides exploration while preventing extreme outliers
@@ -159,7 +177,8 @@ class EdgePolicy(nn.Module):
             log_std: Tensor of shape [E, D]
         """
         node_emb = self.forward_node_embeddings(x, edge_index, edge_type)
-        mean, log_std = self.forward_edges(node_emb, edge_index, edge_feat)
+        p1_for_skip = x if self.p1_dim > 0 else None
+        mean, log_std = self.forward_edges(node_emb, edge_index, edge_feat, p1_for_skip)
         # ensure 2D
         if mean.dim() == 1:
             mean = mean.unsqueeze(-1)
@@ -175,14 +194,9 @@ class EdgePolicy(nn.Module):
             actions = dist.rsample()
             logp_per = dist.log_prob(actions)
             
-            # CRITICAL: Clip sampled actions to intended ranges per bias type.
-            # Limits match the tanh scale factors in forward_edges so the full
-            # dynamic range of the policy is reachable during exploration.
-            # Previous values [61.4, 70.5, 6.6, 3.6] were from an older version
-            # of the code and were far below the tanh scales [305, 520, 85, 30],
-            # causing skew and end outputs to saturate permanently at the clip ceiling.
-            # 5% margin allows slight overshoot without hard clamping.
-            clip_limits = torch.tensor([305.0, 520.0, 85.0, 30.0], device=actions.device) * 1.05
+            # Clip sampled actions to the scale-factor range (+5% margin).
+            # Matches the tanh scale factors in forward_edges.
+            clip_limits = self.scale_factors * 1.05
             actions = torch.clamp(actions, -clip_limits.unsqueeze(0), clip_limits.unsqueeze(0))
 
         # sum logp across output dims to get per-edge scalar logp
@@ -216,7 +230,8 @@ class EdgePolicy(nn.Module):
             log_std: [E, D] current log_std (for entropy regularisation caller).
         """
         node_emb = self.forward_node_embeddings(x, edge_index, edge_type)
-        mean, log_std = self.forward_edges(node_emb, edge_index, edge_feat)
+        p1_for_skip = x if self.p1_dim > 0 else None
+        mean, log_std = self.forward_edges(node_emb, edge_index, edge_feat, p1_for_skip)
         if mean.dim() == 1:
             mean = mean.unsqueeze(-1)
         if log_std.dim() == 1:
@@ -231,18 +246,20 @@ class EdgePolicy(nn.Module):
         return logp, log_std
 
     @classmethod
-    def from_pyg_data(cls, encoder: nn.Module, emb_dim: int, data, mlp_hidden: int = 64, mlp_out_dim: int = 1):
-        """Construct an EdgePolicy using a PyG `data` object to infer edge_feat_dim.
+    def from_pyg_data(cls, encoder: nn.Module, emb_dim: int, data, mlp_hidden: int = 64,
+                      mlp_out_dim: int = 1, p1_dim: int = 0):
+        """Construct an EdgePolicy using a PyG ``data`` object to infer edge_feat_dim.
 
-        This helper reads `data.edge_attr` (if present) to determine the
-        per-edge feature size so the internal MLP has the correct fixed input
-        dimension: 2*emb_dim + edge_feat_dim.
+        Reads ``data.edge_attr`` (if present) for per-edge feature size.
+        Pass ``p1_dim=data.x.size(1)`` to enable the skip-connection path where
+        pre-RGCN node embeddings are concatenated alongside RGCN embeddings.
+
+        Input dimension: 2*(emb_dim + p1_dim) + edge_feat_dim.
         """
         edge_feat_dim = 0
         if hasattr(data, 'edge_attr') and data.edge_attr is not None:
-            # edge_attr is [E, F]
             try:
                 edge_feat_dim = int(data.edge_attr.shape[1])
             except Exception:
                 edge_feat_dim = 0
-        return cls(encoder, emb_dim, edge_feat_dim, mlp_hidden, mlp_out_dim)
+        return cls(encoder, emb_dim, edge_feat_dim, mlp_hidden, mlp_out_dim, p1_dim)

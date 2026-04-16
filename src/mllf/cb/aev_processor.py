@@ -216,13 +216,101 @@ def get_atom_features(pdb_path, rtf_entry=None, include_charges=True, include_at
                 charges = torch.zeros(num_atoms, dtype=torch.float32)
         result['charges'] = charges
     
-    # Extract atom IDs
+    # Extract atom IDs (and atom names for bond-topology-aware models)
     if include_atom_ids:
         mol = Chem.MolFromPDBFile(pdb_path, removeHs=False)
-        element_ids = [map_element_to_species_id(atom.GetSymbol()) for atom in mol.GetAtoms()]
+        element_ids = []
+        atom_names_list = []
+        for atom in mol.GetAtoms():
+            element_ids.append(map_element_to_species_id(atom.GetSymbol()))
+            info = atom.GetMonomerInfo()
+            atom_names_list.append(info.GetName().strip() if info else f'X{atom.GetIdx()}')
         result['atom_ids'] = torch.tensor(element_ids, dtype=torch.long)
-    
+        result['atom_names'] = atom_names_list
+
     return result
+
+
+def get_bond_edge_index_from_pdb(
+    pdb_path: str,
+    rtf_bonds: Optional[List[Tuple[str, str]]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build bidirectional bond edge index and bond-type edge attributes.
+
+    Priority: RTF BOND section (when rtf_bonds provided) → RDKit Chem.MolFromPDBFile.
+    CHARMM-format PDB files lack a filled element column, so RDKit emits per-atom
+    warnings and frequently returns a mol with no bonds; RTF bonds avoid this entirely.
+
+    Bond-type weights: SINGLE=1.0, DOUBLE=2.0, TRIPLE=3.0, AROMATIC=1.5 (RDKit path only).
+
+    Args:
+        pdb_path: Path to substituent PDB file.
+        rtf_bonds: Optional list of (atom_name1, atom_name2) tuples from the RTF
+                   BOND section, used as fallback when RDKit returns None or has
+                   no bonds.
+
+    Returns:
+        edge_index: [2, 2E] bidirectional edge indices (both directions per bond)
+        edge_attr:  [2E, 1] bond-type weights (one per directed edge)
+    """
+    BOND_TYPE_WEIGHT = {
+        Chem.rdchem.BondType.SINGLE: 1.0,
+        Chem.rdchem.BondType.DOUBLE: 2.0,
+        Chem.rdchem.BondType.TRIPLE: 3.0,
+        Chem.rdchem.BondType.AROMATIC: 1.5,
+    }
+
+    # When RTF bonds are available, prefer them: CHARMM-format PDB files rarely
+    # have a filled element column, so RDKit warnings flood the log and the mol
+    # frequently has no bonds.  RTF BOND sections are always correct for these
+    # systems, so skip the RDKit attempt entirely when rtf_bonds are provided.
+    if not rtf_bonds:
+        from rdkit.rdBase import BlockLogs
+        with BlockLogs():
+            mol = Chem.MolFromPDBFile(str(pdb_path), removeHs=False)
+        if mol is not None and mol.GetNumBonds() > 0:
+            src_list, dst_list, weights = [], [], []
+            for bond in mol.GetBonds():
+                i = bond.GetBeginAtomIdx()
+                j = bond.GetEndAtomIdx()
+                w = BOND_TYPE_WEIGHT.get(bond.GetBondType(), 1.0)
+                src_list += [i, j]
+                dst_list += [j, i]
+                weights += [w, w]
+            edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+            edge_attr = torch.tensor(weights, dtype=torch.float32).unsqueeze(1)
+            return edge_index, edge_attr
+
+    # RTF BOND section (preferred for CHARMM systems; fallback otherwise)
+    if rtf_bonds:
+        # Build atom name → index mapping from PDB ATOM/HETATM records
+        name_to_idx: dict = {}
+        try:
+            with open(str(pdb_path)) as fh:
+                idx = 0
+                for line in fh:
+                    if line.startswith(('ATOM', 'HETATM')):
+                        aname = line[12:16].strip().upper()
+                        name_to_idx[aname] = idx
+                        idx += 1
+        except Exception:
+            pass
+
+        src_list, dst_list = [], []
+        for a1, a2 in rtf_bonds:
+            i = name_to_idx.get(a1.upper())
+            j = name_to_idx.get(a2.upper())
+            if i is not None and j is not None:
+                src_list += [i, j]
+                dst_list += [j, i]
+
+        if src_list:
+            edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+            edge_attr = torch.ones(len(src_list), 1, dtype=torch.float32)
+            return edge_index, edge_attr
+
+    # Nothing found — return empty graph
+    return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, 1), dtype=torch.float32)
 
 
 def parse_pdb_coordinates_and_elements(pdb_path):

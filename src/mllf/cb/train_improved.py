@@ -47,12 +47,12 @@ def compute_msld_reward_improved(
     - **Tier 3: "Success Zone" (≥10 transitions)**: Penalty = 0.0, unlocks R_T
     
     **Reward Components:**
-        R = R_P + R_T + R_U + R_entropy + R_penalties
+        R = coverage_factor * (R_P + R_T + R_entropy) + R_penalties
     
     where:
         R_P: Population balance reward × C_F (confidence-scaled)
         R_T: Transition reward (gated: only if all sites ≥ min_transitions)
-        R_U: Coverage uniformity reward
+        coverage_factor: (nonzero_count/total_subs)^2 — smooth partial-coverage multiplier
         R_entropy: Bonus for high-entropy (uniform) distributions
         R_penalties: Tiered transition penalties + coverage/concentration penalties
     
@@ -188,27 +188,8 @@ def compute_msld_reward_improved(
     nonzero_count = np.sum(pop_array > 0)
     coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
     
-    # Adaptive coverage requirement: scales with system size to encourage visiting multiple subs
-    # Formula: min_subs = 1 + 0.5*(total-1)
-    # Examples: 2 subs→1.5 (75%), 3 subs→2.0 (67%), 4 subs→2.5 (62.5%), 6 subs→3.5 (58%)
-    min_subs_required = 1.0 + 0.5 * (total_subs - 1) if total_subs > 1 else 0.5
-    adaptive_min_coverage = min_subs_required / total_subs if total_subs > 0 else 0.0
-    
-    # NO DOUBLE JEOPARDY: Don't penalize coverage if transitions are too low for reliable statistics
-    # Coverage is only meaningful when there are enough transitions to have statistical confidence
-    # Only apply coverage penalty if transitions are at or above the success threshold
-    total_transitions = sum(site_transitions.values())
-    
-    # Coverage penalties only apply when the system has enough transitions for reliable sampling
-    # Below min_transitions_per_site, the transition penalty already captures the problem
-    if coverage_ratio < adaptive_min_coverage and min_transitions_across_sites >= min_transitions_per_site:
-        # System has sufficient transitions but poor coverage - penalize the sampling inefficiency
-        deficit = adaptive_min_coverage - coverage_ratio
-        penalty_scale = np.sqrt(total_subs) if total_subs > 1 else 1.0
-        penalties -= gamma * 20.0 * deficit / penalty_scale
-        print(f"  Warning: Coverage {coverage_ratio:.2f} below adaptive minimum {adaptive_min_coverage:.2f} (need {min_subs_required:.1f}/{total_subs} subs)")
-    elif coverage_ratio < adaptive_min_coverage and min_transitions_across_sites < min_transitions_per_site:
-        print(f"  Info: Coverage {coverage_ratio:.2f} below minimum, but transitions too low for reliable statistics ({min_transitions_across_sites}/{min_transitions_per_site}), no double penalty")
+    # Coverage is handled by coverage_factor (quadratic penalty) rather than a hard threshold.
+    # This gives smooth partial credit instead of a cliff at 100% coverage.
     
     # Check 3: Detect single-dominant-population per site
     # Extract actual substituents per site from graph_info.json
@@ -271,18 +252,9 @@ def compute_msld_reward_improved(
         
         if len(nonzero_pops) > 1 and len(nonzero_pops) >= min_meaningful_coverage:
             # Use coefficient of variation (std/mean) for balance
-            pop_mean = np.mean(nonzero_pops)
-            pop_std = np.std(nonzero_pops)
-            cv = pop_std / pop_mean if pop_mean > 0 else 1.0
-            
-            # Balance factor: exp(-cv) ranges from ~0.37 (CV=1) to 1.0 (CV=0)
-            balance_factor = np.exp(-cv)
-            
-            # Normalized population reward (only count non-zero populations)
+            # Normalized population reward (balance_factor removed: R_entropy captures uniformity)
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-            
-            # Apply confidence factor to prevent rewarding low-transition runs
-            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
+            R_P = w_P * total_pop_normalized * confidence_factor
         else:
             # Insufficient coverage: minimal reward proportional to coverage
             R_P = w_P * 0.01 * coverage_ratio * confidence_factor
@@ -297,9 +269,6 @@ def compute_msld_reward_improved(
         avg_trans_per_site = total_trans / total_sites if total_sites > 0 else 0
         if avg_trans_per_site > min_transitions_per_site * 2:
             R_T *= 1.5  # 50% bonus for high transition counts
-    
-    # R_U: Coverage uniformity reward
-    R_U = w_U * coverage_ratio
     
     # R_entropy: Shannon entropy bonus for uniform distributions
     R_entropy = 0.0
@@ -326,19 +295,14 @@ def compute_msld_reward_improved(
     
     # ========== FINAL REWARD ==========
 
-    # Completeness gate: if any substituent was never visited, replace the positive
-    # reward components with -0.01 so the total is always negative. Penalties are
-    # still added to preserve gradient signal (worse behaviour = more negative).
-    if nonzero_count < total_subs:
-        R = -0.01 + penalties
-    else:
-        R = R_P + R_T + R_U + R_entropy + penalties
+    # coverage_factor: smooth quadratic multiplier — full credit at 100% coverage,
+    # proportional partial credit below (e.g. 2/3 → 0.44×, 1/3 → 0.11×).
+    coverage_factor = (nonzero_count / total_subs) ** 2 if total_subs > 0 else 0.0
+    R = coverage_factor * (R_P + R_T + R_entropy) + penalties
 
     # Debug output
-    print(f"  Reward breakdown: R_P={R_P:.2f}, R_T={R_T:.2f}, R_U={R_U:.2f}, "
-          f"R_entropy={R_entropy:.2f}, penalties={penalties:.2f}, total={R:.2f}")
-    if nonzero_count < total_subs:
-        print(f"  Completeness gate applied ({nonzero_count}/{total_subs} subs visited) → positive components replaced with -0.01, penalties retained")
+    print(f"  Reward breakdown: R_P={R_P:.2f}, R_T={R_T:.2f}, R_entropy={R_entropy:.2f}, "
+          f"coverage_factor={coverage_factor:.2f}, penalties={penalties:.2f}, total={R:.2f}")
     print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.2%}), "
           f"Transitions: {list(site_transitions.values())}, "
           f"Confidence: {confidence_factor:.2f}")
@@ -461,28 +425,33 @@ def compute_reward_from_raw_metrics(
     
     for trans_count in transitions:
         min_transitions_across_sites = min(min_transitions_across_sites, trans_count)
-        
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-            
-            if trans_count == 0:
-                penalties -= 40.0
-            elif trans_count == 1:
-                penalties -= 32.0
-            elif trans_count == 2:
-                penalties -= 24.0
-            elif trans_count < min_transitions_per_site:
-                deficit = min_transitions_per_site - trans_count
-                penalties -= (2.0 + 2.0 * deficit)
+    
+    # Base penalty from worst site only (prevents unfair accumulation)
+    if min_transitions_across_sites == 0:
+        base_penalty = 40.0
+    elif min_transitions_across_sites == 1:
+        base_penalty = 32.0
+    elif min_transitions_across_sites == 2:
+        base_penalty = 24.0
+    elif min_transitions_across_sites < min_transitions_per_site:
+        deficit = min_transitions_per_site - min_transitions_across_sites
+        base_penalty = 2.0 + 2.0 * deficit
+    else:
+        base_penalty = 0.0
+    
+    if sites_below_threshold > 1:
+        multisite_penalty = (sites_below_threshold - 1) * 4.0
+        penalties -= base_penalty + multisite_penalty
+    elif sites_below_threshold == 1:
+        penalties -= base_penalty
     
     # ========== COVERAGE PENALTIES ==========
+    # NOTE: static coverage penalty removed — replaced by coverage_factor below
     pop_array = np.array(populations)
     nonzero_count = np.sum(pop_array > 0)
     coverage_ratio = nonzero_count / total_subs if total_subs > 0 else 0.0
-    
-    if coverage_ratio < min_coverage_ratio:
-        deficit = min_coverage_ratio - coverage_ratio
-        penalties -= gamma * 20.0 * deficit
     
     # ========== CONCENTRATION PENALTIES ==========
     # Assume uniform subs per site distribution
@@ -501,7 +470,7 @@ def compute_reward_from_raw_metrics(
             concentration_ratio = max_pop / total_pop
             
             if concentration_ratio > concentration_penalty_threshold:
-                penalties -= gamma * 5.0 * (concentration_ratio - concentration_penalty_threshold)
+                penalties -= gamma * 2.0 * (concentration_ratio - concentration_penalty_threshold)
         
         pop_idx += nsubs
     
@@ -517,12 +486,8 @@ def compute_reward_from_raw_metrics(
         min_meaningful_coverage = max(2, total_sites * 1.5)
         
         if len(nonzero_pops) > 1 and len(nonzero_pops) >= min_meaningful_coverage:
-            pop_mean = np.mean(nonzero_pops)
-            pop_std = np.std(nonzero_pops)
-            cv = pop_std / pop_mean if pop_mean > 0 else 1.0
-            balance_factor = np.exp(-cv)
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
-            R_P = w_P * total_pop_normalized * balance_factor * confidence_factor
+            R_P = w_P * total_pop_normalized * confidence_factor
         else:
             R_P = w_P * 0.01 * coverage_ratio * confidence_factor
     
@@ -535,9 +500,6 @@ def compute_reward_from_raw_metrics(
         if avg_trans_per_site > min_transitions_per_site * 2:
             R_T *= 1.5
     
-    # R_U: Coverage uniformity reward
-    R_U = w_U * coverage_ratio
-    
     # R_entropy: Shannon entropy bonus
     R_entropy = 0.0
     if np.sum(pop_array) > 0:
@@ -549,15 +511,13 @@ def compute_reward_from_raw_metrics(
         R_entropy = entropy_bonus * entropy_score
     
     # Clamp penalties
-    max_penalty = 50.0
+    max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
     
-    # Completeness gate: replace positive components with -0.01, keep penalties
-    if nonzero_count < total_subs:
-        R = -0.01 + penalties
-    else:
-        R = R_P + R_T + R_U + R_entropy + penalties
+    # coverage_factor: smooth quadratic multiplier replacing hard completeness gate
+    coverage_factor = (nonzero_count / total_subs) ** 2 if total_subs > 0 else 0.0
+    R = coverage_factor * (R_P + R_T + R_entropy) + penalties
 
     return R
 
