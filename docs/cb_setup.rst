@@ -11,19 +11,110 @@ molecular graph structure.
 
 **Architecture Pipeline**:
 
-The policy network uses a two-stage architecture to predict bias coefficients:
+The policy network uses a three-stage architecture to predict bias coefficients:
 
-1. **RGCN Encoder**: Processes the molecular graph with DeepSet embeddings (64D) as initial 
-   node features, producing refined context-aware node embeddings (32D). The RGCN learns 
-   separate transformations for different bias types, allowing it to capture bias-specific 
-   molecular interactions.
+1. **AtomBondGNN (Phase 1, frozen)**: A graph neural network pretrained on diverse molecular
+   data that encodes each substituent's 3D atomic structure into a 64-dimensional vector.
+   It uses GINConv message passing over the molecular bond graph (topology from RDKit;
+   RTF BOND section as fallback) followed by GlobalAttentionPool. Weights are loaded from
+   a pre-trained checkpoint and held fixed during all CB training.
 
-2. **EdgeValueMLP Policy**: Takes pairs of RGCN-processed node embeddings and predicts 
-   bias coefficients for each edge. Uses a shared trunk with separate heads per bias type,
-   outputting Gaussian distributions (mean, std) for sampling actions.
+2. **RGCN Encoder (Phase 2, frozen during RL)**: Processes the 64-dimensional AtomBondGNN
+   embeddings through a 3-layer Relational GCN (64→64→64→32) with LayerNorm pre-conditioning,
+   producing 32-dimensional context-aware node embeddings. Trained during behavior-cloning
+   pretraining; weights are frozen when the REINFORCE loop begins.
 
-This separation allows the encoder to learn general molecular representations while the 
-policy network specializes in predicting bias-specific coefficients for individual transitions.
+3. **EdgeValueMLP + Q-Critic (Phase 3, trained by RL)**: A pairwise edge network that
+   receives the concatenated Phase 1 (64D) and Phase 2 (32D) embeddings for both endpoint
+   substituents, plus an 8-dimensional one-hot edge-type feature — 200D total — and
+   outputs Gaussian distributions over bias coefficients via a shared trunk and four
+   per-type heads. A companion Q-network provides per-edge advantage estimates for
+   variance-reduced REINFORCE.
+
+This staged design allows Phase 1 and 2 to capture general molecular representations while
+Phase 3 specializes in per-edge coefficient prediction with reinforcement feedback.
+
+.. _Architecture Diagram:
+
+**Full Architecture**:
+
+.. code-block:: text
+
+   ╔══════════════════════════════════════════════════════════════════════════╗
+   ║  PHASE 1 — AtomBondGNN  [FROZEN in all training phases]                ║
+   ║                                                                          ║
+   ║  Per substituent, independently:                                         ║
+   ║  AEV[2288] + charge[1] + atom_id[11] = 2300D per atom                  ║
+   ║      │  Linear projection: 2300 → 256D + ReLU                          ║
+   ║      │  GINConv layer 1 (bond topology from RDKit / RTF BOND) + ReLU   ║
+   ║      │       bond weights: single=1.0, double=2.0, aromatic=1.5        ║
+   ║      │       (computed but not consumed by GINConv; topology only)      ║
+   ║      │  GINConv layer 2 + ReLU                                          ║
+   ║      │  GlobalAttentionPool (gate_nn: 256→1, nn: 256→64)               ║
+   ║      ▼                                                                   ║
+   ║   64D  P1 embedding  (data.x)  ─────────────────────── skip ──────────►║
+   ╚══════════════════════════════════════════════════════════════════════════╝
+                       │
+                       │ data.x (same tensor, passed to RGCN)
+                       ▼
+   ╔══════════════════════════════════════════════════════════════════════════╗
+   ║  PHASE 2 — RGCNEncoder  [FROZEN during RL; trained by BC pretraining]  ║
+   ║                                                                          ║
+   ║  LayerNorm(64)                                                           ║
+   ║  → RGCNConv(64→64, 8 relations) → ReLU                                 ║
+   ║  → RGCNConv(64→64, 8 relations) → ReLU                                 ║
+   ║  → RGCNConv(64→32, 8 relations)                                         ║
+   ║      ▼                                                                   ║
+   ║   32D  P2 embedding (per substituent node)                              ║
+   ╚══════════════════════════════════════════════════════════════════════════╝
+            │                                         │
+            │  P2 per node                            │  P1 = data.x (skip)
+            └──────────────────┬──────────────────────┘
+                               ▼
+   ╔══════════════════════════════════════════════════════════════════════════╗
+   ║  PHASE 3 — Pairwise edge inputs  (Sub_A ↔ Sub_B)                       ║
+   ║                                                                          ║
+   ║  concat(P1_A[64], P2_A[32], P1_B[64], P2_B[32], edge_type[8]) = 200D  ║
+   ║           64% atomic/topo    32% system context    4% relation          ║
+   ║                     │                                                    ║
+   ║          ┌──────────┴──────────┐                                        ║
+   ║          ▼                     ▼                                        ║
+   ║  ┌── ACTOR ──────────┐  ┌── Q-CRITIC ─────────────────────────────┐   ║
+   ║  │  EdgeValueMLP     │  │  QNetwork                               │   ║
+   ║  │  Trunk:           │  │  Linear(200→64) → ReLU                  │   ║
+   ║  │  Linear(200→64)   │  │  Linear(64→32)  → ReLU                  │   ║
+   ║  │  → ReLU           │  │  Linear(32→1)                           │   ║
+   ║  │  4 heads (l/q/s/x)│  │  Output: Q(s,pair) per edge [E]         │   ║
+   ║  │  each head input: │  │  Updated by MSE on R_pair each episode  │   ║
+   ║  │  [trunk(64),      │  └─────────────────────────────────────────┘   ║
+   ║  │   bias_emb(16)]   │                                                  ║
+   ║  │  = 80D            │  ┌── V-BASELINE ───────────────────────────┐   ║
+   ║  │  Linear(80→64)    │  │  GlobalMeanPool(P2 nodes) → 32D         │   ║
+   ║  │  → ReLU           │  │  Linear(32→64) → ReLU                   │   ║
+   ║  │  Linear(64→32)    │  │  Linear(64→32) → ReLU                   │   ║
+   ║  │  → ReLU           │  │  Linear(32→1)  → V(s) scalar            │   ║
+   ║  │  Linear(32→2)     │  │  Updated by MSE on R_global each episode│   ║
+   ║  │  → (μ, logσ) per  │  └─────────────────────────────────────────┘   ║
+   ║  │    bias per edge  │                                                  ║
+   ║  │  [RL only]        │                                                  ║
+   ║  └───────────────────┘                                                  ║
+   ╚══════════════════════════════════════════════════════════════════════════╝
+                               ▼
+   ╔══════════════════════════════════════════════════════════════════════════╗
+   ║  PER-PAIR REWARD  (from simulation output)                              ║
+   ║                                                                          ║
+   ║  R_pair(i,j) = -1.0                            if DDG is None (stuck)  ║
+   ║  R_pair(i,j) = +1.0 + min(pop_i, pop_j)       if DDG is finite        ║
+   ║                        ──────────────────                               ║
+   ║                        pop_i + pop_j                                    ║
+   ║                                                                          ║
+   ║  Range: [-1.0, +1.5]   (balance adds 0→0.5 only on successes)         ║
+   ║                                                                          ║
+   ║  A_pair = R_pair - Q(s,pair).detach()          [E] per directed edge   ║
+   ║  A_pair normalised across edges within episode                          ║
+   ║                                                                          ║
+   ║  policy_loss = -(logp_edge × A_pair).sum()     per-pair REINFORCE      ║
+   ╚══════════════════════════════════════════════════════════════════════════╝
 
 Core Components
 ---------------
@@ -62,28 +153,29 @@ Each edge can have multiple bias coefficient types:
 Graph Construction
 ^^^^^^^^^^^^^^^^^^
 
-Graphs are constructed with **DeepSet embeddings** as the primary node features, representing
+Graphs are constructed with **AtomBondGNN embeddings** as the primary node features, representing
 each substituent's 3D atomic structure and chemical composition as a learned 64-dimensional
 vector. These embeddings replace manual feature engineering with neural representations
 pretrained on diverse molecular data.
 
-**DeepSet-Based Construction**:
+**AtomBondGNN-Based Construction**:
 
 The standard construction pipeline:
 
 1. Parse RTF files to identify substituents and extract metadata (site numbers, charges, atom types)
 2. Build graph topology: one node per substituent, edges connecting substituents within each site
-3. Compute DeepSet embeddings for each node from PDB coordinates and RTF charges
+3. Compute AtomBondGNN embeddings for each node from PDB coordinates, RTF charges, and bond topology
 4. Store embeddings as node features for neural network input
 
-The DeepSet embeddings capture rich molecular information automatically:
+The AtomBondGNN embeddings capture rich molecular information automatically:
 
 * **Spatial structure**: Bond lengths, angles, 3D conformations from atomic coordinates
 * **Chemical composition**: Element types, functional groups, charge distributions
+* **Bond-topology context**: GINConv message passing propagates bonded-neighbor information before pooling
 * **Environmental context**: Nearby protein atoms and core structure atoms (via context-aware AEV computation)
 
-See :doc:`deepset_pretraining` for technical details on the 4-step pretraining pipeline
-(atom-level AEV features → autoencoder → sum-pooling aggregation).
+See :doc:`deepset_pretraining` for technical details on the AtomBondGNN pretraining
+pipeline (atom-level AEV features + bond topology → GINConv × 2 → GlobalAttentionPool).
 
 **Environmental Context Encoding**:
 
@@ -128,10 +220,10 @@ edge expansion and relation type encoding for the RGCN policy network.
 
 **Node Features**:
 
-The 64-dimensional DeepSet embeddings computed during graph construction become the node
-feature matrix. Each row represents one substituent with its learned molecular representation
-already encoding all necessary information (structure, chemistry, environment). No additional
-feature engineering is required—the embeddings serve as direct input to the RGCN.
+The 64-dimensional AtomBondGNN embeddings computed during graph construction become the
+node feature matrix. Each row represents one substituent with its learned molecular
+representation encoding structure, chemistry, and environment. These embeddings are passed
+directly to the RGCN encoder — no additional feature engineering is applied.
 
 **Edge Expansion**:
 
@@ -200,11 +292,16 @@ The ``EdgeValueMLP`` uses a two-stage design:
    * Layer 2: Linear(64 → 64) + ReLU
    * Output: 64-dimensional shared representation
 
-2. **Separate Heads**: Independent linear layers per bias type
-   
+2. **Separate Heads**: Independent deep MLPs per bias type, each enriched with a
+   learnable bias-type embedding (16D)
+
    * 4 heads (one per bias type: linear, quadratic, skew, end)
-   * Each head: Linear(64 → 2) outputting [mean, log_std]
+   * Each head input: [trunk output (64D), bias-type embedding (16D)] = 80D
+   * Each head: Linear(80 → 64) + ReLU → Linear(64 → 32) + ReLU → Linear(32 → 2)
+   * Each head outputs [mean, log_std] for its bias type
    * Total output: 8 values per edge (4 means + 4 log_stds)
+   * Bias-type embeddings are learned during training, giving each head a unique identity
+     signal that reinforces specialisation
 
 **Key Features**:
 
@@ -232,7 +329,7 @@ The policy outputs:
 * ``actions``: Sampled coefficient values (shape: [num_edges, 4])
 * ``logp``: Log-probabilities for REINFORCE updates
 * ``mean``: Mean of the Gaussian distribution per edge per bias type (scaled to [-20, 20])
-* ``log_std``: Log standard deviation per edge per bias type (clamped to [-20, 3.5])
+* ``log_std``: Log standard deviation per edge per bias type (clamped to [-20, 2.0])
 
 Each directed edge receives 4 independent Gaussian distributions (one per bias type),
 and actions are sampled independently:
@@ -246,37 +343,71 @@ where :math:`k \\in \\{\\text{linear, quadratic, skew, end}\\}`.
 Training and Optimization
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The policy network is trained using an **Actor-Critic** architecture (REINFORCE with learned 
-value network) that provides state-dependent baselines for variance reduction.
+The policy network is trained using an **Actor-Critic** architecture (REINFORCE with
+per-pair Q-critic and a global value baseline) that provides variance-reduced credit
+assignment at the substituent-pair level.
 
 **Actor-Critic Components**:
 
-* **Actor (Policy Network)**: RGCN encoder + EdgeValueMLP that predicts bias coefficients from graph structure
-* **Critic (Value Network)**: 3-layer MLP that predicts expected reward for a combination
+* **Actor (Policy Network)**: ``EdgeValueMLP`` that predicts bias coefficients from the
+  200D per-edge inputs assembled from Phase 1 and Phase 2 embeddings. Only the EdgeValueMLP
+  (Phase 3) has its weights updated by RL; the RGCN encoder (Phase 2) and AtomBondGNN
+  (Phase 1) are both frozen before the REINFORCE loop begins.
+* **Q-Critic (Per-Edge)**: ``QNetwork`` — a 3-layer MLP (200→64→32→1) receiving the
+  same 200D edge inputs as the actor. Estimates :math:`Q(s, \text{pair})` per directed
+  edge and is updated each episode by MSE against the per-pair reward.
+* **Value Baseline (Global)**: ``ValueNetwork`` — GlobalMeanPool over 32D RGCN node
+  embeddings then MLP (32→64→32→1). Predicts the expected episode reward :math:`V(s)`
+  and is updated by MSE against the global reward to reduce variance.
 
-**Value Network Architecture**:
+**Per-Pair Reward**:
 
-The value network maps node embeddings to expected rewards via global pooling and MLP:
+Rather than a single global reward, each directed edge :math:`(i, j)` receives an
+independent signal based on whether the simulation produced lambda-space transitions
+between substituents *i* and *j*:
 
 .. math::
 
-   V(\mathbf{s}) = \text{MLP}_{32 \to 64 \to 32 \to 1}\left(\text{GlobalMeanPool}(\mathbf{H})\right)
+   R_{\text{pair}}(i,j) = \begin{cases}
+     -1.0 & \text{if } \Delta\Delta G_{ij} \text{ is None, NaN, or } \pm\infty \\
+     1.0 + \dfrac{\min(p_i, p_j)}{p_i + p_j} & \text{if } \Delta\Delta G_{ij} \text{ is finite}
+   \end{cases}
 
-where :math:`\mathbf{H} \in \mathbb{R}^{N \times 32}` are node embeddings from the RGCN encoder. 
-The network is trained to minimize :math:`(V(s) - R)^2` where :math:`R` is the actual reward.
+where :math:`p_i, p_j` are the block populations at the highest :math:`\lambda` window.
+Finite DDG means transitions were observed; the population-balance term (0–0.5) gives
+additional credit when both substituents were sampled roughly equally. Total range: [-1.0, +1.5].
+
+**Per-Pair Advantage**:
+
+The per-edge advantage subtracts the Q-network prediction as baseline:
+
+.. math::
+
+   A_{\text{pair}}(i,j) = R_{\text{pair}}(i,j) - Q_\phi(s, \text{pair}_{ij})
+
+Advantages are normalised (zero-mean, unit-variance) across all edges within an episode
+before computing the policy loss:
+
+.. math::
+
+   \mathcal{L}_{\text{policy}} = -\sum_{(i,j)} \log \pi_\theta(a_{ij} | s) \cdot A_{\text{pair}}(i,j)
 
 **Training Updates**:
 
 For each combination:
 
-1. Encode graph to node embeddings :math:`\mathbf{H}` via RGCN
-2. Sample bias coefficients :math:`\mathbf{a} \sim \pi_\theta(\cdot | \mathbf{s})` from policy
-3. Run simulation and compute reward :math:`R` from metrics
-4. Compute advantage: :math:`A = R - V_\phi(\mathbf{s})`
-5. Update value network: minimize :math:`(V_\phi(\mathbf{s}) - R)^2`
-6. Update policy: maximize :math:`\log \pi_\theta(\mathbf{a} | \mathbf{s}) \cdot A`
+1. Encode graph via AtomBondGNN (frozen) → 64D P1 node embeddings
+2. Refine via RGCN (frozen) → 32D P2 node embeddings
+3. Build 200D per-edge inputs: [P1ₚ₁, P2ₚ₁, P1ₚ₂, P2ₚ₂, edge\_type]
+4. Sample bias coefficients :math:`a \sim \pi_\theta(\cdot | s)` from EdgeValueMLP
+5. Run simulation; parse DDG pairs and block populations
+6. Compute per-edge :math:`R_{\text{pair}}` via ``compute_pair_reward``
+7. Update Q-critic: minimize :math:`(Q_\phi(s, \text{pair}) - R_{\text{pair}})^2`
+8. Compute advantage :math:`A_{\text{pair}} = R_{\text{pair}} - Q_\phi.\text{detach()}`, normalise
+9. Update EdgeValueMLP: maximise :math:`\sum \log \pi_\theta(a) \cdot A_{\text{pair}}`
+10. Update value baseline: minimize :math:`(V_\psi(s) - R_{\text{global}})^2`
 
-For details on reward function components, curriculum learning, and workflow configuration, 
+For details on reward function components, curriculum learning, and workflow configuration,
 see :doc:`workflow`.
 
 Variables.py Format
@@ -382,6 +513,6 @@ See Also
 * :doc:`workflow` - Complete workflow from combo generation to training
 * :doc:`examples` - Running the full training workflow
 * :doc:`api` - API reference for CB modules
-* ``examples/run_workflow_deepset.py`` - Full training implementation (DeepSet + pretrained weights)
+* ``examples/run_workflow_deepset.py`` - Full training implementation
 * ``examples/workflow_14benz.yaml`` - Configuration file for the 14benz system
 * ``examples/workflow_deepset.yaml`` - Alternate configuration file template

@@ -27,29 +27,15 @@ coefficients to different molecular transition types.
 
 **Training Objective**:
 
-The model minimizes a **weighted, masked** mean squared error. Two mechanisms focus
-the gradient signal on the most informative edges:
-
-1. **Masking** — backpropagation runs only through the *active* (non-zero) target for
-   each edge. Because each directed edge carries exactly one non-zero bias type (e.g., a
-   ``linear_fwd`` edge has a non-zero linear target but zero quadratic, skew, and end
-   targets), naively averaging over all four outputs would produce a gradient signal
-   dominated by pushing inactive heads toward zero. The mask avoids this.
-
-2. **ΔΔG-based edge weighting** — in MSLD, the biased relative free-energy difference
-   :math:`\Delta\Delta G_{i \to j}` between two substituents *i* and *j* is estimated from
-   round-trip λ-space crossings during the simulation. When no crossings occurred for a
-   pair, CHARMM reports ``NaN`` (zero crossings) or ``±Infinity`` (one-direction only,
-   so no round-trip estimate is possible) in the SINGLE DDG output block. Edges
-   corresponding to such pairs are down-weighted by ``ddg_no_transition_weight``
-   (default 0.2) because, without observed transitions, the recorded bias targets for that
-   pair reflect extrapolation rather than sampled behaviour and are therefore less reliable
-   as expert demonstrations. Edges where transitions *were* observed — and a finite
-   :math:`\Delta\Delta G_{i \to j}` was computed — receive weight 1.0.
+The model minimizes a **masked** mean squared error. Backpropagation runs only through
+the *active* (non-zero) target for each edge. Because each directed edge carries exactly
+one non-zero bias type (e.g., a ``linear_fwd`` edge has a non-zero linear target but zero
+quadratic, skew, and end targets), averaging over all four outputs would produce a gradient
+signal dominated by pushing inactive heads toward zero. The mask avoids this.
 
 .. math::
 
-   \mathcal{L}_{\text{BC}} = \frac{1}{|\mathcal{A}|} \sum_{(i,j,k) \in \mathcal{A}} w_{ij} \cdot \| a_{ij}^{(k)} - \hat{a}_{ij}^{(k)} \|^2
+   \mathcal{L}_{\text{BC}} = \frac{1}{|\mathcal{A}|} \sum_{(i,j,k) \in \mathcal{A}} \| a_{ij}^{(k)} - \hat{a}_{ij}^{(k)} \|^2
 
 where:
 
@@ -57,12 +43,11 @@ where:
 - :math:`k \in \{\text{linear, quadratic, skew, end}\}` are bias types
 - :math:`a_{ij}^{(k)}` is the expert coefficient
 - :math:`\hat{a}_{ij}^{(k)}` is the predicted coefficient
-- :math:`w_{ij} \in \{w_{\text{no-trans}},\, 1.0\}` is the per-edge weight derived from whether :math:`\Delta\Delta G_{i \to j}` was observable
 - :math:`\epsilon = 10^{-8}` is a small threshold to identify non-zero targets
 
-When ``ddg_pairs`` data is absent from a run's ``simulation_results.json`` (e.g. for
-older pretraining data collected before this feature), all edges default to weight
-1.0 so the loss is unchanged for those runs.
+The DDG signal from λ-space crossings is instead used during reinforcement learning
+via per-pair rewards (see :doc:`workflow` and :doc:`cb_setup`), which provides a
+cleaner separation between supervised imitation (BC) and exploration feedback (RL).
 
 
 **Graph Caching**:
@@ -258,45 +243,42 @@ runs would give equal weight to both poor and excellent solutions from the same 
 Best-only mode focuses learning on proven successful configurations, which is particularly
 valuable when pretraining data includes many exploratory runs.
 
-If the number of systems is small, then behavior cloning may not be as effective due to 
+If the number of systems is small, then behavior cloning may not be as effective due to
 limited data diversity.
+
+**4. Stratified Negative Sampling**
+
+As an alternative to a hard reward threshold, stratified negative sampling keeps all
+positive-reward runs and samples a fraction from each negative-reward bucket
+(``(-inf,−50]``, ``(-50,−40]``, …, ``(-10,0)``) using a **quadratic ramp**: the
+worst bucket retains 0% and the best negative bucket retains at most
+``fraction_per_bucket`` (default: **55%**). Intermediate buckets scale as
+:math:`f_i = f_{\max} \times (i / (N-1))^2`, concentrating sampling on near-zero runs
+whose coefficients were almost correct.
+
+*Why this matters:* Pure best-only cloning can leave the Q-critic with an impoverished view
+of the reward distribution, making it hard to distinguish near-success from complete failure.
+Stratified sampling exposes the Q-critic to the full reward landscape while still
+over-representing higher-quality runs, enabling better-calibrated value estimates during
+RL warmup. Positive-reward runs are always retained in full.
 
 **Combined Filtering Strategy**:
 
-Filters can be combined to implement sophisticated data selection policies. 
-The filtering statistics reported during pretraining help assess data quality and inform
-decisions about threshold settings. Excluding too few runs may include noisy data, while
-excluding too many reduces the effective dataset size and risks overfitting.
-
-**4. ΔΔG-Based Edge Down-Weighting**
-
-Rather than excluding runs outright, edges whose substituent pairs had no observed
-λ-space transitions — and therefore no computable :math:`\Delta\Delta G_{i \to j}` (relative
-free-energy difference between substituents *i* and *j*) — are down-weighted during loss
-computation (see `Training Objective`_ above). This is controlled by the
-``ddg_no_transition_weight`` parameter (default 0.2).
-
-Set it in the ``reward`` section of your YAML config:
-
-.. code-block:: yaml
-
-   reward:
-     ddg_no_transition_weight: 0.2   # 0 = ignore no-transition edges; 1 = treat equally
-
-Or override per run with the CLI flag ``--ddg-no-transition-weight W``.
-A value of 1.0 reverts to the original unweighted masked MSE. Lower values (e.g. 0.1)
-more aggressively suppress learning from unreliable pairs.
+Filters can be combined to implement sophisticated data selection policies. The typical
+production configuration uses **outlier filtering** + **best-only BC** + **stratified
+negative sampling for Q-warmup** (controlled by ``--q-stratified-fraction``): BC clones
+only the best-run behavior while the Q-critic sees the full reward distribution.
 
 
 See Also
 --------
 
 * :doc:`file_handling` - Bias coefficient file formats, ``parse_single_ddg`` reference
-* :doc:`deepset_pretraining` - Pretrained DeepSet node embeddings
+* :doc:`deepset_pretraining` - Pretrained AtomBondGNN node embeddings
 * :doc:`cb_setup` - CB infrastructure and policy architecture
 * :doc:`workflow` - Complete CB training workflow
 * :doc:`examples` - Running pretraining and workflows
 * ``examples/pretrain_with_filtering.sh`` - Pretraining SLURM script
 * ``src/mllf/cb/pretrain_policy.py`` - Behavior cloning implementation
 * ``src/mllf/cb/policy.py`` - Policy network architecture
-* ``src/mllf/cb/workflow_utils.py`` - ``build_edge_weights``, ``parse_simulation_metrics``
+* ``src/mllf/cb/workflow_utils.py`` - ``compute_pair_reward``, ``parse_simulation_metrics``

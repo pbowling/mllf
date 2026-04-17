@@ -14,6 +14,7 @@
       extract_environment_atoms_from_minimized
       get_atom_features
       get_atom_features_with_context
+      get_bond_edge_index_from_pdb
       get_substituent_aevs
       map_element_to_species_id
       parse_pdb_coordinates_and_elements

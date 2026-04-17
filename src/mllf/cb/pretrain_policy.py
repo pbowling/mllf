@@ -1878,6 +1878,7 @@ def pretrain_with_runs(
     freeze_encoder_after: Optional[int] = None,
     q_epochs: int = 0,
     q_lr: float = 1e-3,
+    q_stratified_fraction: Optional[float] = None,
 ):
     """Run policy pretraining with provided runs.
     
@@ -1922,7 +1923,12 @@ def pretrain_with_runs(
     if len(runs) == 0:
         print("Error: No valid runs found")
         return
-    
+
+    # Snapshot the full run pool before any BC-specific selection.
+    # Used by Q warmup when q_stratified_fraction is set so the Q-critic
+    # can draw from the broader reward distribution rather than best-only.
+    all_runs_unfiltered = list(runs)
+
     # Optionally filter to keep only best run per system for behavior cloning
     if use_best_only:
         # Use reward config from workflow yaml for consistent reward calculation
@@ -2115,6 +2121,10 @@ def pretrain_with_runs(
 
     graph_cache = [None] * len(runs)
 
+    # Caches (group_key → (struct_data, nsubs_per_site, pairs)) for reuse
+    # when Q warmup uses a different run set that shares the same structures.
+    struct_meta_cache: dict = {}
+
     # Group run indices by their resolved prep_dir so the expensive graph
     # structure (DeepSet AEVs + topology) is built once per unique structure.
     # All runs in the same dataset/combo dir share the same prep/ and thus
@@ -2178,6 +2188,7 @@ def pretrain_with_runs(
                 done   += len(group_runs)
                 continue
 
+            struct_meta_cache[group_key] = (struct_data, _nsubs, _pairs)
             for gidx, run in group_runs:
                 _tgts = _extract_targets_from_variables(
                     run["run_dir"], _nsubs, _pairs)
@@ -2362,15 +2373,97 @@ def pretrain_with_runs(
         q_network = QNetwork(in_dim=q_in_dim, action_dim=q_action_dim, hidden_dims=[64, 32]).to(device)
         q_optimizer = optim.Adam(q_network.parameters(), lr=q_lr)
 
+        # When q_stratified_fraction is set, build a broader run set for the Q-critic
+        # using the same quadratic-ramp stratified sampling as BC but applied to the
+        # full (pre-BC-filter) run pool.  The Q-critic benefits from seeing a range of
+        # rewards — not just best-run outcomes — to learn a well-calibrated value function.
+        if q_stratified_fraction is not None:
+            print(f"\nBuilding Q-warmup run set from full dataset "
+                  f"(stratified, max_fraction={q_stratified_fraction:.0%})...")
+            q_candidate_runs = list(all_runs_unfiltered)
+            if filter_outliers:
+                q_candidate_runs = filter_runs_by_coefficient_range(
+                    q_candidate_runs, n_std=outlier_std_threshold
+                )
+            q_runs = sample_runs_stratified_negative(
+                q_candidate_runs, fraction_per_bucket=q_stratified_fraction
+            )
+            print(f"Q-warmup: {len(q_runs)} runs selected (BC used {len(runs)} runs)")
+
+            # Build graph cache for Q runs, reusing already-built structures where possible.
+            print(f"\nBuilding Q-warmup graph cache ({len(q_runs)} runs)...")
+            q_graph_cache: list = [None] * len(q_runs)
+            q_groups: dict = _dd(list)
+            for idx, run in enumerate(q_runs):
+                _run_dir = run["run_dir"]
+                if deepset_model is not None:
+                    _pdir = None
+                    _local = Path(_run_dir).parent / "prep"
+                    if _local.is_dir():
+                        _pdir = str(_local)
+                    if _pdir is None:
+                        _src = run.get("source_dir")
+                        if _src:
+                            _cand = Path(_src) / "prep"
+                            if _cand.is_dir():
+                                _pdir = str(_cand)
+                    gk = _pdir if _pdir else str(_run_dir)
+                else:
+                    gk = str(_run_dir)
+                q_groups[gk].append((idx, run))
+
+            q_ok = q_fail = 0
+            for gk, q_group_runs in q_groups.items():
+                if gk in struct_meta_cache:
+                    # Reuse structure already built during BC graph caching
+                    s_data, _nsubs, _pairs = struct_meta_cache[gk]
+                else:
+                    # Build fresh for structures not encountered during BC
+                    first_rd = q_group_runs[0][1]["run_dir"]
+                    gi_path = first_rd / "graph_info.json"
+                    if not gi_path.exists():
+                        q_fail += len(q_group_runs)
+                        continue
+                    prep_b = gk if (deepset_model is not None and gk != str(first_rd)) else None
+                    _sol = q_group_runs[0][1].get("metadata", {}).get("solvent_state")
+                    try:
+                        s_data, _, _nsubs, _pairs = _build_graph_structure(
+                            prep_b, gi_path,
+                            toppar_dir=toppar_dir, toppar_files=toppar_files,
+                            warn_missing_types=warn_missing_types,
+                            deepset_model=deepset_model, solvent_state=_sol,
+                        )
+                        struct_meta_cache[gk] = (s_data, _nsubs, _pairs)
+                    except Exception as exc:
+                        print(f"  Error building Q structure ({Path(gk).name}): {exc}")
+                        q_fail += len(q_group_runs)
+                        continue
+                for gidx, run in q_group_runs:
+                    _tgts = _extract_targets_from_variables(run["run_dir"], _nsubs, _pairs)
+                    if _tgts:
+                        q_graph_cache[gidx] = (s_data, _tgts)
+                        q_ok += 1
+                    else:
+                        q_fail += 1
+            print(f"Q graph cache: {q_ok} built, {q_fail} skipped")
+            q_epoch_groups_for_warmup = {k: [i for (i, _) in v] for k, v in q_groups.items()}
+            q_runs_for_warmup = q_runs
+            q_graph_cache_for_warmup = q_graph_cache
+        else:
+            # No separate Q run set — fall back to the BC run set
+            q_runs_for_warmup = runs
+            q_graph_cache_for_warmup = graph_cache
+            q_epoch_groups_for_warmup = epoch_groups
+
         q_history = warmup_q_network(
-            runs=runs,
+            runs=q_runs_for_warmup,
             policy=policy,
             q_network=q_network,
             q_optimizer=q_optimizer,
             epochs=q_epochs,
             device=device,
-            graph_cache=graph_cache,
-            epoch_groups=epoch_groups,
+            graph_cache=q_graph_cache_for_warmup,
+            epoch_groups=q_epoch_groups_for_warmup,
         )
 
         q_path = output_dir / "pretrained_q.pt"
@@ -2536,6 +2629,18 @@ def main():
         default=1e-3,
         help="Learning rate for Q-network warmup (default: 1e-3).",
     )
+    parser.add_argument(
+        "--q-stratified-fraction",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="When set, the Q-network warmup draws runs from the full pre-filter dataset "
+             "using the same quadratic-ramp stratified sampling as BC pretraining. "
+             "FRAC is the max fraction kept from the best negative-reward bucket; "
+             "the worst bucket gets 0%% and all positive-reward runs are always included. "
+             "Useful when --use-best-only is set for BC but you want the Q-critic to see "
+             "a broader reward distribution (e.g. 0.55). Default: disabled (Q uses BC runs).",
+    )
     args = parser.parse_args()
     
     # Load config
@@ -2586,6 +2691,7 @@ def main():
         freeze_encoder_after=args.freeze_encoder_after,
         q_epochs=args.q_epochs,
         q_lr=args.q_lr,
+        q_stratified_fraction=args.q_stratified_fraction,
     )
 
 

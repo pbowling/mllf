@@ -8,5 +8,6 @@
 
    .. autosummary::
    
+      QNetwork
       ValueNetwork
    

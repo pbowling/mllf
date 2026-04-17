@@ -294,7 +294,17 @@ through multiple components:
 
 .. math::
 
-   R_{\text{total}} = R_P + R_T + R_U + R_{\text{entropy}} + R_{\text{penalties}}
+   R_{\text{total}} = coverage\_factor \times (R_P + R_T + R_{\text{entropy}}) + R_{\text{penalties}}
+
+where :math:`coverage\_factor = \left(\frac{N_{\text{visited}}}{N_{\text{subs}}}\right)^2` is a smooth
+quadratic multiplier that scales all positive reward components by coverage. At 100% coverage it is 1.0;
+at 50% it is 0.25; at 0% it is 0.0. This replaces the earlier hard completeness gate
+(which clipped all positive reward to −0.01 when any substituent was unvisited) with a
+smooth gradient signal that rewards partial progress.
+
+This eliminates :math:`R_U` (the explicit uniformity term) and the adaptive
+coverage penalty :math:`P_{\text{cov}}` — both are now subsumed by
+:math:`coverage\_factor`.
 
 **Population Balance Reward** :math:`R_P`:
 
@@ -302,20 +312,21 @@ Encourages equal sampling across all substituents with balanced populations:
 
 .. math::
 
-   R_P = w_P \cdot \frac{\sum_{k \in \text{visited}} p_k}{P_{\text{baseline}}} \cdot e^{-CV} \cdot C_F
+   R_P = w_P \cdot \frac{\sum_{k \in \text{visited}} p_k}{P_{\text{baseline}}} \cdot C_F
 
 where:
 
 * :math:`w_P` is the population weight (default: 0.5)
 * :math:`p_k` is the population count for visited substituent :math:`k`
 * :math:`P_{\text{baseline}}` is the normalization constant (default: 500.0)
-* :math:`CV = \sigma / \mu` is the coefficient of variation (std/mean of nonzero populations)
 * :math:`C_F = \min(1.0, T_{\min} / (2 \times N_{\text{req}}))` is the confidence factor
 * :math:`T_{\min}` is the minimum transitions across all sites
 * :math:`N_{\text{req}}` is the minimum required transitions per site (default: 10)
 
 The confidence factor scales population rewards based on data reliability, reducing
 false rewards from low-transition runs with unreliable population distributions.
+Within-visited uniformity is now captured entirely by :math:`R_{\text{entropy}}`
+(see below) rather than by the balance factor :math:`e^{-CV}` which has been removed.
 
 **Transition Reward** :math:`R_T`:
 
@@ -335,14 +346,6 @@ where:
 * :math:`T_s` is the transition count for site :math:`s`
 * :math:`T_{\text{baseline}}` is the normalization constant (default: 50.0)
 * The 1.5× bonus applies when average transitions per site exceeds 20 (2× the default minimum)
-
-**Uniformity Reward** :math:`R_U`:
-
-Rewards visiting a high fraction of available substituents:
-
-.. math::
-
-   R_U = w_U \cdot \frac{|\{k : p_k > 0\}|}{N_{\text{subs}}}
 
 **Entropy Bonus** :math:`R_{\text{entropy}}`:
 
@@ -384,17 +387,6 @@ multi-site awareness to fairly handle systems with multiple λ-sites:
 
 where :math:`n_{\text{bad}} = |\{s : T_s < N_{\text{req}}\}|` counts sites below threshold.
 
-**Coverage Penalty** (applied only when transitions are sufficient for reliable statistics):
-
-.. math::
-
-   P_{\text{cov}} = \begin{cases}
-   \gamma \cdot 20.0 \cdot \frac{r_{\text{min}} - r_{\text{actual}}}{\sqrt{N_{\text{subs}}}} & \text{if } r_{\text{actual}} < r_{\text{min}} \text{ and } T_{\min} \geq N_{\text{req}} \\
-   0 & \text{otherwise}
-   \end{cases}
-
-The adaptive coverage requirement :math:`r_{\text{min}} = \frac{1 + 0.5(N_{\text{subs}} - 1)}{N_{\text{subs}}}` 
-scales with system size (e.g., 2 subs → 75%, 4 subs → 62.5%, 6 subs → 58%).
 
 **Concentration Penalty** (per-site check for single-substituent dominance):
 
@@ -402,7 +394,7 @@ scales with system size (e.g., 2 subs → 75%, 4 subs → 62.5%, 6 subs → 58%)
 
    P_{\text{conc}} = \sum_{s=1}^{N_{\text{sites}}} \mathbb{1}\left[\frac{\max_k p_{s,k}}{\sum_k p_{s,k}} > 0.8\right] \cdot \gamma \cdot 5.0 \cdot \left(\frac{\max_k p_{s,k}}{\sum_k p_{s,k}} - 0.8\right)
 
-Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0, P_{\text{trans}} + P_{\text{cov}} + P_{\text{conc}})`
+Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0, P_{\text{trans}} + P_{\text{conc}})`
 
 **Default Hyperparameters**:
 
@@ -410,13 +402,13 @@ Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0
 
    reward:
      w_P: 0.5                                # Population weight
-     w_T: 0.75                                # Transition weight
-     w_U: 0.3                                # Uniformity weight
+     w_T: 0.75                               # Transition weight
+     w_U: 0.3                                # Accepted for API compatibility; coverage handled by coverage_factor
      gamma: 4.0                              # Base penalty coefficient
      P_baseline: 500.0                       # Population normalization
      T_baseline: 50.0                        # Transition normalization
      min_transitions_per_site: 10            # Tier 3 threshold
-     min_coverage_ratio: 0.5                 # Minimum fraction of substituents to visit
+     min_coverage_ratio: 0.5                 # Accepted for API compatibility; coverage handled by coverage_factor
      entropy_bonus: 8.0                      # Entropy bonus coefficient
      concentration_penalty_threshold: 0.8    # Single-substituent dominance threshold
 
