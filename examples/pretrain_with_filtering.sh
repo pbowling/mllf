@@ -9,8 +9,8 @@
 
 # SLURM script for running CB policy pretraining on collected MSLD simulation data.
 #
-# Uses the full DeepSet → sum-pool → RGCN pipeline by default:
-#   - Loads the pretrained DeepSet encoder from pretraining/deepset_pretraining_output/
+# Uses the full AtomBondGNN (GINConv + GlobalAttentionPool) → RGCN pipeline by default:
+#   - Loads the pretrained AtomBondGNN encoder from pretraining/deepset_pretraining_output/
 #   - Replaces standard atom-type node features with 64-dim AEV-based embeddings
 #   - Trains the RGCN+EdgePolicy on behavior-cloning MSE loss
 #
@@ -22,8 +22,11 @@
 # With custom parameters:
 #   sbatch --export=ALL,OUTLIER_THRESHOLD=2.5,EPOCHS=100 pretrain_with_filtering.sh
 #
-# To use stratified negative sampling (keeps all positive + 25% of each neg bucket by default):
-#   sbatch --export=ALL,STRATIFIED_FRACTION=0.25 pretrain_with_filtering.sh
+# To use stratified negative sampling (quadratic ramp: 0% for worst bucket to 55% for best):
+#   sbatch --export=ALL,STRATIFIED_FRACTION=0.55 pretrain_with_filtering.sh
+#
+# To enable reward-weighted loss (high-reward runs get proportionally more gradient signal):
+#   sbatch --export=ALL,REWARD_WEIGHTED=true pretrain_with_filtering.sh
 #
 # To disable stratified sampling and fall back to reward threshold filtering:
 #   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=0 pretrain_with_filtering.sh
@@ -84,10 +87,14 @@ OUTLIER_THRESHOLD="${OUTLIER_THRESHOLD:-3.0}"
 REWARD_THRESHOLD="${REWARD_THRESHOLD:-0}"
 NO_FILTER="${NO_FILTER:-true}"
 USE_BEST_ONLY="${USE_BEST_ONLY:-false}"
-STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.25}"
-DEEPSET_ENCODER="${DEEPSET_ENCODER:-pretraining/deepset_pretraining_output/trained_models/best_encoder.pt}"
-EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos luis_cdk2_protein_group1 luis_cdk2_protein_group2 luis_cdk2_solvent_group1 luis_cdk2_solvent_group2 luis_ptp1b_protein_group1 luis_ptp1b_solvent_group1 p38_protein_groupA p38_protein_groupB p38_protein_groupC mup1_solvent_group2 luis_p38_protein_group2}"
+STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.55}"
+REWARD_WEIGHTED="${REWARD_WEIGHTED:-false}"
+DEEPSET_ENCODER="${DEEPSET_ENCODER:-$SLURM_SUBMIT_DIR/../pretraining/deepset_pretraining_output/trained_models/best_encoder.pt}"
+#EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos luis_cdk2_protein_group1 luis_cdk2_protein_group2 luis_cdk2_solvent_group1 luis_cdk2_solvent_group2 luis_ptp1b_protein_group1 luis_ptp1b_solvent_group1 p38_protein_groupA p38_protein_groupB p38_protein_groupC mup1_solvent_group2 luis_p38_protein_group2}"
 PATIENCE="${PATIENCE:-10}"
+Q_EPOCHS="${Q_EPOCHS:-0}"
+Q_LR="${Q_LR:-1e-3}"
+Q_STRATIFIED_FRACTION="${Q_STRATIFIED_FRACTION:-}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -99,10 +106,11 @@ echo "  Reward threshold: >= $REWARD_THRESHOLD"
 echo "  Filtering enabled: $([ "$NO_FILTER" = "false" ] && echo "yes" || echo "no")"
 echo "  Use best only: $([ "$USE_BEST_ONLY" = "true" ] && echo "yes" || echo "no")"
 if [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
-    echo "  Stratified negative sampling: ${STRATIFIED_FRACTION} (fraction per bucket)"
+    echo "  Stratified negative sampling: ${STRATIFIED_FRACTION} (max fraction, quadratic ramp)"
 else
     echo "  Stratified negative sampling: DISABLED"
 fi
+echo "  Reward-weighted loss: $([ "$REWARD_WEIGHTED" = "true" ] && echo "ENABLED" || echo "disabled")"
 if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ] && [ -f "$DEEPSET_ENCODER" ]; then
     echo "  DeepSet encoder: $DEEPSET_ENCODER"
 else
@@ -112,6 +120,15 @@ if [ -n "$EXCLUDE_DATASETS" ]; then
     echo "  Excluded datasets: $EXCLUDE_DATASETS"
 fi
 echo "  Early stopping patience: $PATIENCE epochs"
+if [ "$Q_EPOCHS" != "0" ] && [ -n "$Q_EPOCHS" ]; then
+    if [ -n "$Q_STRATIFIED_FRACTION" ]; then
+        echo "  Q-network warmup: $Q_EPOCHS epochs (lr=$Q_LR, stratified fraction=$Q_STRATIFIED_FRACTION)"
+    else
+        echo "  Q-network warmup: $Q_EPOCHS epochs (lr=$Q_LR, uses BC runs)"
+    fi
+else
+    echo "  Q-network warmup: DISABLED"
+fi
 echo ""
 
 # Find pretraining directory
@@ -231,9 +248,12 @@ else
 fi
 
 # Add reward filtering
-if [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
+if [ -n "$MIN_TRANSITIONS" ] && [ "$MIN_TRANSITIONS" != "0" ]; then
+    CMD="$CMD --min-transitions $MIN_TRANSITIONS"
+    echo "Transition filtering: ENABLED (>= $MIN_TRANSITIONS per site)"
+elif [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
     CMD="$CMD --stratified-negative-fraction $STRATIFIED_FRACTION"
-    echo "Stratified negative sampling: ENABLED (${STRATIFIED_FRACTION} per bucket)"
+    echo "Stratified negative sampling: ENABLED (max ${STRATIFIED_FRACTION}, quadratic ramp)"
 elif [ -n "$REWARD_THRESHOLD" ]; then
     CMD="$CMD --min-reward-threshold $REWARD_THRESHOLD"
     echo "Reward filtering: ENABLED (>= $REWARD_THRESHOLD)"
@@ -263,6 +283,23 @@ fi
 # Add early stopping patience
 CMD="$CMD --patience $PATIENCE"
 echo "Early stopping patience: $PATIENCE epochs"
+
+# Add reward-weighted loss if requested
+if [ "$REWARD_WEIGHTED" = "true" ]; then
+    CMD="$CMD --reward-weighted"
+    echo "Reward-weighted loss: ENABLED"
+fi
+
+# Add Q-network warmup if requested
+if [ "$Q_EPOCHS" != "0" ] && [ -n "$Q_EPOCHS" ]; then
+    CMD="$CMD --q-epochs $Q_EPOCHS --q-lr $Q_LR"
+    if [ -n "$Q_STRATIFIED_FRACTION" ]; then
+        CMD="$CMD --q-stratified-fraction $Q_STRATIFIED_FRACTION"
+        echo "Q-network warmup: ENABLED ($Q_EPOCHS epochs, lr=$Q_LR, stratified fraction=$Q_STRATIFIED_FRACTION)"
+    else
+        echo "Q-network warmup: ENABLED ($Q_EPOCHS epochs, lr=$Q_LR, uses BC run set)"
+    fi
+fi
 
 echo ""
 echo "Command:"

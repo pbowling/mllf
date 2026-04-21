@@ -25,7 +25,7 @@ Running:
   python -m mllf.file_handling.generate_combinations input_dir --out combos_out
 
 Will produce directories like:
-  combos_out/comb_0001_site1_1__site1_2/
+  combos_out/comb_0001_site1_subs_1_2/
     ├── prep/
     │   ├── site1_sub1_pres.rtf    (renamed if necessary, see mapping.json)
     │   ├── site1_sub1_frag.pdb
@@ -252,32 +252,36 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int],
 
     Returns:
         Directory name like:
-        - Within-site: 'comb_0001_site1_2__site1_3__site1_4'
-        - Cross-site: 'comb_0001_site1_1__site1_2__site2_3__site2_4'
+        - Within-site: 'comb_0001_site1_subs_2_3_4'
+        - Cross-site: 'comb_0001_site1_subs_1_2__site2_subs_3_4'
+
+        Sites are separated by ``__``; substituent IDs for each site are listed
+        after ``subs_`` separated by ``_``.  This is shorter than the old
+        per-sub ``site{N}_{sub}`` format while remaining unambiguous.
     """
     parts = []
-    
+
     if len(sites) == 1:
         # Within-site combination: all subs belong to same site
         s = sites[0]
-        for sub in subs:
-            parts.append(f"site{s}_{sub}")
+        sub_str = "_".join(str(sub) for sub in subs)
+        parts.append(f"site{s}_subs_{sub_str}")
     else:
-        # Cross-site combination: distribute subs across sites using actual counts
+        # Cross-site combination: one part per site
         idx = 0
         for i, site in enumerate(sites):
             if subs_per_site_counts is not None:
                 count = subs_per_site_counts[i]
             else:
                 # Fallback: even split (legacy behavior)
-                subs_per_site = len(subs) // len(sites)
+                n_per = len(subs) // len(sites)
                 remainder = len(subs) % len(sites)
-                count = subs_per_site + (1 if i < remainder else 0)
-            for _ in range(count):
-                if idx < len(subs):
-                    parts.append(f"site{site}_{subs[idx]}")
-                    idx += 1
-    
+                count = n_per + (1 if i < remainder else 0)
+            site_subs = subs[idx: idx + count]
+            idx += count
+            sub_str = "_".join(str(sub) for sub in site_subs)
+            parts.append(f"site{site}_subs_{sub_str}")
+
     joined = "__".join(parts)
     return f"comb_{counter:04d}_{joined}"
 

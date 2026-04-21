@@ -8,10 +8,10 @@
 # - Shared trunk: 1 layer (lightweight)
 # - Bias-type embeddings: Learnable 16-dim vectors providing unique context per head
 # - Separate heads: Deep 3-layer networks receiving [trunk_out, bias_embedding]
-# - Output scaling: tanh clamped to [Linear ±305, Quadratic ±520, Skew ±85, End ±30]
-#   (based on full 20K+ run scan: linear max 277, quadratic max 470, skew max 77, end max 27)
+# - Output scaling: tanh * [±305, ±520, ±85, ±30] (full coefficient range)
+#   (empirical maxima: linear 277, quadratic 470, skew 77, end 27; ~10% headroom)
 # - Exploration: log_std max = 2.0 (std up to ~7.4)
-# - Action clipping: bias_clip = 1000.0 (safety net above tanh bounds)
+# - Action clipping: policy clips actions to ±[320, 546, 89, 31.5] (scale_factors * 1.05)
 # mlp_out_dim is automatically computed from relation_names (typically 4: quadratic, skew, end, linear)
 training:
   encoder:
@@ -23,14 +23,14 @@ training:
   optimizer:
     lr: 0.001
   bias_clip: 1000.0         # Safety net applied when writing variables.py at inference time;
-                            # clips all coefficients to ±1000 (well above tanh bounds of ±305/±520/±85/±30)
+                            # clips coefficients to ±1000
 
 # Reward configuration (improved reward function with graduated transition penalties)
 reward:
   # Reward component weights
   w_P: 0.5              # Weight for population distribution
   w_T: 0.75             # Weight for transition counts (increased from 0.5)
-  w_U: 0.3              # Weight for uniformity/entropy
+  w_U: 0.3              # Accepted but unused in current formula; coverage handled by coverage_factor quadratic
   
   # Scaling and bonuses
   gamma: 4.0            # Scaling factor for coverage/concentration penalties
@@ -51,9 +51,6 @@ reward:
   # Additional constraints
   min_coverage_ratio: 0.5             # Minimum ratio of substituents visited (0.5 = 50%)
   concentration_penalty_threshold: 0.8  # Threshold for concentration penalty (0.8 = 80%)
-  
-  # Legacy parameters (for backward compatibility)
-  lambda_entropy: 0.01
 
 # Atom type vocabulary configuration
 vocabulary:

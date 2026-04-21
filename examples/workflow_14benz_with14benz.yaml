@@ -9,7 +9,7 @@ system:
 # Combination generation
 create_combos:
   input_dir: /home/pbowling/mllf/examples/14benz
-  out_dir: /home/pbowling/mllf/examples/14benz/generated_combos
+  out_dir: /home/pbowling/mllf/examples/14benz/generated_combos_with14benz
   include_patterns:
     - msld_flat.py
 
@@ -20,9 +20,20 @@ split:
   seed: 16
 
 pretrain:
-  model_path: /home/pbowling/mllf/models/pretraining/best_policy.pt
+  model_path: /home/pbowling/mllf/examples/models/pretraining_with14benz/best_policy.pt
 
-# DeepSet encoder configuration (pretrained, frozen during RL training)
+# Warm-start configuration: at epoch 0, use pretraining biases instead of sampling
+# from the policy.  Build the mapping file with:
+#   python examples/build_warmstart_map.py \
+#     --pretrain-dir /home/pbowling/mllf/pretraining/14benz_solv \
+#     --nsubs-per-site 6 5 \
+#     --output /home/pbowling/mllf/examples/models/warmstart_14benz_solv.json
+# Set mapping_path to null (or omit this block) to disable.
+warmstart:
+  mapping_path: /home/pbowling/mllf/examples/models/warmstart_14benz_solv.json
+  epoch: 0  # Which epoch receives warm-start biases (default 0)
+
+# AtomBondGNN encoder configuration (pretrained, frozen during all training phases)
 deepset:
   encoder_path: /home/pbowling/mllf/pretraining/deepset_pretraining_output/trained_models/best_encoder.pt
 
@@ -34,54 +45,28 @@ curriculum:
   max_train_combos_per_stage: 250  # e.g., 100 to limit to 100 random combos per stage
   
   stages:
-    # 1. WARM UP: Learning the basics with a "Leaky Gate"
-    - name: triples_single_site_easy
+    # 1. WARM UP: Learn graphs most like what the model saw during pretraining
+    - name: similar_to_pretraining
       min_sites: 1
       max_sites: 1
       min_subs_per_site: 3
-      max_subs_per_site: 3
-      epochs: 100
+      max_subs_per_site: 4
+      epochs: 2
       # Optional: Override max_train_combos for this specific stage
       # max_train_combos: 50
       # Override reward parameters for easier early learning
       reward_override:
-        min_transitions_per_site: 5  # Lower threshold for warm-up stage
+        min_transitions_per_site: 3  # Lower threshold 
 
-    # 2. MASTERY: Perfecting the pairwise edge weights
-    #- name: triples_single_site_full
-    #  min_sites: 1
-    #  max_sites: 1
-    #  min_subs_per_site: 3
-    #  max_subs_per_site: 3
-    #  epochs: 50
-
-    # # 3. DENSITY: Learning crowding effects
-    # - name: more_combos_single_site_easy
-    #   min_sites: 1
-    #   max_sites: 1
-    #   min_subs_per_site: 3
-    #   max_subs_per_site: 5
-    #   epochs: 50  # Increased: Density is harder than pairs
-    #   reward_override:
-    #     min_transitions_per_site: 5  # Lower threshold for warm-up stage
-
-    # # 4. EXTRAPOLATION: The big jump to Multi-Site
-    # - name: two_sites_easy
+    # 2. EXPANSION: Try less similar combos to encourage generalization
+    # - name: expand_combo_space
     #   min_sites: 2
     #   max_sites: 2
-    #   min_subs_per_site: 2
-    #   max_subs_per_site: 4
-    #   epochs: 50 
-    #   reward_override:
-    #     min_transitions_per_site: 5  # Lower threshold for warm-up stage
-
-    # 5. COMPLEXITY: The "Endgame"
-    #- name: complex_two_sites
-    #  min_subs: 5
-    #  max_subs: 8
-    # min_sites: 2
-    #  max_sites: 2
-    #  epochs: 50
+      # min_subs_per_site: 5
+      # max_subs_per_site: 6
+      # epochs: 25
+      # reward_override:
+      #   min_transitions_per_site: 3  # Lower threshold
   
   # Progression criteria (advance after fixed epochs)
   progression:
@@ -127,7 +112,7 @@ training:
 # Simulation configuration
 run_sims: true
 wait_for_jobs: true  # Wait for jobs to complete before computing rewards
-max_concurrent_jobs: 60  # Maximum SLURM jobs running simultaneously
+max_concurrent_jobs: 100  # Maximum SLURM jobs running simultaneously
 timeout: 600  # 10 minutes per simulation (matches SLURM --time=00:10:00)
 
 # Reward configuration (improved reward function with graduated transition penalties)
@@ -165,7 +150,7 @@ reward:
 
 # Output organization
 output:
-  base_dir: /home/pbowling/mllf/examples/14benz/training_output
+  base_dir: /home/pbowling/mllf/examples/14benz/training_output_with14benz
   save_checkpoints: true
   checkpoint_freq: 5  # Save checkpoint every 5 epochs
 
@@ -178,4 +163,4 @@ archive:
   per_stage: true             # Archive at end of each curriculum stage (runs in background)
   pattern: 'comb_*'          # Glob pattern for directories to archive (unused with per_stage=true)
   remove_after: false        # Remove original directories after archiving
-  archive_dir: /home/pbowling/mllf/examples/14benz/archives  # Where to store .tar.gz files
+  archive_dir: /home/pbowling/mllf/examples/14benz/archives_with14benz  # Where to store .tar.gz files

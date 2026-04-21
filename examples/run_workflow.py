@@ -27,7 +27,7 @@ import numpy as np
 import json
 import subprocess
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 import re
 
 from mllf.file_handling.generate_combinations import create_combination_dirs, create_single_combination_dir
@@ -48,60 +48,68 @@ from mllf.cb.workflow_utils import (
 from mllf.cli.sim import run_simulation_batch
 
 
-def filter_combos_by_curriculum(combos: List[Path], 
-                                 min_subs: int, max_subs: int,
-                                 min_sites: int, max_sites: int) -> List[Path]:
+def filter_combos_by_curriculum(combos: List[Path],
+                                 min_sites: int, max_sites: int,
+                                 min_subs_per_site: int = 1,
+                                 max_subs_per_site: Optional[int] = None) -> List[Path]:
     """Filter combinations based on curriculum stage criteria.
-    
+
     Parses combination directory names to extract number of sites and substituents,
     then filters based on curriculum constraints.
-    
+
     Args:
         combos: List of combination directory paths
-        min_subs: Minimum number of substituents
-        max_subs: Maximum number of substituents
         min_sites: Minimum number of sites
         max_sites: Maximum number of sites
-    
+        min_subs_per_site: Minimum substituents at any single site (default 1)
+        max_subs_per_site: Maximum substituents at any single site (default unconstrained)
+
     Returns:
         Filtered list of combinations matching curriculum criteria
     """
     filtered = []
-    
+
     for combo_path in combos:
         # Handle both string paths and Path objects
         if isinstance(combo_path, str):
             combo_name = Path(combo_path).name
         else:
             combo_name = combo_path.name
-        
-        # Parse combination name: comb_NNNN_site1_1__site1_2__site2_3...
-        # Count unique sites and total substituents
+
+        # Parse combination name: comb_NNNN__site1_1__site1_2__site2_3...
         parts = combo_name.split('__')
-        
+
         if len(parts) < 2:
             continue  # Invalid format
-        
-        sites_seen = set()
-        num_subs = 0
-        
+
+        subs_per_site: Dict[int, int] = {}
+
         for part in parts:
-            # Each part is like 'site1_1' or from comb prefix 'comb_0001_site1_1'
+            # Each part is like 'site1_subs_1_2' or from comb prefix 'comb_0001_site1_subs_1_2'
             if 'site' in part:
-                # Extract siteX_Y pattern
-                site_match = re.search(r'site(\d+)_(\d+)', part)
+                site_match = re.search(r'site(\d+)_subs_([\d_]+)', part)
                 if site_match:
                     site_id = int(site_match.group(1))
-                    sites_seen.add(site_id)
-                    num_subs += 1
-        
-        num_sites = len(sites_seen)
-        
-        # Check if this combo matches curriculum criteria
-        if (min_subs <= num_subs <= max_subs and 
-            min_sites <= num_sites <= max_sites):
-            filtered.append(combo_path)
-    
+                    sub_ids = site_match.group(2).split('_')
+                    subs_per_site[site_id] = len(sub_ids)
+
+        if not subs_per_site:
+            continue
+
+        num_sites = len(subs_per_site)
+        site_counts = list(subs_per_site.values())
+
+        if not (min_sites <= num_sites <= max_sites):
+            continue
+
+        if min(site_counts) < min_subs_per_site:
+            continue
+
+        if max_subs_per_site is not None and max(site_counts) > max_subs_per_site:
+            continue
+
+        filtered.append(combo_path)
+
     return filtered
 
 
@@ -813,10 +821,10 @@ def main():
         # Filter train combos for this stage
         filtered_combos = filter_combos_by_curriculum(
             train_combos,
-            min_subs=current_stage['min_subs'],
-            max_subs=current_stage['max_subs'],
             min_sites=current_stage['min_sites'],
-            max_sites=current_stage['max_sites']
+            max_sites=current_stage['max_sites'],
+            min_subs_per_site=current_stage.get('min_subs_per_site', 1),
+            max_subs_per_site=current_stage.get('max_subs_per_site', None)
         )
         print(f"Filtered to {len(filtered_combos)} training combinations for this stage")
         
@@ -920,10 +928,10 @@ def main():
                     # Filter train combos for new stage
                     filtered_combos = filter_combos_by_curriculum(
                         train_combos,
-                        min_subs=current_stage['min_subs'],
-                        max_subs=current_stage['max_subs'],
                         min_sites=current_stage['min_sites'],
-                        max_sites=current_stage['max_sites']
+                        max_sites=current_stage['max_sites'],
+                        min_subs_per_site=current_stage.get('min_subs_per_site', 1),
+                        max_subs_per_site=current_stage.get('max_subs_per_site', None)
                     )
                     print(f"Filtered to {len(filtered_combos)} training combinations for this stage")
                     

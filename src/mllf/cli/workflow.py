@@ -548,9 +548,20 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             if b_vec:
                 b_vec[0] = 0.0
     else:
-        # Fallback: always set b[0] to 0.0 (first element must be zero)
-        if b_vec:
-            b_vec[0] = 0.0
+        # Fallback: infer reference subs from linear edge topology.
+        # Linear edges are always sub1(src) → other_sub(dst), so the reference
+        # node of each site appears as the min-index end of every linear pair
+        # (i.e. it appears as `i` in canonical pairs but never as `j`).
+        linear_vals = per_base_forward.get('linear', {})
+        if linear_vals:
+            as_src = set(i for i, j in linear_vals)
+            as_dst = set(j for i, j in linear_vals)
+            ref_nodes = as_src - as_dst  # reference: src-only, never dst
+            for ref_idx in sorted(ref_nodes):
+                if ref_idx < len(b_vec):
+                    b_vec[ref_idx] = 0.0
+        elif b_vec:
+            b_vec[0] = 0.0  # last-resort: no linear edges at all
 
     # Format bias_string manually to match expected YAML structure
     # b: single row with first element using '- -' then rest using just '-'
