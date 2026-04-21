@@ -532,8 +532,21 @@ class TestExtractProteinAtomsFromMinimized:
             else:
                 elem_count[elem] = elem_count.get(elem, 0) + 1
                 name = f'{elem}{elem_count[elem]:02d}'
+            # Standard CHARMM PDB column layout (0-indexed):
+            # 0-5  record "ATOM  "
+            # 6-10 serial (5 chars)
+            # 11   space
+            # 12-15 atom name (4 chars) ← _read_atom_names_from_pdb reads line[12:16]
+            # 16   alt loc (space)
+            # 17-19 residue name "ALA"
+            # 20   space
+            # 21   chain "A"
+            # 22-25 residue seq
+            # 26-29 spacers
+            # 30-37 X, 38-45 Y, 46-53 Z
+            # 76-77 element symbol
             lines.append(
-                f'ATOM{i:>7}  {name:<4}ALA A{i:>4}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}\n'
+                f'ATOM  {i:>5} {name:<4} ALA A{i:>4}    {x:>8.3f}{y:>8.3f}{z:>8.3f}  1.00  0.00          {elem:>2}\n'
             )
         lines.append('END\n')
         path.write_text(''.join(lines))
