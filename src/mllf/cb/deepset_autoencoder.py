@@ -258,9 +258,9 @@ class AtomBondGNNAutoencoder(nn.Module):
     """Autoencoder for pretraining AtomBondGNN atom-level embeddings.
 
     Uses the same layer architecture as :class:`~mllf.cb.deepset.AtomBondGNN`
-    (input projection → GINConv × 2 → GlobalAttentionPool) as the encoder,
+    (input projection → GINEConv × 2 → AttentionalAggregation) as the encoder,
     with a lightweight per-atom decoder (Linear) that reconstructs the full
-    input feature vector from the GINConv hidden states *before* pooling.
+    input feature vector from the GINEConv hidden states *before* pooling.
 
     Training loss: per-atom MSE reconstruction of input features
     (AEV + charge + atom-type one-hot; the full ``input_dim``-dimensional
@@ -274,9 +274,10 @@ class AtomBondGNNAutoencoder(nn.Module):
         aev_length: AEV feature dimension (default: 2288).
         num_atom_types: Number of element species (default: 11).
         embedding_dim: Substituent embedding bottleneck dimension (default: 64).
-        hidden_dim: Hidden dimension for GINConv MLPs (default: 256).
+        hidden_dim: Hidden dimension for GINEConv MLPs (default: 256).
         include_charge: Include partial charge in input features (default: True).
         include_atom_id: Include atom-type one-hot in input features (default: True).
+        bond_attr_dim: Dimension of bond-type edge features (default: 1).
     """
 
     def __init__(
@@ -287,9 +288,11 @@ class AtomBondGNNAutoencoder(nn.Module):
         hidden_dim: int = 256,
         include_charge: bool = True,
         include_atom_id: bool = True,
+        bond_attr_dim: int = 1,
+        num_gin_layers: int = 4,
     ):
         super().__init__()
-        from torch_geometric.nn import GINConv, GlobalAttention
+        from torch_geometric.nn import GINEConv
 
         self.aev_length = aev_length
         self.num_atom_types = num_atom_types
@@ -297,6 +300,8 @@ class AtomBondGNNAutoencoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.include_charge = include_charge
         self.include_atom_id = include_atom_id
+        self.bond_attr_dim = bond_attr_dim
+        self.num_gin_layers = num_gin_layers
 
         input_dim = aev_length
         if include_charge:
@@ -306,11 +311,6 @@ class AtomBondGNNAutoencoder(nn.Module):
         self.input_dim = input_dim
 
         # ── Encoder layers (same names as AtomBondGNN for direct state-dict transfer) ──
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-        )
-
         def _gin_mlp(in_d: int, out_d: int) -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(in_d, out_d),
@@ -318,17 +318,35 @@ class AtomBondGNNAutoencoder(nn.Module):
                 nn.Linear(out_d, out_d),
             )
 
-        self.gin1 = GINConv(_gin_mlp(hidden_dim, hidden_dim))
-        self.gin2 = GINConv(_gin_mlp(hidden_dim, hidden_dim))
+        # Substituent stream
+        self.sub_input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+        )
+        self.sub_gin_layers = nn.ModuleList([
+            GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
+            for _ in range(num_gin_layers)
+        ])
 
-        gate_nn = nn.Linear(hidden_dim, 1)
-        pool_nn = nn.Linear(hidden_dim, embedding_dim)
-        self.pool = GlobalAttention(gate_nn=gate_nn, nn=pool_nn)
+        # Core stream
+        self.core_input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+        )
+        self.core_gin_layers = nn.ModuleList([
+            GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
+            for _ in range(num_gin_layers)
+        ])
+
+        # Hybrid attentional pooling
+        self.gate_nn = nn.Linear(hidden_dim * 2, 1)
+        self.pool_nn = nn.Linear(hidden_dim, embedding_dim)
 
         # Compatibility shim (matches AtomBondGNN attribute)
         self.atom_mlp = nn.Sequential(nn.Linear(hidden_dim, embedding_dim))
 
-        # ── Decoder: per-atom reconstruction from GINConv hidden states ──
+        # ── Decoder: shared per-atom reconstruction from hidden states ──
+        # Applied separately to x_sub and x_core; both share the same input_dim target.
         self.decoder = nn.Linear(hidden_dim, input_dim)
 
     # ------------------------------------------------------------------
@@ -354,21 +372,84 @@ class AtomBondGNNAutoencoder(nn.Module):
             parts.append(one_hot)
         return torch.cat(parts, dim=-1)
 
-    def _message_pass(
+    def _run_stream(
         self,
-        x: torch.Tensor,
+        input_proj: nn.Module,
+        gin_layers: nn.ModuleList,
+        aev: torch.Tensor,
+        charges: torch.Tensor,
+        atom_ids: torch.Tensor,
         bond_edge_index: torch.Tensor,
+        bond_edge_attr: torch.Tensor = None,
     ) -> torch.Tensor:
-        """Project → GINConv × 2, falling back to self-loops if no bonds."""
+        """Project → N×(GINEConv + residual), with self-loop fallback when no bonds."""
+        x = input_proj(self._build_input(aev, charges, atom_ids))
+        dev = aev.device
         if bond_edge_index is not None and bond_edge_index.size(1) > 0:
-            edge_index = bond_edge_index.to(x.device)
+            ei = bond_edge_index.to(dev)
+            if bond_edge_attr is not None:
+                ea = bond_edge_attr.to(dev)
+                if ea.dim() == 1:
+                    ea = ea.unsqueeze(1)
+            else:
+                ea = torch.zeros(ei.size(1), self.bond_attr_dim, device=dev)
         else:
             n = x.size(0)
-            idx = torch.arange(n, device=x.device)
-            edge_index = torch.stack([idx, idx], dim=0)
-        x = torch.relu(self.gin1(x, edge_index))
-        x = torch.relu(self.gin2(x, edge_index))
+            idx = torch.arange(n, device=dev)
+            ei = torch.stack([idx, idx])
+            ea = torch.zeros(n, self.bond_attr_dim, device=dev)
+        for gin in gin_layers:
+            x = torch.relu(gin(x, ei, ea) + x)
         return x
+
+    def _dual_stream(
+        self,
+        aev_tensor: torch.Tensor,
+        charges: torch.Tensor,
+        atom_ids: torch.Tensor,
+        bond_edge_index: torch.Tensor,
+        bond_edge_attr: torch.Tensor,
+        sub_mask: torch.Tensor,
+    ):
+        """Run dual-stream processing; returns (x_sub, x_core, core_summary, n_sub)."""
+        n_sub = int(sub_mask.sum())
+        core_mask = ~sub_mask
+
+        # Partition edge graph into sub-only and core-only sub-graphs
+        if bond_edge_index is not None and bond_edge_index.size(1) > 0:
+            src, dst = bond_edge_index
+            sub_e   = (src < n_sub) & (dst < n_sub)
+            core_e  = (src >= n_sub) & (dst >= n_sub)
+            sub_ei  = bond_edge_index[:, sub_e]
+            sub_ea  = bond_edge_attr[sub_e]  if bond_edge_attr is not None else None
+            core_ei = bond_edge_index[:, core_e] - n_sub
+            core_ea = bond_edge_attr[core_e] if bond_edge_attr is not None else None
+        else:
+            sub_ei = sub_ea = core_ei = core_ea = None
+
+        x_sub = self._run_stream(
+            self.sub_input_proj, self.sub_gin_layers,
+            aev_tensor[sub_mask],
+            charges[sub_mask]  if charges  is not None else None,
+            atom_ids[sub_mask] if atom_ids is not None else None,
+            sub_ei, sub_ea,
+        )  # [n_sub, H]
+
+        n_core = int(core_mask.sum())
+        if n_core > 0:
+            x_core = self._run_stream(
+                self.core_input_proj, self.core_gin_layers,
+                aev_tensor[core_mask],
+                charges[core_mask]  if charges  is not None else None,
+                atom_ids[core_mask] if atom_ids is not None else None,
+                core_ei, core_ea,
+            )  # [n_core, H]
+            core_summary = x_core.mean(0, keepdim=True).expand(n_sub, -1)
+        else:
+            x_core = torch.zeros(0, self.hidden_dim, device=aev_tensor.device)
+            core_summary = torch.zeros(n_sub, self.hidden_dim, device=aev_tensor.device)
+
+        return x_sub, x_core, core_summary, n_sub
 
     # ------------------------------------------------------------------
     # Forward / encode
@@ -381,26 +462,47 @@ class AtomBondGNNAutoencoder(nn.Module):
         atom_ids: torch.Tensor,
         bond_edge_index: torch.Tensor,
         bond_edge_attr: torch.Tensor = None,
+        sub_mask: torch.Tensor = None,
     ) -> dict:
         """Autoencoder forward pass (training mode).
 
-        Args:
-            aev_tensor: [N, aev_length]
-            charges: [N] partial charges
-            atom_ids: [N] integer element IDs
-            bond_edge_index: [2, 2E] bidirectional bond edges
-            bond_edge_attr: [2E, 1] bond-type weights (unused by GINConv)
+        In dual-stream mode (``sub_mask`` provided) the sub and core atoms are
+        processed through their respective GNN streams.  The decoder reconstructs
+        all ligand atoms: sub atoms from ``x_sub`` and core atoms from ``x_core``.
+        The reconstruction output maintains the original atom ordering (sub first).
 
-        Returns:
-            dict with:
-                ``'input'``: [N, input_dim] — original concatenated features
-                ``'reconstruction'``: [N, input_dim] — decoder output
+        When ``sub_mask`` is ``None`` all atoms are treated as substituent (legacy).
         """
-        x_in = self._build_input(aev_tensor, charges, atom_ids)
-        h = self._message_pass(self.input_proj(x_in), bond_edge_index)
+        x_in = self._build_input(aev_tensor, charges, atom_ids)  # [N, input_dim]
+
+        if sub_mask is not None:
+            x_sub, x_core, core_summary, n_sub = self._dual_stream(
+                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr, sub_mask
+            )
+            # Reconstruct all atoms: sub decoded from x_sub, core from x_core
+            recon_sub  = self.decoder(x_sub)
+            recon_core = self.decoder(x_core) if x_core.size(0) > 0 else x_core.new_zeros(0, self.input_dim)
+            reconstruction = torch.cat([recon_sub, recon_core], dim=0)  # [N, input_dim]
+        else:
+            # Legacy: single stream
+            n_sub = aev_tensor.size(0)
+            x_sub = self._run_stream(
+                self.sub_input_proj, self.sub_gin_layers,
+                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr,
+            )
+            core_summary = torch.zeros(n_sub, self.hidden_dim, device=aev_tensor.device)
+            reconstruction = self.decoder(x_sub)
+
+        # Compute embedding here (reusing x_sub/core_summary — no second forward pass)
+        gates    = torch.softmax(self.gate_nn(torch.cat([x_sub, core_summary], dim=-1)), dim=0)
+        features = self.pool_nn(x_sub)
+        embedding = (gates * features).sum(0)  # [embedding_dim]
+
         return {
-            'input': x_in,
-            'reconstruction': self.decoder(h),
+            'input':          x_in,
+            'reconstruction': reconstruction,
+            'sub_mask':       sub_mask,
+            'embedding':      embedding,
         }
 
     def encode(
@@ -410,12 +512,24 @@ class AtomBondGNNAutoencoder(nn.Module):
         atom_ids: torch.Tensor,
         bond_edge_index: torch.Tensor,
         bond_edge_attr: torch.Tensor = None,
+        sub_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """Encode a substituent to a pooled [embedding_dim] vector (inference)."""
-        x_in = self._build_input(aev_tensor, charges, atom_ids)
-        h = self._message_pass(self.input_proj(x_in), bond_edge_index)
-        batch = torch.zeros(h.size(0), dtype=torch.long, device=h.device)
-        return self.pool(h, batch).squeeze(0)
+        if sub_mask is not None:
+            x_sub, _, core_summary, n_sub = self._dual_stream(
+                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr, sub_mask
+            )
+        else:
+            n_sub = aev_tensor.size(0)
+            x_sub = self._run_stream(
+                self.sub_input_proj, self.sub_gin_layers,
+                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr,
+            )
+            core_summary = torch.zeros(n_sub, self.hidden_dim, device=aev_tensor.device)
+
+        gates    = torch.softmax(self.gate_nn(torch.cat([x_sub, core_summary], dim=-1)), dim=0)
+        features = self.pool_nn(x_sub)
+        return (gates * features).sum(0)
 
     # ------------------------------------------------------------------
     # Checkpoint helpers
@@ -449,6 +563,8 @@ class AtomBondGNNAutoencoder(nn.Module):
                 'hidden_dim': self.hidden_dim,
                 'include_charge': self.include_charge,
                 'include_atom_id': self.include_atom_id,
+                'bond_attr_dim': self.bond_attr_dim,
+                'num_gin_layers': self.num_gin_layers,
             },
             path,
         )
@@ -487,6 +603,8 @@ def load_pretrained_atombondgnn(encoder_path: str, freeze_weights: bool = True):
         hidden_dim=ckpt['hidden_dim'],
         include_charge=ckpt['include_charge'],
         include_atom_id=ckpt['include_atom_id'],
+        bond_attr_dim=ckpt.get('bond_attr_dim', 1),
+        num_gin_layers=ckpt.get('num_gin_layers', 2),
     )
     model.load_state_dict(ckpt['state_dict'])
     if freeze_weights:

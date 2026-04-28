@@ -37,28 +37,26 @@ class EdgeValueMLP(nn.Module):
         self.num_bias_types = num_bias_types
         self.bias_embed_dim = bias_embed_dim
         
-        # Shared trunk - lightweight for basic edge representation
+        # Shared trunk: fixed 256 → 128 regardless of 'hidden' param
         self.trunk = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU()
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
         )
-        
-        # Learnable bias-type embeddings
-        # Each bias type gets a unique embedding that will be learned during training
-        # This provides bias-specific context to force head specialization
+
+        # Learnable bias-type embeddings (16D)
         self.bias_type_embeddings = nn.Embedding(num_bias_types, bias_embed_dim)
-        
-        # Separate heads - deep and specialized for each bias type
-        # Input: [trunk_output (hidden), bias_type_embedding (bias_embed_dim)]
-        # This concatenated input ensures each head receives unique information
-        head_input_dim = hidden + bias_embed_dim
+
+        # Separate heads: 144D (128 trunk + 16 bias embed) → 64 → 32 → 2
+        head_input_dim = 128 + bias_embed_dim  # 128 + 16 = 144
         self.heads = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(head_input_dim, hidden),
+                nn.Linear(head_input_dim, 64),
                 nn.ReLU(),
-                nn.Linear(hidden, hidden // 2),
+                nn.Linear(64, 32),
                 nn.ReLU(),
-                nn.Linear(hidden // 2, 2)
+                nn.Linear(32, 2)
             ) for _ in range(num_bias_types)
         ])
 
@@ -263,3 +261,178 @@ class EdgePolicy(nn.Module):
             except Exception:
                 edge_feat_dim = 0
         return cls(encoder, emb_dim, edge_feat_dim, mlp_hidden, mlp_out_dim, p1_dim)
+
+
+class SitePoolMLPPolicy(nn.Module):
+    """Direct MLP policy: no RGCN, site-conditioned pooling as system context.
+
+    Replaces the RGCN encoder with a simple site-level mean-pool of the frozen
+    AtomBondGNN P1 embeddings.  For each directed edge (A → B) the input is:
+
+        concat(P1_A[p1_dim], P1_B[p1_dim], site_pool_A[p1_dim], edge_attr[edge_attr_dim])
+
+    where ``site_pool_A`` is the mean of all P1 embeddings at site A.  This
+    gives the edge MLP a lightweight system-context signal without message
+    passing over the perturbation-network graph topology.
+
+    During training a *block dropout* mask is applied to the entire site_pool
+    slice with probability ``context_dropout_p``.  This forces the trunk to
+    learn a pairwise-sufficient predictor that degrades gracefully to zero
+    context, preventing over-reliance on the site-context signal.
+
+    The ``edge_mlp`` (EdgeValueMLP) and ``scale_factors`` are identical to
+    ``EdgePolicy``, so the same BC pretraining and REINFORCE update logic apply.
+
+    Args:
+        p1_dim: Dimension of AtomBondGNN node embeddings (default: 64).
+        edge_attr_dim: Dimension of per-edge one-hot relation features (default: 8).
+        mlp_hidden: Hidden size for EdgeValueMLP trunk and heads (default: 64).
+        mlp_out_dim: Number of bias types / output coefficients (default: 4).
+        context_dropout_p: Probability of zeroing the entire site_pool block per
+            edge during training (block dropout).  Default: 0.3.
+    """
+
+    def __init__(self, p1_dim: int = 64, edge_attr_dim: int = 8,
+                 mlp_hidden: int = 64, mlp_out_dim: int = 4,
+                 context_dropout_p: float = 0.3):
+        super().__init__()
+        self.p1_dim = int(p1_dim)
+        self.mlp_out_dim = int(mlp_out_dim)
+        self.context_dropout_p = float(context_dropout_p)
+        # Edge input: [P1_src, P1_dst, site_pool_src, edge_attr]
+        in_dim = 2 * p1_dim + p1_dim + edge_attr_dim
+        self.edge_mlp = EdgeValueMLP(in_dim, mlp_hidden, num_bias_types=self.mlp_out_dim)
+        self.register_buffer(
+            'scale_factors',
+            torch.tensor([305.0, 520.0, 85.0, 30.0]),
+            persistent=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Site pooling
+    # ------------------------------------------------------------------
+
+    def _site_pool(self, x: torch.Tensor, site_index: torch.Tensor) -> torch.Tensor:
+        """Compute per-site mean of P1 embeddings, then expand back to node dim.
+
+        Args:
+            x: [N, p1_dim] node (substituent) embeddings.
+            site_index: [N] 0-indexed site assignment for each node.
+
+        Returns:
+            [N, p1_dim]: each node replaced by its site's mean embedding.
+        """
+        num_sites = int(site_index.max().item()) + 1
+        pool = torch.zeros(num_sites, x.size(1), dtype=x.dtype, device=x.device)
+        count = torch.zeros(num_sites, dtype=x.dtype, device=x.device)
+        pool.scatter_add_(0, site_index.unsqueeze(1).expand_as(x), x)
+        count.scatter_add_(0, site_index,
+                           torch.ones(x.size(0), dtype=x.dtype, device=x.device))
+        pool = pool / count.unsqueeze(1).clamp(min=1.0)
+        return pool[site_index]  # [N, p1_dim]
+
+    # ------------------------------------------------------------------
+    # Edge input construction
+    # ------------------------------------------------------------------
+
+    def _build_edge_inputs(self, x: torch.Tensor, edge_index: torch.LongTensor,
+                           edge_attr: Optional[torch.Tensor],
+                           site_index: torch.Tensor) -> torch.Tensor:
+        """Build [E, in_dim] edge input tensor.
+
+        concat(P1_src, P1_dst, site_pool_src, edge_attr)
+        During training, the entire site_pool block is zeroed with probability
+        context_dropout_p (block dropout) to prevent over-reliance on context.
+        """
+        site_pool = self._site_pool(x, site_index)  # [N, p1_dim]
+        src, dst = edge_index[0], edge_index[1]
+        ctx = site_pool[src]  # [E, p1_dim]
+        # Block dropout: zero the entire context slice per edge during training
+        if self.training and self.context_dropout_p > 0.0:
+            # [E, 1] Bernoulli keep-mask broadcast over p1_dim
+            keep = (torch.rand(ctx.size(0), 1, device=ctx.device)
+                    >= self.context_dropout_p).float()
+            # Rescale to preserve expected value (inverted dropout)
+            ctx = ctx * keep / (1.0 - self.context_dropout_p)
+        parts = [x[src], x[dst], ctx]
+        if edge_attr is not None:
+            parts.append(edge_attr)
+        return torch.cat(parts, dim=-1)
+
+    # ------------------------------------------------------------------
+    # Forward helpers
+    # ------------------------------------------------------------------
+
+    def _forward_edges(self, x: torch.Tensor, edge_index: torch.LongTensor,
+                       edge_attr: Optional[torch.Tensor],
+                       site_index: torch.Tensor):
+        """Compute (mean, log_std) tensors for all edges.
+
+        Returns:
+            mean: [E, mlp_out_dim] tanh-scaled bias coefficient means.
+            log_std: [E, mlp_out_dim] clamped log standard deviations.
+        """
+        inp = self._build_edge_inputs(x, edge_index, edge_attr, site_index)
+        out = self.edge_mlp(inp)  # [E, 2*D]
+        if out.dim() == 1:
+            out = out.unsqueeze(0)
+        D = self.mlp_out_dim
+        mean = torch.tanh(out[:, :D]) * self.scale_factors.unsqueeze(0)
+        log_std = torch.clamp(out[:, D:], min=-20.0, max=2.0)
+        return mean, log_std
+
+    # ------------------------------------------------------------------
+    # Public API (mirrors EdgePolicy)
+    # ------------------------------------------------------------------
+
+    def get_actions(self, x, edge_index, edge_type=None, edge_attr=None,
+                    site_index=None, deterministic: bool = False):
+        """Sample actions and log-probabilities for every directed edge.
+
+        Args:
+            x: [N, p1_dim] frozen AtomBondGNN node embeddings.
+            edge_index: [2, E] directed edge index.
+            edge_type: unused (kept for API compatibility with EdgePolicy callers).
+            edge_attr: [E, edge_attr_dim] one-hot relation features.
+            site_index: [N] 0-indexed site assignment per node.
+            deterministic: if True, returns mean actions with zero logp.
+
+        Returns:
+            actions: [E, D] sampled bias coefficients.
+            logp: [E] per-edge sum log-probability.
+            mean: [E, D] distribution means.
+            log_std: [E, D] distribution log standard deviations.
+        """
+        mean, log_std = self._forward_edges(x, edge_index, edge_attr, site_index)
+        if deterministic:
+            actions = mean
+            logp = torch.zeros(mean.size(0), device=mean.device)
+        else:
+            std = torch.exp(log_std)
+            dist = torch.distributions.Normal(mean, std)
+            actions = dist.rsample()
+            clip_limits = self.scale_factors * 1.05
+            actions = torch.clamp(actions,
+                                  -clip_limits.unsqueeze(0), clip_limits.unsqueeze(0))
+            logp = dist.log_prob(actions).sum(dim=-1)
+        return actions, logp, mean, log_std
+
+    def evaluate_logp(self, x, edge_index, edge_type=None, edge_attr=None,
+                      site_index=None, saved_actions=None):
+        """Evaluate log π_θ(saved_actions | x) under current policy parameters.
+
+        Args:
+            saved_actions: [E] or [E, D] actions from the simulation run.
+
+        Returns:
+            logp: [E] scalar log-prob per edge summed over output dims.
+            log_std: [E, D] current log_std (for entropy regularisation).
+        """
+        mean, log_std = self._forward_edges(x, edge_index, edge_attr, site_index)
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mean, std)
+        a = saved_actions.detach().to(mean.device)
+        if a.dim() == 1:
+            a = a.unsqueeze(-1)
+        logp = dist.log_prob(a).sum(dim=-1)
+        return logp, log_std

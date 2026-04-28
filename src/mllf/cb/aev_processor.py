@@ -313,6 +313,316 @@ def get_bond_edge_index_from_pdb(
     return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, 1), dtype=torch.float32)
 
 
+def build_full_ligand_bond_graph(
+    sub_pdb: str,
+    core_pdb: str,
+    sub_rtf_bonds: List[Tuple[str, str]],
+    core_rtf_bonds: List[Tuple[str, str]],
+    ref_sub_info: Optional[List[Tuple[str, List[Tuple[str, str]]]]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int, List[int]]:
+    """Build full-ligand bidirectional bond graph spanning sub + core + ref subs.
+
+    Atom ordering matches :func:`get_full_ligand_atom_features`: substituent atoms
+    first (indices 0..n_sub-1), then core atoms (n_sub..n_sub+n_core-1), then ref-sub
+    atoms in ``ref_sub_info`` order.
+
+    Each pres.rtf BOND section already encodes the attachment bond(s) between the
+    substituent and the core scaffold (e.g. ``BOND C014 C022`` where C014 is a core
+    atom).  These cross-group bonds are resolved correctly because we build a unified
+    atom-name → global-index map that spans all three atom groups.
+
+    Args:
+        sub_pdb: Path to substituent fragment PDB file.
+        core_pdb: Path to core PDB file.
+        sub_rtf_bonds: Bond list from sub pres.rtf (may include cross-group attachment bonds).
+        core_rtf_bonds: Bond list from core.rtf.
+        ref_sub_info: Optional list of ``(pdb_path, rtf_bonds)`` for reference substituents
+            at other sites (typically sub1 at each non-active site).
+
+    Returns:
+        edge_index: [2, 2E] bidirectional bond edge indices over the full ligand.
+        edge_attr: [2E, 1] bond-type weights (all 1.0 for RTF-sourced bonds).
+        n_sub: Number of substituent atoms.
+        n_core: Number of core atoms.
+        n_ref_per_site: List of atom counts for each reference substituent.
+    """
+    ref_sub_info_list = ref_sub_info or []
+
+    # Read atom names from each PDB group using fixed-column parsing (reliable for CHARMM)
+    sub_names = _read_atom_names_from_pdb(Path(sub_pdb))
+    core_names = _read_atom_names_from_pdb(Path(core_pdb))
+    ref_names_list: List[List[str]] = [
+        _read_atom_names_from_pdb(Path(ref_pdb))
+        for ref_pdb, _ in ref_sub_info_list
+    ]
+
+    n_sub = len(sub_names)
+    n_core = len(core_names)
+    n_ref_per_site = [len(names) for names in ref_names_list]
+
+    # Build unified name → global index map
+    # Sub atoms: indices 0..n_sub-1
+    # Core atoms: indices n_sub..n_sub+n_core-1
+    # Ref sub atoms: contiguous after core
+    name_to_idx: dict = {}
+    for i, name in enumerate(sub_names):
+        name_to_idx[name] = i
+    offset = n_sub
+    for i, name in enumerate(core_names):
+        name_to_idx[name] = offset + i
+    offset += n_core
+    for ref_names in ref_names_list:
+        for i, name in enumerate(ref_names):
+            if name not in name_to_idx:   # sub/core names take precedence
+                name_to_idx[name] = offset + i
+        offset += len(ref_names)
+
+    # Warn when bond information is missing for any ligand component
+    if not sub_rtf_bonds:
+        warnings.warn(
+            f"build_full_ligand_bond_graph: no bond information for substituent PDB "
+            f"'{Path(sub_pdb).name}'. Sub atoms will be isolated (no intra-sub or "
+            f"attachment bonds). Provide a pres.rtf with BOND entries."
+        )
+    if not core_rtf_bonds:
+        warnings.warn(
+            f"build_full_ligand_bond_graph: no bond information for core PDB "
+            f"'{Path(core_pdb).name}'. Core atoms will be isolated. "
+            f"Provide a core.rtf with BOND entries."
+        )
+    for ref_idx, (ref_pdb, ref_bonds) in enumerate(ref_sub_info_list):
+        if not ref_bonds:
+            warnings.warn(
+                f"build_full_ligand_bond_graph: no bond information for reference "
+                f"substituent '{Path(ref_pdb).name}' (index {ref_idx}). "
+                f"Ref-sub atoms will be isolated."
+            )
+
+    # Collect all bonds from all RTF sources and resolve to global indices
+    all_bond_lists: List[List[Tuple[str, str]]] = [sub_rtf_bonds, core_rtf_bonds]
+    for _, ref_bonds in ref_sub_info_list:
+        all_bond_lists.append(ref_bonds)
+
+    src_list: List[int] = []
+    dst_list: List[int] = []
+    for bond_list in all_bond_lists:
+        for a1, a2 in bond_list:
+            i = name_to_idx.get(a1.upper())
+            j = name_to_idx.get(a2.upper())
+            if i is not None and j is not None:
+                src_list += [i, j]
+                dst_list += [j, i]
+            # Silently skip bonds referencing atoms outside the current graph.
+            # MSLD pres.rtf files include attachment bonds for all substituents
+            # at a site; atoms from other subs (in different pretraining groups)
+            # will not be in name_to_idx and should simply be ignored.
+
+    if src_list:
+        edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+        edge_attr = torch.ones(len(src_list), 1, dtype=torch.float32)
+    else:
+        warnings.warn(
+            f"build_full_ligand_bond_graph (sub='{Path(sub_pdb).name}'): "
+            f"no bonds resolved for the full ligand graph. GINEConv will operate "
+            f"on isolated nodes. Verify that sub_rtf_bonds and core_rtf_bonds are "
+            f"non-empty and atom names match."
+        )
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_attr = torch.zeros((0, 1), dtype=torch.float32)
+
+    return edge_index, edge_attr, n_sub, n_core, n_ref_per_site
+
+
+def get_full_ligand_atom_features(
+    sub_pdb: str,
+    core_pdb: str,
+    sub_rtf_data: Optional[dict] = None,
+    core_rtf_data: Optional[dict] = None,
+    ref_sub_info: Optional[List[Tuple[str, Optional[dict]]]] = None,
+    protein_pdb=None,
+    solvent_context=None,
+    aev_cutoff: float = 5.1,
+) -> dict:
+    """Compute atom features for all ligand atoms (sub + core + ref subs).
+
+    Unlike :func:`get_atom_features_with_context` which returns only substituent atom
+    features, this function returns AEVs, charges, and atom_ids for the **entire
+    ligand**: substituent + core scaffold + reference substituents at other sites.
+
+    AEVs are computed with full molecular context (protein/solvent atoms are included
+    in the AEV neighbourhood computation where available) but protein/solvent atoms are
+    **not** returned — only ligand atoms are included in the output.
+
+    Atom ordering: substituent first (indices 0..n_sub-1), then core
+    (n_sub..n_sub+n_core-1), then ref subs in ``ref_sub_info`` order.  This matches
+    the ordering expected by :func:`build_full_ligand_bond_graph`.
+
+    Args:
+        sub_pdb: Path to substituent fragment PDB file.
+        core_pdb: Path to core PDB file.
+        sub_rtf_data: Parsed RTF dict for the substituent (used for charges).
+        core_rtf_data: Parsed RTF dict for the core (used for charges).
+        ref_sub_info: List of ``(pdb_path, rtf_data)`` for reference substituents at
+            other sites (typically sub1 at each non-active site).
+        protein_pdb: Optional protein PDB path or pre-parsed ``(coords, elements)`` tuple
+            for AEV context (protein atoms NOT returned in output).
+        solvent_context: Optional pre-parsed ``(coords, elements)`` for solvent atoms
+            (solvent atoms NOT returned in output).
+        aev_cutoff: AEV spatial cutoff in Angstroms (default: 5.1).
+
+    Returns:
+        dict with:
+            ``'aevs'``: [N_ligand, 2288] AEVs for all ligand atoms.
+            ``'charges'``: [N_ligand] partial charges.
+            ``'atom_ids'``: [N_ligand] int64 element species IDs.
+            ``'n_sub'``: int — substituent atom count (aevs[0:n_sub] are sub atoms).
+            ``'n_core'``: int — core atom count.
+            ``'n_ref_per_site'``: list[int] — atom counts per reference substituent.
+    """
+    ref_sub_info_list = ref_sub_info or []
+
+    # Parse coords/elements for each ligand group
+    sub_coords, sub_elements = parse_pdb_file(str(sub_pdb))
+    core_coords, core_elements = parse_pdb_file(str(core_pdb))
+    ref_coords_list: List[list] = []
+    ref_elements_list: List[list] = []
+    for ref_pdb, _ in ref_sub_info_list:
+        rc, re = parse_pdb_file(str(ref_pdb))
+        ref_coords_list.append(rc)
+        ref_elements_list.append(re)
+
+    # Parse context atoms (protein or solvent) for AEV accuracy — NOT returned
+    ctx_coords: list = []
+    ctx_elements: list = []
+    if protein_pdb is not None:
+        if isinstance(protein_pdb, tuple):
+            ctx_coords, ctx_elements = protein_pdb
+        else:
+            ctx_coords, ctx_elements = parse_pdb_file(str(protein_pdb))
+    elif solvent_context is not None and isinstance(solvent_context, tuple) and solvent_context[0]:
+        ctx_coords, ctx_elements = solvent_context
+
+    # Concatenate in order: sub, core, ref subs, context
+    all_groups = (
+        [sub_coords, core_coords]
+        + ref_coords_list
+        + [ctx_coords]
+    )
+    all_elems = (
+        [sub_elements, core_elements]
+        + ref_elements_list
+        + [ctx_elements]
+    )
+    group_counts = [len(e) for e in all_elems]
+
+    n_sub = group_counts[0]
+    n_core = group_counts[1]
+    n_ref_per_site = group_counts[2:-1]      # ref sub groups (context group is last)
+    n_ligand = n_sub + n_core + sum(n_ref_per_site)
+
+    flat_coords = [c for g in all_groups for c in g]
+    flat_elements = [e for g in all_elems for e in g]
+
+    if not flat_coords:
+        raise ValueError(f"No atoms found for full ligand of {sub_pdb}")
+
+    # Compute AEVs for all atoms together (gives each atom proper environment context)
+    species_ids = [map_element_to_species_id(e, warn_rare=False) for e in flat_elements]
+    species_tensor = torch.tensor(species_ids, dtype=torch.long).unsqueeze(0)
+    coords_tensor = torch.tensor(flat_coords, dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        all_aevs = aev_computer(species_tensor, coords_tensor).squeeze(0)   # [N_total, 2288]
+
+    # Extract only ligand atoms (exclude context)
+    ligand_aevs = all_aevs[:n_ligand]                                        # [N_ligand, 2288]
+    ligand_atom_ids = torch.tensor(species_ids[:n_ligand], dtype=torch.long) # [N_ligand]
+
+    # Warn when charge information is missing for any ligand component
+    if sub_rtf_data is None:
+        warnings.warn(
+            f"get_full_ligand_atom_features: no RTF data for substituent "
+            f"'{Path(sub_pdb).name}'. Charges for {n_sub} sub atoms will be zero."
+        )
+    elif sub_rtf_data.get('charges') is None:
+        warnings.warn(
+            f"get_full_ligand_atom_features: RTF data for '{Path(sub_pdb).name}' "
+            f"contains no 'charges' key. Charges for {n_sub} sub atoms will be zero."
+        )
+    if core_rtf_data is None:
+        warnings.warn(
+            f"get_full_ligand_atom_features: no RTF data for core "
+            f"'{Path(core_pdb).name}'. Charges for {n_core} core atoms will be zero."
+        )
+    elif core_rtf_data.get('charges') is None:
+        warnings.warn(
+            f"get_full_ligand_atom_features: RTF data for core '{Path(core_pdb).name}' "
+            f"contains no 'charges' key. Charges for {n_core} core atoms will be zero."
+        )
+    for ref_idx, (ref_pdb, ref_rtf) in enumerate(ref_sub_info_list):
+        n_ref = len(ref_elements_list[ref_idx])
+        if ref_rtf is None:
+            warnings.warn(
+                f"get_full_ligand_atom_features: no RTF data for reference substituent "
+                f"'{Path(ref_pdb).name}' (index {ref_idx}). "
+                f"Charges for {n_ref} ref atoms will be zero."
+            )
+        elif ref_rtf.get('charges') is None:
+            warnings.warn(
+                f"get_full_ligand_atom_features: RTF data for ref sub "
+                f"'{Path(ref_pdb).name}' contains no 'charges' key. "
+                f"Charges for {n_ref} ref atoms will be zero."
+            )
+
+    # Read atom names from PDB files for name-based charge matching
+    sub_pdb_names = _read_atom_names_from_pdb(Path(sub_pdb))
+    core_pdb_names = _read_atom_names_from_pdb(Path(core_pdb))
+    ref_pdb_names_list = [
+        _read_atom_names_from_pdb(Path(rp)) for rp, _ in ref_sub_info_list
+    ]
+
+    # Assemble charges from RTF data for each group
+    def _charges(rtf_data: Optional[dict], n: int, label: str = '',
+                 pdb_names: Optional[List[str]] = None) -> torch.Tensor:
+        if rtf_data is not None:
+            c = rtf_data.get('charges')
+            if c is not None:
+                t = torch.tensor(c, dtype=torch.float32)
+                if len(t) == n:
+                    return t
+                # Count mismatch: try name-based matching when atom name lists available
+                rtf_names = rtf_data.get('atom_names')
+                if (pdb_names is not None and rtf_names is not None
+                        and len(rtf_names) == len(c)):
+                    name_to_charge = {name.upper(): q for name, q in zip(rtf_names, c)}
+                    matched = [name_to_charge.get(name.upper()) for name in pdb_names]
+                    if all(q is not None for q in matched):
+                        return torch.tensor(matched, dtype=torch.float32)
+                warnings.warn(
+                    f"get_full_ligand_atom_features: charge count mismatch for "
+                    f"{label or 'component'}: RTF has {len(t)} charges but PDB has "
+                    f"{n} atoms. Using zero charges."
+                )
+        return torch.zeros(n, dtype=torch.float32)
+
+    parts = (
+        [_charges(sub_rtf_data, n_sub, Path(sub_pdb).name, sub_pdb_names),
+         _charges(core_rtf_data, n_core, Path(core_pdb).name, core_pdb_names)]
+        + [_charges(rrtf, len(ref_elements_list[i]), Path(rp).name,
+                    ref_pdb_names_list[i])
+           for i, (rp, rrtf) in enumerate(ref_sub_info_list)]
+    )
+    ligand_charges = torch.cat(parts, dim=0)   # [N_ligand]
+
+    return {
+        'aevs': ligand_aevs,
+        'charges': ligand_charges,
+        'atom_ids': ligand_atom_ids,
+        'n_sub': n_sub,
+        'n_core': n_core,
+        'n_ref_per_site': n_ref_per_site,
+    }
+
+
 def parse_pdb_coordinates_and_elements(pdb_path):
     """Parse PDB file to extract coordinates and elements.
     

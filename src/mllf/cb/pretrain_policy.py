@@ -52,7 +52,7 @@ from torch_geometric.data import Data
 
 from mllf.cli.workflow import build_data_and_targets_from_combo
 from mllf.cb.rgcn import RGCNEncoder
-from mllf.cb.policy import EdgePolicy
+from mllf.cb.policy import EdgePolicy, SitePoolMLPPolicy
 
 
 def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=None, warn_missing_types=True):
@@ -159,6 +159,7 @@ def _build_graph_structure(prep_dir: str, graph_info_path: Path,
         edge_index=edge_index,
         edge_type=edge_type,
         edge_attr=edge_attr,
+        site_index=data_sparse.site_index,
     )
     return data.cpu(), extras, nsubs_per_site, pairs
 
@@ -413,7 +414,8 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         x=data_sparse.x,  # Use node features from sparse graph
         edge_index=edge_index,
         edge_type=edge_type,
-        edge_attr=edge_attr
+        edge_attr=edge_attr,
+        site_index=data_sparse.site_index,
     )
     
     # Build targets for each edge: [linear, quadratic, skew, end]
@@ -1441,9 +1443,6 @@ def sample_runs_stratified_negative(
     return result
 
 
-
-
-
 def pretrain_epoch(
     encoder: nn.Module,
     policy: nn.Module,
@@ -1459,6 +1458,7 @@ def pretrain_epoch(
     graph_cache: Optional[List] = None,
     groups: Optional[Dict] = None,
     reward_weighted: bool = False,
+    awr_temperature: float = 1.0,
 ) -> Dict[str, float]:
     """Run one behavior cloning epoch with MSE loss.
     
@@ -1485,7 +1485,8 @@ def pretrain_epoch(
         Dict with epoch statistics
     """
     policy.train()
-    encoder.train()
+    if encoder is not None:
+        encoder.train()
 
     # Build normalised reward weights (mean = 1.0) so the learning rate is unchanged.
     # Weights are pre-computed by pretrain_with_runs and stored in run["_bc_reward"].
@@ -1503,6 +1504,7 @@ def pretrain_epoch(
 
     epoch_loss = 0.0
     num_updates = 0
+    total_runs = 0
 
     if groups is not None and graph_cache is not None:
         # ── Per-graph gradient accumulation (one optimizer step per unique graph structure) ───
@@ -1525,19 +1527,28 @@ def pretrain_epoch(
                 data_cpu, targets_list = graph_cache[run_idx]
                 data = data_cpu.to(device)
                 targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
-                _, _, predicted_means, _ = policy.get_actions(
-                    data.x, data.edge_index, data.edge_type, data.edge_attr,
-                    deterministic=True,
-                )
+                if isinstance(policy, SitePoolMLPPolicy):
+                    mean, log_std = policy._forward_edges(
+                        data.x, data.edge_index, data.edge_attr,
+                        getattr(data, 'site_index', None),
+                    )
+                else:
+                    node_emb = policy.forward_node_embeddings(
+                        data.x, data.edge_index, data.edge_type)
+                    p1_for_skip = data.x if policy.p1_dim > 0 else None
+                    mean, log_std = policy.forward_edges(
+                        node_emb, data.edge_index, data.edge_attr, p1_for_skip)
                 active_mask = targets.abs() > 1e-8
                 if not active_mask.any():
                     continue
-                # Normalise per bias-type so all 4 output dimensions contribute equally
-                # regardless of their raw magnitude range (quadratic ~520 vs end ~30).
-                bc_scales = policy.scale_factors[:targets.shape[-1]].unsqueeze(0)
-                sq_err = ((predicted_means - targets) / bc_scales) ** 2
+                # AWR loss: -exp(r/β) · log π(a | s) over active elements.
+                # exp(r/β) amplifies gradient from high-reward expert trajectories.
+                std = torch.exp(log_std)
+                logp_per = torch.distributions.Normal(mean, std).log_prob(targets)  # [E, D]
+                raw_r = runs[run_idx].get("_bc_reward", 0.0)
+                awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
                 # Divide by group size so the effective loss = per-run mean (not sum)
-                run_loss = sq_err[active_mask].mean() * rw / n_valid
+                run_loss = -awr_w * logp_per[active_mask].mean() / n_valid
                 if torch.isnan(run_loss) or torch.isinf(run_loss):
                     continue
                 run_loss.backward()
@@ -1547,10 +1558,11 @@ def pretrain_epoch(
                 optimizer.step()
                 epoch_loss += group_loss
                 num_updates += 1
+                total_runs += n_valid
             else:
                 optimizer.zero_grad()  # release any partially accumulated gradients
         avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
-        return {'loss': avg_loss, 'num_runs': num_updates}
+        return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates}
 
     # ── Legacy per-run updates (backward-compatible; used when graph_cache is None) ─────────
     for run_idx, run in enumerate(runs):
@@ -1622,20 +1634,27 @@ def pretrain_epoch(
                 print(f"  Error building graph for {run_dir.name}: {e}")
                 continue
         
-        # Get predicted coefficients from policy (deterministic mean)
-        _, _, predicted_means, _ = policy.get_actions(
-            data.x, data.edge_index, data.edge_type, data.edge_attr,
-            deterministic=True  # Use mean predictions, not sampled
-        )
+        # Compute mean and log_std for AWR loss
+        if isinstance(policy, SitePoolMLPPolicy):
+            mean, log_std = policy._forward_edges(
+                data.x, data.edge_index, data.edge_attr,
+                getattr(data, 'site_index', None),
+            )
+        else:
+            node_emb = policy.forward_node_embeddings(
+                data.x, data.edge_index, data.edge_type)
+            p1_for_skip = data.x if policy.p1_dim > 0 else None
+            mean, log_std = policy.forward_edges(
+                node_emb, data.edge_index, data.edge_attr, p1_for_skip)
         
-        # Behavior Cloning: masked MSE.
-        # active_mask selects the one non-zero target per edge.
+        # AWR loss: -exp(r/β) · log π(a | s) over active elements.
         active_mask = targets.abs() > 1e-8            # [E, 4], one True per row
         if active_mask.any():
-            # Normalise per bias-type so all 4 output dimensions contribute equally.
-            bc_scales = policy.scale_factors[:targets.shape[-1]].unsqueeze(0)
-            sq_err = ((predicted_means - targets) / bc_scales) ** 2  # [E, 4]
-            run_loss = sq_err[active_mask].mean() * rw  # scale by reward weight
+            std = torch.exp(log_std)
+            logp_per = torch.distributions.Normal(mean, std).log_prob(targets)  # [E, 4]
+            raw_r = run.get("_bc_reward", 0.0)
+            awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
+            run_loss = -awr_w * logp_per[active_mask].mean()
         else:
             run_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
@@ -1792,15 +1811,25 @@ def warmup_q_network(
 
                 # Build edge inputs and sample actions from frozen policy
                 with torch.no_grad():
-                    p2_emb = policy.encoder(data.x, data.edge_index, data.edge_type)
-                    p1_for_skip = data.x if policy.p1_dim > 0 else None
-                    edge_inp = policy.edge_inputs(
-                        p2_emb, data.edge_index, data.edge_attr, p1_for_skip
-                    )
-                    # Sample actions (bias coefficients) so Q sees Q(s, a)
-                    actions, _, _, _ = policy.get_actions(
-                        data.x, data.edge_index, data.edge_type, data.edge_attr
-                    )
+                    if isinstance(policy, SitePoolMLPPolicy):
+                        _site_idx = getattr(data, 'site_index', None)
+                        edge_inp = policy._build_edge_inputs(
+                            data.x, data.edge_index, data.edge_attr, _site_idx
+                        )
+                        actions, _, _, _ = policy.get_actions(
+                            data.x, data.edge_index, None, data.edge_attr,
+                            site_index=_site_idx,
+                        )
+                    else:
+                        p2_emb = policy.encoder(data.x, data.edge_index, data.edge_type)
+                        p1_for_skip = data.x if policy.p1_dim > 0 else None
+                        edge_inp = policy.edge_inputs(
+                            p2_emb, data.edge_index, data.edge_attr, p1_for_skip
+                        )
+                        # Sample actions (bias coefficients) so Q sees Q(s, a)
+                        actions, _, _, _ = policy.get_actions(
+                            data.x, data.edge_index, data.edge_type, data.edge_attr
+                        )
 
                 # Per-edge pair reward from this run's simulation
                 r_pair = compute_pair_reward(
@@ -1879,6 +1908,7 @@ def pretrain_with_runs(
     q_epochs: int = 0,
     q_lr: float = 1e-3,
     q_stratified_fraction: Optional[float] = None,
+    awr_temperature: float = 1.0,
 ):
     """Run policy pretraining with provided runs.
     
@@ -2029,22 +2059,36 @@ def pretrain_with_runs(
     train_config = config.get('training', {})
     encoder_config = train_config.get('encoder', {})
     policy_config = train_config.get('policy', {})
-    
-    encoder = RGCNEncoder(
-        in_dim=node_feat_dim,
-        hidden_dims=encoder_config.get('hidden_dims', [64, 64]),
-        out_dim=encoder_config.get('out_dim', 32),
-        num_relations=sample_data.edge_type.max().item() + 1
-    ).to(device)
-    
-    policy = EdgePolicy.from_pyg_data(
-        encoder=encoder,
-        emb_dim=encoder_config.get('out_dim', 32),
-        data=sample_data,
-        mlp_hidden=policy_config.get('mlp_hidden', 64),
-        mlp_out_dim=len(sample_extras['relation_names']) // 2,
-        p1_dim=node_feat_dim,  # skip connection — must match run_workflow_deepset.py
-    ).to(device)
+
+    # Determine policy type: 'sitepool' for direct MLP, 'rgcn' (default) for RGCN+EdgePolicy
+    policy_type = policy_config.get('type', 'rgcn')
+
+    if policy_type == 'sitepool':
+        # SitePool-MLP: no RGCN encoder; uses scatter_mean site context + P1 embeddings
+        encoder = None
+        edge_attr_dim = sample_data.edge_attr.size(1) if sample_data.edge_attr is not None else 8
+        policy = SitePoolMLPPolicy(
+            p1_dim=node_feat_dim,
+            edge_attr_dim=edge_attr_dim,
+            mlp_hidden=policy_config.get('mlp_hidden', 64),
+            mlp_out_dim=len(sample_extras['relation_names']) // 2,
+        ).to(device)
+    else:
+        # Default: RGCN encoder + EdgePolicy
+        encoder = RGCNEncoder(
+            in_dim=node_feat_dim,
+            hidden_dims=encoder_config.get('hidden_dims', [64, 64]),
+            out_dim=encoder_config.get('out_dim', 32),
+            num_relations=sample_data.edge_type.max().item() + 1
+        ).to(device)
+        policy = EdgePolicy.from_pyg_data(
+            encoder=encoder,
+            emb_dim=encoder_config.get('out_dim', 32),
+            data=sample_data,
+            mlp_hidden=policy_config.get('mlp_hidden', 64),
+            mlp_out_dim=len(sample_extras['relation_names']) // 2,
+            p1_dim=node_feat_dim,  # skip connection — must match run_workflow_deepset.py
+        ).to(device)
     
     # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
     optimizer = optim.Adam(
@@ -2056,9 +2100,9 @@ def pretrain_with_runs(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=learning_rate / 100.0
     )
-    # MLP-only optimizer/scheduler — activated when encoder is frozen
+    # MLP-only optimizer/scheduler — activated when encoder is frozen (RGCN mode only)
     _mlp_n = (epochs - freeze_encoder_after) if freeze_encoder_after is not None else epochs
-    if freeze_encoder_after is not None:
+    if freeze_encoder_after is not None and encoder is not None:
         mlp_optimizer = optim.Adam(policy.edge_mlp.parameters(), lr=learning_rate)
         mlp_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             mlp_optimizer, T_max=max(_mlp_n, 1), eta_min=learning_rate / 100.0
@@ -2070,8 +2114,9 @@ def pretrain_with_runs(
     active_sched = scheduler
 
     print(f"\nModel architecture:")
-    print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())} params")
-    print(f"  Policy: {sum(p.numel() for p in policy.parameters())} params")
+    if encoder is not None:
+        print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())} params")
+    print(f"  Policy ({policy_type}): {sum(p.numel() for p in policy.parameters())} params")
     print(f"  LR schedule: cosine annealing, {learning_rate} → {learning_rate/100:.6f} over {epochs} epochs")
     print(f"  Early stopping patience: {patience} epochs")
     print(f"  Graph caching: all {len(runs)} graphs pre-built once, reused across all epochs")
@@ -2224,43 +2269,42 @@ def pretrain_with_runs(
     # Map group_key → list of run indices for per-graph gradient accumulation
     epoch_groups = {k: [i for (i, _) in v] for k, v in groups.items()}
 
-    # Pre-compute per-run rewards for reward-weighted loss.
-    # Stored as run["_bc_reward"] = max(0, reward) so pretrain_epoch can normalise.
-    if reward_weighted:
-        _VALID_RC = {
-            "w_P", "w_T", "w_U", "gamma", "P_baseline", "T_baseline",
-            "min_transitions_per_site", "min_coverage_ratio",
-            "entropy_bonus", "concentration_penalty_threshold",
-        }
-        filtered_rc = {k: v for k, v in reward_config.items() if k in _VALID_RC}
-        print("\nPre-computing rewards for reward-weighted loss...")
-        n_pos_w = 0
-        total_pos_w = 0.0
-        for run in runs:
-            try:
-                run_dir = Path(run["run_dir"])
-                with open(run_dir / "graph_info.json") as _f:
-                    gi = json.load(_f)
-                sites = gi.get("sites", {})
-                site_cnts: Dict[int, int] = {}
-                for bd in sites.values():
-                    s = bd["site"]
-                    site_cnts[s] = site_cnts.get(s, 0) + 1
-                nsubs_per_site = [site_cnts[s] for s in sorted(site_cnts)]
-                r = compute_reward_from_sim_results(
-                    run["sim_results"], len(site_cnts), nsubs_per_site, **filtered_rc
-                )
-                run["_bc_reward"] = max(0.0, r)
-                if r > 0:
-                    n_pos_w += 1
-                    total_pos_w += r
-            except Exception:
-                run["_bc_reward"] = 0.0
-        print(f"  Positive-reward runs: {n_pos_w}/{len(runs)}  "
-              f"(total positive reward mass: {total_pos_w:.2f})")
-        if n_pos_w == 0:
-            print("  Warning: all rewards zero or negative — disabling reward weighting.")
-            reward_weighted = False
+    # Always pre-compute per-run rewards: AWR uses exp(r/β) weighting directly.
+    # Stored as run["_bc_reward"] = max(0, reward) so pretrain_epoch can weight by exp(r/β).
+    _VALID_RC = {
+        "w_P", "w_T", "w_U", "gamma", "P_baseline", "T_baseline",
+        "min_transitions_per_site", "min_coverage_ratio",
+        "entropy_bonus", "concentration_penalty_threshold",
+    }
+    filtered_rc = {k: v for k, v in reward_config.items() if k in _VALID_RC}
+    print("\nPre-computing per-run rewards for AWR loss weighting...")
+    n_pos_w = 0
+    total_pos_w = 0.0
+    for run in runs:
+        try:
+            run_dir = Path(run["run_dir"])
+            with open(run_dir / "graph_info.json") as _f:
+                gi = json.load(_f)
+            sites = gi.get("sites", {})
+            site_cnts: Dict[int, int] = {}
+            for bd in sites.values():
+                s = bd["site"]
+                site_cnts[s] = site_cnts.get(s, 0) + 1
+            nsubs_per_site = [site_cnts[s] for s in sorted(site_cnts)]
+            r = compute_reward_from_sim_results(
+                run["sim_results"], len(site_cnts), nsubs_per_site, **filtered_rc
+            )
+            run["_bc_reward"] = max(0.0, r)
+            if r > 0:
+                n_pos_w += 1
+                total_pos_w += r
+        except Exception:
+            run["_bc_reward"] = 0.0
+    print(f"  Positive-reward runs: {n_pos_w}/{len(runs)}  "
+          f"(total positive reward mass: {total_pos_w:.2f})")
+    if reward_weighted and n_pos_w == 0:
+        print("  Warning: all rewards zero or negative — disabling reward weighting.")
+        reward_weighted = False
 
     print(f"\n{'='*60}")
     print(f"Starting behavior cloning for {epochs} epochs")
@@ -2272,7 +2316,8 @@ def pretrain_with_runs(
     for epoch in range(epochs):
         # ── Phase transition: freeze RGCN encoder and switch to MLP-only optimizer ─────────
         if (
-            freeze_encoder_after is not None
+            encoder is not None
+            and freeze_encoder_after is not None
             and epoch == freeze_encoder_after
             and mlp_optimizer is not None
         ):
@@ -2295,10 +2340,11 @@ def pretrain_with_runs(
             graph_cache=graph_cache,
             groups=epoch_groups,
             reward_weighted=reward_weighted,
+            awr_temperature=awr_temperature,
         )
 
-        print(f"  MSE Loss: {stats['loss']:.4f}")
-        print(f"  Runs processed: {stats['num_runs']}")
+        print(f"  AWR Loss: {stats['loss']:.4f}")
+        print(f"  Runs processed: {stats['num_runs']} ({stats.get('num_updates', stats['num_runs'])} grad steps)")
         print(f"  LR: {active_sched.get_last_lr()[0]:.6f}")
 
         # Step LR scheduler after each epoch
@@ -2310,26 +2356,26 @@ def pretrain_with_runs(
             epochs_without_improvement = 0
 
             best_path = output_dir / "best_policy.pt"
-            torch.save({
-                'encoder_state': encoder.state_dict(),
-                'policy_state': policy.state_dict(),
-                'epoch': epoch + 1,
-                'loss': stats['loss'],
-            }, best_path)
+            _ckpt = {'policy_state': policy.state_dict(), 'epoch': epoch + 1, 'loss': stats['loss']}
+            if encoder is not None:
+                _ckpt['encoder_state'] = encoder.state_dict()
+            torch.save(_ckpt, best_path)
             print(f"  Saved best model (loss: {best_loss:.4f})")
         else:
             epochs_without_improvement += 1
 
         # Save checkpoint
         checkpoint_path = output_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
-        torch.save({
-            'encoder_state': encoder.state_dict(),
+        _epoch_ckpt = {
             'policy_state': policy.state_dict(),
             'optimizer_state': active_opt.state_dict(),
             'scheduler_state': active_sched.state_dict(),
             'epoch': epoch + 1,
             'stats': stats,
-        }, checkpoint_path)
+        }
+        if encoder is not None:
+            _epoch_ckpt['encoder_state'] = encoder.state_dict()
+        torch.save(_epoch_ckpt, checkpoint_path)
 
         # Early stopping
         if epochs_without_improvement >= patience:
@@ -2338,11 +2384,10 @@ def pretrain_with_runs(
     
     # Save final model
     final_path = output_dir / "final_policy.pt"
-    torch.save({
-        'encoder_state': encoder.state_dict(),
-        'policy_state': policy.state_dict(),
-        'epoch': epochs,
-    }, final_path)
+    _final_ckpt = {'policy_state': policy.state_dict(), 'epoch': epochs}
+    if encoder is not None:
+        _final_ckpt['encoder_state'] = encoder.state_dict()
+    torch.save(_final_ckpt, final_path)
     
     # Save metadata
     metadata = {
@@ -2350,6 +2395,7 @@ def pretrain_with_runs(
         'num_relations': sample_data.edge_type.max().item() + 1,
         'encoder_config': encoder_config,
         'policy_config': policy_config,
+        'policy_type': policy_type,
         'num_pretraining_runs': len(runs),
         'epochs': epochs,
         'best_loss': best_loss,
@@ -2617,6 +2663,15 @@ def main():
              "all epochs.",
     )
     parser.add_argument(
+        "--policy-type",
+        type=str,
+        default=None,
+        choices=["rgcn", "sitepool"],
+        help="Policy architecture: 'rgcn' (default) uses RGCN encoder + EdgePolicy; "
+             "'sitepool' uses direct SitePool-MLP with no encoder (requires deepset-encoder "
+             "for P1 embeddings). Overrides training.policy.type in the config file.",
+    )
+    parser.add_argument(
         "--q-epochs",
         type=int,
         default=0,
@@ -2641,11 +2696,24 @@ def main():
              "Useful when --use-best-only is set for BC but you want the Q-critic to see "
              "a broader reward distribution (e.g. 0.55). Default: disabled (Q uses BC runs).",
     )
+    parser.add_argument(
+        "--awr-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature β for AWR loss: each run is weighted by exp(r/β). Higher β → "
+             "more uniform weighting; lower β → sharper emphasis on high-reward runs. "
+             "Default: 1.0.",
+    )
     args = parser.parse_args()
     
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Allow --policy-type to override the config value
+    if args.policy_type is not None:
+        config.setdefault('training', {}).setdefault('policy', {})['type'] = args.policy_type
+        print(f"Policy type overridden via CLI: {args.policy_type}")
 
     # Load pretrained DeepSet encoder if specified
     deepset_model = None
@@ -2692,6 +2760,7 @@ def main():
         q_epochs=args.q_epochs,
         q_lr=args.q_lr,
         q_stratified_fraction=args.q_stratified_fraction,
+        awr_temperature=args.awr_temperature,
     )
 
 

@@ -98,20 +98,24 @@ class AtomBondGNN(nn.Module):
         aev_length: Dimension of AEV vectors (default: 2288)
         num_atom_types: Number of distinct atom types/elements (default: 11)
         embedding_dim: Output dimension for substituent embedding (default: 64)
-        hidden_dim: Hidden layer dimension in GINConv MLPs (default: 256)
+        hidden_dim: Hidden layer dimension in GINEConv MLPs (default: 256)
         include_charge: Whether to include atomic charge in features (default: True)
         include_atom_id: Whether to include atom type one-hot in features (default: True)
     """
 
     def __init__(self, aev_length=2288, num_atom_types=11, embedding_dim=64,
-                 hidden_dim=256, include_charge=True, include_atom_id=True):
+                 hidden_dim=256, include_charge=True, include_atom_id=True,
+                 bond_attr_dim=1, num_gin_layers=4):
         super().__init__()
-        from torch_geometric.nn import GINConv, GlobalAttention
+        from torch_geometric.nn import GINEConv
 
         self.include_charge = include_charge
         self.include_atom_id = include_atom_id
         self.num_atom_types = num_atom_types
         self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.bond_attr_dim = bond_attr_dim
+        self.num_gin_layers = num_gin_layers
 
         input_dim = aev_length
         if include_charge:
@@ -119,13 +123,6 @@ class AtomBondGNN(nn.Module):
         if include_atom_id:
             input_dim += num_atom_types
 
-        # Input projection
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-        )
-
-        # Two GINConv layers with bond-graph topology
         def _gin_mlp(in_d, out_d):
             return nn.Sequential(
                 nn.Linear(in_d, out_d),
@@ -133,61 +130,144 @@ class AtomBondGNN(nn.Module):
                 nn.Linear(out_d, out_d),
             )
 
-        self.gin1 = GINConv(_gin_mlp(hidden_dim, hidden_dim))
-        self.gin2 = GINConv(_gin_mlp(hidden_dim, hidden_dim))
+        # Substituent stream: processes sub atoms only through their sub-graph
+        self.sub_input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+        )
+        self.sub_gin_layers = nn.ModuleList([
+            GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
+            for _ in range(num_gin_layers)
+        ])
 
-        # GlobalAttentionPool: gate scores atoms; nn projects to embedding_dim
-        gate_nn = nn.Linear(hidden_dim, 1)
-        pool_nn = nn.Linear(hidden_dim, embedding_dim)
-        self.pool = GlobalAttention(gate_nn=gate_nn, nn=pool_nn)
+        # Core stream: processes core + ref-sub atoms through the core sub-graph
+        self.core_input_proj = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+        )
+        self.core_gin_layers = nn.ModuleList([
+            GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
+            for _ in range(num_gin_layers)
+        ])
+
+        # Hybrid attentional pooling:
+        #   Gate: concat(sub_node[H], core_summary[H]) -> scalar weight
+        #         = "how important is this sub atom given this scaffold?"
+        #   Features: sub_node[H] -> embedding_dim  (pure substituent identity)
+        self.gate_nn = nn.Linear(hidden_dim * 2, 1)
+        self.pool_nn = nn.Linear(hidden_dim, embedding_dim)
 
         # atom_mlp[-1] compatibility shim for graph_utils fallback embedding-dim query
         self.atom_mlp = nn.Sequential(nn.Linear(hidden_dim, embedding_dim))
 
     def forward(self, aev_tensor, charges=None, atom_ids=None,
-                bond_edge_index=None, bond_edge_attr=None):
-        """Forward pass through AtomBondGNN.
+                bond_edge_index=None, bond_edge_attr=None, sub_mask=None):
+        """Forward pass through AtomBondGNN (dual-stream architecture).
+
+        Atoms are split into two independent GINEConv streams:
+          - **Sub stream**: substituent atoms processed through their own sub-graph.
+          - **Core stream**: core + ref-sub atoms processed through the core sub-graph.
+
+        The core stream produces a single mean-pooled summary vector that is
+        concatenated into the *gate* of the attentional pooling step, making
+        the attention weights scaffold-aware without contaminating the sub feature
+        path.  The final embedding is a weighted sum of purely sub-derived features.
+
+        When ``sub_mask`` is ``None`` (legacy mode) all atoms are processed through
+        the sub stream with a zero core summary.
 
         Args:
-            aev_tensor: [num_atoms, aev_length]
-            charges: [num_atoms] or [num_atoms, 1] partial charges (optional)
-            atom_ids: [num_atoms] integer atom-type IDs (optional)
-            bond_edge_index: [2, 2E] bidirectional bond edges (optional)
-            bond_edge_attr: [2E, 1] bond-type weights (optional; not used by GINConv)
+            aev_tensor: [N, aev_length]
+            charges: [N] or [N, 1] partial charges (required when include_charge=True)
+            atom_ids: [N] integer atom-type IDs (required when include_atom_id=True)
+            bond_edge_index: [2, 2E] bidirectional bond edges over full ligand (optional)
+            bond_edge_attr: [2E, bond_attr_dim] bond-type weights (optional)
+            sub_mask: [N] boolean tensor marking substituent atoms.  When provided
+                the bond graph is partitioned into sub-only and core-only sub-graphs.
 
         Returns:
             substituent_embedding: [embedding_dim]
         """
-        features = [aev_tensor]
-        if self.include_charge:
-            if charges is None:
-                raise ValueError("charges must be provided when include_charge=True")
-            if charges.dim() == 1:
-                charges = charges.unsqueeze(1)
-            features.append(charges)
-        if self.include_atom_id:
-            if atom_ids is None:
-                raise ValueError("atom_ids must be provided when include_atom_id=True")
-            atom_one_hot = torch.nn.functional.one_hot(
-                atom_ids, num_classes=self.num_atom_types
-            ).float()
-            features.append(atom_one_hot)
+        dev = aev_tensor.device
 
-        x = torch.cat(features, dim=-1)   # [N, input_dim]
-        x = self.input_proj(x)            # [N, hidden_dim]
+        def _build_features(aev, chg, ids):
+            parts = [aev]
+            if self.include_charge:
+                if chg is None:
+                    raise ValueError("charges must be provided when include_charge=True")
+                parts.append(chg.unsqueeze(1) if chg.dim() == 1 else chg)
+            if self.include_atom_id:
+                if ids is None:
+                    raise ValueError("atom_ids must be provided when include_atom_id=True")
+                parts.append(torch.nn.functional.one_hot(ids, self.num_atom_types).float())
+            return torch.cat(parts, dim=-1)
 
-        # Bond-graph message passing (fall back to self-loops if no edges)
-        if bond_edge_index is not None and bond_edge_index.size(1) > 0:
-            edge_index = bond_edge_index.to(x.device)
+        def _prep_edges(n, ei, ea):
+            """Return (edge_index, edge_attr), falling back to self-loops."""
+            if ei is not None and ei.size(1) > 0:
+                ea2 = ea.to(dev) if ea is not None else torch.zeros(ei.size(1), self.bond_attr_dim, device=dev)
+                return ei.to(dev), (ea2.unsqueeze(1) if ea2.dim() == 1 else ea2)
+            idx = torch.arange(n, device=dev)
+            return torch.stack([idx, idx]), torch.zeros(n, self.bond_attr_dim, device=dev)
+
+        def _run_stream(proj, gin_layers, aev, chg, ids, ei, ea):
+            x = proj(_build_features(aev, chg, ids))
+            ei2, ea2 = _prep_edges(x.size(0), ei, ea)
+            for gin in gin_layers:
+                x = torch.relu(gin(x, ei2, ea2) + x)
+            return x
+
+        if sub_mask is not None:
+            n_sub = int(sub_mask.sum())
+            core_mask = ~sub_mask
+
+            # Partition bond graph into sub-only and core-only sub-graphs
+            if bond_edge_index is not None and bond_edge_index.size(1) > 0:
+                src, dst = bond_edge_index
+                sub_e  = (src < n_sub) & (dst < n_sub)
+                core_e = (src >= n_sub) & (dst >= n_sub)
+                sub_ei  = bond_edge_index[:, sub_e]
+                sub_ea  = bond_edge_attr[sub_e]  if bond_edge_attr is not None else None
+                core_ei = bond_edge_index[:, core_e] - n_sub   # reindex to 0-based
+                core_ea = bond_edge_attr[core_e] if bond_edge_attr is not None else None
+            else:
+                sub_ei = sub_ea = core_ei = core_ea = None
+
+            # Sub stream
+            x_sub = _run_stream(
+                self.sub_input_proj, self.sub_gin_layers,
+                aev_tensor[sub_mask],
+                charges[sub_mask]  if charges  is not None else None,
+                atom_ids[sub_mask] if atom_ids is not None else None,
+                sub_ei, sub_ea,
+            )  # [n_sub, H]
+
+            # Core stream -> mean-pool to single scaffold summary
+            n_core = int(core_mask.sum())
+            if n_core > 0:
+                x_core = _run_stream(
+                    self.core_input_proj, self.core_gin_layers,
+                    aev_tensor[core_mask],
+                    charges[core_mask]  if charges  is not None else None,
+                    atom_ids[core_mask] if atom_ids is not None else None,
+                    core_ei, core_ea,
+                )  # [n_core, H]
+                core_summary = x_core.mean(0, keepdim=True).expand(n_sub, -1)  # [n_sub, H]
+            else:
+                core_summary = torch.zeros(n_sub, self.hidden_dim, device=dev)
         else:
-            N = x.size(0)
-            idx = torch.arange(N, device=x.device)
-            edge_index = torch.stack([idx, idx], dim=0)
+            # Legacy: single stream over all atoms, zero core context
+            n_sub = aev_tensor.size(0)
+            x_sub = _run_stream(
+                self.sub_input_proj, self.sub_gin_layers,
+                aev_tensor, charges, atom_ids,
+                bond_edge_index, bond_edge_attr,
+            )
+            core_summary = torch.zeros(n_sub, self.hidden_dim, device=dev)
 
-        x = torch.relu(self.gin1(x, edge_index))   # [N, hidden_dim]
-        x = torch.relu(self.gin2(x, edge_index))   # [N, hidden_dim]
-
-        # GlobalAttentionPool → single substituent vector
-        batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        emb = self.pool(x, batch)   # [1, embedding_dim]
-        return emb.squeeze(0)       # [embedding_dim]
+        # Hybrid attentional pooling
+        # Gate: scaffold-aware importance score per sub atom
+        gates   = torch.softmax(self.gate_nn(torch.cat([x_sub, core_summary], dim=-1)), dim=0)  # [n_sub, 1]
+        # Features: pure substituent identity
+        features = self.pool_nn(x_sub)                                                          # [n_sub, emb]
+        return (gates * features).sum(0)                                                        # [emb]

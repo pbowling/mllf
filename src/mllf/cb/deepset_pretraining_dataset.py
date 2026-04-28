@@ -16,6 +16,8 @@ from mllf.cb.aev_processor import (
     get_substituent_aevs,
     extract_charges_from_rtf_metadata,
     get_atom_features_with_context,
+    get_full_ligand_atom_features,
+    build_full_ligand_bond_graph,
     detect_minimized_pdb,
     extract_environment_atoms_from_minimized,
     get_bond_edge_index_from_pdb,
@@ -699,13 +701,25 @@ def generate_bond_training_data_for_system(
 
     print(f"  Found {len(sub_pdbs)} substituent PDB files")
 
+    # Parse core RTF (bonds + charges shared across all substituents)
+    core_rtf_data = None
+    core_rtf_path = prep_dir / 'core.rtf'
+    if core_rtf_path.exists():
+        try:
+            core_rtf_data = parse_rtf_file(str(core_rtf_path))
+        except Exception as e:
+            warnings.warn(f"[{system_name}] Could not parse core.rtf: {e}")
+    else:
+        warnings.warn(f"[{system_name}] core.rtf not found in {prep_dir}")
+    core_rtf_bonds = core_rtf_data.get('bonds', []) if core_rtf_data else []
+
     all_substituents: List[Dict] = []
     total_atoms = 0
     first_sub_processed = False
 
     for pdb_path in sub_pdbs:
         try:
-            # Parse RTF for charges + bond fallback
+            # Parse sub RTF for charges + bonds (including attachment bonds to core)
             rtf_path = pdb_path.parent / pdb_path.name.replace('_frag.pdb', '_pres.rtf')
             rtf_data = None
             if rtf_path.exists():
@@ -713,15 +727,37 @@ def generate_bond_training_data_for_system(
                     rtf_data = parse_rtf_file(str(rtf_path))
                 except Exception as e:
                     warnings.warn(f"[{system_name}] Could not parse RTF {rtf_path.name}: {e}")
+            sub_rtf_bonds = rtf_data.get('bonds', []) if rtf_data else []
 
-            # ── Context-aware AEV computation (identical branch logic to
-            #    generate_training_data_for_system, but with include_atom_ids=True) ──
+            # Discover reference substituents at other sites (sub1 for each non-active site)
+            # These are included in the full-ligand graph.
+            sub_site = None
+            m = __import__('re').search(r'site(\d+)_sub\d+', pdb_path.name)
+            if m:
+                sub_site = int(m.group(1))
+            ref_sub_info = []
+            all_site_sub1s = sorted(prep_dir.glob('site*_sub1_frag.pdb'))
+            for ref_pdb in all_site_sub1s:
+                ref_m = __import__('re').search(r'site(\d+)_sub1', ref_pdb.name)
+                if ref_m and int(ref_m.group(1)) == sub_site:
+                    continue  # skip same site
+                ref_rtf_path = ref_pdb.parent / ref_pdb.name.replace('_frag.pdb', '_pres.rtf')
+                ref_rtf = None
+                if ref_rtf_path.exists():
+                    try:
+                        ref_rtf = parse_rtf_file(str(ref_rtf_path))
+                    except Exception:
+                        pass
+                ref_bonds = ref_rtf.get('bonds', []) if ref_rtf else []
+                ref_sub_info.append((str(ref_pdb), ref_rtf, ref_bonds))
 
+            # Build environment context (protein/solvent) for accurate AEVs
+            protein_ctx = None
+            solvent_ctx = None
             if solvent_state in ('protein', 'prot') and core_pdb and (minimized_pdb or protein_pdb):
-                protein_context = None
                 if minimized_pdb:
                     try:
-                        protein_context = extract_environment_atoms_from_minimized(
+                        protein_ctx = extract_environment_atoms_from_minimized(
                             minimized_pdb=minimized_pdb,
                             sub_pdb=pdb_path,
                             core_pdb=core_pdb,
@@ -729,121 +765,78 @@ def generate_bond_training_data_for_system(
                             prep_dir=prep_dir,
                         )
                     except Exception as e:
-                        warnings.warn(
-                            f"[{system_name}] Could not extract protein context for "
-                            f"{pdb_path.name}: {e}"
-                        )
-                effective_protein_pdb = protein_context if protein_context is not None else (
-                    str(protein_pdb) if protein_pdb else None
-                )
-                features_dict = get_atom_features_with_context(
-                    substituent_pdb=str(pdb_path),
-                    core_pdb=str(core_pdb),
-                    protein_pdb=effective_protein_pdb,
-                    rtf_entry=rtf_data,
-                    include_charges=True,
-                    include_atom_ids=True,
-                    prep_dir=str(prep_dir),
-                    aev_cutoff=aev_cutoff,
-                )
+                        warnings.warn(f"[{system_name}] protein ctx error for {pdb_path.name}: {e}")
+                if protein_ctx is None and protein_pdb:
+                    protein_ctx = str(protein_pdb)
+            elif solvent_state in ('solvent', 'water', 'solv') and core_pdb and minimized_pdb:
+                try:
+                    solvent_ctx = extract_environment_atoms_from_minimized(
+                        minimized_pdb=minimized_pdb,
+                        sub_pdb=pdb_path,
+                        core_pdb=core_pdb,
+                        aev_cutoff=aev_cutoff,
+                        prep_dir=prep_dir,
+                    )
+                except Exception as e:
+                    warnings.warn(f"[{system_name}] solvent ctx error for {pdb_path.name}: {e}")
 
-            elif solvent_state in ('solvent', 'water', 'solv') and core_pdb:
-                solvent_context = None
-                if minimized_pdb:
-                    try:
-                        solvent_context = extract_environment_atoms_from_minimized(
-                            minimized_pdb=minimized_pdb,
-                            sub_pdb=pdb_path,
-                            core_pdb=core_pdb,
-                            aev_cutoff=aev_cutoff,
-                            prep_dir=prep_dir,
-                        )
-                    except Exception as e:
-                        warnings.warn(
-                            f"[{system_name}] Could not extract solvent context for "
-                            f"{pdb_path.name}: {e}"
-                        )
-                features_dict = get_atom_features_with_context(
-                    substituent_pdb=str(pdb_path),
-                    core_pdb=str(core_pdb),
-                    solvent_context=solvent_context,
-                    rtf_entry=rtf_data,
-                    include_charges=True,
-                    include_atom_ids=True,
-                    prep_dir=str(prep_dir),
-                    aev_cutoff=aev_cutoff,
-                )
+            if core_pdb is None:
+                warnings.warn(f"[{system_name}] No core.pdb — skipping {pdb_path.name}")
+                continue
 
-            elif core_pdb:
-                features_dict = get_atom_features_with_context(
-                    substituent_pdb=str(pdb_path),
-                    core_pdb=str(core_pdb),
-                    rtf_entry=rtf_data,
-                    include_charges=True,
-                    include_atom_ids=True,
-                    prep_dir=str(prep_dir),
-                    aev_cutoff=aev_cutoff,
-                )
-
-            else:
-                # Substituent-only fallback
-                aevs_only = get_substituent_aevs(str(pdb_path))
-                charges_only = (
-                    extract_charges_from_rtf_metadata(rtf_data)
-                    if rtf_data else None
-                )
-                features_dict = {
-                    'aevs': aevs_only,
-                    'charges': charges_only,
-                    'atom_ids': None,
-                }
-
-            if verbose and not first_sub_processed:
-                ctx = features_dict.get('context_info', {})
-                print(f"\n  [VERBOSE] Bond dataset AEV context for {pdb_path.name}:")
-                print(f"    Context sources: {', '.join(ctx.get('context_sources', []))}")
-                print(f"    Total context atoms: {ctx.get('total_context_atoms', 0)}")
-                first_sub_processed = True
-
-            aevs = features_dict['aevs']           # [N, 2288]
-            charges = features_dict.get('charges')  # [N] or None
-            atom_ids = features_dict.get('atom_ids')  # [N] int or None
-
-            num_atoms = aevs.shape[0]
-
-            if charges is None:
-                warnings.warn(
-                    f"[{system_name}] No charges for {pdb_path.name}, using zeros"
-                )
-                charges = torch.zeros(num_atoms, dtype=torch.float32)
-            if len(charges) != num_atoms:
-                warnings.warn(
-                    f"[{system_name}] Charge count mismatch for {pdb_path.name}: "
-                    f"{len(charges)} vs {num_atoms} atoms. Using zeros."
-                )
-                charges = torch.zeros(num_atoms, dtype=torch.float32)
-
-            if atom_ids is None:
-                warnings.warn(
-                    f"[{system_name}] No atom_ids for {pdb_path.name}, using zeros"
-                )
-                atom_ids = torch.zeros(num_atoms, dtype=torch.long)
-
-            # Bond topology (RDKit primary; RTF BOND section fallback)
-            rtf_bonds = rtf_data.get('bonds', []) if rtf_data else []
-            bond_edge_index, bond_edge_attr = get_bond_edge_index_from_pdb(
-                str(pdb_path), rtf_bonds=rtf_bonds
+            # Compute full-ligand atom features (sub + core + ref subs), AEVs with env context
+            ligand_feats = get_full_ligand_atom_features(
+                sub_pdb=str(pdb_path),
+                core_pdb=str(core_pdb),
+                sub_rtf_data=rtf_data,
+                core_rtf_data=core_rtf_data,
+                ref_sub_info=[(rp, rrtf) for rp, rrtf, _ in ref_sub_info],
+                protein_pdb=protein_ctx,
+                solvent_context=solvent_ctx,
+                aev_cutoff=aev_cutoff,
             )
 
+            aevs = ligand_feats['aevs']             # [N_ligand, 2288]
+            charges = ligand_feats['charges']        # [N_ligand]
+            atom_ids = ligand_feats['atom_ids']      # [N_ligand]
+            n_sub = ligand_feats['n_sub']
+            n_core = ligand_feats['n_core']
+            n_ref_per_site = ligand_feats['n_ref_per_site']
+            n_ligand = aevs.shape[0]
+
+            # Build full-ligand bond graph (sub bonds + core bonds + attachment bonds)
+            bond_edge_index, bond_edge_attr, _, _, _ = build_full_ligand_bond_graph(
+                sub_pdb=str(pdb_path),
+                core_pdb=str(core_pdb),
+                sub_rtf_bonds=sub_rtf_bonds,
+                core_rtf_bonds=core_rtf_bonds,
+                ref_sub_info=[(rp, rbonds) for rp, _, rbonds in ref_sub_info],
+            )
+
+            # Sub mask: first n_sub atoms in the full-ligand array are substituent atoms
+            sub_mask = torch.zeros(n_ligand, dtype=torch.bool)
+            sub_mask[:n_sub] = True
+
+            if verbose and not first_sub_processed:
+                print(f"\n  [VERBOSE] Full-ligand bond dataset for {pdb_path.name}:")
+                print(f"    n_sub={n_sub}, n_core={n_core}, n_ref_per_site={n_ref_per_site}")
+                print(f"    N_ligand={n_ligand}, bonds={bond_edge_index.size(1)//2}")
+                first_sub_processed = True
+
             all_substituents.append({
-                'aev': aevs,                         # [N, 2288]
-                'charges': charges,                  # [N]
-                'atom_ids': atom_ids,                # [N] int64
-                'bond_edge_index': bond_edge_index,  # [2, 2E]
+                'aev': aevs,                         # [N_ligand, 2288]
+                'charges': charges,                  # [N_ligand]
+                'atom_ids': atom_ids,                # [N_ligand] int64
+                'bond_edge_index': bond_edge_index,  # [2, 2E] over full ligand
                 'bond_edge_attr': bond_edge_attr,    # [2E, 1]
+                'sub_mask': sub_mask,                # [N_ligand] bool — sub atoms
+                'n_sub': n_sub,                      # int
                 'pdb_name': pdb_path.name,
+                # Temporary fields removed after post-processing (below)
+                '_site': sub_site if sub_site is not None else -1,
+                '_raw_atom_types': list(rtf_data.get('atom_types', [])) if rtf_data else [],
             })
-            total_atoms += num_atoms
+            total_atoms += n_ligand
 
         except Exception as e:
             warnings.warn(f"[{system_name}] Error processing {pdb_path.name}: {e}")
@@ -852,8 +845,26 @@ def generate_bond_training_data_for_system(
     if not all_substituents:
         raise ValueError(f"No valid substituents generated for {system_dir.name}")
 
+    # Post-process: compute distinct_atom_types per site (atom types not shared
+    # by ALL substituents at the same site — mirrors production graph.py logic).
+    from collections import defaultdict as _defaultdict
+    site_subs: dict = _defaultdict(list)
+    for sd in all_substituents:
+        site_subs[sd['_site']].append((sd, sd['_raw_atom_types']))
+    for site, sub_list in site_subs.items():
+        type_sets = [set(raw) for _, raw in sub_list]
+        intersection = set.intersection(*type_sets) if len(type_sets) > 1 else set()
+        for sd, raw_types in sub_list:
+            sd['distinct_atom_types'] = [t for t in raw_types if t not in intersection]
+    # Strip temporary fields
+    for sd in all_substituents:
+        sd.pop('_site', None)
+        sd.pop('_raw_atom_types', None)
+
     aev_length = all_substituents[0]['aev'].shape[1]
-    print(f"  Generated {len(all_substituents)} substituents, {total_atoms} total atoms")
+    n_sub_avg = sum(s['n_sub'] for s in all_substituents) / len(all_substituents)
+    print(f"  Generated {len(all_substituents)} substituents, {total_atoms} total ligand atoms "
+          f"(avg {n_sub_avg:.1f} sub atoms, {total_atoms/len(all_substituents):.1f} ligand atoms each)")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
