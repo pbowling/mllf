@@ -50,30 +50,7 @@ import torch.optim as optim
 import numpy as np
 from torch_geometric.data import Data
 
-from mllf.cli.workflow import build_data_and_targets_from_combo
-from mllf.cb.rgcn import RGCNEncoder
-from mllf.cb.policy import EdgePolicy, SitePoolMLPPolicy
-
-
-def build_graph_from_saved_data(run_dir: Path, toppar_dir=None, toppar_files=None, warn_missing_types=True):
-    """Build PyG graph from saved variables.py.
-    
-    Args:
-        run_dir: Directory containing variables.py
-        toppar_dir: Path to toppar directory (None uses package default)
-        toppar_files: List of specific toppar filenames to include
-        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
-    
-    Returns:
-        Tuple of (data, targets, extras)
-    """
-    # Use the existing workflow function to build graph from variables.py
-    return build_data_and_targets_from_combo(
-        str(run_dir), 
-        toppar_dir=toppar_dir,
-        toppar_files=toppar_files,
-        warn_missing_types=warn_missing_types
-    )
+from mllf.cb.policy import SitePoolMLPPolicy
 
 
 # ── per-system graph cache helpers ──────────────────────────────────────────
@@ -1444,7 +1421,6 @@ def sample_runs_stratified_negative(
 
 
 def pretrain_epoch(
-    encoder: nn.Module,
     policy: nn.Module,
     optimizer: optim.Optimizer,
     runs: List[Dict],
@@ -1453,18 +1429,16 @@ def pretrain_epoch(
     toppar_dir=None,
     toppar_files=None,
     warn_missing_types=True,
-    use_fully_connected=True,
     deepset_model=None,
     graph_cache: Optional[List] = None,
     groups: Optional[Dict] = None,
     reward_weighted: bool = False,
-    awr_temperature: float = 1.0,
+    awr_temperature: float = 0.5,
 ) -> Dict[str, float]:
-    """Run one behavior cloning epoch with MSE loss.
-    
+    """Run one behavior cloning AWR epoch for SitePoolMLPPolicy.
+
     Args:
-        encoder: GNN encoder
-        policy: Edge policy
+        policy: SitePoolMLPPolicy to train
         optimizer: Optimizer
         runs: List of pretraining run dicts (should be best runs only)
         reward_config: Reward function configuration (used for reward-weighted loss)
@@ -1472,21 +1446,15 @@ def pretrain_epoch(
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
-        use_fully_connected: If True, use fully-connected graph with all pairs within sites.
-                            If False, use sparse graph with only non-zero coefficient edges.
-                            Fully-connected provides more training data and proper linear bias encoding.
-        deepset_model: Optional PretrainedDeepSet model. When provided, node features are
-                      64-dim DeepSet embeddings computed from 3D atomic structure + AEVs
-                      instead of standard atom-type encodings.
-        reward_weighted: If True, weight each run's MSE loss by its pre-computed normalised
+        deepset_model: Frozen PretrainedDeepSet model used to compute 64-dim P1 node features
+                       from 3D atomic structure + AEVs.
+        reward_weighted: If True, weight each run's loss by its pre-computed normalised
                         reward (stored in run["_bc_reward"]).  Zero-weight runs are skipped.
-    
+
     Returns:
         Dict with epoch statistics
     """
     policy.train()
-    if encoder is not None:
-        encoder.train()
 
     # Build normalised reward weights (mean = 1.0) so the learning rate is unchanged.
     # Weights are pre-computed by pretrain_with_runs and stored in run["_bc_reward"].
@@ -1531,13 +1499,8 @@ def pretrain_epoch(
                     mean, log_std = policy._forward_edges(
                         data.x, data.edge_index, data.edge_attr,
                         getattr(data, 'site_index', None),
+                        getattr(data, 'edge_type', None),
                     )
-                else:
-                    node_emb = policy.forward_node_embeddings(
-                        data.x, data.edge_index, data.edge_type)
-                    p1_for_skip = data.x if policy.p1_dim > 0 else None
-                    mean, log_std = policy.forward_edges(
-                        node_emb, data.edge_index, data.edge_attr, p1_for_skip)
                 active_mask = targets.abs() > 1e-8
                 if not active_mask.any():
                     continue
@@ -1603,24 +1566,16 @@ def pretrain_epoch(
 
             # Build graph from saved data AND get target coefficients
             try:
-                if use_fully_connected:
-                    data, targets, extras = build_fully_connected_graph_for_pretraining(
-                        run_dir,
-                        toppar_dir=toppar_dir,
-                        toppar_files=toppar_files,
-                        warn_missing_types=warn_missing_types,
-                        deepset_model=deepset_model,
-                        pdb_dir=pdb_dir,
-                        prep_dir=prep_dir,
-                        solvent_state=solvent_state,
-                    )
-                else:
-                    data, targets, extras = build_graph_from_saved_data(
-                        run_dir,
-                        toppar_dir=toppar_dir,
-                        toppar_files=toppar_files,
-                        warn_missing_types=warn_missing_types
-                    )
+                data, targets, extras = build_fully_connected_graph_for_pretraining(
+                    run_dir,
+                    toppar_dir=toppar_dir,
+                    toppar_files=toppar_files,
+                    warn_missing_types=warn_missing_types,
+                    deepset_model=deepset_model,
+                    pdb_dir=pdb_dir,
+                    prep_dir=prep_dir,
+                    solvent_state=solvent_state,
+                )
 
                 data = data.to(device)
 
@@ -1635,17 +1590,11 @@ def pretrain_epoch(
                 continue
         
         # Compute mean and log_std for AWR loss
-        if isinstance(policy, SitePoolMLPPolicy):
-            mean, log_std = policy._forward_edges(
-                data.x, data.edge_index, data.edge_attr,
-                getattr(data, 'site_index', None),
-            )
-        else:
-            node_emb = policy.forward_node_embeddings(
-                data.x, data.edge_index, data.edge_type)
-            p1_for_skip = data.x if policy.p1_dim > 0 else None
-            mean, log_std = policy.forward_edges(
-                node_emb, data.edge_index, data.edge_attr, p1_for_skip)
+        mean, log_std = policy._forward_edges(
+            data.x, data.edge_index, data.edge_attr,
+            getattr(data, 'site_index', None),
+            getattr(data, 'edge_type', None),
+        )
         
         # AWR loss: -exp(r/β) · log π(a | s) over active elements.
         active_mask = targets.abs() > 1e-8            # [E, 4], one True per row
@@ -1757,7 +1706,7 @@ def warmup_q_network(
     Args:
         runs: Pretraining run dicts (must contain ``sim_results`` with ``ddg_pairs``
               and ``populations`` keys populated by ``backfill_ddg_pairs``).
-        policy: Frozen EdgePolicy (P2 RGCN + P3 MLP) used only for building edge inputs.
+        policy: SitePoolMLPPolicy used only for building edge inputs.
         q_network: QNetwork to train.
         q_optimizer: Optimizer for q_network.
         epochs: Number of warmup epochs.
@@ -1908,7 +1857,7 @@ def pretrain_with_runs(
     q_epochs: int = 0,
     q_lr: float = 1e-3,
     q_stratified_fraction: Optional[float] = None,
-    awr_temperature: float = 1.0,
+    awr_temperature: float = 0.5,
 ):
     """Run policy pretraining with provided runs.
     
@@ -2022,23 +1971,41 @@ def pretrain_with_runs(
     toppar_files = vocab_config.get('toppar_files')
     warn_missing_types = vocab_config.get('warn_missing_types', True)
     
-    # Get a sample run to infer graph structure (num_relations, relation_names)
-    # Node feature dim is taken from deepset_model.embedding_dim when available.
+    # Get a sample run to infer graph schema (num_relations, relation_names, edge_attr_dim).
+    # Uses build_fully_connected_graph_for_pretraining so the schema matches training exactly.
     sample_data = None
     sample_extras = None
     for run in runs:
         try:
-            data, _, extras = build_data_and_targets_from_combo(
-                str(run["run_dir"]),
+            _run_dir = run["run_dir"]
+            _prep = None
+            _local = Path(_run_dir).parent / "prep"
+            if _local.is_dir():
+                _prep = str(_local)
+            if _prep is None:
+                _src = run.get("source_dir")
+                if _src:
+                    _cand = Path(_src) / "prep"
+                    if _cand.is_dir():
+                        _prep = str(_cand)
+            if _prep is None:
+                continue
+            _solvent = run.get("metadata", {}).get("solvent_state")
+            data, _, extras = build_fully_connected_graph_for_pretraining(
+                _run_dir,
                 toppar_dir=toppar_dir,
                 toppar_files=toppar_files,
-                warn_missing_types=warn_missing_types
+                warn_missing_types=warn_missing_types,
+                deepset_model=deepset_model,
+                pdb_dir=_prep,
+                prep_dir=_prep,
+                solvent_state=_solvent,
             )
-            if data.edge_index.size(1) > 0:  # Has edges
+            if data.edge_index.size(1) > 0:
                 sample_data = data
                 sample_extras = extras
                 break
-        except Exception as e:
+        except Exception:
             continue
     
     if sample_data is None:
@@ -2060,63 +2027,33 @@ def pretrain_with_runs(
     encoder_config = train_config.get('encoder', {})
     policy_config = train_config.get('policy', {})
 
-    # Determine policy type: 'sitepool' for direct MLP, 'rgcn' (default) for RGCN+EdgePolicy
-    policy_type = policy_config.get('type', 'rgcn')
+    # Determine policy type: only 'sitepool' is supported.
+    policy_type = policy_config.get('type', 'sitepool')
+    if policy_type != 'sitepool':
+        raise ValueError(f"Only 'sitepool' policy type is supported for pretraining. Got: {policy_type!r}")
 
-    if policy_type == 'sitepool':
-        # SitePool-MLP: no RGCN encoder; uses scatter_mean site context + P1 embeddings
-        encoder = None
-        edge_attr_dim = sample_data.edge_attr.size(1) if sample_data.edge_attr is not None else 8
-        policy = SitePoolMLPPolicy(
-            p1_dim=node_feat_dim,
-            edge_attr_dim=edge_attr_dim,
-            mlp_hidden=policy_config.get('mlp_hidden', 64),
-            mlp_out_dim=len(sample_extras['relation_names']) // 2,
-        ).to(device)
-    else:
-        # Default: RGCN encoder + EdgePolicy
-        encoder = RGCNEncoder(
-            in_dim=node_feat_dim,
-            hidden_dims=encoder_config.get('hidden_dims', [64, 64]),
-            out_dim=encoder_config.get('out_dim', 32),
-            num_relations=sample_data.edge_type.max().item() + 1
-        ).to(device)
-        policy = EdgePolicy.from_pyg_data(
-            encoder=encoder,
-            emb_dim=encoder_config.get('out_dim', 32),
-            data=sample_data,
-            mlp_hidden=policy_config.get('mlp_hidden', 64),
-            mlp_out_dim=len(sample_extras['relation_names']) // 2,
-            p1_dim=node_feat_dim,  # skip connection — must match run_workflow_deepset.py
-        ).to(device)
+    edge_attr_dim = sample_data.edge_attr.size(1) if sample_data.edge_attr is not None else 8
+    policy = SitePoolMLPPolicy(
+        p1_dim=node_feat_dim,
+        edge_attr_dim=edge_attr_dim,
+        mlp_hidden=policy_config.get('mlp_hidden', 64),
+        mlp_out_dim=len(sample_extras['relation_names']) // 2,
+    ).to(device)
     
-    # Optimizer: policy.parameters() already includes encoder since encoder is a submodule
+    # Optimizer: cosine-annealed Adam over all policy parameters.
     optimizer = optim.Adam(
         policy.parameters(),
         lr=learning_rate
     )
     # Cosine annealing LR schedule: decays smoothly from lr → lr/100 over all epochs.
-    # Prevents the optimizer from escaping good basins found in early epochs.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=learning_rate / 100.0
     )
-    # MLP-only optimizer/scheduler — activated when encoder is frozen (RGCN mode only)
-    _mlp_n = (epochs - freeze_encoder_after) if freeze_encoder_after is not None else epochs
-    if freeze_encoder_after is not None and encoder is not None:
-        mlp_optimizer = optim.Adam(policy.edge_mlp.parameters(), lr=learning_rate)
-        mlp_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            mlp_optimizer, T_max=max(_mlp_n, 1), eta_min=learning_rate / 100.0
-        )
-    else:
-        mlp_optimizer = None
-        mlp_scheduler = None
     active_opt = optimizer
     active_sched = scheduler
 
     print(f"\nModel architecture:")
-    if encoder is not None:
-        print(f"  Encoder: {sum(p.numel() for p in encoder.parameters())} params")
-    print(f"  Policy ({policy_type}): {sum(p.numel() for p in policy.parameters())} params")
+    print(f"  Policy (sitepool): {sum(p.numel() for p in policy.parameters())} params")
     print(f"  LR schedule: cosine annealing, {learning_rate} → {learning_rate/100:.6f} over {epochs} epochs")
     print(f"  Early stopping patience: {patience} epochs")
     print(f"  Graph caching: all {len(runs)} graphs pre-built once, reused across all epochs")
@@ -2246,24 +2183,6 @@ def pretrain_with_runs(
                 if done % 500 == 0 or done == len(runs):
                     print(f"  {done}/{len(runs)} runs cached "
                           f"({struct_num}/{n_unique} structures, {n_fail} failed)...")
-        else:
-            for gidx, run in group_runs:
-                try:
-                    _data, _tgts, _ = build_graph_from_saved_data(
-                        run["run_dir"], toppar_dir=toppar_dir, toppar_files=toppar_files,
-                        warn_missing_types=warn_missing_types,
-                    )
-                    if _tgts is None or len(_tgts) == 0:
-                        n_fail += 1
-                    else:
-                        graph_cache[gidx] = (_data.cpu(), _tgts)
-                        n_ok += 1
-                except Exception as exc:
-                    print(f"  Error building graph for {run['run_dir'].name}: {exc}")
-                    n_fail += 1
-                done += 1
-                if done % 500 == 0 or done == len(runs):
-                    print(f"  {done}/{len(runs)} graphs built ({n_fail} failed)...")
 
     print(f"Graph cache ready: {n_ok} built, {n_fail} skipped")
     # Map group_key → list of run indices for per-graph gradient accumulation
@@ -2314,28 +2233,13 @@ def pretrain_with_runs(
     print(f"{'='*60}\n")
 
     for epoch in range(epochs):
-        # ── Phase transition: freeze RGCN encoder and switch to MLP-only optimizer ─────────
-        if (
-            encoder is not None
-            and freeze_encoder_after is not None
-            and epoch == freeze_encoder_after
-            and mlp_optimizer is not None
-        ):
-            encoder.requires_grad_(False)
-            active_opt = mlp_optimizer
-            active_sched = mlp_scheduler
-            best_loss = float('inf')         # reset so MLP-only phase tracks its own best
-            epochs_without_improvement = 0
-            print(f"\nEpoch {epoch+1}: RGCN encoder frozen — switching to MLP-only optimizer")
-
         print(f"Epoch {epoch+1}/{epochs}")
 
         stats = pretrain_epoch(
-            encoder, policy, active_opt, runs, reward_config, device,
+            policy, active_opt, runs, reward_config, device,
             toppar_dir=toppar_dir,
             toppar_files=toppar_files,
             warn_missing_types=warn_missing_types,
-            use_fully_connected=use_fully_connected,
             deepset_model=deepset_model,
             graph_cache=graph_cache,
             groups=epoch_groups,
@@ -2357,8 +2261,6 @@ def pretrain_with_runs(
 
             best_path = output_dir / "best_policy.pt"
             _ckpt = {'policy_state': policy.state_dict(), 'epoch': epoch + 1, 'loss': stats['loss']}
-            if encoder is not None:
-                _ckpt['encoder_state'] = encoder.state_dict()
             torch.save(_ckpt, best_path)
             print(f"  Saved best model (loss: {best_loss:.4f})")
         else:
@@ -2373,8 +2275,6 @@ def pretrain_with_runs(
             'epoch': epoch + 1,
             'stats': stats,
         }
-        if encoder is not None:
-            _epoch_ckpt['encoder_state'] = encoder.state_dict()
         torch.save(_epoch_ckpt, checkpoint_path)
 
         # Early stopping
@@ -2385,8 +2285,6 @@ def pretrain_with_runs(
     # Save final model
     final_path = output_dir / "final_policy.pt"
     _final_ckpt = {'policy_state': policy.state_dict(), 'epoch': epochs}
-    if encoder is not None:
-        _final_ckpt['encoder_state'] = encoder.state_dict()
     torch.save(_final_ckpt, final_path)
     
     # Save metadata
@@ -2414,7 +2312,7 @@ def pretrain_with_runs(
     # ── Q-network warmup (optional) ──────────────────────────────────────────────────────────
     if q_epochs > 0:
         from mllf.cb.value_net import QNetwork
-        q_in_dim = policy.edge_mlp.trunk[0].in_features
+        q_in_dim = policy.edge_mlp.mlps[0].net[0].in_features
         q_action_dim = policy.mlp_out_dim  # 4 bias types: linear, quadratic, skew, end
         q_network = QNetwork(in_dim=q_in_dim, action_dim=q_action_dim, hidden_dims=[64, 32]).to(device)
         q_optimizer = optim.Adam(q_network.parameters(), lr=q_lr)
@@ -2658,18 +2556,14 @@ def main():
         type=int,
         default=None,
         metavar="N",
-        help="Freeze the RGCN encoder after N BC epochs and fine-tune only the EdgeValueMLP "
-             "for the remaining epochs. If not set, encoder and MLP are trained jointly for "
-             "all epochs.",
+        help="(Unused for sitepool — kept for config file compatibility.)",
     )
     parser.add_argument(
         "--policy-type",
         type=str,
-        default=None,
-        choices=["rgcn", "sitepool"],
-        help="Policy architecture: 'rgcn' (default) uses RGCN encoder + EdgePolicy; "
-             "'sitepool' uses direct SitePool-MLP with no encoder (requires deepset-encoder "
-             "for P1 embeddings). Overrides training.policy.type in the config file.",
+        default="sitepool",
+        choices=["sitepool"],
+        help="Policy architecture (only 'sitepool' is supported).",
     )
     parser.add_argument(
         "--q-epochs",
@@ -2702,7 +2596,7 @@ def main():
         default=1.0,
         help="Temperature β for AWR loss: each run is weighted by exp(r/β). Higher β → "
              "more uniform weighting; lower β → sharper emphasis on high-reward runs. "
-             "Default: 1.0.",
+             "Default: 0.5.",
     )
     args = parser.parse_args()
     

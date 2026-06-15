@@ -27,27 +27,43 @@ coefficients to different molecular transition types.
 
 **Training Objective**:
 
-The model minimizes a **masked** mean squared error. Backpropagation runs only through
-the *active* (non-zero) target for each edge. Because each directed edge carries exactly
-one non-zero bias type (e.g., a ``linear_fwd`` edge has a non-zero linear target but zero
-quadratic, skew, and end targets), averaging over all four outputs would produce a gradient
-signal dominated by pushing inactive heads toward zero. The mask avoids this.
+The model minimises an **Advantage-Weighted Regression (AWR)** loss: the negative
+log-likelihood of the expert action under the current policy distribution, scaled by
+an exponential weight derived from the run’s reward. Backpropagation runs only through
+the *active* (non-zero) target for each edge via an ``active_mask``:
 
 .. math::
 
-   \mathcal{L}_{\text{BC}} = \frac{1}{|\mathcal{A}|} \sum_{(i,j,k) \in \mathcal{A}} \| a_{ij}^{(k)} - \hat{a}_{ij}^{(k)} \|^2
+   \mathcal{L}_{\text{AWR}} = -\frac{1}{|\mathcal{G}|}
+   \sum_{r \in \mathcal{G}}
+   \exp\!\left(\frac{R_r}{\beta}\right)
+   \cdot
+   \frac{1}{|\mathcal{A}_r|}
+   \sum_{(i,j,k) \in \mathcal{A}_r}
+   \log \mathcal{N}\!\left(a_{ij}^{(k)};
+     \mu_{ij}^{(k)}, (\sigma_{ij}^{(k)})^2\right)
 
 where:
 
-- :math:`\mathcal{A} = \{(i,j,k) : |a_{ij}^{(k)}| > \epsilon\}` is the set of active (non-zero) target entries
+- :math:`\mathcal{G}` is the set of runs sharing the same graph structure (gradient-accumulated
+  before a single optimizer step)
+- :math:`R_r` is the pre-computed BC reward for run :math:`r` (stored in ``run["_bc_reward"]``)
+- :math:`\beta` is the AWR temperature (default: 1.0)
+- :math:`\mathcal{A}_r = \{(i,j,k) : |a_{ij}^{(k)}| > \epsilon\}` is the set of active
+  (non-zero) target entries for run :math:`r`
 - :math:`k \in \{\text{linear, quadratic, skew, end}\}` are bias types
-- :math:`a_{ij}^{(k)}` is the expert coefficient
-- :math:`\hat{a}_{ij}^{(k)}` is the predicted coefficient
+- :math:`a_{ij}^{(k)}` is the expert coefficient; :math:`\mu_{ij}^{(k)}, \sigma_{ij}^{(k)}`
+  are the predicted mean and standard deviation
 - :math:`\epsilon = 10^{-8}` is a small threshold to identify non-zero targets
+- The exponential weight is capped at 20 to prevent a single excellent run from dominating
 
-The DDG signal from λ-space crossings is instead used during reinforcement learning
-via per-pair rewards (see :doc:`workflow` and :doc:`cb_setup`), which provides a
-cleaner separation between supervised imitation (BC) and exploration feedback (RL).
+When ``_bc_reward`` is 0.0 (default), :math:`\exp(0/\beta) = 1.0` and AWR reduces to
+unweighted NLL — pure behavior cloning with no weighting.
+
+The AWR objective uses the Gaussian NLL rather than MSE, which trains the standard deviation
+:math:`\sigma` alongside the mean. Larger :math:`\sigma` values allow the policy more
+exploratory freedom in RL fine-tuning; the learned :math:`\sigma` is a useful prior for
+initialising the exploration scale.
 
 
 **Graph Caching**:
@@ -83,10 +99,6 @@ The pretraining process produces several artifacts:
 The pretrained policy provides a strong initialization for reinforcement learning on new
 systems. Rather than starting with random weights, the CB agent begins with a policy that
 already understands basic patterns in bias coefficient assignment.
-
-The pretrained encoder (RGCN) can be frozen during initial CB training to preserve learned
-graph representations, or allowed to fine-tune for task-specific adaptation. Fine-tuning
-typically uses a lower learning rate (e.g., 0.0001) to prevent disrupting pretrained features.
 
 Transfer learning is most effective when pretraining systems share structural or chemical
 similarity with the target system. However, even diverse pretraining data improves learning

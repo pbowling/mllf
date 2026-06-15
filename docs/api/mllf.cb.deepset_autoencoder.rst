@@ -9,12 +9,14 @@
    .. autosummary::
    
       create_autoencoder
+      load_pretrained_atombondgnn
       load_pretrained_deepset
    
    .. rubric:: Classes
 
    .. autosummary::
    
+      AtomBondGNNAutoencoder
       DeepSetAutoencoder
       DeepSetDecoder
       DeepSetEncoder

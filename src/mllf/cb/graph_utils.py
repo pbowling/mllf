@@ -9,6 +9,23 @@ import os
 import warnings
 from torch_geometric.data import Data
 from .atom_vocab import get_atom_type_vocab
+from pathlib import Path as _Path
+
+
+def _find_protein_pdb(prep_path) -> Optional[str]:
+    """Return path string to protein PDB in prep_path, or None.
+
+    Checks (in order): protein.pdb, proa.pdb, proa_*.pdb (first match).
+    """
+    prep = _Path(prep_path)
+    for name in ('protein.pdb', 'proa.pdb'):
+        p = prep / name
+        if p.exists():
+            return str(p)
+    # proa variants like proa_i315.pdb
+    for p in sorted(prep.glob('proa_*.pdb')):
+        return str(p)
+    return None
 
 
 def compute_deepset_embedding_for_node(
@@ -21,6 +38,7 @@ def compute_deepset_embedding_for_node(
     prep_dir: Optional[str] = None,
     protein_pdb: Optional[str] = None,
     solvent_state: Optional[str] = None,
+    solvent_pdb: Optional[str] = None,
     aev_cutoff: float = 5.1
 ):
     """Compute DeepSet embedding for a single node/substituent.
@@ -118,18 +136,18 @@ def compute_deepset_embedding_for_node(
                     # vacuum/gas: env_ctx not used (no extra environment atoms)
                 elif solvent_state == 'protein' and protein_pdb is None:
                     # minimized.pdb gave nothing — look for standalone protein PDB
-                    default_protein = prep_path / 'protein.pdb'
-                    if default_protein.exists():
-                        effective_protein = str(default_protein)
-                        warnings.warn("Using protein.pdb from prep directory for AEV spatial filtering")
+                    _standalone = _find_protein_pdb(prep_path)
+                    if _standalone:
+                        effective_protein = _standalone
+                        warnings.warn(f"Using {_Path(_standalone).name} from prep directory for AEV spatial filtering")
                     else:
                         warnings.warn(
                             f"solvent_state is 'protein' but no environment atoms found in "
-                            f"minimized structure and no protein.pdb in prep directory: {prep_dir}"
+                            f"minimized structure and no protein PDB (protein.pdb/proa.pdb) in prep directory: {prep_dir}"
                         )
                 elif solvent_state in ('solvent', 'solv', 'water'):
-                    # minimized.pdb gave no environment atoms — fall back to standalone solvent.pdb
-                    _default_solvent = prep_path / 'solvent.pdb'
+                    # minimized.pdb gave no environment atoms — fall back to solvent PDB
+                    _default_solvent = _Path(solvent_pdb) if solvent_pdb else prep_path / 'solvent.pdb'
                     if _default_solvent.exists():
                         _ref_pdb = sub_frag_pdb if sub_frag_pdb.exists() else prep_path / pdb_filename
                         solvent_ctx = extract_environment_atoms_from_minimized(
@@ -142,24 +160,24 @@ def compute_deepset_embedding_for_node(
                         if solvent_ctx is not None:
                             warnings.warn(
                                 f"solvent_state is 'solvent' but minimized.pdb gave no environment atoms; "
-                                f"using solvent.pdb from prep directory for AEV context: {_default_solvent}"
+                                f"using {_default_solvent.name} from prep directory for AEV context: {_default_solvent}"
                             )
             elif solvent_state == 'protein' and protein_pdb is None:
                 # No minimized structure and no sub_frag — try standalone protein PDB
-                default_protein = prep_path / 'protein.pdb'
-                if default_protein.exists():
-                    effective_protein = str(default_protein)
-                    warnings.warn(f"Using protein.pdb from prep directory for AEV spatial filtering: {prep_dir}")
+                _standalone = _find_protein_pdb(prep_path)
+                if _standalone:
+                    effective_protein = _standalone
+                    warnings.warn(f"Using {_Path(_standalone).name} from prep directory for AEV spatial filtering: {prep_dir}")
                 else:
                     warnings.warn(
                         f"solvent_state is 'protein' but no protein PDB found in prep directory: {prep_dir}. "
-                        f"Specify protein_pdb in config or add protein.pdb to prep directory."
+                        f"Specify protein_pdb in config or add protein.pdb/proa.pdb to prep directory."
                     )
             elif solvent_state in ('solvent', 'solv', 'water'):
-                # No minimized structure — fall back to standalone solvent.pdb
+                # No minimized structure — fall back to solvent PDB for AEV context.
                 # This is the common case during RL training on a new combo before any
                 # simulation has run (minimized.pdb does not exist yet).
-                _default_solvent = prep_path / 'solvent.pdb'
+                _default_solvent = _Path(solvent_pdb) if solvent_pdb else prep_path / 'solvent.pdb'
                 if _default_solvent.exists():
                     _ref_pdb = sub_frag_pdb if sub_frag_pdb.exists() else Path(pdb_path)
                     solvent_ctx = extract_environment_atoms_from_minimized(
@@ -171,7 +189,7 @@ def compute_deepset_embedding_for_node(
                     )
                     if solvent_ctx is not None:
                         warnings.warn(
-                            f"Using solvent.pdb from prep directory for AEV solvent context "
+                            f"Using {_default_solvent.name} from prep directory for AEV solvent context "
                             f"(minimized.pdb not found): {_default_solvent}"
                         )
 
@@ -301,6 +319,7 @@ def compute_deepset_embeddings_for_graph(
     prep_dir: Optional[str] = None,
     protein_pdb: Optional[str] = None,
     solvent_state: Optional[str] = None,
+    solvent_pdb: Optional[str] = None,
     aev_cutoff: float = 5.1
 ) -> torch.Tensor:
     """Compute DeepSet embeddings for all nodes in a graph.
@@ -312,8 +331,9 @@ def compute_deepset_embeddings_for_graph(
         pdb_pattern: Pattern for PDB filenames
         rtf_results: Optional dict of RTF parsed data
         prep_dir: Optional prep directory for multi-site spatial filtering
-        protein_pdb: Optional protein PDB file path (for protein phase systems)
+        protein_pdb: Optional protein PDB file path or pre-parsed (coords, elements) tuple.
         solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
+        solvent_pdb: Optional explicit path to solvent/water PDB for AEV context fallback.
         aev_cutoff: Distance cutoff in Angstroms for spatial filtering (default: 5.1 Å)
         
     Returns:
@@ -328,6 +348,7 @@ def compute_deepset_embeddings_for_graph(
                 prep_dir=prep_dir,
                 protein_pdb=protein_pdb,
                 solvent_state=solvent_state,
+                solvent_pdb=solvent_pdb,
                 aev_cutoff=aev_cutoff
             )
             embeddings.append(embedding)
@@ -456,6 +477,7 @@ def build_pyg_graph_from_mllf_graph(
     prep_dir: Optional[str] = None,
     protein_pdb: Optional[str] = None,
     solvent_state: Optional[str] = None,
+    solvent_pdb: Optional[str] = None,
     aev_cutoff: float = 5.1
 ) -> Tuple[object, dict]:
     """Convert a Graph-like object `g` into a PyG Data object and metadata.
@@ -525,10 +547,9 @@ def build_pyg_graph_from_mllf_graph(
 
     rel_to_idx = {r: i for i, r in enumerate(relation_names)}
 
-    # Load atom type and element vocabularies from toppar files
-    # Default to CGenFF only if no files specified
-    if toppar_files is None:
-        toppar_files = ['top_all36_cgenff.rtf']
+    # Load atom type and element vocabularies from toppar files.
+    # Pass toppar_files=None when unspecified so all .rtf/.str files in the
+    # toppar directory are parsed (including custom_ligand_types.rtf).
     atom_type_vocab, element_vocab, atom_to_element = get_atom_type_vocab(toppar_dir, toppar_files)
     
     # Check for missing atom types in graph if requested
@@ -566,6 +587,7 @@ def build_pyg_graph_from_mllf_graph(
             prep_dir=prep_dir,
             protein_pdb=protein_pdb,
             solvent_state=solvent_state,
+            solvent_pdb=solvent_pdb,
             aev_cutoff=aev_cutoff
         )
     

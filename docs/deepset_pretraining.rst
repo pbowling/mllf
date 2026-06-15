@@ -9,10 +9,12 @@ manual feature engineering. Instead of hand-crafted features like atom counts an
 we use a pretrained graph neural network to compress atom-level physics (spatial arrangements,
 charges, chemical composition, and bond topology) into compact 64-dimensional embeddings.
 
-These embeddings are then used as input features for the RGCN policy network in the
+These embeddings are then used as input features for the ``SitePoolMLPPolicy`` in the
 contextual bandit training (see :doc:`cb_setup`). The ``AtomBondGNN`` improves on earlier
-DeepSet-style pooling by propagating information along molecular bonds before aggregation,
-capturing bonded chemical context that independent per-atom processing cannot represent.
+DeepSet-style pooling by using a **dual-stream GINEConv architecture**: a substituent
+stream propagates information along sub-graph bonds, and a parallel core stream processes
+the shared scaffold, whose mean-pooled summary modulates the attention gate. This provides
+scaffold-aware pooling while keeping the embedding a pure substituent representation.
 
 
 4-Step Pretraining Pipeline
@@ -87,24 +89,36 @@ Step 2-3: AtomBondGNN Autoencoder Training
 
 Train an ``AtomBondGNNAutoencoder`` to learn bond-topology-aware atom representations:
 
-**Encoder Architecture**:
+**Encoder Architecture** (dual-stream):
 
 .. code-block:: text
 
    Input: [AEV (2288D), charge (1D), atom_id (11D)] = 2300D per atom
-       Linear(2300 → 256) + ReLU                    [input projection]
-       GINConv layer 1 (bond-graph topology) + ReLU  [bond propagation]
-       GINConv layer 2 (bond-graph topology) + ReLU  [bond propagation]
-       GlobalAttentionPool(gate: 256→1, nn: 256→64)  [substituent pooling]
+   
+   Substituent stream (sub atoms only):
+       sub_input_proj: Linear(2300→256) + ReLU, Linear(256→256) + ReLU
+       sub_gin_layers: 4× GINEConv(256→256, edge_dim=1) + ReLU
+   
+   Core stream (core + ref-sub atoms):
+       core_input_proj: Linear(2300→256) + ReLU, Linear(256→256) + ReLU
+       core_gin_layers: 4× GINEConv(256→256, edge_dim=1) + ReLU
+       core_summary = mean-pool(core_gin output)
+   
+   Scaffold-aware attention pooling (over sub atoms only):
+       gate_score = sigmoid(Linear(concat(sub_h, core_summary), 1))
+       pool_nn(sub_h) weighted sum → 64D substituent embedding
    Output: 64D substituent embedding
 
-The **GINConv layers** pass messages along molecular bonds extracted from RDKit
-bond topology (RTF BOND section as fallback). This lets each atom "see" its bonded
-neighbors before pooling — capturing functional group identity and local bonded context
-that independent per-atom processing cannot represent.
+The **GINEConv layers** pass messages along molecular bonds extracted from RDKit
+bond topology (RTF BOND section as fallback), using edge features encoding bond type.
+Each atom "sees" its bonded neighbors before pooling, capturing functional group
+identity and local bonded context that independent per-atom processing cannot represent.
 
-The **GlobalAttentionPool** learns to weight atoms by their importance to the substituent
-prediction task, rather than applying equal weight to each atom as in max- or sum-pooling.
+The **core stream** produces a single mean-pooled scaffold summary that is concatenated
+into the gate of the attentional pooling step. This makes the attention weights
+scaffold-aware (the same sub atom should be weighted differently in different scaffolds)
+without contaminating the sub feature path — the final pooled embedding remains a
+pure substituent representation.
 
 **Decoder Architecture**:
 
@@ -118,14 +132,37 @@ The decoder is a lightweight per-atom linear layer applied to GINConv hidden sta
 This reconstruction target forces the GINConv layers to maintain atom-level information
 in their hidden states, even though the encoder ultimately produces a single pooled vector.
 
-**Loss Function**: Mean Squared Error (MSE) between input and reconstructed atom features
+**Loss Function**: Combined reconstruction (MSE) + supervised contrastive (NT-Xent) loss:
 
 .. math::
 
-   \mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \| \mathbf{x}_i - \hat{\mathbf{x}}_i \|^2
+   \mathcal{L} = \mathcal{L}_{\text{MSE}} + \alpha \cdot \mathcal{L}_{\text{NT-Xent}}
 
-where :math:`\mathbf{x}_i` is the 2300D input feature for atom :math:`i` and
-:math:`\hat{\mathbf{x}}_i` is the per-atom reconstruction from the GINConv hidden state.
+where:
+
+.. math::
+
+   \mathcal{L}_{\text{MSE}} = \frac{1}{N} \sum_{i=1}^{N} \| \mathbf{x}_i - \hat{\mathbf{x}}_i \|^2
+
+and :math:`\mathcal{L}_{\text{NT-Xent}}` is the **supervised NT-Xent contrastive loss**
+(Khosla et al., 2020) applied at the substituent embedding level.  Two substituents are
+treated as **positive pairs** when their sets of distinct CGenFF atom types are identical
+(i.e., they contain chemically equivalent functional groups).  This pulls chemically
+equivalent substituents together in embedding space and pushes chemically distinct
+substituents apart, regardless of scaffold:
+
+.. math::
+
+   \mathcal{L}_{\text{NT-Xent}} = -\frac{1}{|\mathcal{P}|}\sum_{i \in \mathcal{P}}
+   \frac{1}{|P_i|} \sum_{j \in P_i}
+   \log \frac{\exp(\mathbf{z}_i \cdot \mathbf{z}_j / \tau)}
+             {\sum_{k \ne i} \exp(\mathbf{z}_i \cdot \mathbf{z}_k / \tau)}
+
+where :math:`\mathbf{z}_i` is the L2-normalised 64D substituent embedding, :math:`\tau` is
+the temperature (default: 0.07), :math:`P_i` is the set of positives for anchor :math:`i`,
+and :math:`\mathcal{P}` is the set of anchors with at least one positive in the batch.
+
+The default weighting is :math:`\alpha = 0.5`.
 
 **Checkpoint Saving**:
 
@@ -138,22 +175,21 @@ Step 4: AtomBondGNN Aggregation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The trained encoder produces a single 64-dimensional substituent embedding per molecule
-via **GlobalAttentionPool** — an attention mechanism that learns to weight atoms
-by their relevance to the prediction task:
+via **scaffold-aware attentional pooling**. The gate score combines each substituent
+atom’s hidden state with the core-stream summary vector, making the importance weight
+scaffold-dependent:
 
 .. code-block:: text
 
-   gate_score(atom) = sigmoid(Linear(hidden, 1))   # learned importance per atom
-   embedding        = sum(gate_score × Linear(hidden, 64)) / sum(gate_score)
+   gate_score(atom) = sigmoid(Linear(concat(sub_h, core_summary), 1))  # scaffold-aware
+   embedding        = sum(gate_score × Linear(sub_h, 64)) / sum(gate_score)
 
 This provides permutation invariance and handles variable-size substituents while
 preferentially weighting atoms that carry the most predictive information.
 
-The RGCN encoder applies **LayerNorm** to the 64D AtomBondGNN embeddings before the first
-graph convolution layer. This normalises the input distribution across features and
-prevents gradient instability caused by embedding magnitudes varying with substituent size.
-LayerNorm's learnable γ/β parameters preserve size-related information while removing
-mean-shift and scale differences that would otherwise destabilise RGCN training.
+The ``SitePoolMLPPolicy`` uses the 64D AtomBondGNN embeddings directly as node features
+(``data.x``), without a subsequent graph convolution step. A site-level mean-pool of
+these embeddings provides the system-context signal (see :doc:`cb_setup`).
 
 Using Pretrained Models
 -----------------------
@@ -186,14 +222,13 @@ See Also
 --------
 
 * :doc:`file_handling` - PDB and RTF file parsing
-* :doc:`cb_setup` - CB infrastructure and RGCN architecture
+* :doc:`cb_setup` - CB infrastructure and SitePoolMLPPolicy architecture
 * :doc:`cb_pretraining` - Behavior cloning from expert coefficients
 * :doc:`workflow` - Complete workflow from combo generation to training
 * ``src/mllf/cb/deepset.py`` - ``AtomBondGNN`` class definition
 * ``src/mllf/cb/deepset_autoencoder.py`` - ``AtomBondGNNAutoencoder``, ``load_pretrained_atombondgnn``
-* ``src/mllf/cb/deepset_pretraining_dataset.py`` - Dataset generation (bond topology extraction, training pipeline)
-* ``src/mllf/cb/train_deepset_autoencoder.py`` - Training script
-* ``src/mllf/cb/aev_processor.py`` - AEV computation, minimized.pdb extraction
+* ``src/mllf/cb/deepset_pretraining_dataset.py`` - Dataset generation (bond topology, distinct_atom_types)
+* ``src/mllf/cb/aev_processor.py`` - AEV computation and sub_mask generation
   (``detect_minimized_pdb``, ``extract_environment_atoms_from_minimized``)
-* ``src/mllf/cb/graph_utils.py`` - RGCN training AEV pipeline (shares extraction logic)
-* ``examples/run_deepset_pretraining.py`` - Example pretraining workflow
+* ``src/mllf/cb/graph_utils.py`` - PyG graph construction with sub_mask and site_index
+* ``examples/run_deepset_pretraining.py`` - Example pretraining workflow (contrastive + reconstruction)

@@ -14,84 +14,93 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class BiasHeadMLP(nn.Module):
+    """Single fully-independent MLP for one MSLD bias type.
+
+    Takes the full edge input (200D) and produces a (mean, log_std) pair
+    for one bias coefficient.  Because each bias type has its own complete
+    stack — input → hidden → output — gradient from one type cannot
+    physically corrupt the weights used by any other type.
+    """
+
+    def __init__(self, in_dim: int):
+        super().__init__()
+        # in_dim → 64 → 2  (shallow: GNN does the heavy lifting; PCA shows ~11 signal dims)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return [E, 2] tensor of (mean_raw, log_std_raw)."""
+        return self.net(x)
+
+
 class EdgeValueMLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 64, num_bias_types: int = 4, bias_embed_dim: int = 16):
-        """MLP with shared trunk and separate heads per bias type.
-        
-        Architecture:
-        - Shared trunk: processes concatenated node embeddings
-        - Bias-type embeddings: learnable vectors identifying each bias type
-        - Separate heads: one per bias type, receives [trunk_output, bias_embedding]
-        - Each head outputs (mean, log_std) for its bias type
-        
-        Key innovation: Bias-type embeddings provide unique context to each head,
-        forcing specialization by giving heads different input signals.
-        
+    def __init__(self, in_dim: int, hidden: int = 64, num_bias_types: int = 4,
+                 bias_embed_dim: int = 16):
+        """Four completely independent MLPs, one per MSLD bias type.
+
+        Replaces the previous shared-trunk + 4-heads design.  Each
+        :class:`BiasHeadMLP` owns its entire feature-extraction stack, so
+        the gradient from one bias type (e.g. the noisy signal)
+        cannot overwrite features learned by another type (e.g. linear).
+
+        The public API is identical to the old class — ``forward(x)`` returns
+        ``[E, 2*num_bias_types]`` — so no callers need to change.
+
         Args:
-            in_dim: Input dimension (typically 2*emb_dim + edge_feat_dim)
-            hidden: Hidden layer size
-            num_bias_types: Number of bias types (default: 4)
-            bias_embed_dim: Dimension of bias-type embeddings (default: 16)
+            in_dim: Input dimension (200 for SitePoolMLPPolicy).
+            hidden: Unused; kept for API compatibility with old constructor.
+            num_bias_types: Number of bias types (default 4).
+            bias_embed_dim: Unused; kept for API compatibility.
         """
         super().__init__()
         self.num_bias_types = num_bias_types
-        self.bias_embed_dim = bias_embed_dim
-        
-        # Shared trunk: fixed 256 → 128 regardless of 'hidden' param
-        self.trunk = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-        )
-
-        # Learnable bias-type embeddings (16D)
-        self.bias_type_embeddings = nn.Embedding(num_bias_types, bias_embed_dim)
-
-        # Separate heads: 144D (128 trunk + 16 bias embed) → 64 → 32 → 2
-        head_input_dim = 128 + bias_embed_dim  # 128 + 16 = 144
-        self.heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(head_input_dim, 64),
-                nn.ReLU(),
-                nn.Linear(64, 32),
-                nn.ReLU(),
-                nn.Linear(32, 2)
-            ) for _ in range(num_bias_types)
+        # One fully-independent MLP per bias type.
+        # Exposed as ``mlps`` so the optimizer can create per-head param groups.
+        self.mlps = nn.ModuleList([
+            BiasHeadMLP(in_dim) for _ in range(num_bias_types)
         ])
 
-    def forward(self, x):
-        """Forward pass with bias-type embeddings.
-        
+    def forward(self, x: torch.Tensor,
+                edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run independent MLPs and return concatenated mean/log_std output.
+
+        Args:
+            x: ``[E, in_dim]`` edge input features.
+            edge_type: ``[E]`` integer relation-type index (0-indexed; values
+                ``0``/``1`` = linear fwd/bwd, ``2``/``3`` = quadratic, etc.).
+                When provided, each edge is routed only to its own MLP
+                (``mlps[edge_type // 2]``).  Gradients cannot cross bias types.
+                When ``None``, all MLPs process all edges (legacy path).
+
         Returns:
-            Tensor [E, 2*num_bias_types] with means and log_stds concatenated:
-            [mean_1, mean_2, ..., mean_D, logstd_1, logstd_2, ..., logstd_D]
+            ``[E, 2*D]``: ``[mean_0, ..., mean_D-1, logstd_0, ..., logstd_D-1]``.
+            In the routed path, only the relevant ``(mean_d, logstd_d)`` slot is
+            populated for each edge; all other slots remain zero.
         """
-        # Shared representation (lightweight)
-        h = self.trunk(x)  # [E, hidden]
-        E = h.shape[0]
-        
-        # Get bias-type embeddings for all types
-        bias_type_ids = torch.arange(self.num_bias_types, device=h.device)  # [num_bias_types]
-        bias_embeddings = self.bias_type_embeddings(bias_type_ids)  # [num_bias_types, bias_embed_dim]
-        
-        # Apply each head with its specific bias-type embedding
-        head_outputs = []
-        for i, head in enumerate(self.heads):
-            # Expand bias embedding to match batch size and concatenate with trunk output
-            bias_emb = bias_embeddings[i:i+1].expand(E, -1)  # [E, bias_embed_dim]
-            head_input = torch.cat([h, bias_emb], dim=-1)  # [E, hidden + bias_embed_dim]
-            head_outputs.append(head(head_input))  # [E, 2]
-        
-        # Stack and split into means and log_stds
-        stacked = torch.stack(head_outputs, dim=1)  # [E, num_bias_types, 2]
-        means = stacked[:, :, 0]  # [E, num_bias_types]
-        log_stds = stacked[:, :, 1]  # [E, num_bias_types]
-        
-        # Concatenate to match expected output format [mean_1...mean_D, logstd_1...logstd_D]
-        out = torch.cat([means, log_stds], dim=-1)  # [E, 2*num_bias_types]
-        
-        return out
+        D = self.num_bias_types
+        if edge_type is None:
+            # Legacy path: all MLPs process all edges (used when edge_type not available).
+            outputs = [mlp(x) for mlp in self.mlps]   # list of [E, 2]
+            stacked = torch.stack(outputs, dim=1)       # [E, D, 2]
+            means = stacked[:, :, 0]                    # [E, D]
+            log_stds = stacked[:, :, 1]                 # [E, D]
+            return torch.cat([means, log_stds], dim=-1)  # [E, 2*D]
+
+        # Routed path: each edge processed only by mlps[edge_type // 2].
+        # bias_type_index: linear_fwd=0, linear_bwd=0, quad_fwd=1, quad_bwd=1, ...
+        bias_type = edge_type // 2  # [E], values 0..D-1
+        out = torch.zeros(x.size(0), 2 * D, dtype=x.dtype, device=x.device)
+        for i, mlp in enumerate(self.mlps):
+            mask = (bias_type == i)
+            if mask.any():
+                mlp_out = mlp(x[mask])        # [E_i, 2]
+                out[mask, i] = mlp_out[:, 0]      # mean for dim i
+                out[mask, i + D] = mlp_out[:, 1]  # log_std for dim i
+        return out  # [E, 2*D]
 
 
 class EdgePolicy(nn.Module):
@@ -153,11 +162,11 @@ class EdgePolicy(nn.Module):
         mean = out[:, :D]
         log_std = out[:, D: D + D]
         
-        # Scale mean outputs to expected bias coefficient range using tanh.
-        # Factors set to cover the empirical maximum across ALL pretraining runs
-        # (20K+ run full scan: linear max 277, quadratic max 470, skew max 77, end max 27)
-        # with ~10% headroom.
-        mean = torch.tanh(mean) * self.scale_factors.unsqueeze(0)
+        # Scale mean outputs using softsign instead of tanh.
+        # softsign(z) = z/(1+|z|) has the same [-1,1] range as tanh but gradient
+        # 1/(1+|z|)^2 stays alive even at large |z|, eliminating the saturation
+        # zone that causes 'dead head' collapse after ~20 training epochs.
+        mean = F.softsign(mean) * self.scale_factors.unsqueeze(0)
         
         # Clamp log_std to prevent extreme standard deviations that can cause NaN
         # exp(-20) ≈ 2e-9, exp(2.0) ≈ 7.4 — provides exploration while preventing extreme outliers
@@ -266,14 +275,17 @@ class EdgePolicy(nn.Module):
 class SitePoolMLPPolicy(nn.Module):
     """Direct MLP policy: no RGCN, site-conditioned pooling as system context.
 
-    Replaces the RGCN encoder with a simple site-level mean-pool of the frozen
+    Replaces the RGCN encoder with a simple site-level sum-pool of the frozen
     AtomBondGNN P1 embeddings.  For each directed edge (A → B) the input is:
 
-        concat(P1_A[p1_dim], P1_B[p1_dim], site_pool_A[p1_dim], edge_attr[edge_attr_dim])
+        concat(P1_A[p1_dim], P1_B[p1_dim], site_pool_A[p1_dim])  = 3*p1_dim D
 
-    where ``site_pool_A`` is the mean of all P1 embeddings at site A.  This
+    where ``site_pool_A`` is the sum of all P1 embeddings at site A.  This
     gives the edge MLP a lightweight system-context signal without message
     passing over the perturbation-network graph topology.
+    ``edge_attr`` (the one-hot relation type) is no longer part of the input:
+    each ``BiasHeadMLP`` is routed only its own edge type (``edge_type // 2``),
+    so there is no ambiguity about which bias type an edge represents.
 
     During training a *block dropout* mask is applied to the entire site_pool
     slice with probability ``context_dropout_p``.  This forces the trunk to
@@ -299,8 +311,11 @@ class SitePoolMLPPolicy(nn.Module):
         self.p1_dim = int(p1_dim)
         self.mlp_out_dim = int(mlp_out_dim)
         self.context_dropout_p = float(context_dropout_p)
-        # Edge input: [P1_src, P1_dst, site_pool_src, edge_attr]
-        in_dim = 2 * p1_dim + p1_dim + edge_attr_dim
+        # Edge input: [P1_src, P1_dst, site_pool_src]  (no edge_attr).
+        # Each BiasHeadMLP is routed only its own edges via edge_type, so the
+        # one-hot relation type is redundant as an input feature.
+        # edge_attr_dim is kept for API compatibility but does not affect in_dim.
+        in_dim = 3 * p1_dim
         self.edge_mlp = EdgeValueMLP(in_dim, mlp_hidden, num_bias_types=self.mlp_out_dim)
         self.register_buffer(
             'scale_factors',
@@ -312,23 +327,40 @@ class SitePoolMLPPolicy(nn.Module):
     # Site pooling
     # ------------------------------------------------------------------
 
+    # def _site_pool(self, x: torch.Tensor, site_index: torch.Tensor) -> torch.Tensor:
+    #     """Compute per-site mean of P1 embeddings, then expand back to node dim.
+
+    #     Args:
+    #         x: [N, p1_dim] node (substituent) embeddings.
+    #         site_index: [N] 0-indexed site assignment for each node.
+
+    #     Returns:
+    #         [N, p1_dim]: each node replaced by its site's mean embedding.
+    #     """
+    #     num_sites = int(site_index.max().item()) + 1
+    #     pool = torch.zeros(num_sites, x.size(1), dtype=x.dtype, device=x.device)
+    #     count = torch.zeros(num_sites, dtype=x.dtype, device=x.device)
+    #     pool.scatter_add_(0, site_index.unsqueeze(1).expand_as(x), x)
+    #     count.scatter_add_(0, site_index,
+    #                        torch.ones(x.size(0), dtype=x.dtype, device=x.device))
+    #     pool = pool / count.unsqueeze(1).clamp(min=1.0)
+    #     return pool[site_index]  # [N, p1_dim]
+
     def _site_pool(self, x: torch.Tensor, site_index: torch.Tensor) -> torch.Tensor:
-        """Compute per-site mean of P1 embeddings, then expand back to node dim.
+        """Compute per-site sum of P1 embeddings, then expand back to node dim.
 
         Args:
             x: [N, p1_dim] node (substituent) embeddings.
             site_index: [N] 0-indexed site assignment for each node.
 
         Returns:
-            [N, p1_dim]: each node replaced by its site's mean embedding.
+            [N, p1_dim]: each node replaced by its site's sum embedding.
         """
         num_sites = int(site_index.max().item()) + 1
         pool = torch.zeros(num_sites, x.size(1), dtype=x.dtype, device=x.device)
-        count = torch.zeros(num_sites, dtype=x.dtype, device=x.device)
+
         pool.scatter_add_(0, site_index.unsqueeze(1).expand_as(x), x)
-        count.scatter_add_(0, site_index,
-                           torch.ones(x.size(0), dtype=x.dtype, device=x.device))
-        pool = pool / count.unsqueeze(1).clamp(min=1.0)
+
         return pool[site_index]  # [N, p1_dim]
 
     # ------------------------------------------------------------------
@@ -336,11 +368,13 @@ class SitePoolMLPPolicy(nn.Module):
     # ------------------------------------------------------------------
 
     def _build_edge_inputs(self, x: torch.Tensor, edge_index: torch.LongTensor,
-                           edge_attr: Optional[torch.Tensor],
-                           site_index: torch.Tensor) -> torch.Tensor:
-        """Build [E, in_dim] edge input tensor.
+                           edge_attr: Optional[torch.Tensor] = None,
+                           site_index: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Build [E, 3*p1_dim] edge input tensor.
 
-        concat(P1_src, P1_dst, site_pool_src, edge_attr)
+        concat(P1_src, P1_dst, site_pool_src)
+        edge_attr is accepted for API compatibility but is no longer used;
+        directionality (fwd vs bwd) is already encoded by the src/dst P1 swap.
         During training, the entire site_pool block is zeroed with probability
         context_dropout_p (block dropout) to prevent over-reliance on context.
         """
@@ -354,30 +388,33 @@ class SitePoolMLPPolicy(nn.Module):
                     >= self.context_dropout_p).float()
             # Rescale to preserve expected value (inverted dropout)
             ctx = ctx * keep / (1.0 - self.context_dropout_p)
-        parts = [x[src], x[dst], ctx]
-        if edge_attr is not None:
-            parts.append(edge_attr)
-        return torch.cat(parts, dim=-1)
+        return torch.cat([x[src], x[dst], ctx], dim=-1)  # [E, 3*p1_dim]
 
     # ------------------------------------------------------------------
     # Forward helpers
     # ------------------------------------------------------------------
 
     def _forward_edges(self, x: torch.Tensor, edge_index: torch.LongTensor,
-                       edge_attr: Optional[torch.Tensor],
-                       site_index: torch.Tensor):
+                       edge_attr: Optional[torch.Tensor] = None,
+                       site_index: Optional[torch.Tensor] = None,
+                       edge_type: Optional[torch.Tensor] = None):
         """Compute (mean, log_std) tensors for all edges.
 
+        Args:
+            edge_type: [E] integer relation index.  When provided, each edge is
+                routed to ``mlps[edge_type // 2]`` so only the relevant MLP
+                computes output for that edge.
+
         Returns:
-            mean: [E, mlp_out_dim] tanh-scaled bias coefficient means.
+            mean: [E, mlp_out_dim] softsign-scaled bias coefficient means.
             log_std: [E, mlp_out_dim] clamped log standard deviations.
         """
         inp = self._build_edge_inputs(x, edge_index, edge_attr, site_index)
-        out = self.edge_mlp(inp)  # [E, 2*D]
+        out = self.edge_mlp(inp, edge_type)  # [E, 2*D]
         if out.dim() == 1:
             out = out.unsqueeze(0)
         D = self.mlp_out_dim
-        mean = torch.tanh(out[:, :D]) * self.scale_factors.unsqueeze(0)
+        mean = F.softsign(out[:, :D]) * self.scale_factors.unsqueeze(0)
         log_std = torch.clamp(out[:, D:], min=-20.0, max=2.0)
         return mean, log_std
 
@@ -403,7 +440,7 @@ class SitePoolMLPPolicy(nn.Module):
             mean: [E, D] distribution means.
             log_std: [E, D] distribution log standard deviations.
         """
-        mean, log_std = self._forward_edges(x, edge_index, edge_attr, site_index)
+        mean, log_std = self._forward_edges(x, edge_index, edge_attr, site_index, edge_type)
         if deterministic:
             actions = mean
             logp = torch.zeros(mean.size(0), device=mean.device)
@@ -428,11 +465,21 @@ class SitePoolMLPPolicy(nn.Module):
             logp: [E] scalar log-prob per edge summed over output dims.
             log_std: [E, D] current log_std (for entropy regularisation).
         """
-        mean, log_std = self._forward_edges(x, edge_index, edge_attr, site_index)
+        mean, log_std = self._forward_edges(x, edge_index, edge_attr, site_index, edge_type)
         std = torch.exp(log_std)
         dist = torch.distributions.Normal(mean, std)
         a = saved_actions.detach().to(mean.device)
         if a.dim() == 1:
             a = a.unsqueeze(-1)
-        logp = dist.log_prob(a).sum(dim=-1)
+        # Per-dimension log-probs [E, D] for per-head REINFORCE weighting.
+        logp = dist.log_prob(a)  # [E, D]
+        # When routing is active, zero out non-relevant dimensions so that only
+        # the MLP that actually produced the action for each edge contributes
+        # a gradient.  This eliminates cross-type reward contamination.
+        if edge_type is not None:
+            rel_mask = torch.zeros_like(logp, dtype=torch.bool)
+            bias_type = edge_type // 2  # [E], values 0..D-1
+            for d in range(self.mlp_out_dim):
+                rel_mask[bias_type == d, d] = True
+            logp = logp * rel_mask.float()
         return logp, log_std

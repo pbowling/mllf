@@ -11,28 +11,23 @@ molecular graph structure.
 
 **Architecture Pipeline**:
 
-The policy network uses a three-stage architecture to predict bias coefficients:
+The policy network uses a two-stage architecture to predict bias coefficients:
 
 1. **AtomBondGNN (Phase 1, frozen)**: A graph neural network pretrained on diverse molecular
    data that encodes each substituent's 3D atomic structure into a 64-dimensional vector.
-   It uses GINConv message passing over the molecular bond graph (topology from RDKit;
-   RTF BOND section as fallback) followed by GlobalAttentionPool. Weights are loaded from
-   a pre-trained checkpoint and held fixed during all CB training.
+   It uses a dual-stream GINEConv architecture — a substituent stream and a scaffold-context
+   (core) stream — with scaffold-aware attentional pooling. Weights are loaded from a
+   pre-trained checkpoint and held fixed during all CB training.
 
-2. **RGCN Encoder (Phase 2, frozen during RL)**: Processes the 64-dimensional AtomBondGNN
-   embeddings through a 3-layer Relational GCN (64→64→64→32) with LayerNorm pre-conditioning,
-   producing 32-dimensional context-aware node embeddings. Trained during behavior-cloning
-   pretraining; weights are frozen when the REINFORCE loop begins.
+2. **SitePoolMLPPolicy (Phase 2, trained by RL)**: A pairwise edge MLP that receives the
+   AtomBondGNN P1 embeddings for both endpoint substituents plus a site-level mean-pool
+   context vector — 192D total — and outputs independent Gaussian distributions over bias
+   coefficients via four completely decoupled ``BiasHeadMLP`` networks (one per bias type).
+   Each edge is routed exclusively to the MLP for its bias type (``edge_type // 2``),
+   preventing gradient cross-contamination between bias types.
 
-3. **EdgeValueMLP + Q-Critic (Phase 3, trained by RL)**: A pairwise edge network that
-   receives the concatenated Phase 1 (64D) and Phase 2 (32D) embeddings for both endpoint
-   substituents, plus an 8-dimensional one-hot edge-type feature — 200D total — and
-   outputs Gaussian distributions over bias coefficients via a shared trunk and four
-   per-type heads. A companion Q-network provides per-edge advantage estimates for
-   variance-reduced REINFORCE.
-
-This staged design allows Phase 1 and 2 to capture general molecular representations while
-Phase 3 specializes in per-edge coefficient prediction with reinforcement feedback.
+This design eliminates the intermediate RGCN encoder, using instead a lightweight
+site-pool context signal computed directly from the frozen Phase 1 embeddings.
 
 .. _Architecture Diagram:
 
@@ -43,77 +38,55 @@ Phase 3 specializes in per-edge coefficient prediction with reinforcement feedba
    ╔══════════════════════════════════════════════════════════════════════════╗
    ║  PHASE 1 — AtomBondGNN  [FROZEN in all training phases]                ║
    ║                                                                          ║
-   ║  Per substituent, independently:                                         ║
+   ║  Per substituent (dual-stream):                                          ║
    ║  AEV[2288] + charge[1] + atom_id[11] = 2300D per atom                  ║
-   ║      │  Linear projection: 2300 → 256D + ReLU                          ║
-   ║      │  GINConv layer 1 (bond topology from RDKit / RTF BOND) + ReLU   ║
-   ║      │       bond weights: single=1.0, double=2.0, aromatic=1.5        ║
-   ║      │       (computed but not consumed by GINConv; topology only)      ║
-   ║      │  GINConv layer 2 + ReLU                                          ║
-   ║      │  GlobalAttentionPool (gate_nn: 256→1, nn: 256→64)               ║
+   ║      │  sub_input_proj: 2300 → 256 → 256 + ReLU (sub atoms)            ║
+   ║      │  core_input_proj: 2300 → 256 → 256 + ReLU (core+ref atoms)      ║
+   ║      │  sub_gin_layers: 4× GINEConv(256→256, edge_dim=1) + ReLU        ║
+   ║      │  core_gin_layers: 4× GINEConv(256→256, edge_dim=1) + ReLU       ║
+   ║      │  core_summary = mean-pool(core_gin_layers output)                ║
+   ║      │  gate = σ(Linear(concat(sub_h, core_summary), 1))               ║
+   ║      │  GlobalAttentionPool: weighted sum of pool_nn(sub_h)             ║
    ║      ▼                                                                   ║
-   ║   64D  P1 embedding  (data.x)  ─────────────────────── skip ──────────►║
+   ║   64D  P1 embedding  (data.x)                                           ║
    ╚══════════════════════════════════════════════════════════════════════════╝
                        │
-                       │ data.x (same tensor, passed to RGCN)
+                       │  data.x [N, 64]  (one row per substituent node)
+                       │  data.site_index [N]  (which λ-site each node belongs to)
                        ▼
    ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PHASE 2 — RGCNEncoder  [FROZEN during RL; trained by BC pretraining]  ║
+   ║  PHASE 2 — SitePoolMLPPolicy  [trained by BC pretraining and RL]       ║
    ║                                                                          ║
-   ║  LayerNorm(64)                                                           ║
-   ║  → RGCNConv(64→64, 8 relations) → ReLU                                 ║
-   ║  → RGCNConv(64→64, 8 relations) → ReLU                                 ║
-   ║  → RGCNConv(64→32, 8 relations)                                         ║
+   ║  site_pool = mean(P1 embeddings at the same λ-site)  [N, 64]           ║
+   ║                                                                          ║
+   ║  Per directed edge (Sub_A → Sub_B):                                     ║
+   ║  concat(P1_A[64], P1_B[64], site_pool_A[64]) = 192D                    ║
+   ║      │   block dropout on site_pool_A slice (p=0.3) during training     ║
+   ║      │   edge_type // 2 → routes edge to its own BiasHeadMLP            ║
    ║      ▼                                                                   ║
-   ║   32D  P2 embedding (per substituent node)                              ║
-   ╚══════════════════════════════════════════════════════════════════════════╝
-            │                                         │
-            │  P2 per node                            │  P1 = data.x (skip)
-            └──────────────────┬──────────────────────┘
-                               ▼
-   ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PHASE 3 — Pairwise edge inputs  (Sub_A ↔ Sub_B)                       ║
-   ║                                                                          ║
-   ║  concat(P1_A[64], P2_A[32], P1_B[64], P2_B[32], edge_type[8]) = 200D  ║
-   ║           64% atomic/topo    32% system context    4% relation          ║
-   ║                     │                                                    ║
-   ║          ┌──────────┴──────────┐                                        ║
-   ║          ▼                     ▼                                        ║
-   ║  ┌── ACTOR ──────────┐  ┌── Q-CRITIC ─────────────────────────────┐   ║
-   ║  │  EdgeValueMLP     │  │  QNetwork                               │   ║
-   ║  │  Trunk:           │  │  Linear(200→64) → ReLU                  │   ║
-   ║  │  Linear(200→64)   │  │  Linear(64→32)  → ReLU                  │   ║
-   ║  │  → ReLU           │  │  Linear(32→1)                           │   ║
-   ║  │  4 heads (l/q/s/x)│  │  Output: Q(s,pair) per edge [E]         │   ║
-   ║  │  each head input: │  │  Updated by MSE on R_pair each episode  │   ║
-   ║  │  [trunk(64),      │  └─────────────────────────────────────────┘   ║
-   ║  │   bias_emb(16)]   │                                                  ║
-   ║  │  = 80D            │  ┌── V-BASELINE ───────────────────────────┐   ║
-   ║  │  Linear(80→64)    │  │  GlobalMeanPool(P2 nodes) → 32D         │   ║
-   ║  │  → ReLU           │  │  Linear(32→64) → ReLU                   │   ║
-   ║  │  Linear(64→32)    │  │  Linear(64→32) → ReLU                   │   ║
-   ║  │  → ReLU           │  │  Linear(32→1)  → V(s) scalar            │   ║
-   ║  │  Linear(32→2)     │  │  Updated by MSE on R_global each episode│   ║
-   ║  │  → (μ, logσ) per  │  └─────────────────────────────────────────┘   ║
-   ║  │    bias per edge  │                                                  ║
-   ║  │  [RL only]        │                                                  ║
-   ║  └───────────────────┘                                                  ║
+   ║  ┌── BiasHeadMLP (linear) ──┐  ┌── BiasHeadMLP (quadratic) ──┐        ║
+   ║  │  192 → 128 → 64 → 32 → 2│  │  192 → 128 → 64 → 32 → 2   │        ║
+   ║  └──────────────────────────┘  └─────────────────────────────┘        ║
+   ║  ┌── BiasHeadMLP (skew) ────┐  ┌── BiasHeadMLP (end) ─────────┐       ║
+   ║  │  192 → 128 → 64 → 32 → 2│  │  192 → 128 → 64 → 32 → 2    │       ║
+   ║  └──────────────────────────┘  └──────────────────────────────┘       ║
+   ║      ▼                                                                   ║
+   ║  (μ_d, log σ_d) for the relevant bias type d of each edge               ║
+   ║  Output scaled: tanh(μ_d) × scale_d                                     ║
+   ║    scale: [305, 520, 85, 30] for [linear, quadratic, skew, end]         ║
    ╚══════════════════════════════════════════════════════════════════════════╝
                                ▼
    ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PER-PAIR REWARD  (from simulation output)                              ║
+   ║  PER-EDGE PER-DIM REWARD  (from simulation output)  [E, 4]             ║
    ║                                                                          ║
-   ║  R_pair(i,j) = -1.0                            if DDG is None (stuck)  ║
-   ║  R_pair(i,j) = +1.0 + min(pop_i, pop_j)       if DDG is finite        ║
-   ║                        ──────────────────                               ║
-   ║                        pop_i + pop_j                                    ║
+   ║  Unvisited pair (DDG None/NaN/Inf):  all 4 dims = -1.0                 ║
+   ║  Visited pair (finite DDG):                                              ║
+   ║    dim 0 (linear):    minority_frac = min(p_i,p_j)/(p_i+p_j) ∈[0,0.5] ║
+   ║    dim 1 (quadratic): (pair_visited + trans_quality) / 2  ∈[0.5,1.0]  ║
+   ║    dim 2 (skew):      combined proxy ∈[0.5,0.75]                       ║
+   ║    dim 3 (end):       combined proxy ∈[0.5,0.75]                       ║
    ║                                                                          ║
-   ║  Range: [-1.0, +1.5]   (balance adds 0→0.5 only on successes)         ║
-   ║                                                                          ║
-   ║  A_pair = R_pair - Q(s,pair).detach()          [E] per directed edge   ║
-   ║  A_pair normalised across edges within episode                          ║
-   ║                                                                          ║
-   ║  policy_loss = -(logp_edge × A_pair).sum()     per-pair REINFORCE      ║
+   ║  policy_loss = -∑_e R_pair[e, d_e] × logp_e[d_e]   per-head REINFORCE ║
    ╚══════════════════════════════════════════════════════════════════════════╝
 
 Core Components
@@ -171,11 +144,14 @@ The AtomBondGNN embeddings capture rich molecular information automatically:
 
 * **Spatial structure**: Bond lengths, angles, 3D conformations from atomic coordinates
 * **Chemical composition**: Element types, functional groups, charge distributions
-* **Bond-topology context**: GINConv message passing propagates bonded-neighbor information before pooling
+* **Bond-topology context**: GINEConv message passing propagates bonded-neighbor information before pooling
+* **Scaffold-aware context**: A parallel core stream processes the shared ligand core, and its
+  mean-pooled summary modulates the attention gate — encoding scaffold identity without
+  contaminating the substituent feature path
 * **Environmental context**: Nearby protein atoms and core structure atoms (via context-aware AEV computation)
 
 See :doc:`deepset_pretraining` for technical details on the AtomBondGNN pretraining
-pipeline (atom-level AEV features + bond topology → GINConv × 2 → GlobalAttentionPool).
+pipeline (atom-level AEV features + bond topology → dual GINEConv streams → scaffold-aware AttentionPool).
 
 **Environmental Context Encoding**:
 
@@ -222,8 +198,9 @@ edge expansion and relation type encoding for the RGCN policy network.
 
 The 64-dimensional AtomBondGNN embeddings computed during graph construction become the
 node feature matrix. Each row represents one substituent with its learned molecular
-representation encoding structure, chemistry, and environment. These embeddings are passed
-directly to the RGCN encoder — no additional feature engineering is applied.
+representation encoding structure, chemistry, and environment. A ``site_index`` tensor
+(one integer per node identifying its λ-site) is stored alongside the embeddings and
+provides the ``SitePoolMLPPolicy`` with its system-context signal via mean-pooling.
 
 **Edge Expansion**:
 
@@ -251,161 +228,156 @@ transformation matrices for each relation type, allowing bias-specific edge proc
 Policy Network Architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-RGCN Encoder
-^^^^^^^^^^^^
+SitePoolMLPPolicy
+^^^^^^^^^^^^^^^^^
 
-Node embeddings are computed using a 3-layer Relational Graph Convolutional Network 
-that handles different edge types explicitly by learning separate transformation matrices 
-for each relation type. The standard architecture uses:
+Node embeddings from the frozen AtomBondGNN are used directly by the policy without
+an intermediate graph convolution step. The ``SitePoolMLPPolicy`` computes a
+site-level mean-pool context on the fly:
 
 .. math::
 
-   \text{RGCN}: \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{32}
+   \text{site\_pool}_i = \frac{1}{|\mathcal{S}_{\text{site}(i)}|}
+   \sum_{j \in \mathcal{S}_{\text{site}(i)}} \mathbf{P1}_j
 
-The input to the RGCN is the **64-dimensional DeepSet embedding** for each substituent node.
-A **LayerNorm** layer is applied to these embeddings before the first convolution. This
-normalises the per-feature mean and variance across nodes, stabilising training when
-sum-pool magnitudes vary with substituent atom count (5–50 atoms). The learnable γ/β
-parameters preserve size-related information after normalisation.
+where :math:`\mathcal{S}_{\text{site}(i)}` is the set of all substituent nodes at the
+same λ-site as node :math:`i`. For each directed edge :math:`(A \to B)` the input is:
 
-The RGCN then processes the normalised embeddings through 3 layers of relational graph
-convolutions, where each layer learns separate transformation matrices for different bias
-types (linear, quadratic, skew, end). The final output produces 32-dimensional node
-embeddings used by the policy and value networks.
+.. math::
 
+   \mathbf{e}_{AB} = [\mathbf{P1}_A,\; \mathbf{P1}_B,\; \text{site\_pool}_A] \in \mathbb{R}^{192}
+
+During training, the entire ``site_pool`` block is zeroed with probability 0.3
+(**block dropout**), forcing the policy to remain useful without context and
+preventing over-reliance on the site-pool signal.
 
 Edge Policy
 ^^^^^^^^^^^
 
-Per-edge coefficients are predicted by an edge-level policy network with **separate heads**
-architecture. This design allows specialized predictions for each bias type while sharing
-common feature representations.
+Per-edge coefficients are predicted by four **completely independent** ``BiasHeadMLP``
+networks, one per MSLD bias type. Each head owns its entire feature-extraction stack
+so that gradient from one bias type (e.g. the noisy end-state signal) cannot overwrite
+features learned by another type (e.g. the linear population-balance signal).
 
 **Architecture Overview**:
 
-The ``EdgeValueMLP`` uses a two-stage design:
+Each ``BiasHeadMLP`` maps the 192D edge input directly to a (mean, log_std) pair:
 
-1. **Shared Trunk**: Two-layer MLP that processes concatenated node embeddings
-   
-   * Input: Concatenated node features [h_i, h_j] from encoder
-   * Layer 1: Linear(in_dim → 64) + ReLU
-   * Layer 2: Linear(64 → 64) + ReLU
-   * Output: 64-dimensional shared representation
+.. code-block:: text
 
-2. **Separate Heads**: Independent deep MLPs per bias type, each enriched with a
-   learnable bias-type embedding (16D)
+   Input [E, 192]
+       Linear(192 → 128) + ReLU
+       Linear(128 →  64) + ReLU
+       Linear( 64 →  32) + ReLU
+       Linear( 32 →   2)          → (mean_raw, log_std_raw) per edge
 
-   * 4 heads (one per bias type: linear, quadratic, skew, end)
-   * Each head input: [trunk output (64D), bias-type embedding (16D)] = 80D
-   * Each head: Linear(80 → 64) + ReLU → Linear(64 → 32) + ReLU → Linear(32 → 2)
-   * Each head outputs [mean, log_std] for its bias type
-   * Total output: 8 values per edge (4 means + 4 log_stds)
-   * Bias-type embeddings are learned during training, giving each head a unique identity
-     signal that reinforces specialisation
+The ``EdgeValueMLP`` container holds all four heads and routes each edge to the
+correct head via ``edge_type // 2``:
+
+* ``edge_type`` 0 or 1 (linear fwd/bwd) → ``mlps[0]``
+* ``edge_type`` 2 or 3 (quadratic fwd/bwd) → ``mlps[1]``
+* ``edge_type`` 4 or 5 (skew fwd/bwd) → ``mlps[2]``
+* ``edge_type`` 6 or 7 (end fwd/bwd) → ``mlps[3]``
+
+In the routed forward pass only the matching head processes each edge; output slots
+for other heads remain zero so the zero-gradient property is enforced by construction.
 
 **Key Features**:
 
-* **Specialized Predictions**: Each bias type gets its own predictor head
-  
-  - Reduces interference between different bias types
-  - Allows learning type-specific patterns
-  - Improves sample efficiency
+* **Full gradient isolation**: Four separate parameter stacks; no shared weights that
+  could mix reward signals between bias types.
 
-* **Output Scaling**: Mean predictions use bias-specific scale factors via ``tanh(mean) * scale_factors``
+* **Output scaling**: Mean predictions scaled via ``tanh(mean_raw) * scale_factors``
   
   - **Linear**: ±305, **Quadratic**: ±520, **Skew**: ±85, **End**: ±30
-  - Derived from a full scan of 20,000+ pretraining runs with margin above the empirical maximum
-  - Covers the full observed range: linear max 235, quadratic max 470, skew max 77, end max 27
-  - Earlier bounds (±61–±70) were derived from a small biased sample and clipped ~17–34% of targets
+  - Covers the empirical maximum from 20,000+ pretraining runs with ~10% headroom.
 
-* **Enhanced Exploration**: Log standard deviation clamped to [-20, 2.0]
-  
-  - Standard deviation range: [~0, 7.4]
-  - Provides exploration while preventing extreme outliers
-  - Higher values (e.g., 3.5 → std≈33) can produce samples far beyond intended ranges
+* **Enhanced exploration**: Log standard deviation clamped to [-20, 2.0]
+  (standard deviation range: [~0, 7.4])
 
 The policy outputs:
 
-* ``actions``: Sampled coefficient values (shape: [num_edges, 4])
+* ``actions``: Sampled coefficient values (shape: [E, 4])
 * ``logp``: Log-probabilities for REINFORCE updates
-* ``mean``: Mean of the Gaussian distribution per edge per bias type (scaled to [-20, 20])
-* ``log_std``: Log standard deviation per edge per bias type (clamped to [-20, 2.0])
+* ``mean``: Mean of the Gaussian distribution per edge per bias type
+* ``log_std``: Log standard deviation per edge per bias type
 
-Each directed edge receives 4 independent Gaussian distributions (one per bias type),
-and actions are sampled independently:
+Each directed edge receives one Gaussian distribution for its relevant bias type.
+Actions are sampled and log-probabilities are computed with dimension masking so
+that only the head responsible for an edge's bias type contributes a gradient:
 
 .. math::
 
-   v_{ij}^{(k)} \\sim \\mathcal{N}(\\mu_{ij}^{(k)}, (\\sigma_{ij}^{(k)})^2)
+   v_{ij}^{(d_{ij})} \sim \mathcal{N}(\mu_{ij}^{(d_{ij})}, (\sigma_{ij}^{(d_{ij})})^2)
 
-where :math:`k \\in \\{\\text{linear, quadratic, skew, end}\\}`.
+where :math:`d_{ij} = \text{edge\_type}_{ij} // 2` is the bias-type index for edge :math:`(i,j)`.
 
 Training and Optimization
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The policy network is trained using an **Actor-Critic** architecture (REINFORCE with
-per-pair Q-critic and a global value baseline) that provides variance-reduced credit
-assignment at the substituent-pair level.
+The policy network is trained using **REINFORCE** with per-edge per-dimension reward
+signals. Each ``BiasHeadMLP`` receives gradient only from simulations where the
+corresponding bias type was responsible for the edge, providing clean per-type credit
+assignment without a value network.
 
-**Actor-Critic Components**:
+**REINFORCE Components**:
 
-* **Actor (Policy Network)**: ``EdgeValueMLP`` that predicts bias coefficients from the
-  200D per-edge inputs assembled from Phase 1 and Phase 2 embeddings. Only the EdgeValueMLP
-  (Phase 3) has its weights updated by RL; the RGCN encoder (Phase 2) and AtomBondGNN
-  (Phase 1) are both frozen before the REINFORCE loop begins.
-* **Q-Critic (Per-Edge)**: ``QNetwork`` — a 3-layer MLP (200→64→32→1) receiving the
-  same 200D edge inputs as the actor. Estimates :math:`Q(s, \text{pair})` per directed
-  edge and is updated each episode by MSE against the per-pair reward.
-* **Value Baseline (Global)**: ``ValueNetwork`` — GlobalMeanPool over 32D RGCN node
-  embeddings then MLP (32→64→32→1). Predicts the expected episode reward :math:`V(s)`
-  and is updated by MSE against the global reward to reduce variance.
+* **Policy (SitePoolMLPPolicy)**: Predicts independent Gaussian distributions for each
+  bias type from 192D per-edge inputs. Only the SitePoolMLPPolicy has its weights
+  updated by RL; the AtomBondGNN (Phase 1) is frozen throughout.
+* **No Q-Critic or value baseline**: The per-bias-type reward tensor (``compute_pair_reward``
+  returning ``[E, 4]``) provides direct per-head reward signals, making a separate
+  critic unnecessary. Dimension masking in ``evaluate_logp`` ensures each MLP head
+  receives gradient only from its own reward dimension.
 
-**Per-Pair Reward**:
+**Per-Edge Per-Dimension Reward**:
 
-Rather than a single global reward, each directed edge :math:`(i, j)` receives an
-independent signal based on whether the simulation produced lambda-space transitions
-between substituents *i* and *j*:
+Rather than a single scalar reward, each directed edge :math:`(i, j)` receives a
+4-dimensional reward vector matching the four bias types. Each dimension captures a
+different physical signal from the simulation:
 
 .. math::
 
-   R_{\text{pair}}(i,j) = \begin{cases}
+   R_{ij}^{(d)} = \begin{cases}
      -1.0 & \text{if } \Delta\Delta G_{ij} \text{ is None, NaN, or } \pm\infty \\
-     1.0 + \dfrac{\min(p_i, p_j)}{p_i + p_j} & \text{if } \Delta\Delta G_{ij} \text{ is finite}
+     \text{dim-specific signal} & \text{if } \Delta\Delta G_{ij} \text{ is finite}
    \end{cases}
 
-where :math:`p_i, p_j` are the block populations at the highest :math:`\lambda` window.
-Finite DDG means transitions were observed; the population-balance term (0–0.5) gives
-additional credit when both substituents were sampled roughly equally. Total range: [-1.0, +1.5].
+For visited pairs (finite DDG):
 
-**Per-Pair Advantage**:
+* **dim 0 (linear)**: ``minority_frac`` = :math:`\min(p_i, p_j)/(p_i + p_j)` ∈ [0, 0.5] —
+  rewards population balance
+* **dim 1 (quadratic)**: ``(pair_visited + trans_quality) / 2`` ∈ [0.5, 1.0] — rewards
+  barrier removal (per-pair crossing + combo-level transition quality)
+* **dim 2 (skew)**: combined proxy from linear and quadratic signals
+* **dim 3 (end)**: same combined proxy as skew
 
-The per-edge advantage subtracts the Q-network prediction as baseline:
+**Policy Loss**:
+
+The loss uses dimension masking so each head's gradient comes exclusively from its
+own reward dimension:
 
 .. math::
 
-   A_{\text{pair}}(i,j) = R_{\text{pair}}(i,j) - Q_\phi(s, \text{pair}_{ij})
+   \mathcal{L}_{\text{policy}} = -\sum_{e} R_{e}^{(d_e)} \cdot \log \pi_\theta(a_e^{(d_e)} \mid s)
 
-Advantages are normalised (zero-mean, unit-variance) across all edges within an episode
-before computing the policy loss:
-
-.. math::
-
-   \mathcal{L}_{\text{policy}} = -\sum_{(i,j)} \log \pi_\theta(a_{ij} | s) \cdot A_{\text{pair}}(i,j)
+where :math:`d_e = \text{edge\_type}_e // 2` is the bias-type index for edge :math:`e`.
 
 **Training Updates**:
 
 For each combination:
 
 1. Encode graph via AtomBondGNN (frozen) → 64D P1 node embeddings
-2. Refine via RGCN (frozen) → 32D P2 node embeddings
-3. Build 200D per-edge inputs: [P1ₚ₁, P2ₚ₁, P1ₚ₂, P2ₚ₂, edge\_type]
-4. Sample bias coefficients :math:`a \sim \pi_\theta(\cdot | s)` from EdgeValueMLP
-5. Run simulation; parse DDG pairs and block populations
-6. Compute per-edge :math:`R_{\text{pair}}` via ``compute_pair_reward``
-7. Update Q-critic: minimize :math:`(Q_\phi(s, \text{pair}) - R_{\text{pair}})^2`
-8. Compute advantage :math:`A_{\text{pair}} = R_{\text{pair}} - Q_\phi.\text{detach()}`, normalise
-9. Update EdgeValueMLP: maximise :math:`\sum \log \pi_\theta(a) \cdot A_{\text{pair}}`
-10. Update value baseline: minimize :math:`(V_\psi(s) - R_{\text{global}})^2`
+2. Compute site-pool context: mean-pool P1 embeddings per λ-site → [N, 64]
+3. Build 192D per-edge inputs: ``[P1_src, P1_dst, site_pool_src]``
+4. Route each edge to its ``BiasHeadMLP`` via ``edge_type // 2``
+5. Sample bias coefficients :math:`a \sim \pi_\theta(\cdot | s)` from ``SitePoolMLPPolicy``
+6. Run simulation; parse DDG pairs and block populations
+7. Compute per-edge, per-dim rewards via ``compute_pair_reward`` → ``[E, 4]``
+8. Evaluate ``log π_θ(a | s)`` with dimension masking (each edge contributes gradient
+   only to its own ``BiasHeadMLP``)
+9. Update ``SitePoolMLPPolicy``: maximise
+   :math:`\sum_e R_e^{(d_e)} \cdot \log \pi_\theta(a_e^{(d_e)} \mid s)`
 
 For details on reward function components, curriculum learning, and workflow configuration,
 see :doc:`workflow`.

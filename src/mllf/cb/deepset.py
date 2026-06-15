@@ -1,6 +1,25 @@
 import torch
 import torch.nn as nn
 
+
+class _AttentionPool(nn.Module):
+    """Simple wrapper for attention pooling gate network."""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.gate_nn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        with torch.no_grad():
+            self.gate_nn[-1].bias.zero_()
+
+    def forward(self, x):
+        gate_logits = self.gate_nn(x)
+        gate_weights = torch.softmax(gate_logits, dim=0)
+        return (x * gate_weights).sum(dim=0)
+
+
 class DeepSetFeatureExtractor(nn.Module):
     """DeepSet feature extractor for substituents using 3D atomic information.
     
@@ -84,11 +103,11 @@ class DeepSetFeatureExtractor(nn.Module):
 
 
 class AtomBondGNN(nn.Module):
-    """Bond-topology-aware substituent encoder using graph neural networks.
+    """Bond-topology-aware substituent encoder using unified graph neural networks.
 
-    Drop-in replacement for DeepSetFeatureExtractor that uses GINConv message
-    passing over the molecular bond graph instead of independent atom processing,
-    followed by GlobalAttentionPool instead of max-pool.
+    Drop-in replacement for DeepSetFeatureExtractor that uses GINEConv message
+    passing over the entire molecular bond graph (not split by sub/core boundaries),
+    followed by GlobalAttentionPool to discover salient atoms.
 
     Same interface attributes as DeepSetFeatureExtractor:
     - ``include_charge``, ``include_atom_id`` flags
@@ -101,6 +120,8 @@ class AtomBondGNN(nn.Module):
         hidden_dim: Hidden layer dimension in GINEConv MLPs (default: 256)
         include_charge: Whether to include atomic charge in features (default: True)
         include_atom_id: Whether to include atom type one-hot in features (default: True)
+        bond_attr_dim: Dimension of bond attributes (default: 1)
+        num_gin_layers: Number of GINEConv layers (default: 4)
     """
 
     def __init__(self, aev_length=2288, num_atom_types=11, embedding_dim=64,
@@ -130,67 +151,47 @@ class AtomBondGNN(nn.Module):
                 nn.Linear(out_d, out_d),
             )
 
-        # Substituent stream: processes sub atoms only through their sub-graph
-        self.sub_input_proj = nn.Sequential(
+        # Unified architecture: single input projection + GINEConv stack
+        self.unified_input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
         )
-        self.sub_gin_layers = nn.ModuleList([
+        self.unified_gin_layers = nn.ModuleList([
             GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
             for _ in range(num_gin_layers)
         ])
 
-        # Core stream: processes core + ref-sub atoms through the core sub-graph
-        self.core_input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-        )
-        self.core_gin_layers = nn.ModuleList([
-            GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
-            for _ in range(num_gin_layers)
-        ])
+        # Global attention pooling: learns to downweight static core, upweight active sites
+        self.attention_pool = _AttentionPool(hidden_dim)
 
-        # Hybrid attentional pooling:
-        #   Gate: concat(sub_node[H], core_summary[H]) -> scalar weight
-        #         = "how important is this sub atom given this scaffold?"
-        #   Features: sub_node[H] -> embedding_dim  (pure substituent identity)
-        self.gate_nn = nn.Linear(hidden_dim * 2, 1)
-        self.pool_nn = nn.Linear(hidden_dim, embedding_dim)
+        # Bottleneck projection: hidden_dim -> embedding_dim
+        self.bottleneck = nn.Linear(hidden_dim, embedding_dim)
 
         # atom_mlp[-1] compatibility shim for graph_utils fallback embedding-dim query
         self.atom_mlp = nn.Sequential(nn.Linear(hidden_dim, embedding_dim))
 
     def forward(self, aev_tensor, charges=None, atom_ids=None,
                 bond_edge_index=None, bond_edge_attr=None, sub_mask=None):
-        """Forward pass through AtomBondGNN (dual-stream architecture).
+        """Forward pass through unified AtomBondGNN architecture.
 
-        Atoms are split into two independent GINEConv streams:
-          - **Sub stream**: substituent atoms processed through their own sub-graph.
-          - **Core stream**: core + ref-sub atoms processed through the core sub-graph.
-
-        The core stream produces a single mean-pooled summary vector that is
-        concatenated into the *gate* of the attentional pooling step, making
-        the attention weights scaffold-aware without contaminating the sub feature
-        path.  The final embedding is a weighted sum of purely sub-derived features.
-
-        When ``sub_mask`` is ``None`` (legacy mode) all atoms are processed through
-        the sub stream with a zero core summary.
+        Processes entire molecule through single GINEConv stack (not split by sub/core).
+        GlobalAttentionPool learns to downweight static core and upweight active sites.
+        The sub_mask parameter is accepted for backward compatibility but ignored.
 
         Args:
             aev_tensor: [N, aev_length]
             charges: [N] or [N, 1] partial charges (required when include_charge=True)
             atom_ids: [N] integer atom-type IDs (required when include_atom_id=True)
-            bond_edge_index: [2, 2E] bidirectional bond edges over full ligand (optional)
+            bond_edge_index: [2, 2E] bidirectional bond edges (optional, falls back to self-loops)
             bond_edge_attr: [2E, bond_attr_dim] bond-type weights (optional)
-            sub_mask: [N] boolean tensor marking substituent atoms.  When provided
-                the bond graph is partitioned into sub-only and core-only sub-graphs.
+            sub_mask: [N] boolean tensor (ACCEPTED FOR COMPATIBILITY, IGNORED in unified model)
 
         Returns:
             substituent_embedding: [embedding_dim]
         """
         dev = aev_tensor.device
 
-        def _build_features(aev, chg, ids):
+        def _build_input(aev, chg, ids):
             parts = [aev]
             if self.include_charge:
                 if chg is None:
@@ -202,72 +203,29 @@ class AtomBondGNN(nn.Module):
                 parts.append(torch.nn.functional.one_hot(ids, self.num_atom_types).float())
             return torch.cat(parts, dim=-1)
 
-        def _prep_edges(n, ei, ea):
-            """Return (edge_index, edge_attr), falling back to self-loops."""
-            if ei is not None and ei.size(1) > 0:
-                ea2 = ea.to(dev) if ea is not None else torch.zeros(ei.size(1), self.bond_attr_dim, device=dev)
-                return ei.to(dev), (ea2.unsqueeze(1) if ea2.dim() == 1 else ea2)
-            idx = torch.arange(n, device=dev)
-            return torch.stack([idx, idx]), torch.zeros(n, self.bond_attr_dim, device=dev)
+        # Project input to hidden dimension
+        x = self.unified_input_proj(_build_input(aev_tensor, charges, atom_ids))  # [N, H]
 
-        def _run_stream(proj, gin_layers, aev, chg, ids, ei, ea):
-            x = proj(_build_features(aev, chg, ids))
-            ei2, ea2 = _prep_edges(x.size(0), ei, ea)
-            for gin in gin_layers:
-                x = torch.relu(gin(x, ei2, ea2) + x)
-            return x
-
-        if sub_mask is not None:
-            n_sub = int(sub_mask.sum())
-            core_mask = ~sub_mask
-
-            # Partition bond graph into sub-only and core-only sub-graphs
-            if bond_edge_index is not None and bond_edge_index.size(1) > 0:
-                src, dst = bond_edge_index
-                sub_e  = (src < n_sub) & (dst < n_sub)
-                core_e = (src >= n_sub) & (dst >= n_sub)
-                sub_ei  = bond_edge_index[:, sub_e]
-                sub_ea  = bond_edge_attr[sub_e]  if bond_edge_attr is not None else None
-                core_ei = bond_edge_index[:, core_e] - n_sub   # reindex to 0-based
-                core_ea = bond_edge_attr[core_e] if bond_edge_attr is not None else None
-            else:
-                sub_ei = sub_ea = core_ei = core_ea = None
-
-            # Sub stream
-            x_sub = _run_stream(
-                self.sub_input_proj, self.sub_gin_layers,
-                aev_tensor[sub_mask],
-                charges[sub_mask]  if charges  is not None else None,
-                atom_ids[sub_mask] if atom_ids is not None else None,
-                sub_ei, sub_ea,
-            )  # [n_sub, H]
-
-            # Core stream -> mean-pool to single scaffold summary
-            n_core = int(core_mask.sum())
-            if n_core > 0:
-                x_core = _run_stream(
-                    self.core_input_proj, self.core_gin_layers,
-                    aev_tensor[core_mask],
-                    charges[core_mask]  if charges  is not None else None,
-                    atom_ids[core_mask] if atom_ids is not None else None,
-                    core_ei, core_ea,
-                )  # [n_core, H]
-                core_summary = x_core.mean(0, keepdim=True).expand(n_sub, -1)  # [n_sub, H]
-            else:
-                core_summary = torch.zeros(n_sub, self.hidden_dim, device=dev)
+        # Prepare edge index and attributes (fall back to self-loops if no edges)
+        if bond_edge_index is not None and bond_edge_index.size(1) > 0:
+            ei = bond_edge_index.to(dev)
+            ea = (bond_edge_attr.to(dev).unsqueeze(1) if bond_edge_attr.dim() == 1
+                  else bond_edge_attr.to(dev)) if bond_edge_attr is not None else torch.zeros(
+                      bond_edge_index.size(1), self.bond_attr_dim, device=dev)
         else:
-            # Legacy: single stream over all atoms, zero core context
-            n_sub = aev_tensor.size(0)
-            x_sub = _run_stream(
-                self.sub_input_proj, self.sub_gin_layers,
-                aev_tensor, charges, atom_ids,
-                bond_edge_index, bond_edge_attr,
-            )
-            core_summary = torch.zeros(n_sub, self.hidden_dim, device=dev)
+            n = x.size(0)
+            idx = torch.arange(n, device=dev)
+            ei = torch.stack([idx, idx])
+            ea = torch.zeros(n, self.bond_attr_dim, device=dev)
 
-        # Hybrid attentional pooling
-        # Gate: scaffold-aware importance score per sub atom
-        gates   = torch.softmax(self.gate_nn(torch.cat([x_sub, core_summary], dim=-1)), dim=0)  # [n_sub, 1]
-        # Features: pure substituent identity
-        features = self.pool_nn(x_sub)                                                          # [n_sub, emb]
-        return (gates * features).sum(0)                                                        # [emb]
+        # Message passing through GINEConv layers with residual connections
+        for gin in self.unified_gin_layers:
+            x = torch.relu(gin(x, ei, ea) + x)
+
+        # Global attention pooling: learn importance weights per atom
+        aggregated = self.attention_pool(x)  # [H]
+
+        # Bottleneck projection to embedding dimension
+        embedding = self.bottleneck(aggregated)  # [embedding_dim]
+
+        return embedding

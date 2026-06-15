@@ -4,8 +4,15 @@ from typing import Dict, Optional, Tuple, List
 
 
 def terminated_normally(text: str) -> bool:
-    """Return True if the output text indicates a normal termination."""
-    return bool(re.search(r"NORMAL TERMINATION", text))
+    """Return True if CHARMM ran dynamics and terminated normally.
+
+    Both a full run and a premature charmm_script('stop') call produce the
+    line 'NORMAL TERMINATION BY NORMAL STOP'.  We distinguish them by
+    requiring actual dynamics output (DYNA> lines) to be present.
+    """
+    has_termination = bool(re.search(r"(?<!AB)NORMAL TERMINATION", text))
+    has_dynamics = bool(re.search(r"^DYNA>", text, re.MULTILINE))
+    return has_termination and has_dynamics
 
 
 def _find_header_lambdas(lines: List[str], start_idx: int, search_forward: bool = False) -> List[float]:

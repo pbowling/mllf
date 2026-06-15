@@ -288,26 +288,34 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int],
 
 def renumber_pres_tokens(content: str, old_site: int, old_sub: int, new_site: int, new_sub: int) -> str:
     """Renumber PRES tokens in RTF file content.
-    
+
+    The PRES name assigned by py_prep (e.g. ``p1_20`` for mol020) does not
+    necessarily match the substituent index used in the file name
+    (e.g. ``site1_sub12_pres.rtf``).  We therefore extract the actual patch
+    name from the first PRES line in the content and replace it with the
+    canonical new name, rather than constructing an assumed old name from
+    ``old_site``/``old_sub``.
+
     Args:
         content: RTF file content as string.
-        old_site: Original site number.
-        old_sub: Original substituent number.
+        old_site: Original site number (kept for API compatibility; not used).
+        old_sub: Original substituent number (kept for API compatibility; not used).
         new_site: New site number.
         new_sub: New substituent number.
-    
+
     Returns:
         Updated content with renumbered PRES tokens.
     """
-    old_token = f"p{old_site}_{old_sub}"
     new_token = f"p{new_site}_{new_sub}"
-    
+
     def _replace_pres_line(m: re.Match) -> str:
         line = m.group(0)
-        if old_token in line:
-            return line.replace(old_token, new_token)
+        parts = line.split()
+        # PRES <name> <charge>  — replace whatever the current name is
+        if len(parts) >= 2:
+            return line.replace(parts[1], new_token, 1)
         return line
-    
+
     new_content, nsub = re.subn(r"(?m)^PRES.*$", _replace_pres_line, content, count=1)
     return new_content if nsub else content
 
@@ -510,7 +518,7 @@ def augment_core_with_excluded_sub1(
     core_pdb_path.write_text('\n'.join(final_pdb_lines))
 
 
-def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Dict, include_patterns: List[str] | None = None) -> Path:
+def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Dict, include_patterns: List[str] | None = None, verbose: bool = True) -> Path:
     """Create a single combination directory with renamed files and support files.
     
     Args:
@@ -594,10 +602,20 @@ def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Di
                     'new_sub': new_sub_idx,
                 })
     
-    # Copy support files from prep directory
+    # Copy support files from prep directory.
+    # Minimized-structure files are excluded: they are only valid for the full
+    # substituent set and would give incorrect starting coordinates for a
+    # partial-substituent combination.  Their absence sets minimizeflag=True in
+    # msld_flat.py so the combo minimises its own fresh coordinates.
+    _SKIP_PREP_FILES = {'minimized.crd', 'minimized.pdb', 'minimized.psf'}
     if prep_in.exists():
         for item in prep_in.iterdir():
-            if item.is_file() and not SITE_SUB_RE.match(item.name):
+            if item.is_dir():
+                # Symlink subdirectories (e.g. prep/pdb/) rather than copying
+                dst = prep_out / item.name
+                if not dst.exists():
+                    dst.symlink_to(item.resolve())
+            elif item.is_file() and not SITE_SUB_RE.match(item.name) and item.name not in _SKIP_PREP_FILES:
                 dst = prep_out / item.name
                 if not dst.exists():
                     copy2(item, dst)
@@ -628,7 +646,8 @@ def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Di
                     core_pdb = prep_out / 'core.pdb'
                     
                     if core_rtf.exists() and core_pdb.exists():
-                        print(f"  Augmenting core with site{excluded_site}_sub1 for single-site combo")
+                        if verbose:
+                            print(f"  Augmenting core with site{excluded_site}_sub1 for single-site combo")
                         augment_core_with_excluded_sub1(core_rtf, core_pdb, sub1_rtf, sub1_pdb)
     
     # Write mapping.json
@@ -802,6 +821,15 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
             # Copy all non-site-specific files from prep directory
             # Site-specific files will be handled separately with renaming
             for prep_file in prep_src.iterdir():
+                if prep_file.is_dir():
+                    # Symlink subdirectories (e.g. prep/pdb/) rather than copying
+                    dest_file = prep_dest / prep_file.name
+                    if dry_run:
+                        print(f"DRY: would symlink prep subdir {prep_file} -> {dest_file}")
+                    elif not dest_file.exists():
+                        dest_file.symlink_to(prep_file.resolve())
+                    continue
+
                 if not prep_file.is_file():
                     continue
                 

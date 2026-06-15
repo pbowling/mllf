@@ -347,8 +347,10 @@ class TestAtomBondGNN:
         assert model.embedding_dim == 64
         assert model.include_charge is True
         assert model.include_atom_id is True
-        assert hasattr(model, 'gin1') and hasattr(model, 'gin2')
-        assert hasattr(model, 'pool')
+        # Dual-stream architecture: sub_gin_layers and core_gin_layers replaced gin1/gin2
+        assert hasattr(model, 'sub_gin_layers') and hasattr(model, 'core_gin_layers')
+        # Attentional pooling replaced simple pool
+        assert hasattr(model, 'gate_nn') and hasattr(model, 'pool_nn')
 
     def test_atom_mlp_shim_out_features(self):
         """atom_mlp[-1].out_features must equal embedding_dim for graph_utils compat."""

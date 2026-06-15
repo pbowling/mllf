@@ -230,40 +230,61 @@ def compute_pair_reward(
     edge_index: torch.Tensor,
     ddg_pairs: dict,
     populations: list,
+    total_transitions: int = 0,
+    t_baseline: float = 50.0,
     block_offset: int = 2,
 ) -> torch.Tensor:
-    """Compute per-edge reward tensor for per-pair credit assignment.
+    """Compute per-edge, per-dimension reward tensor for credit assignment.
 
-    Reward is assigned at the *pair* level and is therefore identical for all
-    directed edges that share the same (src, dst) node pair.  In the MSLD
-    graph a substituent pair can contribute up to 8 edges — 4 bias-coefficient
-    types (linear, quadratic, skew, end) × 2 directions (i→j and j→i) because
-    the potential energy surface is not symmetric.
+    Returns a separate reward signal for each of the 4 MSLD bias types so that
+    each MLP head receives a gradient signal matched to the physical quantity it
+    controls.  Dimension assignments mirror the policy output order:
 
-    Per-pair reward:
-      - ``-1.0``   if DDG is None / NaN / Inf (no lambda-space crossings observed)
-      - ``+1.0 + minority_fraction``  if DDG is a finite float (transitions observed)
-        where ``minority_fraction = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)``
-        ranges in [0.0, 0.5]: rewards combinations where sampling is balanced.
+      0  linear    — population balance between substituents.
+                     Signal: ``minority_frac = min(pop_i,pop_j)/(pop_i+pop_j+ε)``
+                     ∈ [0, 0.5].  Higher = more equal sampling = better.
+      1  quadratic — barrier height.  Uses two signals in tandem:
+                     (a) Per-pair DDG existence (binary 1.0 when this specific
+                         pair's DDG is finite) — precise even with 3+ subs,
+                         because each pair's DDG is checked independently.
+                     (b) Normalized total transitions ``min(n_trans,T_base)/T_base``
+                         — a continuous quality signal shared across the combo.
+                     Combined as ``(pair_visited + trans_quality) / 2`` ∈ [0.5, 1.0]
+                     when the pair was visited, giving both per-pair resolution and
+                     a continuous quality gradient.
+      2  skew      — barrier asymmetry from soft-core introduction.
+                     Signal: mean of the above two signals (cannot be further
+                     isolated from available data).
+      3  end       — entropic / surface-tension cost of creating substituent space.
+                     Signal: same combined proxy as skew.
+
+    For all dimensions: ``-1.0`` when this specific pair was not visited
+    (DDG is None/NaN/Inf), regardless of total transition count.  With 3+
+    substituents per site this correctly penalises edges whose pair was never
+    sampled even when other pairs contributed many transitions.
 
     Args:
         edge_index: [2, E] node-index tensor.
         ddg_pairs: dict from simulation_results 'ddg_pairs':
                    keys ``"blk_lo_blk_hi"`` → float | None.
         populations: list of raw highest-lambda population counts per block
-                     (produced by ``_extract_highest_lambda_counts``).  Each
-                     entry is the single count at the largest lambda observed
-                     for that block — the counts at different lambdas are NOT
-                     combined or normalised.
-                     Block ID = node_idx + block_offset (default 2, matching
-                     MSLD convention where block 1 is the reference ligand).
+                     (Block ID = node_idx + block_offset).
+        total_transitions: total lambda-space crossings observed for this combo
+                           (sum of per-site transition counts).  Used as a
+                           continuous quality modifier for the quadratic signal;
+                           the per-pair DDG check provides per-pair resolution.
+        t_baseline: normalization constant for transition rate (default 50.0,
+                    matching ``T_baseline`` in the reward config).
         block_offset: integer offset from node index to block ID (default 2).
 
     Returns:
-        Float tensor of shape [E] with per-edge reward values.
+        Float tensor of shape ``[E, 4]`` with per-dimension per-edge rewards.
     """
     num_edges = edge_index.size(1)
-    rewards = torch.zeros(num_edges, dtype=torch.float32)
+    rewards = torch.zeros(num_edges, 4, dtype=torch.float32)
+
+    # Combo-level transition quality: continuous, shared across all edges.
+    trans_quality = float(min(total_transitions, t_baseline)) / float(t_baseline)
 
     for k in range(num_edges):
         src = int(edge_index[0, k].item())
@@ -272,16 +293,102 @@ def compute_pair_reward(
         hi = max(src + block_offset, dst + block_offset)
         entry = ddg_pairs.get(f"{lo}_{hi}")
 
+        # Per-pair DDG existence: True only when THIS pair was never visited.
+        # With 3+ subs, total_transitions may be non-zero while this specific
+        # pair has no DDG — the per-pair check catches that correctly.
         no_crossing = (
             entry is None
             or (isinstance(entry, float) and (math.isinf(entry) or math.isnan(entry)))
         )
         if no_crossing:
-            rewards[k] = -1.0
+            rewards[k, :] = -1.0
         else:
             pop_i = populations[src] if src < len(populations) else 0
             pop_j = populations[dst] if dst < len(populations) else 0
             minority_frac = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)
-            rewards[k] = 1.0 + minority_frac
+
+            # Quadratic: tandem of per-pair visited binary (1.0, since we are
+            # inside the else branch) and combo-level quality → ∈ [0.5, 1.0].
+            pair_visited = 1.0
+            quad_signal = (pair_visited + trans_quality) / 2.0
+
+            # Combined proxy for skew/end: population balance (normalised to
+            # [0,1]) and quad_signal averaged.
+            combined = (minority_frac * 2.0 + quad_signal) / 2.0
+
+            rewards[k, 0] = minority_frac   # linear:    population balance ∈ [0, 0.5]
+            rewards[k, 1] = quad_signal     # quadratic: per-pair visited + quality ∈ [0.5, 1]
+            rewards[k, 2] = combined        # skew:      combined proxy
+            rewards[k, 3] = combined        # end:       combined proxy
+
+    return rewards
+
+
+def compute_failure_reward(
+    edge_index: torch.Tensor,
+    populations: list,
+    failure_advantage: float = -2.0,
+    block_offset: int = 2,
+) -> torch.Tensor:
+    """Compute per-edge, per-dimension advantages for below-floor (failed) combos.
+
+    When a combo produces fewer transitions than the floor threshold, we cannot
+    compute a meaningful DDG-based reward.  However, the REMD *population* data
+    is still valid: it reflects how much time the system spent in each state
+    regardless of crossing events.
+
+    This function constructs a physically grounded per-dimension signal that
+    avoids penalising dimensions whose actions may have been correct:
+
+      - Dim 0 (linear): calibrated by population balance.  If ``minority_frac``
+        is near 0.5 (populations balanced), the linear bias was probably fine and
+        receives a near-zero advantage.  If ``minority_frac`` is near 0 (system
+        pinned in one state), it receives the full ``failure_advantage``.
+        Formula: ``failure_advantage * (1 - 2 * minority_frac)``  ∈
+        [failure_advantage, 0].
+
+      - Dim 1 (quadratic): fixed ``failure_advantage``.  No transitions always
+        means the quadratic barrier was too high, regardless of populations.
+
+      - Dims 2, 3 (skew, end): partial penalty combining linear calibration
+        (half-weight) with the full quadratic failure.  Cannot be isolated from
+        available data, but should not receive the full penalty when the
+        population is already balanced.
+        Formula: ``(failure_advantage * (1 - 2*minority_frac) + failure_advantage) / 2``
+                  ``= failure_advantage * (1 - minority_frac)``  ∈
+        [failure_advantage, failure_advantage/2].
+
+    Args:
+        edge_index: [2, E] node-index tensor.
+        populations: list of raw highest-lambda population counts per block.
+        failure_advantage: magnitude of penalty (negative; default -2.0).
+        block_offset: integer offset from node index to block ID (default 2).
+
+    Returns:
+        Float tensor of shape ``[E, 4]`` with per-dimension pre-normalised
+        advantages, ready to be used directly in the policy gradient without
+        batch normalisation.
+    """
+    num_edges = edge_index.size(1)
+    rewards = torch.zeros(num_edges, 4, dtype=torch.float32)
+
+    for k in range(num_edges):
+        src = int(edge_index[0, k].item())
+        dst = int(edge_index[1, k].item())
+        pop_i = populations[src] if src < len(populations) else 0
+        pop_j = populations[dst] if dst < len(populations) else 0
+        minority_frac = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)
+
+        # Dim 0 (linear): penalty scales with population imbalance.
+        # minority_frac ≈ 0.5 → near-zero penalty (linear was fine).
+        # minority_frac ≈ 0.0 → full failure_advantage (linear pinned the system).
+        rewards[k, 0] = failure_advantage * (1.0 - 2.0 * minority_frac)
+
+        # Dim 1 (quadratic): always full penalty — no transitions = barrier too high.
+        rewards[k, 1] = failure_advantage
+
+        # Dims 2, 3 (skew/end): average of linear calibration and quadratic penalty.
+        rewards[k, 2] = failure_advantage * (1.0 - minority_frac)
+        rewards[k, 3] = failure_advantage * (1.0 - minority_frac)
 
     return rewards

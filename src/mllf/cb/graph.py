@@ -126,8 +126,7 @@ class Graph:
         of substituents and attach them to the node metadata under 'subs' and
         also store the raw parsed entries under 'rtf'. For each substituent we
         populate metadata: total_charge, atom_types, distinct_atom_types (atoms
-        not present in ALL subs at the same site) and solvent state (a
-        simple heuristic based on filename).
+        not present in sub1, the reference substituent at each site) and solvent state.
         """
         # collect subs per site
         sites = {}
@@ -146,18 +145,21 @@ class Graph:
             if site_idx - 1 < 0 or site_idx - 1 >= self.num_nodes:
                 # ignore out-of-range site indices
                 continue
-            # compute atom type sets per sub for distinct types computation
+            # compute distinct_atom_types using sub1 as the scaffold reference:
+            # atoms present in sub1 are the scaffold; anything not in sub1 is distinct.
             per_sub = data['rtf']
-            atom_sets = {s: set((per_sub[s].get('atom_types') or [])) for s in per_sub}
-            # compute intersection of all subs at this site
-            intersection_all = set.intersection(*atom_sets.values()) if len(atom_sets) > 0 else set()
+            ref_types = set(per_sub[1].get('atom_types') or []) if 1 in per_sub else set()
+            if not ref_types and per_sub:
+                # Fallback: intersection of all subs if sub1 not present
+                atom_sets = {s: set((per_sub[s].get('atom_types') or [])) for s in per_sub}
+                ref_types = set.intersection(*atom_sets.values()) if len(atom_sets) > 0 else set()
 
             subs_meta = {}
             for s, parsed in per_sub.items():
                 fname = parsed.get('filename')
                 atom_types = list(parsed.get('atom_types') or [])
-                # distinct_atom_types: preserve duplicates and order but exclude atoms in intersection
-                distinct_list = [a for a in atom_types if a not in intersection_all]
+                # distinct_atom_types: atoms not present in sub1 (the reference sub)
+                distinct_list = [a for a in atom_types if a not in ref_types]
                 subs_meta[s] = {
                     'site': site_idx,
                     'sub': s,
@@ -222,15 +224,17 @@ class Graph:
             per_site.setdefault(site, {})
             per_site[site][sub] = parsed
 
-        # compute the intersection across all subs at a site (atoms common to every sub)
+        # compute scaffold reference per site: use sub1's atom type set.
+        # Atoms present in sub1 are the shared scaffold; anything not in sub1 is distinct.
         site_intersection = {}
         for site, subdict in per_site.items():
-            atom_sets = {s: set((subdict[s].get('atom_types') or [])) for s in subdict}
-            if atom_sets:
-                intersection_all = set.intersection(*atom_sets.values()) if len(atom_sets) > 0 else set()
+            if 1 in subdict:
+                ref_types = set(subdict[1].get('atom_types') or [])
             else:
-                intersection_all = set()
-            site_intersection[site] = intersection_all
+                # Fallback: intersection of all subs if sub1 not present
+                atom_sets = {s: set((subdict[s].get('atom_types') or [])) for s in subdict}
+                ref_types = set.intersection(*atom_sets.values()) if atom_sets else set()
+            site_intersection[site] = ref_types
 
         # create graph with one node per substituent
         nsubs = len(subs)
@@ -240,10 +244,9 @@ class Graph:
         for idx, (site, sub, key, parsed) in enumerate(subs):
             atom_types = list(parsed.get('atom_types') or [])
             total_charge = float(parsed.get('total_charge', 0.0) or 0.0)
-            # distinct_atom_types: preserve duplicates and order but exclude atoms
-            # that are present in every sub at this site (site_intersection)
-            intersection_all = site_intersection.get(site, set())
-            distinct_list = [a for a in atom_types if a not in intersection_all]
+            # distinct_atom_types: atoms not present in sub1 (the scaffold reference).
+            ref_types = site_intersection.get(site, set())
+            distinct_list = [a for a in atom_types if a not in ref_types]
 
             # Validate solvent_override if provided; warn and set to 'unknown' if invalid
             allowed_solvents = {'solv', 'gas', 'protein'}

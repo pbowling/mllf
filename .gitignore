@@ -29,6 +29,7 @@ generated_combos*/
 pretraining/
 old_files/
 models/
+training/
 examples/14benz/training_output/
 *status.out
 *.tar.gz

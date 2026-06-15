@@ -281,10 +281,10 @@ Reward Function
 
 **Pretraining**
 
-Before training begins, the policy can be pretrained using behavior cloning 
-(supervised learning with MSE loss) to imitate successful bias coefficients from 
-completed simulations. For complete details on pretraining loss, data organization, 
-and transfer learning strategies, see :doc:`cb_pretraining`.
+Before training begins, the policy can be pretrained using behavior cloning
+(AWR NLL loss) to imitate successful bias coefficients from completed simulations.
+For complete details on pretraining loss, data organization, and transfer learning
+strategies, see :doc:`cb_pretraining`.
 
 **Training Reward**
 
@@ -414,12 +414,15 @@ Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0
 
 **Policy Gradient Training**:
 
-The policy is optimized using an **Actor-Critic** architecture where the policy network 
-(actor) predicts bias coefficients and a value network (critic) provides state-dependent 
-baselines for variance reduction. This approach prevents catastrophic forgetting of 
-pretrained weights and enables more stable learning.
+The policy is optimized using **REINFORCE** with per-edge per-dimension reward signals.
+The ``SitePoolMLPPolicy`` samples bias coefficients from independent Gaussian distributions
+(one per bias type per edge), runs the MSLD simulation, and then updates weights by
+maximising the log-probability of actions that produced positive rewards. Each
+``BiasHeadMLP`` receives gradient only from the reward dimension that corresponds to
+its bias type, providing clean per-type credit assignment without a value network or
+Q-critic.
 
-For architectural details on the RGCN encoder, policy network, and value network, see :doc:`cb_setup`.
+For architectural details on the policy network and per-dimension reward signals, see :doc:`cb_setup`.
 
 Simulation Execution
 --------------------

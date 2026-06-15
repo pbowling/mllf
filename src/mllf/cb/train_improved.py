@@ -5,8 +5,9 @@ concentrated populations and low transition counts, encouraging the policy
 to explore the full alchemical space rather than converging to single-substituent
 solutions.
 """
+import warnings
 from pathlib import Path
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import torch
 import numpy as np
@@ -29,7 +30,8 @@ def compute_msld_reward_improved(
     min_transitions_per_site: int = 10,
     min_coverage_ratio: float = 0.5,
     entropy_bonus: float = 8.0,
-    concentration_penalty_threshold: float = 0.8
+    concentration_penalty_threshold: float = 0.8,
+    suppress_warnings: bool = False,
 ) -> float:
     """Compute improved scalarized reward that prevents degenerate solutions.
     
@@ -91,18 +93,18 @@ def compute_msld_reward_improved(
             break
     
     if output_file is None:
-        print(f"  Warning: No output file found in {combo_dir}")
+        warnings.warn(f"No output file found in {combo_dir}")
         return -50.0  # Capped penalty for failed simulation
     
     try:
         with open(output_file, 'r') as f:
             output_text = f.read()
     except Exception as e:
-        print(f"  Warning: Could not read {output_file}: {e}")
+        warnings.warn(f"Could not read {output_file}: {e}")
         return -50.0
     
     if not terminated_normally(output_text):
-        print(f"  Warning: Simulation did not terminate normally in {combo_dir}")
+        warnings.warn(f"Simulation did not terminate normally in {combo_dir}")
         return -50.0
     
     # Parse outputs
@@ -110,7 +112,7 @@ def compute_msld_reward_improved(
     transitions_data, _ = parse_transitions_and_rates(output_text)
     
     if not population_data or not transitions_data:
-        print(f"  Warning: No population or transition data in {output_file}")
+        warnings.warn(f"No population or transition data in {output_file}")
         return -50.0
     
     # Extract populations (per block/substituent) - use only HIGHEST lambda value
@@ -178,10 +180,12 @@ def compute_msld_reward_improved(
         multisite_penalty = (sites_below_threshold - 1) * 4.0
         total_transition_penalty = base_penalty + multisite_penalty
         penalties -= total_transition_penalty
-        print(f"  Warning: {sites_below_threshold} sites below threshold: -{base_penalty:.1f} (base) + -{multisite_penalty:.1f} (multisite) = -{total_transition_penalty:.1f}")
+        if not suppress_warnings:
+            warnings.warn(f"{sites_below_threshold} sites below threshold: -{base_penalty:.1f} (base) + -{multisite_penalty:.1f} (multisite) = -{total_transition_penalty:.1f}")
     elif sites_below_threshold == 1:
         penalties -= base_penalty
-        print(f"  Warning: 1 site below threshold: -{base_penalty:.1f}")
+        if not suppress_warnings:
+            warnings.warn(f"1 site below threshold: -{base_penalty:.1f}")
     
     # Check 2: Minimum coverage (fraction of substituents visited)
     pop_array = np.array(populations)
@@ -230,7 +234,8 @@ def compute_msld_reward_improved(
             # Reduced coefficient (2.0 instead of 5.0) to prevent excessive accumulation in multi-site systems
             if concentration_ratio > concentration_penalty_threshold:
                 penalties -= gamma * 2.0 * (concentration_ratio - concentration_penalty_threshold)
-                print(f"  Warning: Site {site_idx} has {concentration_ratio:.2%} concentration")
+                if not suppress_warnings:
+                    warnings.warn(f"Site {site_idx} has {concentration_ratio:.2%} concentration")
         
         pop_idx += nsubs
     
@@ -291,7 +296,8 @@ def compute_msld_reward_improved(
     max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
-        print(f"  Warning: Penalties clamped to -{max_penalty}")
+        if not suppress_warnings:
+            warnings.warn(f"Penalties clamped to -{max_penalty}")
     
     # ========== FINAL REWARD ==========
 

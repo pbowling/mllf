@@ -8,6 +8,8 @@
 
    .. autosummary::
    
+      BiasHeadMLP
       EdgePolicy
       EdgeValueMLP
+      SitePoolMLPPolicy
    

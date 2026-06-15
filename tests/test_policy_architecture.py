@@ -14,65 +14,75 @@ from mllf.cb.policy import EdgePolicy, EdgeValueMLP
 
 
 class TestEdgeValueMLP:
-    """Tests for EdgeValueMLP with separate heads."""
-    
-    def test_separate_heads_architecture(self):
-        """Test that MLP has separate heads for each bias type."""
+    """Tests for EdgeValueMLP with 4 independent BiasHeadMLPs."""
+
+    def test_independent_mlps_architecture(self):
+        """Test that MLP has 4 independent BiasHeadMLP instances."""
         in_dim = 64
-        hidden = 64
         num_bias_types = 4
-        
-        mlp = EdgeValueMLP(in_dim=in_dim, hidden=hidden, num_bias_types=num_bias_types)
-        
-        # Check trunk architecture
-        assert hasattr(mlp, 'trunk'), "MLP should have shared trunk"
-        assert len(mlp.trunk) == 2, "Trunk should have 2 layers (Linear, ReLU)"
-        
-        # Check separate heads
-        assert hasattr(mlp, 'heads'), "MLP should have separate heads"
-        assert len(mlp.heads) == num_bias_types, f"Should have {num_bias_types} heads"
-        
-        # Each head should be a Sequential module that outputs 2 values (mean, log_std)
-        for i, head in enumerate(mlp.heads):
-            assert isinstance(head, nn.Sequential), f"Head {i} should be Sequential"
+
+        mlp = EdgeValueMLP(in_dim=in_dim, num_bias_types=num_bias_types)
+
+        assert hasattr(mlp, 'mlps'), "EdgeValueMLP should have 'mlps' ModuleList"
+        assert len(mlp.mlps) == num_bias_types, f"Should have {num_bias_types} independent MLPs"
+
+        from mllf.cb.policy import BiasHeadMLP
+        for i, head in enumerate(mlp.mlps):
+            assert isinstance(head, BiasHeadMLP), f"mlps[{i}] should be a BiasHeadMLP"
             # Check final layer output dimension
-            final_layer = list(head.children())[-1]
-            assert isinstance(final_layer, nn.Linear), f"Head {i} final layer should be Linear"
-            assert final_layer.out_features == 2, f"Head {i} should output 2 values"
-    
+            final_layer = list(head.net.children())[-1]
+            assert isinstance(final_layer, nn.Linear), f"mlps[{i}] final layer should be Linear"
+            assert final_layer.out_features == 2, f"mlps[{i}] should output 2 values"
+
     def test_output_shape(self):
         """Test that output has correct shape."""
         in_dim = 64
-        hidden = 64
         num_bias_types = 4
         batch_size = 10
-        
-        mlp = EdgeValueMLP(in_dim=in_dim, hidden=hidden, num_bias_types=num_bias_types)
-        
+
+        mlp = EdgeValueMLP(in_dim=in_dim, num_bias_types=num_bias_types)
+
         x = torch.randn(batch_size, in_dim)
         out = mlp(x)
-        
+
         expected_shape = (batch_size, 2 * num_bias_types)
         assert out.shape == expected_shape, f"Output shape {out.shape} != expected {expected_shape}"
-    
-    def test_gradient_flow_through_all_heads(self):
-        """Test that gradients flow through all heads."""
-        mlp = EdgeValueMLP(in_dim=32, hidden=64, num_bias_types=4)
-        
+
+    def test_gradient_isolation(self):
+        """Test that gradients for each MLP are isolated via edge_type routing."""
+        mlp = EdgeValueMLP(in_dim=32, num_bias_types=4)
         x = torch.randn(5, 32)
-        out = mlp(x)
-        loss = out.sum()
-        loss.backward()
-        
-        # Check trunk gradients
-        for param in mlp.trunk.parameters():
-            assert param.grad is not None, "Trunk should receive gradients"
-            assert not torch.allclose(param.grad, torch.zeros_like(param.grad)), "Gradients should be non-zero"
-        
-        # Check all heads receive gradients
-        for i, head in enumerate(mlp.heads):
-            for param in head.parameters():
-                assert param.grad is not None, f"Head {i} should receive gradients"
+
+        # --- Routed path: edge_type provided, all edges belong to bias type 0 ---
+        # edge_type 0 and 1 both map to bias_type_index 0 (linear fwd/bwd)
+        edge_type = torch.zeros(5, dtype=torch.long)  # all linear edges
+        out = mlp(x, edge_type)
+        out[:, 0].sum().backward()
+
+        # mlps[0] should have non-zero gradients (it processed all edges)
+        for param in mlp.mlps[0].parameters():
+            assert param.grad is not None and param.grad.norm().item() > 0.0, \
+                "mlps[0] should receive non-zero gradients for its own edge type"
+
+        # mlps[1], [2], [3] must have zero (or no) gradients — routing excluded them
+        for i in range(1, 4):
+            for param in mlp.mlps[i].parameters():
+                grad_norm = param.grad.norm().item() if param.grad is not None else 0.0
+                assert grad_norm == 0.0, (
+                    f"mlps[{i}] should NOT receive non-zero gradients when only mlps[0] "
+                    f"edge type is active; got grad_norm={grad_norm:.6f}"
+                )
+
+        # --- Legacy path (no edge_type): all MLPs run, all get gradients ---
+        for p in mlp.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+        out_legacy = mlp(x, edge_type=None)
+        out_legacy[:, 0].sum().backward()
+        # In the legacy path all MLPs participate, so non-zero grads everywhere
+        for i in range(4):
+            for param in mlp.mlps[i].parameters():
+                assert param.grad is not None, f"mlps[{i}] should have grads in legacy path"
 
 
 class TestEdgePolicyArchitecture:
@@ -263,7 +273,7 @@ class TestP1DimSkipConnection:
     def test_edge_mlp_input_dim_with_p1(self):
         """When p1_dim=16 and emb_dim=8, edge MLP input should be 2*(8+16) = 48."""
         policy = self._make_policy(N=5, x_dim=10, emb_dim=8, p1_dim=16)
-        first_layer = policy.edge_mlp.trunk[0]
+        first_layer = policy.edge_mlp.mlps[0].net[0]
         assert first_layer.in_features == 2 * (8 + 16), (
             f"Expected in_features=48, got {first_layer.in_features}"
         )
@@ -271,7 +281,7 @@ class TestP1DimSkipConnection:
     def test_edge_mlp_input_dim_without_p1(self):
         """Without p1_dim, edge MLP input should be 2*emb_dim = 16."""
         policy = self._make_policy(N=5, x_dim=10, emb_dim=8, p1_dim=0)
-        first_layer = policy.edge_mlp.trunk[0]
+        first_layer = policy.edge_mlp.mlps[0].net[0]
         assert first_layer.in_features == 2 * 8, (
             f"Expected in_features=16, got {first_layer.in_features}"
         )

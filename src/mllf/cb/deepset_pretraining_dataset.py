@@ -189,20 +189,26 @@ def load_system_metadata(system_dir: Path) -> Dict:
     raise ValueError(f"Could not load valid metadata from {system_dir}")
 
 
-def _collect_leaf_system_dirs(top_dirs: List[Path]) -> List[Tuple[Path, str]]:
+def _collect_leaf_system_dirs(top_dirs: List[Path], skip_combos: bool = False) -> List[Tuple[Path, str]]:
     """Expand collection directories into (system_dir, unique_output_name) pairs.
 
-    A *collection* directory is one that contains no ``run*`` / ``n_run*``
-    entries itself but whose children each have a ``prep/`` directory or their
-    own ``run*`` / ``n_run*`` entries.  Examples: ``14benz_combos``,
-    ``14benz_triplet_combos``, ``14benz_quad_combos_v2``.
+    Three directory patterns are handled:
 
-    Leaf systems are returned as-is.  Collection directories are expanded so
-    each child becomes a (path, unique_name) entry where ``unique_name`` is
-    ``<parent>__<child>`` to avoid output-file collisions.
+    1. **Pure leaf** — has its own ``run*`` / ``n_run*`` entries, no sub-leaves.
+       Returned as-is: ``(d, d.name)``.
+    2. **Pure collection** — no direct run entries, but children each have a
+       ``prep/`` directory or their own run entries.  Examples:
+       ``14benz_combos``, ``cmet_vac``.  Expanded so each qualifying child
+       becomes a ``(child, "<parent>__<child>")`` entry.
+    3. **Mixed** — has both direct run entries (it is itself a leaf) AND leaf-like
+       children (e.g. ``comb_*`` sub-combinations added later).  Both the parent
+       and every qualifying child are included.  Examples: ``14benz_vac``,
+       ``indolizine_solv``.
 
     Args:
         top_dirs: Top-level candidate directories (after skip-list filtering).
+        skip_combos: If True, exclude any directories matching 'comb_*' pattern
+                    to avoid fragmented training labels from combinatorial samples.
 
     Returns:
         List of (system_dir, unique_name) tuples ready for dataset generation.
@@ -210,23 +216,31 @@ def _collect_leaf_system_dirs(top_dirs: List[Path]) -> List[Tuple[Path, str]]:
     result: List[Tuple[Path, str]] = []
     for d in top_dirs:
         run_entries = list(d.glob('run*')) + list(d.glob('n_run*'))
-        if run_entries:
-            # Leaf system — has its own run directories.
-            result.append((d, d.name))
-        else:
-            children = sorted(c for c in d.iterdir() if c.is_dir())
-            is_collection = any(
+
+        # Children that look like leaf systems (have prep/ or their own run*)
+        leaf_children = sorted(
+            c for c in d.iterdir() if c.is_dir()
+            and (
                 (c / 'prep').exists()
                 or list(c.glob('run*'))
                 or list(c.glob('n_run*'))
-                for c in children
             )
-            if is_collection:
-                for child in children:
-                    result.append((child, f"{d.name}__{child.name}"))
-            else:
-                # Not a recognisable collection; pass through so it fails clearly.
-                result.append((d, d.name))
+            and not (skip_combos and c.name.startswith('comb_'))  # Skip combo dirs if requested
+        )
+
+        if run_entries:
+            # This directory is itself a leaf system.
+            result.append((d, d.name))
+            # Also expand any leaf-like children (mixed directory pattern).
+            for child in leaf_children:
+                result.append((child, f"{d.name}__{child.name}"))
+        elif leaf_children:
+            # Pure collection — expand all qualifying children.
+            for child in leaf_children:
+                result.append((child, f"{d.name}__{child.name}"))
+        else:
+            # Not a recognisable pattern; pass through so it fails clearly.
+            result.append((d, d.name))
     return result
 
 
@@ -561,7 +575,8 @@ def generate_all_pretraining_datasets(
     output_root: Path,
     skip_systems: Optional[List[str]] = None,
     aev_cutoff: float = 5.1,
-    verbose: bool = False
+    verbose: bool = False,
+    skip_combos: bool = False,
 ) -> List[Dict]:
     """Generate training datasets for all pretraining systems.
     
@@ -571,6 +586,8 @@ def generate_all_pretraining_datasets(
         skip_systems: List of system names to skip (default: ['14benz_pair_combos'])
         aev_cutoff: AEV spatial cutoff in Angstroms (default: 5.1 Å, matches ANI-2x radial cutoff)
         verbose: If True, print detailed context information for each system
+        skip_combos: If True, skip all 'comb_*' combo directories to reduce
+                    label fragmentation in contrastive training.
         
     Returns:
         List of statistics dicts for each system
@@ -583,7 +600,10 @@ def generate_all_pretraining_datasets(
         d for d in pretraining_root.iterdir()
         if d.is_dir() and d.name not in skip_systems
     )
-    leaf_systems = _collect_leaf_system_dirs(top_dirs)
+    leaf_systems = _collect_leaf_system_dirs(top_dirs, skip_combos=skip_combos)
+
+    if skip_combos:
+        print(f"⚠️  Combo directories ('comb_*') will be SKIPPED to reduce label fragmentation")
 
     print(f"Found {len(leaf_systems)} pretraining systems to process "
           f"(from {len(top_dirs)} top-level directories)")
@@ -732,9 +752,11 @@ def generate_bond_training_data_for_system(
             # Discover reference substituents at other sites (sub1 for each non-active site)
             # These are included in the full-ligand graph.
             sub_site = None
-            m = __import__('re').search(r'site(\d+)_sub\d+', pdb_path.name)
+            sub_num = None
+            m = __import__('re').search(r'site(\d+)_sub(\d+)', pdb_path.name)
             if m:
                 sub_site = int(m.group(1))
+                sub_num = int(m.group(2))
             ref_sub_info = []
             all_site_sub1s = sorted(prep_dir.glob('site*_sub1_frag.pdb'))
             for ref_pdb in all_site_sub1s:
@@ -823,17 +845,41 @@ def generate_bond_training_data_for_system(
                 print(f"    N_ligand={n_ligand}, bonds={bond_edge_index.size(1)//2}")
                 first_sub_processed = True
 
+            # Extract ref sub information for per-epoch random sampling during training
+            ref_sub_metadata = []
+            for ref_site_idx, (ref_pdb, ref_rtf, _) in enumerate(ref_sub_info):
+                ref_atom_count = 0
+                if ref_rtf:
+                    # Count atoms in this ref sub
+                    ref_atom_types = ref_rtf.get('atom_types', [])
+                    ref_atom_count = len(ref_atom_types)
+                # Extract site number from ref_pdb path
+                import re as _re
+                ref_match = _re.search(r'site(\d+)_sub\d+', ref_pdb)
+                if ref_match:
+                    ref_site_num = int(ref_match.group(1))
+                    ref_sub_metadata.append({
+                        'site': ref_site_num,
+                        'atom_count': ref_atom_count,
+                        'sub_num': 1,  # Currently we only use sub1 as ref
+                    })
+
             all_substituents.append({
                 'aev': aevs,                         # [N_ligand, 2288]
                 'charges': charges,                  # [N_ligand]
-                'atom_ids': atom_ids,                # [N_ligand] int64
+                'atom_ids': atom_ids,                # [N_ligand] int64 (element-only: 0-10)
+                'cgenff_atom_types': list(rtf_data.get('atom_types', [])) if rtf_data else [],  # [N_ligand] strings (e.g., CG2R61)
                 'bond_edge_index': bond_edge_index,  # [2, 2E] over full ligand
                 'bond_edge_attr': bond_edge_attr,    # [2E, 1]
                 'sub_mask': sub_mask,                # [N_ligand] bool — sub atoms
                 'n_sub': n_sub,                      # int
+                'n_core': n_core,                    # int — for label regeneration
+                'n_ref_per_site': n_ref_per_site,    # int per non-active site
+                'ref_sub_metadata': ref_sub_metadata,  # metadata for random sampling
                 'pdb_name': pdb_path.name,
                 # Temporary fields removed after post-processing (below)
                 '_site': sub_site if sub_site is not None else -1,
+                '_sub_num': sub_num if sub_num is not None else -1,
                 '_raw_atom_types': list(rtf_data.get('atom_types', [])) if rtf_data else [],
             })
             total_atoms += n_ligand
@@ -845,20 +891,34 @@ def generate_bond_training_data_for_system(
     if not all_substituents:
         raise ValueError(f"No valid substituents generated for {system_dir.name}")
 
-    # Post-process: compute distinct_atom_types per site (atom types not shared
-    # by ALL substituents at the same site — mirrors production graph.py logic).
+    # Post-process: compute distinct_atom_types per site.
+    # Use sub1's atom type SET as the scaffold reference: atoms present in sub1
+    # are shared scaffold atoms; anything NOT in sub1 is a "distinct" addition.
+    # This ensures sub1 at any site always gets distinct=[], and substituents
+    # with the same chemistry (e.g. methyl at site1 vs site2) get the same label
+    # regardless of how large or differently-partitioned the ring fragment is.
     from collections import defaultdict as _defaultdict
     site_subs: dict = _defaultdict(list)
     for sd in all_substituents:
         site_subs[sd['_site']].append((sd, sd['_raw_atom_types']))
     for site, sub_list in site_subs.items():
-        type_sets = [set(raw) for _, raw in sub_list]
-        intersection = set.intersection(*type_sets) if len(type_sets) > 1 else set()
+        # Find the reference (sub1) types for this site
+        ref_types: set = set()
         for sd, raw_types in sub_list:
-            sd['distinct_atom_types'] = [t for t in raw_types if t not in intersection]
+            if sd.get('_sub_num') == 1:
+                ref_types = set(raw_types)
+                break
+        if not ref_types and sub_list:
+            # Fallback: use full intersection if no sub1 present
+            type_sets = [set(raw) for _, raw in sub_list]
+            ref_types = set.intersection(*type_sets) if len(type_sets) > 1 else set()
+        for sd, raw_types in sub_list:
+            sd['distinct_atom_types'] = [t for t in raw_types if t not in ref_types]
+    
     # Strip temporary fields
     for sd in all_substituents:
         sd.pop('_site', None)
+        sd.pop('_sub_num', None)
         sd.pop('_raw_atom_types', None)
 
     aev_length = all_substituents[0]['aev'].shape[1]
@@ -893,6 +953,7 @@ def generate_all_bond_pretraining_datasets(
     skip_systems: Optional[List[str]] = None,
     aev_cutoff: float = 5.1,
     verbose: bool = False,
+    skip_combos: bool = False,
 ) -> List[Dict]:
     """Generate bond-topology training datasets for all pretraining systems.
 
@@ -906,6 +967,9 @@ def generate_all_bond_pretraining_datasets(
         skip_systems: System directory names to skip.
         aev_cutoff: AEV spatial cutoff in Angstroms (default: 5.1 Å).
         verbose: Print verbose AEV context info for first substituent per system.
+        skip_combos: If True, skip all 'comb_*' combo directories to reduce
+                    label fragmentation in contrastive training. Each system's
+                    direct runs and variable files will still be included.
 
     Returns:
         List of statistics dicts for each processed system.
@@ -918,7 +982,10 @@ def generate_all_bond_pretraining_datasets(
         d for d in pretraining_root.iterdir()
         if d.is_dir() and d.name not in skip_systems
     )
-    leaf_systems = _collect_leaf_system_dirs(top_dirs)
+    leaf_systems = _collect_leaf_system_dirs(top_dirs, skip_combos=skip_combos)
+
+    if skip_combos:
+        print(f"⚠️  Combo directories ('comb_*') will be SKIPPED to reduce label fragmentation")
 
     print(f"Found {len(leaf_systems)} pretraining systems to process "
           f"(from {len(top_dirs)} top-level directories, bond topology mode)")

@@ -251,20 +251,69 @@ def load_pretrained_deepset(encoder_path, freeze_weights=True):
 
 
 # ---------------------------------------------------------------------------
+# Attention pooling for unified architecture
+# ---------------------------------------------------------------------------
+
+class GlobalAttentionPool(nn.Module):
+    """Learnable attention pooling that discovers salient nodes.
+    
+    Computes a gating network that assigns attention weights to each node,
+    then returns the weighted sum of node embeddings. This allows the model
+    to automatically learn which atoms (active sites) are important and which
+    (core scaffold) can be downweighted.
+    
+    Args:
+        hidden_dim: Dimension of input node embeddings
+    """
+    
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.gate_nn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        # Initialize gate biases toward uniform attention to prevent collapse
+        with torch.no_grad():
+            self.gate_nn[-1].bias.zero_()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Aggregate node embeddings with learned attention weights.
+        
+        Args:
+            x: [num_atoms, hidden_dim] node embeddings
+            
+        Returns:
+            [hidden_dim] weighted-sum aggregated embedding
+        """
+        if x.size(0) == 0:
+            return torch.zeros(x.size(1), device=x.device)
+        
+        gate_logits = self.gate_nn(x)  # [num_atoms, 1]
+        gate_weights = torch.softmax(gate_logits, dim=0)  # [num_atoms, 1]
+        aggregated = (x * gate_weights).sum(dim=0)  # [hidden_dim]
+        return aggregated
+
+
+# ---------------------------------------------------------------------------
 # AtomBondGNN autoencoder (for bond-topology-aware pretraining)
 # ---------------------------------------------------------------------------
 
 class AtomBondGNNAutoencoder(nn.Module):
     """Autoencoder for pretraining AtomBondGNN atom-level embeddings.
 
-    Uses the same layer architecture as :class:`~mllf.cb.deepset.AtomBondGNN`
-    (input projection → GINEConv × 2 → AttentionalAggregation) as the encoder,
-    with a lightweight per-atom decoder (Linear) that reconstructs the full
-    input feature vector from the GINEConv hidden states *before* pooling.
+    Uses a unified graph neural network architecture: all atoms (focus sub + core + 
+    other subs) are processed through a single GINEConv stack. A learnable 
+    GlobalAttentionPool then discovers which atoms (typically the active site) are 
+    most important and downweights the static core scaffold.
+
+    This design is boundary-invariant: identical final ligands with different 
+    sub/core file splits get identical embeddings (up to the learned attention).
+    The contrastive loss uses full-ligand atom composition to enable this invariance,
+    and uniformity loss separates different cores.
 
     Training loss: per-atom MSE reconstruction of input features
-    (AEV + charge + atom-type one-hot; the full ``input_dim``-dimensional
-    vector that was fed into ``input_proj``).
+    (AEV + charge + atom-type one-hot) applied to hidden states *before* pooling.
 
     After training call :meth:`save_encoder` to persist an
     ``AtomBondGNN``-compatible checkpoint.  The decoder weights are
@@ -278,6 +327,7 @@ class AtomBondGNNAutoencoder(nn.Module):
         include_charge: Include partial charge in input features (default: True).
         include_atom_id: Include atom-type one-hot in input features (default: True).
         bond_attr_dim: Dimension of bond-type edge features (default: 1).
+        num_gin_layers: Number of GINEConv layers (default: 4).
     """
 
     def __init__(
@@ -310,7 +360,7 @@ class AtomBondGNNAutoencoder(nn.Module):
             input_dim += num_atom_types
         self.input_dim = input_dim
 
-        # ── Encoder layers (same names as AtomBondGNN for direct state-dict transfer) ──
+        # ── Unified encoder layers (single stream for entire molecule) ──
         def _gin_mlp(in_d: int, out_d: int) -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(in_d, out_d),
@@ -318,35 +368,28 @@ class AtomBondGNNAutoencoder(nn.Module):
                 nn.Linear(out_d, out_d),
             )
 
-        # Substituent stream
-        self.sub_input_proj = nn.Sequential(
+        # Single unified input projection for entire ligand (sub + core + ref subs)
+        self.unified_input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
         )
-        self.sub_gin_layers = nn.ModuleList([
+
+        # Single unified GINEConv stack (messages propagate across entire topology)
+        self.unified_gin_layers = nn.ModuleList([
             GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
             for _ in range(num_gin_layers)
         ])
 
-        # Core stream
-        self.core_input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-        )
-        self.core_gin_layers = nn.ModuleList([
-            GINEConv(_gin_mlp(hidden_dim, hidden_dim), edge_dim=bond_attr_dim)
-            for _ in range(num_gin_layers)
-        ])
+        # Learnable attention pooling (discovers important atoms automatically)
+        self.attention_pool = GlobalAttentionPool(hidden_dim)
 
-        # Hybrid attentional pooling
-        self.gate_nn = nn.Linear(hidden_dim * 2, 1)
-        self.pool_nn = nn.Linear(hidden_dim, embedding_dim)
+        # Final bottleneck projection (hidden → embedding)
+        self.bottleneck = nn.Linear(hidden_dim, embedding_dim)
 
         # Compatibility shim (matches AtomBondGNN attribute)
         self.atom_mlp = nn.Sequential(nn.Linear(hidden_dim, embedding_dim))
 
-        # ── Decoder: shared per-atom reconstruction from hidden states ──
-        # Applied separately to x_sub and x_core; both share the same input_dim target.
+        # ── Decoder: per-atom reconstruction from hidden states ──
         self.decoder = nn.Linear(hidden_dim, input_dim)
 
     # ------------------------------------------------------------------
@@ -372,19 +415,23 @@ class AtomBondGNNAutoencoder(nn.Module):
             parts.append(one_hot)
         return torch.cat(parts, dim=-1)
 
-    def _run_stream(
+    def _unified_forward(
         self,
-        input_proj: nn.Module,
-        gin_layers: nn.ModuleList,
-        aev: torch.Tensor,
+        aev_tensor: torch.Tensor,
         charges: torch.Tensor,
         atom_ids: torch.Tensor,
         bond_edge_index: torch.Tensor,
         bond_edge_attr: torch.Tensor = None,
     ) -> torch.Tensor:
-        """Project → N×(GINEConv + residual), with self-loop fallback when no bonds."""
-        x = input_proj(self._build_input(aev, charges, atom_ids))
-        dev = aev.device
+        """Process entire molecule through unified GINEConv stack.
+        
+        Returns:
+            [N, hidden_dim] hidden node embeddings after message passing
+        """
+        x = self.unified_input_proj(self._build_input(aev_tensor, charges, atom_ids))
+        dev = aev_tensor.device
+        
+        # Ensure bond edge index is valid; use self-loops if needed
         if bond_edge_index is not None and bond_edge_index.size(1) > 0:
             ei = bond_edge_index.to(dev)
             if bond_edge_attr is not None:
@@ -394,62 +441,17 @@ class AtomBondGNNAutoencoder(nn.Module):
             else:
                 ea = torch.zeros(ei.size(1), self.bond_attr_dim, device=dev)
         else:
+            # No bonds: use self-loops only
             n = x.size(0)
             idx = torch.arange(n, device=dev)
             ei = torch.stack([idx, idx])
             ea = torch.zeros(n, self.bond_attr_dim, device=dev)
-        for gin in gin_layers:
+        
+        # Message passing with residual connections
+        for gin in self.unified_gin_layers:
             x = torch.relu(gin(x, ei, ea) + x)
+        
         return x
-
-    def _dual_stream(
-        self,
-        aev_tensor: torch.Tensor,
-        charges: torch.Tensor,
-        atom_ids: torch.Tensor,
-        bond_edge_index: torch.Tensor,
-        bond_edge_attr: torch.Tensor,
-        sub_mask: torch.Tensor,
-    ):
-        """Run dual-stream processing; returns (x_sub, x_core, core_summary, n_sub)."""
-        n_sub = int(sub_mask.sum())
-        core_mask = ~sub_mask
-
-        # Partition edge graph into sub-only and core-only sub-graphs
-        if bond_edge_index is not None and bond_edge_index.size(1) > 0:
-            src, dst = bond_edge_index
-            sub_e   = (src < n_sub) & (dst < n_sub)
-            core_e  = (src >= n_sub) & (dst >= n_sub)
-            sub_ei  = bond_edge_index[:, sub_e]
-            sub_ea  = bond_edge_attr[sub_e]  if bond_edge_attr is not None else None
-            core_ei = bond_edge_index[:, core_e] - n_sub
-            core_ea = bond_edge_attr[core_e] if bond_edge_attr is not None else None
-        else:
-            sub_ei = sub_ea = core_ei = core_ea = None
-
-        x_sub = self._run_stream(
-            self.sub_input_proj, self.sub_gin_layers,
-            aev_tensor[sub_mask],
-            charges[sub_mask]  if charges  is not None else None,
-            atom_ids[sub_mask] if atom_ids is not None else None,
-            sub_ei, sub_ea,
-        )  # [n_sub, H]
-
-        n_core = int(core_mask.sum())
-        if n_core > 0:
-            x_core = self._run_stream(
-                self.core_input_proj, self.core_gin_layers,
-                aev_tensor[core_mask],
-                charges[core_mask]  if charges  is not None else None,
-                atom_ids[core_mask] if atom_ids is not None else None,
-                core_ei, core_ea,
-            )  # [n_core, H]
-            core_summary = x_core.mean(0, keepdim=True).expand(n_sub, -1)
-        else:
-            x_core = torch.zeros(0, self.hidden_dim, device=aev_tensor.device)
-            core_summary = torch.zeros(n_sub, self.hidden_dim, device=aev_tensor.device)
-
-        return x_sub, x_core, core_summary, n_sub
 
     # ------------------------------------------------------------------
     # Forward / encode
@@ -466,43 +468,36 @@ class AtomBondGNNAutoencoder(nn.Module):
     ) -> dict:
         """Autoencoder forward pass (training mode).
 
-        In dual-stream mode (``sub_mask`` provided) the sub and core atoms are
-        processed through their respective GNN streams.  The decoder reconstructs
-        all ligand atoms: sub atoms from ``x_sub`` and core atoms from ``x_core``.
-        The reconstruction output maintains the original atom ordering (sub first).
+        Uses unified GINEConv processing over the entire molecular graph
+        (focus sub + core + other reference subs). The sub_mask parameter
+        is accepted for backward compatibility but ignored; all atoms are 
+        processed together.
 
-        When ``sub_mask`` is ``None`` all atoms are treated as substituent (legacy).
+        Returns:
+            dict with keys:
+                'input': [N, input_dim] original input features
+                'reconstruction': [N, input_dim] reconstructed features
+                'embedding': [embedding_dim] final pooled embedding
         """
         x_in = self._build_input(aev_tensor, charges, atom_ids)  # [N, input_dim]
 
-        if sub_mask is not None:
-            x_sub, x_core, core_summary, n_sub = self._dual_stream(
-                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr, sub_mask
-            )
-            # Reconstruct all atoms: sub decoded from x_sub, core from x_core
-            recon_sub  = self.decoder(x_sub)
-            recon_core = self.decoder(x_core) if x_core.size(0) > 0 else x_core.new_zeros(0, self.input_dim)
-            reconstruction = torch.cat([recon_sub, recon_core], dim=0)  # [N, input_dim]
-        else:
-            # Legacy: single stream
-            n_sub = aev_tensor.size(0)
-            x_sub = self._run_stream(
-                self.sub_input_proj, self.sub_gin_layers,
-                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr,
-            )
-            core_summary = torch.zeros(n_sub, self.hidden_dim, device=aev_tensor.device)
-            reconstruction = self.decoder(x_sub)
+        # Unified forward: process entire molecule
+        x_hidden = self._unified_forward(
+            aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr
+        )  # [N, hidden_dim]
 
-        # Compute embedding here (reusing x_sub/core_summary — no second forward pass)
-        gates    = torch.softmax(self.gate_nn(torch.cat([x_sub, core_summary], dim=-1)), dim=0)
-        features = self.pool_nn(x_sub)
-        embedding = (gates * features).sum(0)  # [embedding_dim]
+        # Reconstruct all atoms from hidden representation
+        reconstruction = self.decoder(x_hidden)  # [N, input_dim]
+
+        # Pool to final embedding via attention
+        aggregated = self.attention_pool(x_hidden)  # [hidden_dim]
+        embedding = self.bottleneck(aggregated)  # [embedding_dim]
 
         return {
-            'input':          x_in,
+            'input': x_in,
             'reconstruction': reconstruction,
-            'sub_mask':       sub_mask,
-            'embedding':      embedding,
+            'sub_mask': sub_mask,  # kept for compatibility, not used
+            'embedding': embedding,
         }
 
     def encode(
@@ -514,22 +509,29 @@ class AtomBondGNNAutoencoder(nn.Module):
         bond_edge_attr: torch.Tensor = None,
         sub_mask: torch.Tensor = None,
     ) -> torch.Tensor:
-        """Encode a substituent to a pooled [embedding_dim] vector (inference)."""
-        if sub_mask is not None:
-            x_sub, _, core_summary, n_sub = self._dual_stream(
-                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr, sub_mask
-            )
-        else:
-            n_sub = aev_tensor.size(0)
-            x_sub = self._run_stream(
-                self.sub_input_proj, self.sub_gin_layers,
-                aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr,
-            )
-            core_summary = torch.zeros(n_sub, self.hidden_dim, device=aev_tensor.device)
+        """Encode a molecule to a pooled [embedding_dim] vector (inference).
+        
+        Args:
+            aev_tensor: [N, 2288] Atomic Environment Vectors
+            charges: [N] or [N, 1] partial charges
+            atom_ids: [N] atom type IDs
+            bond_edge_index: [2, num_bonds] edge indices
+            bond_edge_attr: [num_bonds] or [num_bonds, 1] bond attributes
+            sub_mask: [N] bool mask (accepted for compatibility, ignored)
+            
+        Returns:
+            [embedding_dim] final embedding vector
+        """
+        # Unified forward
+        x_hidden = self._unified_forward(
+            aev_tensor, charges, atom_ids, bond_edge_index, bond_edge_attr
+        )  # [N, hidden_dim]
 
-        gates    = torch.softmax(self.gate_nn(torch.cat([x_sub, core_summary], dim=-1)), dim=0)
-        features = self.pool_nn(x_sub)
-        return (gates * features).sum(0)
+        # Pool and project to embedding
+        aggregated = self.attention_pool(x_hidden)  # [hidden_dim]
+        embedding = self.bottleneck(aggregated)  # [embedding_dim]
+        
+        return embedding
 
     # ------------------------------------------------------------------
     # Checkpoint helpers
