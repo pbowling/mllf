@@ -259,9 +259,11 @@ def compute_pair_reward(
                      Signal: same combined proxy as skew.
 
     For all dimensions: ``-1.0`` when this specific pair was not visited
-    (DDG is None/NaN/Inf), regardless of total transition count.  With 3+
-    substituents per site this correctly penalises edges whose pair was never
-    sampled even when other pairs contributed many transitions.
+    (DDG is None/NaN/Inf) OR when both substituents have zero population
+    (neither was ever sampled by REMD).  With 3+ substituents per site this
+    correctly penalises edges whose pair was never sampled even when other
+    pairs contributed many transitions, and also catches the failure case
+    where the sampling biases failed to explore one or both substituents.
 
     Args:
         edge_index: [2, E] node-index tensor.
@@ -293,18 +295,23 @@ def compute_pair_reward(
         hi = max(src + block_offset, dst + block_offset)
         entry = ddg_pairs.get(f"{lo}_{hi}")
 
+        # Fetch populations for this edge
+        pop_i = populations[src] if src < len(populations) else 0
+        pop_j = populations[dst] if dst < len(populations) else 0
+
         # Per-pair DDG existence: True only when THIS pair was never visited.
         # With 3+ subs, total_transitions may be non-zero while this specific
         # pair has no DDG — the per-pair check catches that correctly.
+        # Also check for zero populations: if both subs were never sampled,
+        # this pair couldn't possibly have been visited (DDG=None).
         no_crossing = (
             entry is None
             or (isinstance(entry, float) and (math.isinf(entry) or math.isnan(entry)))
+            or (pop_i == 0 and pop_j == 0)  # Both subs never sampled = failure
         )
         if no_crossing:
             rewards[k, :] = -1.0
         else:
-            pop_i = populations[src] if src < len(populations) else 0
-            pop_j = populations[dst] if dst < len(populations) else 0
             minority_frac = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)
 
             # Quadratic: tandem of per-pair visited binary (1.0, since we are

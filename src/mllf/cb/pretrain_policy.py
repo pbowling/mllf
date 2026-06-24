@@ -10,12 +10,6 @@ different from REINFORCE training:
 - Filter data to use only the best runs (highest rewards per system)
 - Requires 50-100 epochs for convergence
 
-**Key Differences from run_workflow.py:**
-- No REINFORCE: Uses supervised MSE loss instead of policy gradients
-- No new simulations run: Learns from historical bias coefficients
-- Uses only best runs: Filters for highest-reward runs per system
-- Multiple epochs needed: Not deterministic - gradient descent on MSE
-
 **Data Requirements:**
 - Must have bias coefficient matrices (c, x, s, b) in variables.py
 - Must have simulation results to compute rewards for filtering
@@ -50,17 +44,124 @@ import torch.optim as optim
 import numpy as np
 from torch_geometric.data import Data
 
-from mllf.cb.policy import SitePoolMLPPolicy
+from mllf.cb.policy import UnimolPolicy
+from mllf.file_handling.read_pdb import parse_pdb_file
+
+
+# ── Uni-Mol embedding computation for pretraining ────────────────────────────
+
+def _compute_unimol_embeddings_and_edges(run_dir: Path, graph_info_path: Path) -> tuple:
+    """Compute Uni-Mol 512D embeddings for all substituents in a run.
+    
+    Uses intelligent environment loading with fallback chain (minimized.pdb preferred,
+    with automatic ligand atom filtering; falls back to individual protein/solvent files).
+    
+    Returns:
+        (unimol_embeddings [N, 512], edge_index [2, E], nsubs_per_site)
+        where N = total substituents, E = directed pairs within sites
+    """
+    import json
+    from mllf.cb.unimol_representation import (
+        get_substituent_unimol_with_environment,
+    )
+    from mllf.cb.graph_utils import build_directed_pairs
+    
+    # Load graph_info to get site structure
+    with open(graph_info_path) as f:
+        graph_info = json.load(f)
+    
+    sites = graph_info.get("sites", {})
+    
+    # Get nsubs_per_site from graph_info if available (preferred)
+    nsubs_per_site = graph_info.get('nsubs_per_site', None)
+    
+    if nsubs_per_site is None:
+        # Reconstruct from sites structure: count subs per site
+        # Sites can be keyed as "site1_sub1" or as "1" with "subs" list
+        from collections import defaultdict
+        site_sub_counts = defaultdict(int)
+        for site_key, site_info in sites.items():
+            site_id = site_info.get("site")
+            if site_id is not None:
+                site_sub_counts[site_id] += 1
+        if site_sub_counts:
+            nsubs_per_site = [site_sub_counts[s] for s in sorted(site_sub_counts.keys())]
+        else:
+            raise ValueError(f"Could not determine nsubs_per_site from {graph_info_path}")
+    
+    n_nodes = sum(nsubs_per_site)
+    
+    # Build mapping from (site_id, sub_id) to global node index
+    # Iterate through sites and map each (site, sub) to its position
+    sub_to_global_idx = {}
+    global_idx = 0
+    for site_id in sorted(set(site_info["site"] for site_info in sites.values())):
+        subs_for_site = sorted([
+            site_info["sub"]
+            for site_info in sites.values()
+            if site_info["site"] == site_id
+        ])
+        for local_idx, sub_id in enumerate(subs_for_site):
+            sub_to_global_idx[(site_id, sub_id)] = global_idx
+            global_idx += 1
+    
+    # Compute Uni-Mol embeddings for each substituent
+    prep_dir = run_dir.parent / "prep"
+    if not prep_dir.is_dir():
+        raise FileNotFoundError(f"Prep dir not found: {prep_dir}")
+    
+    unimol_embeddings = torch.zeros((n_nodes, 512), dtype=torch.float32)
+    
+    # Read core PDB once (needed for environment loading)
+    core_pdb = prep_dir / "core.pdb"
+    if not core_pdb.exists():
+        raise FileNotFoundError(f"Core PDB not found: {core_pdb}")
+    
+    # Compute embedding for each substituent with environment context
+    for site_key, site_info in sites.items():
+        site_id = site_info.get("site")
+        sub_id = site_info.get("sub")
+        
+        if site_id is None or sub_id is None:
+            continue
+        
+        try:
+            sub_pdb = prep_dir / f"site{site_id}_sub{sub_id}_frag.pdb"
+            if not sub_pdb.exists():
+                print(f"  Warning: Sub PDB not found: {sub_pdb}, using zeros")
+                continue
+            
+            # Get 512D Uni-Mol embedding with full environment context
+            emb = get_substituent_unimol_with_environment(
+                sub_pdb=str(sub_pdb),
+                core_pdb=str(core_pdb),
+                prep_dir=prep_dir,
+                env_cutoff=5.0,
+                atom_limit=256,
+            )
+            global_idx = sub_to_global_idx[(site_id, sub_id)]
+            unimol_embeddings[global_idx] = torch.from_numpy(emb).float()
+            
+        except Exception as e:
+            print(f"  Warning: Could not compute embedding for site{site_id}_sub{sub_id}: {e}")
+    
+    # Build edge_index for all directed pairs within each site
+    pairs = build_directed_pairs(nsubs_per_site)
+    src_list = [p[0] for p in pairs]
+    dst_list = [p[1] for p in pairs]
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    
+    return unimol_embeddings, edge_index, nsubs_per_site
 
 
 # ── per-system graph cache helpers ──────────────────────────────────────────
 
 def _build_graph_structure(prep_dir: str, graph_info_path: Path,
                            toppar_dir, toppar_files, warn_missing_types,
-                           deepset_model, solvent_state) -> tuple:
+                           solvent_state) -> tuple:
     """Build the *structure-only* part of a pretraining graph (node features + edges).
 
-    This is the expensive step (DeepSet AEV computation).  All runs that share
+    This is the expensive step.  All runs that share
     the same prep directory will produce an identical structure, so we call this
     once per prep_dir and reuse the result for every run in that group.
 
@@ -79,14 +180,10 @@ def _build_graph_structure(prep_dir: str, graph_info_path: Path,
     g = Graph.from_graph_info(graph_info)
 
     rtf_results = None
-    if deepset_model is not None and prep_dir is not None:
-        from mllf.file_handling.read_rtf import parse_rtf_dir
-        rtf_results = parse_rtf_dir(prep_dir)
 
     data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
         g, toppar_dir=toppar_dir, toppar_files=toppar_files,
         warn_missing_types=warn_missing_types,
-        deepset_model=deepset_model,
         pdb_dir=prep_dir,
         pdb_pattern='site{site}_sub{sub}_frag.pdb',
         rtf_results=rtf_results,
@@ -147,6 +244,9 @@ def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
     This is cheap (pure Python, no AEV computation).  Call once per run after
     the shared graph structure has been built via ``_build_graph_structure``.
 
+    For UnimolPolicy, each edge gets ONE target row with 4 values: [linear, quadratic, skew, end].
+    This matches the policy architecture where each edge produces 4 bias predictions.
+
     Returns a list of [linear, quadratic, skew, end] targets (one per directed
     edge), or None if the variables file cannot be parsed, is missing, or the
     bias matrix size does not match nsubs_per_site.
@@ -186,23 +286,22 @@ def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         c_matrix = np.array(bias_data['c'], dtype=float)
         x_matrix = np.array(bias_data['x'], dtype=float)
         s_matrix = np.array(bias_data['s'], dtype=float)
+        
         targets = []
         for (i, j) in pairs:
             linear    = float(b_vector[j] - b_vector[i])
-            quadratic = float(c_matrix[i, j]) if i < j else -float(c_matrix[j, i])
+            quadratic = float(c_matrix[i, j]) if i < j else float(c_matrix[j, i])
             skew      = float(x_matrix[i, j])
             end       = float(s_matrix[i, j])
-            targets.append([linear,    0.0, 0.0, 0.0])
-            targets.append([0.0, quadratic, 0.0, 0.0])
-            targets.append([0.0,       0.0, skew, 0.0])
-            targets.append([0.0,       0.0, 0.0,  end])
+            # One row per edge with all 4 bias types (matches UnimolPolicy output)
+            targets.append([linear, quadratic, skew, end])
         return targets
     except Exception:
         return None
 
 
 def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None,
-                                                 warn_missing_types=True, deepset_model=None,
+                                                 warn_missing_types=True,
                                                  pdb_dir=None, prep_dir=None, solvent_state=None,
                                                  pdb_pattern='site{site}_sub{sub}_frag.pdb'):
     """Build fully-connected PyG graph for pretraining from saved variables.py.
@@ -228,9 +327,7 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
-        deepset_model: Optional PretrainedDeepSet model for 3D structural node features.
-            When provided, node features are DeepSet embeddings instead of atom-type encodings.
-        pdb_dir: Directory containing _frag.pdb files (required when deepset_model is provided).
+        pdb_dir: Directory containing _frag.pdb files (required to construct Uni-Mol representations).
         prep_dir: Prep directory for MIC/context-aware AEV computation (usually same as pdb_dir).
         solvent_state: Environment type ('gas'/'vacuum', 'protein', 'solvent'/'water').
         pdb_pattern: Filename pattern for substituent PDB files (default: site{site}_sub{sub}_frag.pdb).
@@ -260,18 +357,9 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     from mllf.cb.graph import Graph
     g = Graph.from_graph_info(graph_info)
     
-    # Build node features (standard or DeepSet embedding mode)
-    # When using DeepSet, load RTF results from the prep directory so that
-    # partial charges are available for AEV feature construction.
-    rtf_results = None
-    if deepset_model is not None and pdb_dir is not None:
-        from mllf.file_handling.read_rtf import parse_rtf_dir
-        rtf_results = parse_rtf_dir(pdb_dir)
-
     data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
         g, toppar_dir=toppar_dir, toppar_files=toppar_files,
         warn_missing_types=warn_missing_types,
-        deepset_model=deepset_model,
         pdb_dir=pdb_dir,
         pdb_pattern=pdb_pattern,
         rtf_results=rtf_results,
@@ -405,13 +493,13 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         # This naturally gives antisymmetric values: linear_ji = b[i] - b[j] = -linear_ij
         linear = float(b_vector[j] - b_vector[i])
         
-        # Quadratic: Antisymmetric, only upper triangle stored
+        # Quadratic: Symmetric, only upper triangle stored
         # If i < j: use c[i,j] directly
-        # If i > j: use -c[j,i] (negate the opposite direction)
+        # If i > j: use c[j,i] (use the opposite direction)
         if i < j:
             quadratic = float(c_matrix[i, j])
         else:
-            quadratic = -float(c_matrix[j, i])
+            quadratic = float(c_matrix[j, i])
         
         # Skew and End: NOT antisymmetric, both directions stored independently
         skew = float(x_matrix[i, j])
@@ -1429,27 +1517,22 @@ def pretrain_epoch(
     toppar_dir=None,
     toppar_files=None,
     warn_missing_types=True,
-    deepset_model=None,
     graph_cache: Optional[List] = None,
     groups: Optional[Dict] = None,
     reward_weighted: bool = False,
     awr_temperature: float = 0.5,
 ) -> Dict[str, float]:
-    """Run one behavior cloning AWR epoch for SitePoolMLPPolicy.
+    """Run one behavior cloning AWR epoch for UnimolPolicy.
 
     Args:
-        policy: SitePoolMLPPolicy to train
+        policy: UnimolPolicy to train
         optimizer: Optimizer
         runs: List of pretraining run dicts (should be best runs only)
         reward_config: Reward function configuration (used for reward-weighted loss)
         device: Device for computation
-        toppar_dir: Path to toppar directory (None uses package default)
-        toppar_files: List of specific toppar filenames to include
-        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
-        deepset_model: Frozen PretrainedDeepSet model used to compute 64-dim P1 node features
-                       from 3D atomic structure + AEVs.
-        reward_weighted: If True, weight each run's loss by its pre-computed normalised
-                        reward (stored in run["_bc_reward"]).  Zero-weight runs are skipped.
+        graph_cache: Cached Uni-Mol embeddings and targets
+        groups: Group mapping for gradient accumulation (optional)
+        reward_weighted: If True, weight each run's loss by its reward
 
     Returns:
         Dict with epoch statistics
@@ -1457,15 +1540,14 @@ def pretrain_epoch(
     policy.train()
 
     # Build normalised reward weights (mean = 1.0) so the learning rate is unchanged.
-    # Weights are pre-computed by pretrain_with_runs and stored in run["_bc_reward"].
     if reward_weighted:
         raw_w = [max(0.0, run.get("_bc_reward", 0.0)) for run in runs]
         total_w = sum(raw_w)
         if total_w > 1e-10:
             n_runs = len(runs)
-            norm_weights = [w * n_runs / total_w for w in raw_w]  # mean weight == 1.0
+            norm_weights = [w * n_runs / total_w for w in raw_w]
         else:
-            reward_weighted = False  # all rewards zero — fall back to uniform
+            reward_weighted = False
             norm_weights = None
     else:
         norm_weights = None
@@ -1475,10 +1557,7 @@ def pretrain_epoch(
     total_runs = 0
 
     if groups is not None and graph_cache is not None:
-        # ── Per-graph gradient accumulation (one optimizer step per unique graph structure) ───
-        # All runs sharing the same prep_dir produce identical RGCN inputs; accumulating their
-        # gradients before stepping gives the RGCN the mean signal across the coefficient
-        # distribution for that graph rather than contradictory sequential updates.
+        # Per-group gradient accumulation (one step per unique Uni-Mol embedding set)
         for group_key, group_indices in groups.items():
             valid = [
                 (i, norm_weights[i] if norm_weights is not None else 1.0)
@@ -1491,31 +1570,35 @@ def pretrain_epoch(
             n_valid = len(valid)
             optimizer.zero_grad()
             group_loss = 0.0
+            
             for run_idx, rw in valid:
-                data_cpu, targets_list = graph_cache[run_idx]
-                data = data_cpu.to(device)
+                unimol_emb, edge_idx, targets_list = graph_cache[run_idx]
                 targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
-                if isinstance(policy, SitePoolMLPPolicy):
-                    mean, log_std = policy._forward_edges(
-                        data.x, data.edge_index, data.edge_attr,
-                        getattr(data, 'site_index', None),
-                        getattr(data, 'edge_type', None),
-                    )
+                
+                # Move embeddings and edge_index to device
+                unimol_emb = unimol_emb.to(device)
+                edge_idx = edge_idx.to(device)
+                
+                # Forward pass through UnimolPolicy
+                mean, log_std = policy._forward_edges(unimol_emb, edge_idx)
+                
                 active_mask = targets.abs() > 1e-8
                 if not active_mask.any():
                     continue
-                # AWR loss: -exp(r/β) · log π(a | s) over active elements.
-                # exp(r/β) amplifies gradient from high-reward expert trajectories.
+                
+                # AWR loss: -exp(r/β) · log π(a | s) over active elements
                 std = torch.exp(log_std)
                 logp_per = torch.distributions.Normal(mean, std).log_prob(targets)  # [E, D]
                 raw_r = runs[run_idx].get("_bc_reward", 0.0)
                 awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
-                # Divide by group size so the effective loss = per-run mean (not sum)
+                
+                # Divide by group size for normalization
                 run_loss = -awr_w * logp_per[active_mask].mean() / n_valid
                 if torch.isnan(run_loss) or torch.isinf(run_loss):
                     continue
                 run_loss.backward()
                 group_loss += run_loss.item()
+            
             if group_loss > 0.0:
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -1523,119 +1606,70 @@ def pretrain_epoch(
                 num_updates += 1
                 total_runs += n_valid
             else:
-                optimizer.zero_grad()  # release any partially accumulated gradients
+                optimizer.zero_grad()
+        
         avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
         return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates}
 
-    # ── Legacy per-run updates (backward-compatible; used when graph_cache is None) ─────────
+    # Legacy per-run updates (when graph_cache provided but groups not)
     for run_idx, run in enumerate(runs):
-        # Skip zero-weight runs before any I/O or forward pass
         rw = norm_weights[run_idx] if norm_weights is not None else 1.0
         if rw < 1e-8:
             continue
 
-        run_dir = run["run_dir"]
-
         if graph_cache is not None:
-            # Use pre-built cached graph — skip all file I/O and AEV computation
             cached = graph_cache[run_idx]
             if cached is None:
                 continue
-            data_cpu, targets_list = cached
-            data    = data_cpu.to(device)
+            unimol_emb, edge_idx, targets_list = cached
             targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
         else:
-            # Resolve prep directory for DeepSet AEV computation
-            pdb_dir = None
-            prep_dir = None
-            solvent_state = None
-            if deepset_model is not None:
-                source_dir = run.get("source_dir")
-                if source_dir:
-                    candidate = Path(source_dir) / "prep"
-                    if candidate.is_dir():
-                        pdb_dir = str(candidate)
-                        prep_dir = pdb_dir
-                # Fallback: prep may be at the combo level (parent of run_dir)
-                if pdb_dir is None:
-                    candidate = run_dir.parent / "prep"
-                    if candidate.is_dir():
-                        pdb_dir = str(candidate)
-                        prep_dir = pdb_dir
-                solvent_state = run.get("metadata", {}).get("solvent_state")
-
-            # Build graph from saved data AND get target coefficients
+            # Fallback: compute embeddings on-the-fly (slow)
+            run_dir = Path(run["run_dir"])
+            gi_path = run_dir / "graph_info.json"
             try:
-                data, targets, extras = build_fully_connected_graph_for_pretraining(
-                    run_dir,
-                    toppar_dir=toppar_dir,
-                    toppar_files=toppar_files,
-                    warn_missing_types=warn_missing_types,
-                    deepset_model=deepset_model,
-                    pdb_dir=pdb_dir,
-                    prep_dir=prep_dir,
-                    solvent_state=solvent_state,
+                unimol_emb, edge_idx, nsubs_per_site = _compute_unimol_embeddings_and_edges(
+                    run_dir, gi_path
                 )
-
-                data = data.to(device)
-
-                if targets is None or len(targets) == 0:
-                    print(f"  Warning: No target coefficients for {run_dir.name}, skipping")
+                from mllf.cb.graph_utils import build_directed_pairs
+                pairs = build_directed_pairs(nsubs_per_site)
+                targets_list = _extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
+                if not targets_list:
                     continue
-
-                targets = torch.tensor(targets, dtype=torch.float32, device=device)
-
+                targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
             except Exception as e:
-                print(f"  Error building graph for {run_dir.name}: {e}")
+                print(f"  Error computing Uni-Mol embeddings for {run_dir.name}: {e}")
                 continue
+
+        # Move to device
+        unimol_emb = unimol_emb.to(device)
+        edge_idx = edge_idx.to(device)
         
-        # Compute mean and log_std for AWR loss
-        mean, log_std = policy._forward_edges(
-            data.x, data.edge_index, data.edge_attr,
-            getattr(data, 'site_index', None),
-            getattr(data, 'edge_type', None),
-        )
+        # Forward pass
+        mean, log_std = policy._forward_edges(unimol_emb, edge_idx)
         
-        # AWR loss: -exp(r/β) · log π(a | s) over active elements.
-        active_mask = targets.abs() > 1e-8            # [E, 4], one True per row
-        if active_mask.any():
-            std = torch.exp(log_std)
-            logp_per = torch.distributions.Normal(mean, std).log_prob(targets)  # [E, 4]
-            raw_r = run.get("_bc_reward", 0.0)
-            awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
-            run_loss = -awr_w * logp_per[active_mask].mean()
-        else:
-            run_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        
-        # Check for NaN/inf
-        if torch.isnan(run_loss) or torch.isinf(run_loss):
-            print(f"  Warning: NaN/inf loss for {run['run_dir'].name}, skipping")
+        active_mask = targets.abs() > 1e-8
+        if not active_mask.any():
             continue
         
-        # Update
+        # Compute AWR loss
         optimizer.zero_grad()
-        run_loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-        optimizer.step()
+        std = torch.exp(log_std)
+        logp_per = torch.distributions.Normal(mean, std).log_prob(targets)
+        raw_r = run.get("_bc_reward", 0.0)
+        awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
+        loss = -awr_w * logp_per[active_mask].mean()
         
-        epoch_loss += run_loss.item()
-        num_updates += 1
-        
-        # Log high losses with run information
-        if run_loss.item() > 500.0:
-            run_name = f"{run_dir.parent.name}/{run_dir.name}"
-            print(f"  ⚠️  HIGH LOSS: Run {run_idx+1}/{len(runs)} ({run_name}): loss={run_loss.item():.2f}")
-        
-        if (run_idx + 1) % 10 == 0:
-            avg_loss = epoch_loss / num_updates
-            print(f"  Run {run_idx+1}/{len(runs)}: loss={run_loss.item():.4f}, avg_loss={avg_loss:.4f}")
-    
+        if not (torch.isnan(loss) or torch.isinf(loss)):
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+            optimizer.step()
+            epoch_loss += loss.item()
+            num_updates += 1
+            total_runs += 1
+
     avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
-    
-    return {
-        'loss': avg_loss,
-        'num_runs': num_updates,
-    }
+    return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates}
 
 
 def _extract_highest_lambda_counts(populations) -> list:
@@ -1684,131 +1718,6 @@ def _extract_highest_lambda_counts(populations) -> list:
     return result
 
 
-def warmup_q_network(
-    runs: List[Dict],
-    policy: nn.Module,
-    q_network: nn.Module,
-    q_optimizer: optim.Optimizer,
-    epochs: int,
-    device: torch.device,
-    graph_cache: List,
-    epoch_groups: Dict[str, List[int]],
-) -> List[Dict]:
-    """Train QNetwork on historical pair rewards with the policy frozen.
-
-    For each unique graph structure (group), accumulates MSE loss between
-    the Q-network's per-edge predictions and the pair rewards computed from
-    each run's simulation_results.json, then takes one gradient step per group.
-
-    The Q-network learns to predict ``R_pair(i,j)`` from the same 200D edge
-    representation used by the actor: ``[P1_src, P2_src, P1_dst, P2_dst, edge_type]``.
-
-    Args:
-        runs: Pretraining run dicts (must contain ``sim_results`` with ``ddg_pairs``
-              and ``populations`` keys populated by ``backfill_ddg_pairs``).
-        policy: SitePoolMLPPolicy used only for building edge inputs.
-        q_network: QNetwork to train.
-        q_optimizer: Optimizer for q_network.
-        epochs: Number of warmup epochs.
-        device: Compute device.
-        graph_cache: Pre-built graph cache from pretrain_with_runs.
-        epoch_groups: Mapping group_key → [run_idx, ...] from pretrain_with_runs.
-
-    Returns:
-        List of per-epoch statistics dicts with key ``'q_loss'``.
-    """
-    import torch.nn.functional as F
-    from mllf.cb.workflow_utils import compute_pair_reward
-
-    # Freeze policy — Q warmup must not update RGCN or MLP weights
-    policy.requires_grad_(False)
-    q_network.train()
-
-    print(f"\n{'='*60}")
-    print(f"Q-network warmup ({epochs} epochs)")
-    print(f"{'='*60}")
-
-    history: List[Dict] = []
-
-    for epoch in range(1, epochs + 1):
-        total_loss = 0.0
-        num_updates = 0
-
-        for group_key, group_indices in epoch_groups.items():
-            # Only use runs that have pair reward data AND a valid cached graph
-            valid = []
-            for run_idx in group_indices:
-                if graph_cache[run_idx] is None:
-                    continue
-                sim = runs[run_idx].get('sim_results', {})
-                ddg_pairs = sim.get('ddg_pairs', {})
-                populations = _extract_highest_lambda_counts(sim.get('populations', []))
-                if not ddg_pairs or not populations:
-                    continue
-                valid.append((run_idx, ddg_pairs, populations))
-
-            if not valid:
-                continue
-
-            n_valid = len(valid)
-            q_optimizer.zero_grad()
-            group_loss = 0.0
-
-            for run_idx, ddg_pairs, populations in valid:
-                data_cpu, _ = graph_cache[run_idx]
-                data = data_cpu.to(device)
-
-                # Build edge inputs and sample actions from frozen policy
-                with torch.no_grad():
-                    if isinstance(policy, SitePoolMLPPolicy):
-                        _site_idx = getattr(data, 'site_index', None)
-                        edge_inp = policy._build_edge_inputs(
-                            data.x, data.edge_index, data.edge_attr, _site_idx
-                        )
-                        actions, _, _, _ = policy.get_actions(
-                            data.x, data.edge_index, None, data.edge_attr,
-                            site_index=_site_idx,
-                        )
-                    else:
-                        p2_emb = policy.encoder(data.x, data.edge_index, data.edge_type)
-                        p1_for_skip = data.x if policy.p1_dim > 0 else None
-                        edge_inp = policy.edge_inputs(
-                            p2_emb, data.edge_index, data.edge_attr, p1_for_skip
-                        )
-                        # Sample actions (bias coefficients) so Q sees Q(s, a)
-                        actions, _, _, _ = policy.get_actions(
-                            data.x, data.edge_index, data.edge_type, data.edge_attr
-                        )
-
-                # Per-edge pair reward from this run's simulation
-                r_pair = compute_pair_reward(
-                    data.edge_index, ddg_pairs, populations
-                ).to(device)  # [E]
-
-                q_pred = q_network(edge_inp, actions)  # [E]
-                loss = F.mse_loss(q_pred, r_pair) / n_valid
-
-                if not (torch.isnan(loss) or torch.isinf(loss)):
-                    loss.backward()
-                    group_loss += loss.item()
-
-            if group_loss > 0.0:
-                torch.nn.utils.clip_grad_norm_(q_network.parameters(), max_norm=1.0)
-                q_optimizer.step()
-                total_loss += group_loss
-                num_updates += 1
-            else:
-                q_optimizer.zero_grad()
-
-        avg_loss = total_loss / num_updates if num_updates > 0 else 0.0
-        history.append({'epoch': epoch, 'q_loss': avg_loss})
-        print(f"  Q epoch {epoch}/{epochs}: loss={avg_loss:.6f}")
-
-    # Unfreeze policy after warmup
-    policy.requires_grad_(True)
-    return history
-
-
 def pretrain(
     pretraining_dir: Path,
     output_dir: Path,
@@ -1850,7 +1759,6 @@ def pretrain_with_runs(
     min_reward_threshold: Optional[float] = None,
     min_transitions: Optional[int] = None,
     stratified_negative_fraction: Optional[float] = None,
-    deepset_model=None,
     patience: int = 10,
     reward_weighted: bool = False,
     freeze_encoder_after: Optional[int] = None,
@@ -1879,9 +1787,6 @@ def pretrain_with_runs(
                             sample this fraction from each negative-reward bucket
                             ((-inf,-50], (-50,-40], ..., (-10,0)).  Applied instead of
                             min_reward_threshold when both are specified.
-        deepset_model: Optional PretrainedDeepSet for 3D atomic node features. When provided,
-                      the RGCN in_dim is set to deepset_model.embedding_dim (64) rather than
-                      the standard atom-type encoding dimension.
         patience: Early stopping patience (default: 10). Training stops if the MSE loss
                   does not improve for this many consecutive epochs.
         reward_weighted: If True, weight each run's MSE loss by its reward (clamped >= 0
@@ -1904,8 +1809,6 @@ def pretrain_with_runs(
         return
 
     # Snapshot the full run pool before any BC-specific selection.
-    # Used by Q warmup when q_stratified_fraction is set so the Q-critic
-    # can draw from the broader reward distribution rather than best-only.
     all_runs_unfiltered = list(runs)
 
     # Optionally filter to keep only best run per system for behavior cloning
@@ -1971,74 +1874,47 @@ def pretrain_with_runs(
     toppar_files = vocab_config.get('toppar_files')
     warn_missing_types = vocab_config.get('warn_missing_types', True)
     
-    # Get a sample run to infer graph schema (num_relations, relation_names, edge_attr_dim).
-    # Uses build_fully_connected_graph_for_pretraining so the schema matches training exactly.
-    sample_data = None
-    sample_extras = None
-    for run in runs:
-        try:
-            _run_dir = run["run_dir"]
-            _prep = None
-            _local = Path(_run_dir).parent / "prep"
-            if _local.is_dir():
-                _prep = str(_local)
-            if _prep is None:
-                _src = run.get("source_dir")
-                if _src:
-                    _cand = Path(_src) / "prep"
-                    if _cand.is_dir():
-                        _prep = str(_cand)
-            if _prep is None:
-                continue
-            _solvent = run.get("metadata", {}).get("solvent_state")
-            data, _, extras = build_fully_connected_graph_for_pretraining(
-                _run_dir,
-                toppar_dir=toppar_dir,
-                toppar_files=toppar_files,
-                warn_missing_types=warn_missing_types,
-                deepset_model=deepset_model,
-                pdb_dir=_prep,
-                prep_dir=_prep,
-                solvent_state=_solvent,
-            )
-            if data.edge_index.size(1) > 0:
-                sample_data = data
-                sample_extras = extras
-                break
-        except Exception:
-            continue
+    # For Uni-Mol pretraining, schema is fixed: 4 bias types (linear, quadratic, skew, end)
+    # with 2 directions each = 8 relations. We don't need to build a sample graph.
+    # (Unlike the old approach which required toppar files and node features.)
     
-    if sample_data is None:
-        print("Error: Could not find a valid graph with edges")
-        return
-
-    # When using DeepSet, node features are embedding_dim-dimensional regardless
-    # of what the standard graph builder returns.
-    node_feat_dim = (
-        deepset_model.embedding_dim if deepset_model is not None
-        else sample_data.x.size(1)
-    )
-    if deepset_model is not None:
-        print(f"\nDeepSet mode: node features = {node_feat_dim}-dim embeddings "
-              f"(replaced standard {sample_data.x.size(1)}-dim atom-type encoding)")
+    relation_names = [
+        'linear_ij', 'linear_ji',
+        'quadratic_ij', 'quadratic_ji',
+        'skew_ij', 'skew_ji',
+        'end_ij', 'end_ji',
+    ]
+    base_relation_map = {
+        'linear': 0, 'quadratic': 1, 'skew': 2, 'end': 3
+    }
     
-    # Create model using config (same as workflow)
+    sample_extras = {
+        'relation_names': relation_names,
+        'base_relation_map': base_relation_map,
+    }
+    
+    print(f"\nSchema for Uni-Mol pretraining:")
+    print(f"  Bias types: 4 (linear, quadratic, skew, end)")
+    print(f"  Relations: {len(relation_names)} (2 directions per type)")
+    print(f"  Relation names: {relation_names}")
+    
+    # Create policy using Uni-Mol representations only
+    # (AtomBondGNN and site pooling are not used)
+    from mllf.cb.policy import UnimolPolicy
+    
     train_config = config.get('training', {})
-    encoder_config = train_config.get('encoder', {})
-    policy_config = train_config.get('policy', {})
-
-    # Determine policy type: only 'sitepool' is supported.
-    policy_type = policy_config.get('type', 'sitepool')
-    if policy_type != 'sitepool':
-        raise ValueError(f"Only 'sitepool' policy type is supported for pretraining. Got: {policy_type!r}")
-
-    edge_attr_dim = sample_data.edge_attr.size(1) if sample_data.edge_attr is not None else 8
-    policy = SitePoolMLPPolicy(
-        p1_dim=node_feat_dim,
-        edge_attr_dim=edge_attr_dim,
+    policy_config = train_config.get('unimol', {})
+    
+    policy = UnimolPolicy(
+        unimol_dim=policy_config.get('unimol_dim', 512),
         mlp_hidden=policy_config.get('mlp_hidden', 64),
         mlp_out_dim=len(sample_extras['relation_names']) // 2,
     ).to(device)
+    
+    print(f"\nModel architecture:")
+    print(f"  Policy: UnimolPolicy (pre-computed Uni-Mol 512D embeddings)")
+    print(f"  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
+    print(f"  Total parameters: {sum(p.numel() for p in policy.parameters())}")
     
     # Optimizer: cosine-annealed Adam over all policy parameters.
     optimizer = optim.Adam(
@@ -2052,9 +1928,7 @@ def pretrain_with_runs(
     active_opt = optimizer
     active_sched = scheduler
 
-    print(f"\nModel architecture:")
-    print(f"  Policy (sitepool): {sum(p.numel() for p in policy.parameters())} params")
-    print(f"  LR schedule: cosine annealing, {learning_rate} → {learning_rate/100:.6f} over {epochs} epochs")
+    print(f"  Learning rate: {learning_rate} (cosine annealed to {learning_rate/100:.6f})")
     print(f"  Early stopping patience: {patience} epochs")
     print(f"  Graph caching: all {len(runs)} graphs pre-built once, reused across all epochs")
 
@@ -2089,104 +1963,113 @@ def pretrain_with_runs(
     warnings.showwarning = _collect_warning
 
     # ------------------------------------------------------------------
-    # Pre-build all graphs once (serially) and cache them.
-    # Graph building (file IO + AEV computation) dominates per-epoch time;
-    # caching eliminates it from epochs 2 onward — the primary benefit.
-    # Building in parallel via ThreadPoolExecutor was benchmarked and found
-    # to be no faster: AEV computation is CPU-bound and PyTorch already
-    # saturates all available cores per build, so multiple workers just
-    # contend for the same threads.
+    # Pre-build per-system Uni-Mol graphs (shared across all runs from that system).
+    # All runs from the same system (prep directory) have identical substitutent
+    # coordinates, so Uni-Mol embeddings and edge indices are identical.
+    # Only the targets differ per run (different variables.py).
     # ------------------------------------------------------------------
     print(f"\n{'='*60}")
-    print(f"Pre-building {len(runs)} graphs (serial)...")
+    print(f"Grouping {len(runs)} runs by system and building per-system graphs...")
     print(f"{'='*60}")
 
-    graph_cache = [None] * len(runs)
-
-    # Caches (group_key → (struct_data, nsubs_per_site, pairs)) for reuse
-    # when Q warmup uses a different run set that shares the same structures.
-    struct_meta_cache: dict = {}
-
-    # Group run indices by their resolved prep_dir so the expensive graph
-    # structure (DeepSet AEVs + topology) is built once per unique structure.
-    # All runs in the same dataset/combo dir share the same prep/ and thus
-    # produce identical node features; only the target coefficients differ.
-    from collections import defaultdict as _dd
-    groups = _dd(list)   # group_key -> [(global_idx, run)]
-    for idx, run in enumerate(runs):
-        _run_dir = run["run_dir"]
-        if deepset_model is not None:
-            # Check local prep first (most reliable — always present after copy_prep_to_local.py).
-            # This ensures all runs in the same pretraining system directory share one
-            # graph-structure build regardless of whether external source paths exist.
-            _pdir = None
-            _local = Path(_run_dir).parent / "prep"
-            if _local.is_dir():
-                _pdir = str(_local)
-            if _pdir is None:
-                # Fall back to source_dir/prep (e.g. combo comb_*/prep)
-                _src = run.get("source_dir")
-                if _src:
-                    _cand = Path(_src) / "prep"
-                    if _cand.is_dir():
-                        _pdir = str(_cand)
-            group_key = _pdir if _pdir else str(_run_dir)
-        else:
-            group_key = str(_run_dir)   # no sharing without DeepSet
-        groups[group_key].append((idx, run))
-
-    n_unique = len(groups)
-    n_ok = n_fail = 0
-    done = 0
-    print(f"  {len(runs)} runs => {n_unique} unique graph structures")
-
-    for struct_num, (group_key, group_runs) in enumerate(groups.items(), 1):
-        first_run_dir = group_runs[0][1]["run_dir"]
-        gi_path = first_run_dir / "graph_info.json"
-        if not gi_path.exists():
-            for gidx, _ in group_runs:
-                n_fail += 1
-                done += 1
-            continue
-
-        prep_for_build = (group_key
-                          if (deepset_model is not None and group_key != str(first_run_dir))
-                          else None)
-        _solvent = group_runs[0][1].get("metadata", {}).get("solvent_state")
-
-        if use_fully_connected:
-            try:
-                struct_data, _extras, _nsubs, _pairs = _build_graph_structure(
-                    prep_for_build, gi_path,
-                    toppar_dir=toppar_dir, toppar_files=toppar_files,
-                    warn_missing_types=warn_missing_types,
-                    deepset_model=deepset_model,
-                    solvent_state=_solvent,
-                )
-            except Exception as exc:
-                print(f"  Error building structure {struct_num}/{n_unique} "
-                      f"({Path(group_key).name}): {exc}")
-                n_fail += len(group_runs)
-                done   += len(group_runs)
+    # Group runs by prep directory (system)
+    system_to_runs = {}  # prep_dir -> list of run indices
+    system_graph_cache = {}  # prep_dir -> (unimol_emb, edge_idx, nsubs_per_site)
+    
+    for run_idx, run in enumerate(runs):
+        run_dir = Path(run["run_dir"])
+        prep_dir = run_dir.parent / "prep"
+        prep_dir_str = str(prep_dir)
+        
+        if prep_dir_str not in system_to_runs:
+            system_to_runs[prep_dir_str] = []
+        system_to_runs[prep_dir_str].append(run_idx)
+    
+    print(f"Found {len(system_to_runs)} unique systems")
+    
+    # Build graph cache per system
+    n_systems_ok = 0
+    n_systems_fail = 0
+    
+    for system_idx, (prep_dir_str, run_indices) in enumerate(sorted(system_to_runs.items())):
+        try:
+            prep_dir = Path(prep_dir_str)
+            
+            # Use first run in system to get graph_info (all runs from same system have identical structure)
+            first_run_idx = run_indices[0]
+            first_run = runs[first_run_idx]
+            run_dir = Path(first_run["run_dir"])
+            gi_path = run_dir / "graph_info.json"
+            
+            if not gi_path.exists():
+                n_systems_fail += 1
                 continue
-
-            struct_meta_cache[group_key] = (struct_data, _nsubs, _pairs)
-            for gidx, run in group_runs:
-                _tgts = _extract_targets_from_variables(
-                    run["run_dir"], _nsubs, _pairs)
-                if _tgts:
-                    graph_cache[gidx] = (struct_data, _tgts)
-                    n_ok += 1
-                else:
-                    n_fail += 1
-                done += 1
-                if done % 500 == 0 or done == len(runs):
-                    print(f"  {done}/{len(runs)} runs cached "
-                          f"({struct_num}/{n_unique} structures, {n_fail} failed)...")
-
-    print(f"Graph cache ready: {n_ok} built, {n_fail} skipped")
-    # Map group_key → list of run indices for per-graph gradient accumulation
-    epoch_groups = {k: [i for (i, _) in v] for k, v in groups.items()}
+            
+            # Compute Uni-Mol embeddings and edge indices for this system
+            unimol_emb, edge_idx, nsubs_per_site = _compute_unimol_embeddings_and_edges(
+                run_dir, gi_path
+            )
+            
+            # Cache the system graph (shared across all runs)
+            system_graph_cache[prep_dir_str] = (unimol_emb, edge_idx, nsubs_per_site)
+            n_systems_ok += 1
+            
+            print(f"  [{system_idx + 1}/{len(system_to_runs)}] {prep_dir.parent.name}: "
+                  f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, {edge_idx.size(1)} edges")
+        
+        except Exception as e:
+            print(f"  System {prep_dir_str}: {e}")
+            n_systems_fail += 1
+    
+    print(f"\nPer-system graph cache ready: {n_systems_ok} systems built, {n_systems_fail} failed")
+    
+    # Now build per-run targets cache (loads shared system embeddings + run-specific targets)
+    graph_cache = [None] * len(runs)
+    n_ok = 0
+    n_fail = 0
+    
+    print(f"\n{'='*60}")
+    print(f"Pre-building per-run targets...")
+    print(f"{'='*60}")
+    
+    for run_idx, run in enumerate(runs):
+        try:
+            run_dir = Path(run["run_dir"])
+            prep_dir = run_dir.parent / "prep"
+            prep_dir_str = str(prep_dir)
+            
+            # Get cached system graph
+            if prep_dir_str not in system_graph_cache:
+                n_fail += 1
+                continue
+            
+            unimol_emb, edge_idx, nsubs_per_site = system_graph_cache[prep_dir_str]
+            
+            # Extract run-specific targets from variables.py
+            from mllf.cb.graph_utils import build_directed_pairs
+            pairs = build_directed_pairs(nsubs_per_site)
+            targets = _extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
+            
+            if targets and edge_idx.size(1) > 0:
+                # Cache: (unimol_embeddings [N, 512], edge_index [2, E], targets [E, 4])
+                # Note: unimol_emb and edge_idx are SHARED from system cache
+                graph_cache[run_idx] = (unimol_emb, edge_idx, targets)
+                n_ok += 1
+            else:
+                n_fail += 1
+            
+            if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
+                print(f"  {run_idx + 1}/{len(runs)} runs ({n_ok} cached, {n_fail} failed)...")
+        
+        except Exception as e:
+            print(f"  Run {run_idx}: {e}")
+            n_fail += 1
+    
+    print(f"\nRun-specific targets cache ready: {n_ok} runs cached, {n_fail} failed")
+    
+    # For compatibility with pretrain_epoch, use a simple grouping (one run per group)
+    # This allows us to reuse the per-graph gradient accumulation logic if needed
+    epoch_groups = {f"run_{i}": [i] for i in range(len(runs)) if graph_cache[i] is not None}
 
     # Always pre-compute per-run rewards: AWR uses exp(r/β) weighting directly.
     # Stored as run["_bc_reward"] = max(0, reward) so pretrain_epoch can weight by exp(r/β).
@@ -2240,7 +2123,6 @@ def pretrain_with_runs(
             toppar_dir=toppar_dir,
             toppar_files=toppar_files,
             warn_missing_types=warn_missing_types,
-            deepset_model=deepset_model,
             graph_cache=graph_cache,
             groups=epoch_groups,
             reward_weighted=reward_weighted,
@@ -2289,15 +2171,16 @@ def pretrain_with_runs(
     
     # Save metadata
     metadata = {
-        'node_feat_dim': node_feat_dim,
-        'num_relations': sample_data.edge_type.max().item() + 1,
-        'encoder_config': encoder_config,
-        'policy_config': policy_config,
-        'policy_type': policy_type,
+        'policy_type': 'unimol',
+        'unimol_dim': policy_config.get('unimol_dim', 512),
+        'mlp_hidden': policy_config.get('mlp_hidden', 64),
+        'num_relations': len(sample_extras['relation_names']),
         'num_pretraining_runs': len(runs),
+        'num_runs_with_graphs': n_ok,
         'epochs': epochs,
         'best_loss': best_loss,
         'training_method': 'behavior_cloning',
+        'device': str(device),
     }
     
     with open(output_dir / "pretrain_metadata.json", 'w') as f:
@@ -2308,117 +2191,6 @@ def pretrain_with_runs(
     print(f"Best MSE loss: {best_loss:.4f}")
     print(f"Saved to: {output_dir}")
     print(f"{'='*60}")
-
-    # ── Q-network warmup (optional) ──────────────────────────────────────────────────────────
-    if q_epochs > 0:
-        from mllf.cb.value_net import QNetwork
-        q_in_dim = policy.edge_mlp.mlps[0].net[0].in_features
-        q_action_dim = policy.mlp_out_dim  # 4 bias types: linear, quadratic, skew, end
-        q_network = QNetwork(in_dim=q_in_dim, action_dim=q_action_dim, hidden_dims=[64, 32]).to(device)
-        q_optimizer = optim.Adam(q_network.parameters(), lr=q_lr)
-
-        # When q_stratified_fraction is set, build a broader run set for the Q-critic
-        # using the same quadratic-ramp stratified sampling as BC but applied to the
-        # full (pre-BC-filter) run pool.  The Q-critic benefits from seeing a range of
-        # rewards — not just best-run outcomes — to learn a well-calibrated value function.
-        if q_stratified_fraction is not None:
-            print(f"\nBuilding Q-warmup run set from full dataset "
-                  f"(stratified, max_fraction={q_stratified_fraction:.0%})...")
-            q_candidate_runs = list(all_runs_unfiltered)
-            if filter_outliers:
-                q_candidate_runs = filter_runs_by_coefficient_range(
-                    q_candidate_runs, n_std=outlier_std_threshold
-                )
-            q_runs = sample_runs_stratified_negative(
-                q_candidate_runs, fraction_per_bucket=q_stratified_fraction
-            )
-            print(f"Q-warmup: {len(q_runs)} runs selected (BC used {len(runs)} runs)")
-
-            # Build graph cache for Q runs, reusing already-built structures where possible.
-            print(f"\nBuilding Q-warmup graph cache ({len(q_runs)} runs)...")
-            q_graph_cache: list = [None] * len(q_runs)
-            q_groups: dict = _dd(list)
-            for idx, run in enumerate(q_runs):
-                _run_dir = run["run_dir"]
-                if deepset_model is not None:
-                    _pdir = None
-                    _local = Path(_run_dir).parent / "prep"
-                    if _local.is_dir():
-                        _pdir = str(_local)
-                    if _pdir is None:
-                        _src = run.get("source_dir")
-                        if _src:
-                            _cand = Path(_src) / "prep"
-                            if _cand.is_dir():
-                                _pdir = str(_cand)
-                    gk = _pdir if _pdir else str(_run_dir)
-                else:
-                    gk = str(_run_dir)
-                q_groups[gk].append((idx, run))
-
-            q_ok = q_fail = 0
-            for gk, q_group_runs in q_groups.items():
-                if gk in struct_meta_cache:
-                    # Reuse structure already built during BC graph caching
-                    s_data, _nsubs, _pairs = struct_meta_cache[gk]
-                else:
-                    # Build fresh for structures not encountered during BC
-                    first_rd = q_group_runs[0][1]["run_dir"]
-                    gi_path = first_rd / "graph_info.json"
-                    if not gi_path.exists():
-                        q_fail += len(q_group_runs)
-                        continue
-                    prep_b = gk if (deepset_model is not None and gk != str(first_rd)) else None
-                    _sol = q_group_runs[0][1].get("metadata", {}).get("solvent_state")
-                    try:
-                        s_data, _, _nsubs, _pairs = _build_graph_structure(
-                            prep_b, gi_path,
-                            toppar_dir=toppar_dir, toppar_files=toppar_files,
-                            warn_missing_types=warn_missing_types,
-                            deepset_model=deepset_model, solvent_state=_sol,
-                        )
-                        struct_meta_cache[gk] = (s_data, _nsubs, _pairs)
-                    except Exception as exc:
-                        print(f"  Error building Q structure ({Path(gk).name}): {exc}")
-                        q_fail += len(q_group_runs)
-                        continue
-                for gidx, run in q_group_runs:
-                    _tgts = _extract_targets_from_variables(run["run_dir"], _nsubs, _pairs)
-                    if _tgts:
-                        q_graph_cache[gidx] = (s_data, _tgts)
-                        q_ok += 1
-                    else:
-                        q_fail += 1
-            print(f"Q graph cache: {q_ok} built, {q_fail} skipped")
-            q_epoch_groups_for_warmup = {k: [i for (i, _) in v] for k, v in q_groups.items()}
-            q_runs_for_warmup = q_runs
-            q_graph_cache_for_warmup = q_graph_cache
-        else:
-            # No separate Q run set — fall back to the BC run set
-            q_runs_for_warmup = runs
-            q_graph_cache_for_warmup = graph_cache
-            q_epoch_groups_for_warmup = epoch_groups
-
-        q_history = warmup_q_network(
-            runs=q_runs_for_warmup,
-            policy=policy,
-            q_network=q_network,
-            q_optimizer=q_optimizer,
-            epochs=q_epochs,
-            device=device,
-            graph_cache=q_graph_cache_for_warmup,
-            epoch_groups=q_epoch_groups_for_warmup,
-        )
-
-        q_path = output_dir / "pretrained_q.pt"
-        torch.save({
-            'q_state': q_network.state_dict(),
-            'q_in_dim': q_in_dim,
-            'q_hidden_dims': [64, 32],
-            'q_action_dim': q_action_dim,
-            'q_history': q_history,
-        }, q_path)
-        print(f"Q-network checkpoint saved to {q_path}")
 
     # Restore original warning handler
     warnings.showwarning = _orig_showwarning
@@ -2528,14 +2300,6 @@ def main():
              "When specified, --min-reward-threshold is ignored. Default: disabled.",
     )
     parser.add_argument(
-        "--deepset-encoder",
-        type=str,
-        default=None,
-        help="Path to a pretrained AtomBondGNN encoder checkpoint (best_encoder.pt). "
-             "When provided, node features are replaced by 64-dim embeddings "
-             "computed from 3D atomic structure + AEVs via GINConv + GlobalAttentionPool.",
-    )
-    parser.add_argument(
         "--patience",
         type=int,
         default=10,
@@ -2556,39 +2320,7 @@ def main():
         type=int,
         default=None,
         metavar="N",
-        help="(Unused for sitepool — kept for config file compatibility.)",
-    )
-    parser.add_argument(
-        "--policy-type",
-        type=str,
-        default="sitepool",
-        choices=["sitepool"],
-        help="Policy architecture (only 'sitepool' is supported).",
-    )
-    parser.add_argument(
-        "--q-epochs",
-        type=int,
-        default=0,
-        help="Number of Q-network warmup epochs after behavior cloning (default: 0 = disabled). "
-             "Trains QNetwork on historical pair rewards with the policy frozen.",
-    )
-    parser.add_argument(
-        "--q-lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate for Q-network warmup (default: 1e-3).",
-    )
-    parser.add_argument(
-        "--q-stratified-fraction",
-        type=float,
-        default=None,
-        metavar="FRAC",
-        help="When set, the Q-network warmup draws runs from the full pre-filter dataset "
-             "using the same quadratic-ramp stratified sampling as BC pretraining. "
-             "FRAC is the max fraction kept from the best negative-reward bucket; "
-             "the worst bucket gets 0%% and all positive-reward runs are always included. "
-             "Useful when --use-best-only is set for BC but you want the Q-critic to see "
-             "a broader reward distribution (e.g. 0.55). Default: disabled (Q uses BC runs).",
+        help="(Unused — kept for config file compatibility.)",
     )
     parser.add_argument(
         "--awr-temperature",
@@ -2603,23 +2335,6 @@ def main():
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-
-    # Allow --policy-type to override the config value
-    if args.policy_type is not None:
-        config.setdefault('training', {}).setdefault('policy', {})['type'] = args.policy_type
-        print(f"Policy type overridden via CLI: {args.policy_type}")
-
-    # Load pretrained DeepSet encoder if specified
-    deepset_model = None
-    if args.deepset_encoder:
-        from mllf.cb.deepset_autoencoder import load_pretrained_deepset, load_pretrained_atombondgnn
-        _ckpt_peek = torch.load(args.deepset_encoder, weights_only=False, map_location='cpu')
-        if _ckpt_peek.get('model_class') == 'AtomBondGNN':
-            print(f"\nLoading pretrained AtomBondGNN encoder from {args.deepset_encoder}...")
-            deepset_model = load_pretrained_atombondgnn(args.deepset_encoder, freeze_weights=True)
-        else:
-            print(f"\nLoading pretrained DeepSet encoder from {args.deepset_encoder}...")
-            deepset_model = load_pretrained_deepset(args.deepset_encoder, freeze_weights=True)
     
     # Combine runs from all pretraining directories
     all_runs = []
@@ -2647,13 +2362,9 @@ def main():
         min_reward_threshold=args.min_reward_threshold,
         min_transitions=args.min_transitions,
         stratified_negative_fraction=args.stratified_negative_fraction,
-        deepset_model=deepset_model,
         patience=args.patience,
         reward_weighted=args.reward_weighted,
         freeze_encoder_after=args.freeze_encoder_after,
-        q_epochs=args.q_epochs,
-        q_lr=args.q_lr,
-        q_stratified_fraction=args.q_stratified_fraction,
         awr_temperature=args.awr_temperature,
     )
 

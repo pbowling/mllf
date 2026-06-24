@@ -328,7 +328,7 @@ class TestEvaluateLogp:
     """Tests for EdgePolicy.evaluate_logp."""
 
     def test_evaluate_logp_shapes(self):
-        """evaluate_logp returns [E] logp and [E, D] log_std."""
+        """evaluate_logp returns [E, D] logp and [E, D] log_std."""
         N, E, D = 5, 8, 4
         encoder = RGCNEncoder(in_dim=10, hidden_dims=[16], out_dim=8, num_relations=2)
         policy = EdgePolicy(encoder=encoder, emb_dim=8, edge_feat_dim=0,
@@ -340,7 +340,7 @@ class TestEvaluateLogp:
         saved_actions = torch.randn(E, D)
 
         logp, log_std = policy.evaluate_logp(x, edge_index, edge_type, None, saved_actions)
-        assert logp.shape == (E,), f"logp shape {logp.shape} != ({E},)"
+        assert logp.shape == (E, D), f"logp shape {logp.shape} != ({E}, {D})"
         assert log_std.shape == (E, D), f"log_std shape {log_std.shape} != ({E}, {D})"
 
     def test_evaluate_logp_gradients(self):

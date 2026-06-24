@@ -380,65 +380,68 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             rel_to_base[bwd] = base
 
     # Collect values for each base type
-    # - For quadratic (antisymmetric): Use undirected pairs (min,max) with forward canonicalization
-    # - For skew/end (NOT antisymmetric): Use directed pairs (src,dst) to preserve both directions
-    per_base_forward = {name: {} for name in base_order}  # For quadratic: undirected pairs
+    # UnimolPolicy outputs all 4 bias types [linear, quadratic, skew, end] for each edge
+    # We extract all dimensions and map them to the appropriate matrices
+    per_base_forward = {name: {} for name in base_order}  # For quadratic, linear: undirected pairs
     per_base_directed = {'skew': {}, 'end': {}}  # For skew/end: directed pairs
+    
+    # Index into policy output for each base type: [linear, quadratic, skew, end]
+    bias_type_index = {'linear': 0, 'quadratic': 1, 'skew': 2, 'end': 3}
     
     ei = data.edge_index
     et = data.edge_type
     for k in range(ei.shape[1]):
         src = int(ei[0, k].item())
         dst = int(ei[1, k].item())
-        rel_idx = int(et[k].item()) if hasattr(data, 'edge_type') and data.edge_type.numel() > k else None
-        rel_name = rel_names[rel_idx] if rel_idx is not None and rel_idx < len(rel_names) else None
-        if rel_name is None:
-            continue
-        base = rel_to_base.get(rel_name)
-        if base is None:
-            continue
-        fwd_name, bwd_name = base_map.get(base, (f"{base}_fwd", f"{base}_bwd"))
         
-        # Extract scalar value from action tensor/array
-        # For multi-output policies (mlp_out_dim=4), each edge predicts all 4 bias types
-        # and we need to extract the correct index based on the bias type:
-        # linear=0, quadratic=1, skew=2, end=3
-        bias_type_index = {'linear': 0, 'quadratic': 1, 'skew': 2, 'end': 3}
-        target_index = bias_type_index.get(base, 0)
-        
+        # Extract action values for this edge
         try:
             a = actions[k]
+            # Handle different action tensor shapes
             if hasattr(a, 'dim') and a.dim() == 0:
-                # Scalar action (single output per edge)
-                val = float(a.item())
+                # Scalar action - only one output
+                action_vals = {'linear': float(a.item()), 'quadratic': 0.0, 'skew': 0.0, 'end': 0.0}
             elif hasattr(a, 'shape') and len(a.shape) > 0 and a.shape[-1] == 4:
-                # Multi-output action (4 values per edge) - extract the correct index
-                val = float(a[target_index].item() if hasattr(a[target_index], 'item') else a[target_index])
+                # Multi-output action: extract all 4 bias types
+                action_vals = {}
+                for base_name in ['linear', 'quadratic', 'skew', 'end']:
+                    idx = bias_type_index[base_name]
+                    try:
+                        action_vals[base_name] = float(a[idx].item() if hasattr(a[idx], 'item') else a[idx])
+                    except Exception:
+                        action_vals[base_name] = 0.0
             else:
-                # Fallback: try to extract first element
+                # Fallback: treat as scalar
                 vlist = a.detach().cpu().numpy().tolist() if hasattr(a, 'detach') else list(a)
                 if isinstance(vlist, list) and len(vlist) == 4:
-                    val = float(vlist[target_index])
+                    action_vals = {base_name: float(vlist[bias_type_index[base_name]]) 
+                                   for base_name in ['linear', 'quadratic', 'skew', 'end']}
                 else:
-                    val = float(vlist) if not isinstance(vlist, list) else float(vlist[0])
+                    scalar_val = float(vlist) if not isinstance(vlist, list) else float(vlist[0])
+                    action_vals = {base_name: (scalar_val if base_name == 'quadratic' else 0.0)
+                                   for base_name in ['linear', 'quadratic', 'skew', 'end']}
         except Exception:
             try:
                 val = float(actions[k])
+                action_vals = {base_name: (val if base_name == 'quadratic' else 0.0)
+                               for base_name in ['linear', 'quadratic', 'skew', 'end']}
             except Exception:
-                val = 0.0
-
-        # For skew and end: store directed pairs (preserve both directions independently)
-        if base in ['skew', 'end']:
-            per_base_directed[base][(src, dst)] = val
-        else:
-            # For quadratic and linear: use undirected canonical pairs
-            pair = (min(src, dst), max(src, dst))
-            # Store forward value if this is the forward relation and we haven't seen this pair yet
-            if rel_name == fwd_name and (pair not in per_base_forward[base]):
-                per_base_forward[base][pair] = val
-            # If only backward exists, store its negative as the canonical forward value
-            elif rel_name == bwd_name and (pair not in per_base_forward[base]):
-                per_base_forward[base][pair] = -val
+                action_vals = {base_name: 0.0 for base_name in ['linear', 'quadratic', 'skew', 'end']}
+        
+        # Store all 4 bias type values for this edge
+        for base in ['linear', 'quadratic', 'skew', 'end']:
+            val = action_vals.get(base, 0.0)
+            
+            if base in ['skew', 'end']:
+                # Skew and end: store directed pairs (preserve both directions)
+                per_base_directed[base][(src, dst)] = val
+            else:
+                # Quadratic and linear: use undirected canonical pairs
+                pair = (min(src, dst), max(src, dst))
+                # Always use the forward direction for canonical storage
+                # For undirected pairs, we only store once per unique pair
+                if pair not in per_base_forward[base]:
+                    per_base_forward[base][pair] = val
 
     # Assemble bias matrices for nonlinear terms
     # IMPORTANT: Quadratic is antisymmetric, so we store ONLY the upper triangle (i < j).
