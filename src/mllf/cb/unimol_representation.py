@@ -32,6 +32,7 @@ from mllf.file_handling.read_pdb import (
 )
 from mllf.cb.aev_processor import (
     get_full_ligand_atom_features,
+    _convert_crd_to_tmp_pdb,
 )
 
 
@@ -257,10 +258,11 @@ def _load_environment_pdb(
     Priority order:
     1. Custom paths (if provided via yaml config)
     2. minimized.pdb (preferred; filter to only environment atoms within cutoff from ligand)
-    3. protein.pdb / proa.pdb / nested pdb/protein.pdb (auto-detect variants)
-    4. solvent.pdb / waterbox.pdb / environment.pdb (auto-detect variants)
+    3. minimized.crd (CHARMM extended format; auto-converted to PDB and filtered)
+    4. protein.pdb / proa.pdb / nested pdb/protein.pdb (auto-detect variants)
+    5. solvent.pdb / waterbox.pdb / environment.pdb (auto-detect variants)
     
-    When loading from minimized.pdb, atoms are filtered to keep only those within
+    When loading from minimized.pdb or minimized.crd, atoms are filtered to keep only those within
     ligand_cutoff of any ligand atom (environment context). Atoms are sorted by distance
     (closest first) to enable proper 256-atom truncation via Uni-Mol atom limit.
     
@@ -394,6 +396,89 @@ def _load_environment_pdb(
         except Exception as e:
             warnings.warn(f"Could not load minimized.pdb: {e}, falling back to other sources")
     
+    # Fallback: Try to convert minimized.crd (CHARMM extended CRD format) if minimized.pdb doesn't exist
+    # This handles cases like luis_p38_protein_group1 where we have CRD but not PDB
+    minimized_crd = prep_dir / "minimized.crd"
+    if minimized_crd.exists():
+        try:
+            # Convert CRD to temporary PDB for consistent coordinate handling
+            crd_pdb = _convert_crd_to_tmp_pdb(minimized_crd)
+            coords, elements = parse_pdb_file(str(crd_pdb))
+            coords_arr = np.array(coords)
+            
+            # Try to extract ligand using atom name matching (same logic as minimized.pdb)
+            ligand_arr = None
+            if core_pdb is not None and sub_pdb is not None:
+                ligand_in_pdb_coords = _extract_ligand_from_pdb(str(crd_pdb), core_pdb, sub_pdb)
+                if ligand_in_pdb_coords is not None and len(ligand_in_pdb_coords) > 0:
+                    ligand_arr = np.array(ligand_in_pdb_coords)
+            
+            # Fall back to provided ligand_coords if extraction didn't work
+            if ligand_arr is None and ligand_coords is not None and len(ligand_coords) > 0:
+                ligand_arr = np.array(ligand_coords)
+            
+            # Filter environment atoms by distance to ligand
+            if ligand_arr is not None:
+                distances = np.min(
+                    np.linalg.norm(coords_arr[:, None, :] - ligand_arr[None, :, :], axis=2),
+                    axis=1
+                )
+                
+                # Keep atoms within the ligand cutoff (environment context)
+                env_mask = distances <= ligand_cutoff
+                
+                # Check for PBC using estimated box (CRD files may not have CRYST1)
+                if not env_mask.any() or np.sum(env_mask) < 10:
+                    # Estimate box from coordinates
+                    all_coords = np.vstack([coords_arr, ligand_arr])
+                    min_coords = np.min(all_coords, axis=0)
+                    max_coords = np.max(all_coords, axis=0)
+                    estimated_box = max_coords - min_coords
+                    
+                    # For cubic system, enforce constraint A=B=C
+                    box_length = np.max(estimated_box)
+                    box_lengths = np.array([box_length, box_length, box_length], dtype=np.float32)
+                    
+                    pbc_distances = _minimum_image_convention(coords_arr, ligand_arr, box_lengths)
+                    env_mask = pbc_distances <= ligand_cutoff
+                    distances = pbc_distances
+                    
+                    if env_mask.any():
+                        print(f"        [ENV] PBC (estimated cubic, from CRD) found {np.sum(env_mask)} atoms within {ligand_cutoff} Å")
+                
+                if env_mask.any():
+                    env_indices = np.where(env_mask)[0]
+                    env_distances = distances[env_indices]
+                    
+                    # Sort by distance (closest first)
+                    sorted_order = np.argsort(env_distances)
+                    env_indices = env_indices[sorted_order]
+                    
+                    # Get filtered environment coordinates and elements
+                    env_coords_filtered = coords_arr[env_indices]
+                    
+                    coords = [env_coords_filtered[i].tolist() for i in range(len(env_coords_filtered))]
+                    elements = [elements[i] for i in env_indices]
+                    
+                    # Enforce Uni-Mol atom limit (256 max)
+                    if len(coords) > 256:
+                        coords = coords[:256]
+                        elements = elements[:256]
+                    
+                    n_total = len(coords_arr)
+                    n_kept = len(coords)
+                    print(f"        [ENV] minimized.crd (converted): filtered to {n_kept}/{n_total} atoms (distance <= {ligand_cutoff} Å, sorted closest-first, capped at 256)")
+                    return (coords, elements)
+                else:
+                    print(f"        [ENV] minimized.crd: no atoms within {ligand_cutoff} Å of ligand")
+                    return None
+            else:
+                # No ligand filtering
+                print(f"        [ENV] minimized.crd: loaded {len(coords)} atoms (no filtering)")
+                return (coords, elements)
+        except Exception as e:
+            warnings.warn(f"Could not load/convert minimized.crd: {e}, falling back to other sources")
+    
     # Fallback: Try individual protein PDB files
     protein_candidates = [
         prep_dir / "protein.pdb",
@@ -409,7 +494,7 @@ def _load_environment_pdb(
             try:
                 coords, elements = parse_pdb_file(str(protein_pdb))
                 rel_path = protein_pdb.relative_to(prep_dir)
-                print(f"        [ENV] {rel_path}: loaded {len(coords)} atoms (protein/structure)")
+                print(f"        [ENV] {rel_path}: loaded {len(coords)} atoms (protein/structure) from {protein_pdb.name}")
                 return (coords, elements)
             except Exception as e:
                 warnings.warn(f"Could not load {protein_pdb.name}: {e}, trying next source")

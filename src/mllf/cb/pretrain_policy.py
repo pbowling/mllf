@@ -300,6 +300,115 @@ def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         return None
 
 
+def compute_pairwise_confidence_weights(
+    sim_results: Dict,
+    nsubs_per_site: List[int],
+    pairs: List[tuple],
+) -> Optional[List[float]]:
+    """Compute per-edge confidence weights from pairwise population balance and DDG data.
+    
+    For each directed edge (i, j), extracts populations and DDG values from simulation results
+    to compute a confidence weight. This weight reflects how well-sampled and reliable the
+    pairwise interaction is.
+    
+    **Confidence Computation:**
+    - If either population is 0 or missing: weight = 0 (no data)
+    - If DDG value is NaN or infinite: weight = 0 (unreliable)
+    - Otherwise: weight = min(pop_i, pop_j) / max(pop_i, pop_j)
+      (population balance, ranges 0-1, perfect when populations are equal)
+    
+    **Node to Block Mapping:**
+    MSLD block numbering starts at 1 (reference), with block 2 being the first real block.
+    In the graph, nodes are 0-indexed (node 0 = block 2, node 1 = block 3, etc.).
+    
+    Args:
+        sim_results: Dict with 'populations' and 'ddg_pairs' from simulation_results.json
+        nsubs_per_site: List of number of substituents per site (for validation)
+        pairs: List of (i, j) directed edge tuples from build_directed_pairs()
+    
+    Returns:
+        List of per-edge confidence weights [0.0, 1.0], or None if cannot extract populations
+    """
+    populations = sim_results.get("populations", {})
+    ddg_pairs = sim_results.get("ddg_pairs", {})
+    
+    if not populations:
+        return None
+    
+    # Extract population counts (use only HIGHEST lambda value, matching reward logic)
+    pop_dict = {}  # node_idx (0-based) -> population count
+    for block_id_str in populations.keys():
+        try:
+            block_id = int(block_id_str)
+        except ValueError:
+            continue
+        
+        # Convert block ID to node index: node_idx = block_id - 2
+        # (block 2 = node 0, block 3 = node 1, etc.)
+        node_idx = block_id - 2
+        if node_idx < 0:
+            continue
+        
+        block_data = populations[block_id_str]
+        counts = block_data.get("counts", {})
+        if counts:
+            # Use only the highest lambda value (same as reward computation)
+            max_lambda = max(counts.keys(), key=lambda x: float(x))
+            pop_dict[node_idx] = counts[max_lambda]
+    
+    if not pop_dict:
+        return None
+    
+    # Compute confidence weight for each edge
+    weights = []
+    for (i, j) in pairs:
+        pop_i = pop_dict.get(i, 0)
+        pop_j = pop_dict.get(j, 0)
+        
+        # Zero weight if either population is missing or zero
+        if pop_i <= 0 or pop_j <= 0:
+            weights.append(0.0)
+            continue
+        
+        # Check DDG value for this pair
+        # DDG key format: "{i+2}_{j+2}" (convert node indices back to block IDs)
+        # For reverse pairs: ΔG(j→i) = -ΔG(i→j), so if forward key missing,
+        # look for reverse key and negate its value
+        ddg_key_fwd = f"{i+2}_{j+2}"
+        ddg_key_rev = f"{j+2}_{i+2}"
+        
+        ddg_value = None
+        if ddg_key_fwd in ddg_pairs:
+            ddg_value = ddg_pairs[ddg_key_fwd]
+        elif ddg_key_rev in ddg_pairs:
+            # Use negation of reverse pair (antisymmetric property)
+            reverse_val = ddg_pairs[ddg_key_rev]
+            try:
+                ddg_value = -float(reverse_val)
+            except (ValueError, TypeError):
+                ddg_value = None
+        
+        # Zero weight if DDG is missing, NaN, or infinite
+        if ddg_value is None:
+            weights.append(0.0)
+            continue
+        
+        try:
+            ddg_val = float(ddg_value)
+            if not (np.isfinite(ddg_val)):  # catches NaN and inf
+                weights.append(0.0)
+                continue
+        except (ValueError, TypeError):
+            weights.append(0.0)
+            continue
+        
+        # Population balance weight: min / max (symmetric around 0.5 for equal pops)
+        balance = min(pop_i, pop_j) / max(pop_i, pop_j)
+        weights.append(float(balance))
+    
+    return weights
+
+
 def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None,
                                                  warn_missing_types=True,
                                                  pdb_dir=None, prep_dir=None, solvent_state=None,
@@ -447,7 +556,9 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     edge_attr_list = []
     
     # For each directed pair, create edges for all 4 bias types
-    for (i, j) in pairs:
+    pairs_to_process = pairs
+
+    for (i, j) in pairs_to_process:
         for bias in ['linear', 'quadratic', 'skew', 'end']:
             fwd_name, bwd_name = base_relation_map[bias]
             
@@ -488,6 +599,8 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
     base_order = list(base_relation_map.keys())  # ['linear', 'quadratic', 'skew', 'end']
     
     targets = []
+    
+    # Process original pairs
     for (i, j) in pairs:
         # Linear: b[j] - b[i] (proper antisymmetric conversion)
         # This naturally gives antisymmetric values: linear_ji = b[i] - b[j] = -linear_ij
@@ -1521,8 +1634,9 @@ def pretrain_epoch(
     groups: Optional[Dict] = None,
     reward_weighted: bool = False,
     awr_temperature: float = 0.5,
+    pairwise_weights_cache: Optional[List] = None,
 ) -> Dict[str, float]:
-    """Run one behavior cloning AWR epoch for UnimolPolicy.
+    """Run one behavior cloning AWR epoch for UnimolPolicy with optional pairwise weighting.
 
     Args:
         policy: UnimolPolicy to train
@@ -1533,6 +1647,11 @@ def pretrain_epoch(
         graph_cache: Cached Uni-Mol embeddings and targets
         groups: Group mapping for gradient accumulation (optional)
         reward_weighted: If True, weight each run's loss by its reward
+        awr_temperature: Temperature for AWR weighting (default: 0.5)
+        pairwise_weights_cache: Optional list of pairwise confidence weight lists, one per run.
+                               If provided, applies per-edge confidence weighting based on
+                               population balance and DDG reliability. Edges with zero
+                               confidence are skipped entirely.
 
     Returns:
         Dict with epoch statistics
@@ -1592,8 +1711,36 @@ def pretrain_epoch(
                 raw_r = runs[run_idx].get("_bc_reward", 0.0)
                 awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
                 
-                # Divide by group size for normalization
-                run_loss = -awr_w * logp_per[active_mask].mean() / n_valid
+                # Apply per-edge pairwise confidence weighting if available
+                if pairwise_weights_cache is not None and pairwise_weights_cache[run_idx] is not None:
+                    edge_weights = torch.tensor(
+                        pairwise_weights_cache[run_idx],
+                        dtype=torch.float32,
+                        device=device
+                    )  # [E]
+                    
+                    # Apply edge weights: zero out low-confidence edges
+                    # Only include edges with non-zero confidence
+                    edge_mask = edge_weights > 1e-8
+                    
+                    if edge_mask.any():
+                        # Weight loss by pairwise confidence (normalized per edge)
+                        # Shape: logp_per is [E, D], edge_weights is [E]
+                        weighted_logp = logp_per * edge_weights.unsqueeze(-1)  # [E, D]
+                        
+                        # Apply both active_mask and edge_mask
+                        combined_mask = active_mask & edge_mask.unsqueeze(-1)
+                        if combined_mask.any():
+                            run_loss = -awr_w * weighted_logp[combined_mask].mean() / n_valid
+                        else:
+                            continue
+                    else:
+                        # No edges with sufficient confidence, skip this run
+                        continue
+                else:
+                    # No pairwise weighting, use original computation
+                    run_loss = -awr_w * logp_per[active_mask].mean() / n_valid
+                
                 if torch.isnan(run_loss) or torch.isinf(run_loss):
                     continue
                 run_loss.backward()
@@ -1658,7 +1805,31 @@ def pretrain_epoch(
         logp_per = torch.distributions.Normal(mean, std).log_prob(targets)
         raw_r = run.get("_bc_reward", 0.0)
         awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
-        loss = -awr_w * logp_per[active_mask].mean()
+        
+        # Apply per-edge pairwise confidence weighting if available
+        if pairwise_weights_cache is not None and pairwise_weights_cache[run_idx] is not None:
+            edge_weights = torch.tensor(
+                pairwise_weights_cache[run_idx],
+                dtype=torch.float32,
+                device=device
+            )  # [E]
+            
+            # Apply edge weights: zero out low-confidence edges
+            edge_mask = edge_weights > 1e-8
+            
+            if edge_mask.any():
+                weighted_logp = logp_per * edge_weights.unsqueeze(-1)  # [E, D]
+                combined_mask = active_mask & edge_mask.unsqueeze(-1)
+                if combined_mask.any():
+                    loss = -awr_w * weighted_logp[combined_mask].mean()
+                else:
+                    continue
+            else:
+                # No edges with sufficient confidence, skip this run
+                continue
+        else:
+            # No pairwise weighting, use original computation
+            loss = -awr_w * logp_per[active_mask].mean()
         
         if not (torch.isnan(loss) or torch.isinf(loss)):
             loss.backward()
@@ -2048,6 +2219,7 @@ def pretrain_with_runs(
             # Extract run-specific targets from variables.py
             from mllf.cb.graph_utils import build_directed_pairs
             pairs = build_directed_pairs(nsubs_per_site)
+
             targets = _extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
             
             if targets and edge_idx.size(1) > 0:
@@ -2066,6 +2238,50 @@ def pretrain_with_runs(
             n_fail += 1
     
     print(f"\nRun-specific targets cache ready: {n_ok} runs cached, {n_fail} failed")
+    
+    # Build per-run pairwise confidence weights cache (based on population balance and DDG reliability)
+    print(f"\n{'='*60}")
+    print(f"Building per-run pairwise confidence weights...")
+    print(f"{'='*60}")
+    
+    pairwise_weights_cache = [None] * len(runs)
+    n_weights_ok = 0
+    
+    for run_idx, run in enumerate(runs):
+        try:
+            run_dir = Path(run["run_dir"])
+            prep_dir = run_dir.parent / "prep"
+            prep_dir_str = str(prep_dir)
+            
+            # Get system graph to know the pairs
+            if prep_dir_str not in system_graph_cache:
+                continue
+            
+            unimol_emb, edge_idx, nsubs_per_site = system_graph_cache[prep_dir_str]
+            
+            # Build pairs for this system
+            from mllf.cb.graph_utils import build_directed_pairs
+            pairs = build_directed_pairs(nsubs_per_site)
+            
+            # Compute pairwise confidence weights from simulation results
+            if "sim_results" in run:
+                weights = compute_pairwise_confidence_weights(
+                    run["sim_results"], nsubs_per_site, pairs
+                )
+                if weights is not None:
+                    pairwise_weights_cache[run_idx] = weights
+                    n_weights_ok += 1
+        
+        except Exception as e:
+            # If pairwise weighting fails, just skip for this run (graceful degradation)
+            pass
+        
+        if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
+            print(f"  {run_idx + 1}/{len(runs)} runs ({n_weights_ok} with pairwise weights)...")
+    
+    print(f"\nPairwise confidence weights ready: {n_weights_ok} runs with weights")
+    if n_weights_ok > 0:
+        print(f"  Pairwise AWR weighting: ENABLED")
     
     # For compatibility with pretrain_epoch, use a simple grouping (one run per group)
     # This allows us to reuse the per-graph gradient accumulation logic if needed
@@ -2127,6 +2343,7 @@ def pretrain_with_runs(
             groups=epoch_groups,
             reward_weighted=reward_weighted,
             awr_temperature=awr_temperature,
+            pairwise_weights_cache=pairwise_weights_cache,
         )
 
         print(f"  AWR Loss: {stats['loss']:.4f}")
