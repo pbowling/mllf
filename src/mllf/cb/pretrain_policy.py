@@ -15,19 +15,39 @@ different from REINFORCE training:
 - Must have simulation results to compute rewards for filtering
 - RTF files used to build graph structure
 
-This allows the policy to learn good bias coefficient predictions from
-successful simulations before running expensive RL episodes.
+**Multi-Structure Support:**
+- Minimized structures: MD-equilibrated, energy-minimized (pretraining data)
+- Unrelaxed structures: Crystallographic/experimental conformations from training data
+- Random selection: Per-run mixing of minimized and unrelaxed
+- Supports caching of Uni-Mol embeddings for fast reuse
 
-Usage:
+This allows the policy to learn good bias coefficient predictions from
+successful simulations before running expensive RL episodes, and supports
+training with diverse structural conformations.
+
+Usage (single structure type):
     python -m mllf.cb.pretrain_policy \\
         --pretraining-dir pretraining/14benz_solv \\
-        --pretraining-dir pretraining/indole_solv \\
         --output-dir models/pretrained_policy \\
         --config examples/workflow_pretrain.yaml \\
-        --epochs 1
+        --epochs 20
+
+Usage (with unrelaxed structures):
+    # Update workflow_pretrain.yaml:
+    # unimol:
+    #   structure_selection: random
+    #   unrelaxed_system_mappings:
+    #     14benz_solv: /path/to/training/systems/14benz_solv/prep
+    
+    python -m mllf.cb.pretrain_policy \\
+        --pretraining-dir pretraining/14benz_solv \\
+        --output-dir models/pretrained_policy \\
+        --config examples/workflow_pretrain.yaml \\
+        --epochs 20
 """
 import argparse
 import collections
+import csv
 import math
 import random
 import re
@@ -35,6 +55,7 @@ import threading
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
+from datetime import datetime
 import json
 import yaml
 
@@ -48,23 +69,341 @@ from mllf.cb.policy import UnimolPolicy
 from mllf.file_handling.read_pdb import parse_pdb_file
 
 
+# ── Representation tracking ────────────────────────────────────────────────────
+
+def initialize_representation_tracker(output_dir: Path) -> Path:
+    """Initialize CSV file for tracking which representations are used.
+    
+    Args:
+        output_dir: Output directory for pretraining
+        
+    Returns:
+        Path to tracking CSV file
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    tracking_file = output_dir / 'pretraining_representations_used.csv'
+    
+    # Create header if file doesn't exist
+    if not tracking_file.exists():
+        with open(tracking_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'system', 'run_idx', 'structure_type', 'source', 
+                'prep_dir_used', 'explicit_mapping', 'timestamp'
+            ])
+            writer.writeheader()
+    
+    return tracking_file
+
+
+def track_representation_choice(
+    tracking_file: Path,
+    system_name: str,
+    run_idx: int,
+    structure_type: str,
+    source: str,
+    prep_dir_used: Path,
+    explicit_mapping: bool = False
+) -> None:
+    """Log which representation (minimized/unrelaxed) was used for a run.
+    
+    Args:
+        tracking_file: Path to tracking CSV file
+        system_name: System name (e.g., 'indolizine_prot')
+        run_idx: Run index
+        structure_type: 'minimized' or 'unrelaxed'
+        source: Where structures came from (e.g., 'pretraining/prep', 'training/systems')
+        prep_dir_used: Full path to prep directory used
+        explicit_mapping: Whether an explicit mapping was used
+    """
+    tracking_file = Path(tracking_file)
+    
+    with open(tracking_file, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'system', 'run_idx', 'structure_type', 'source',
+            'prep_dir_used', 'explicit_mapping', 'timestamp'
+        ])
+        writer.writerow({
+            'system': system_name,
+            'run_idx': run_idx,
+            'structure_type': structure_type,
+            'source': source,
+            'prep_dir_used': str(prep_dir_used.resolve()),
+            'explicit_mapping': str(explicit_mapping),
+            'timestamp': datetime.now().isoformat(),
+        })
+
+
+def read_representation_tracking(tracking_file: Path) -> List[Dict]:
+    """Read and parse representation tracking CSV.
+    
+    Args:
+        tracking_file: Path to tracking CSV file
+        
+    Returns:
+        List of tracking records (dicts)
+    """
+    tracking_file = Path(tracking_file)
+    records = []
+    
+    if tracking_file.exists():
+        with open(tracking_file, 'r') as f:
+            reader = csv.DictReader(f)
+            records = list(reader)
+    
+    return records
+
+
+# ── Structure type selection and unrelaxed path detection ───────────────────
+
+# ── Structure type selection and path detection ────────────────────────────
+
+
+def _select_structure_type_for_run(
+    run_idx: int, 
+    strategy: str, 
+    system_name: Optional[str] = None,
+    skip_patterns: Optional[List[str]] = None,
+    seed: int = 42
+) -> str:
+    """Determine which structure type to use for a given run.
+    
+    **Strategies:**
+    - 'minimized': Always use minimized (pretraining) structures
+    - 'unrelaxed': Always use unrelaxed (crystallographic) structures  
+    - 'random': Randomly alternate between minimized and unrelaxed per run
+    
+    **System-Specific Skipping:**
+    If skip_patterns is provided and the system_name matches any pattern,
+    unrelaxed structures are skipped regardless of strategy (falls back to minimized).
+    
+    Args:
+        run_idx: Index of the run (used for random seeding if needed)
+        strategy: Strategy to use ('minimized', 'unrelaxed', 'random')
+        system_name: Name of the system (for pattern matching against skip list)
+        skip_patterns: List of patterns to match against system_name (case-insensitive)
+                      Uses 'if pattern.lower() in system_name.lower()'
+        seed: Random seed for reproducibility in 'random' mode
+        
+    Returns:
+        str: 'minimized' or 'unrelaxed'
+    """
+    strategy = strategy.lower()
+    
+    # Check if this system should skip unrelaxed
+    should_skip_unrelaxed = False
+    if system_name is not None and skip_patterns:
+        system_name_lower = system_name.lower()
+        for pattern in skip_patterns:
+            if pattern.lower() in system_name_lower:
+                should_skip_unrelaxed = True
+                break
+    
+    if strategy == 'minimized' or should_skip_unrelaxed:
+        return 'minimized'
+    elif strategy == 'unrelaxed':
+        return 'unrelaxed'
+    elif strategy == 'random':
+        rng = np.random.RandomState(seed + run_idx)  # Deterministic per run
+        return 'minimized' if rng.rand() < 0.5 else 'unrelaxed'
+    else:
+        raise ValueError(f"Unknown structure selection strategy: {strategy}. Use 'minimized', 'unrelaxed', or 'random'.")
+
+
+def build_unrelaxed_system_mappings(
+    pretraining_base_dir: Path,
+    training_systems_base: Optional[Path] = None,
+    config_mappings: Optional[Dict[str, str]] = None,
+) -> Dict[str, Path]:
+    """Build mapping from pretraining system directories to unrelaxed (training) directories.
+    
+    Supports three modes:
+    1. Config-provided mappings: Use explicitly provided paths from config
+    2. Automatic detection: Match pretraining system names to training/systems/
+    3. Hybrid: Config mappings override automatic detection
+    
+    **Example:**
+    If pretraining has:
+        - pretraining/indolizine_prot/prep
+        - pretraining/indolizine_solv/prep
+    
+    This function returns:
+        {
+            'indolizine_prot': Path('/mllf/training/systems/indolizine_prot/prep'),
+            'indolizine_solv': Path('/mllf/training/systems/indolizine_solv/prep'),
+        }
+    
+    Args:
+        pretraining_base_dir: Base pretraining directory containing system subdirs
+        training_systems_base: Base training/systems directory (auto-detected if None)
+        config_mappings: Dict of explicit system_name -> unrelaxed_path mappings from config
+        
+    Returns:
+        Dict mapping system names to online prep directories
+    """
+    pretraining_base_dir = Path(pretraining_base_dir)
+    
+    # Auto-detect training base if not provided
+    if training_systems_base is None:
+        training_systems_base = pretraining_base_dir.parent / 'training' / 'systems'
+    else:
+        training_systems_base = Path(training_systems_base)
+    
+    mappings = {}
+    
+    # First, scan pretraining directory for systems
+    if pretraining_base_dir.exists():
+        for sys_dir in pretraining_base_dir.iterdir():
+            if sys_dir.is_dir() and (sys_dir / 'prep').exists():
+                sys_name = sys_dir.name
+                
+                # Check config mappings first
+                if config_mappings and sys_name in config_mappings:
+                    unrelaxed_path = Path(config_mappings[sys_name])
+                else:
+                    # Try automatic detection
+                    unrelaxed_path = Path(training_systems_base) / sys_name / 'prep'
+                
+                if unrelaxed_path.exists():
+                    mappings[sys_name] = unrelaxed_path
+                else:
+                    print(f"    Warning: Could not find unrelaxed path for {sys_name}: {unrelaxed_path}")
+    
+    return mappings
+
+
+def prepare_pretraining_config(
+    config: Dict,
+    pretraining_base_dir: Path,
+    training_systems_base: Optional[Path] = None,
+) -> Dict:
+    """Prepare and validate pretraining configuration for multi-structure support.
+    
+    Processes config to:
+    - Build unrelaxed system mappings if needed
+    - Validate structure selection strategy
+    - Set up cache directory if requested
+    
+    Args:
+        config: Loaded workflow_pretrain.yaml configuration dict
+        pretraining_base_dir: Base pretraining directory
+        training_systems_base: Base training/systems directory
+        
+    Returns:
+        Updated config dict with resolved mappings and paths
+    """
+    config = config.copy()
+    
+    # Extract Uni-Mol configuration
+    unimol_cfg = config.get('unimol', {})
+    structure_selection = unimol_cfg.get('structure_selection', 'minimized').lower()
+    
+    # Validate strategy
+    if structure_selection not in ['minimized', 'unrelaxed', 'random']:
+        raise ValueError(
+            f"Invalid structure_selection: {structure_selection}. "
+            f"Must be 'minimized', 'unrelaxed', or 'random'."
+        )
+    
+    # Build unrelaxed mappings if needed
+    if structure_selection in ['unrelaxed', 'random']:
+        config_mappings = unimol_cfg.get('unrelaxed_system_mappings')
+        unrelaxed_mappings = build_unrelaxed_system_mappings(
+            pretraining_base_dir,
+            training_systems_base=training_systems_base,
+            config_mappings=config_mappings,
+        )
+        config['_unrelaxed_system_mappings'] = unrelaxed_mappings  # Store resolved mappings
+        
+        if not unrelaxed_mappings:
+            print(f"    Warning: No unrelaxed system mappings found. Check paths!")
+    
+    # Setup cache directory
+    if unimol_cfg.get('cache_embeddings', False):
+        cache_dir = unimol_cfg.get('cache_dir')
+        if cache_dir is None:
+            cache_dir = Path(pretraining_base_dir) / 'embeddings_cache'
+        config['_cache_dir'] = Path(cache_dir)
+    
+    return config
+
+
 # ── Uni-Mol embedding computation for pretraining ────────────────────────────
 
-def _compute_unimol_embeddings_and_edges(run_dir: Path, graph_info_path: Path) -> tuple:
-    """Compute Uni-Mol 512D embeddings for all substituents in a run.
+def _compute_unimol_embeddings_and_edges(
+    run_dir: Path,
+    graph_info_path: Path,
+    structure_type: str = 'minimized',
+    unrelaxed_system_mappings: Optional[Dict[str, Path]] = None,
+    custom_search_paths: Optional[Dict[str, List[str]]] = None,
+    cache_dir: Optional[Path] = None,
+    run_idx: int = 0,
+    env_cutoff: float = 8.0,
+    use_environment_difference: bool = True,
+    consensus_dict: Optional[Dict[str, Dict[str, Optional[set]]]] = None,
+) -> tuple:
+    """Compute Uni-Mol embeddings for all substituents in a run.
     
-    Uses intelligent environment loading with fallback chain (minimized.pdb preferred,
-    with automatic ligand atom filtering; falls back to individual protein/solvent files).
+    Supports both minimized (pretraining) and unrelaxed (crystallographic) structures.
+    Both representations are constructed from the same prep directory - the choice only
+    affects semantic interpretation (e.g., which PDB files represent the initial vs relaxed state).
+    
+    **Embedding Modes:**
+    - **Standard mode** (use_environment_difference=False): Single 512D embedding per node
+      - Input to policy: [ligand+environment diff, ligand+environment mean]
+      - Backward compatible with original UnimolPolicy design
+    - **Dual embedding mode** (use_environment_difference=True): Two separate 512D embeddings per node
+      - Ligand-only: core + sub (captures substituent-specific information)
+      - Full: core + sub + environment + ref_subs (captures ligand+environment context)
+      - Edge input to policy: [diff_ligand (antisymmetric), mean_full (symmetric)]
+      - This allows MLPs to learn substituent-dependent and environment-dependent info in parallel
+    
+    **Structure Types:**
+    - 'minimized': Use minimized (relaxed, MD-equilibrated) representation
+    - 'unrelaxed': Use unrelaxed (crystallographic/experimental) representation
+    
+    Both use the same prep directory files; the selection is logged for tracking.
+    
+    **Consensus Filtering:**
+    If consensus_dict is provided, environment atoms are filtered to only atoms present in
+    ALL substituents at a site. Each system has its own consensus built from its substituents.
+    
+    Args:
+        run_dir: Directory containing variables.py and graph_info.json
+        graph_info_path: Path to graph_info.json
+        structure_type: 'minimized' or 'unrelaxed' (default: 'minimized')
+        unrelaxed_system_mappings: Dict mapping system names to alternate prep paths (optional override)
+        custom_search_paths: Dict mapping system solvent_state to custom PDB search paths
+                           e.g., {'protein': ['pdb/protein.pdb'], 'solv': ['solvent.pdb']}
+        cache_dir: Optional directory to cache/load embeddings
+        run_idx: Run index (for reference in tracking)
+        env_cutoff: Environment distance cutoff in Ångströms (default: 8.0)
+        use_environment_difference: If True, compute dual embeddings: [ligand-only(512), full(512)] = 1024D per node.
+                                   If False, use standard embedding: ligand+environment(512) per node.
+        consensus_dict: Optional nested dict mapping systems to site consensus atoms.
+                       Structure: {prep_dir_str: {site_key: {(resnum, chain, atomname), ...}, ...}, ...}
+                       If provided, environment atoms are filtered to consensus atoms for each site.
+                       Use None for sites with no consensus (environment not filtered for that site).
     
     Returns:
-        (unimol_embeddings [N, 512], edge_index [2, E], nsubs_per_site)
-        where N = total substituents, E = directed pairs within sites
+        (unimol_embeddings [N, emb_dim], edge_index [2, E], nsubs_per_site, representation_source)
+        where:
+        - N = total substituents
+        - E = directed pairs within sites
+        - emb_dim = 1024 when use_environment_difference=True (dual embeddings)
+        - emb_dim = 512 when use_environment_difference=False (standard embeddings)
+        - representation_source = dict with 'structure_type', 'prep_dir_used', 'source', 'explicit_mapping'
     """
     import json
     from mllf.cb.unimol_representation import (
         get_substituent_unimol_with_environment,
+        get_substituent_dual_embeddings,
+        construct_full_ligand,
+        get_unimol_representation,
     )
     from mllf.cb.graph_utils import build_directed_pairs
+    from mllf.file_handling.read_pdb import parse_pdb_file
     
     # Load graph_info to get site structure
     with open(graph_info_path) as f:
@@ -110,14 +449,53 @@ def _compute_unimol_embeddings_and_edges(run_dir: Path, graph_info_path: Path) -
     if not prep_dir.is_dir():
         raise FileNotFoundError(f"Prep dir not found: {prep_dir}")
     
-    unimol_embeddings = torch.zeros((n_nodes, 512), dtype=torch.float32)
+    # Determine which prep directory to use
+    # Both minimized and unrelaxed use the same prep_dir; only the choice is tracked
+    # Handle nested combos: need to look TWO levels up if in comb_* directory
+    sys_name = prep_dir.parent.name
+    if sys_name.startswith('comb_'):
+        sys_name = prep_dir.parent.parent.name
+    active_prep_dir = prep_dir
+    explicit_mapping = False
+    source = 'pretraining/prep'
+    
+    # Check if explicit mapping provided for unrelaxed
+    if structure_type == 'unrelaxed' and unrelaxed_system_mappings and sys_name in unrelaxed_system_mappings:
+        active_prep_dir = Path(unrelaxed_system_mappings[sys_name])
+        explicit_mapping = True
+        source = 'training/systems'
+        if not active_prep_dir.exists():
+            raise FileNotFoundError(f"Mapped prep dir not found: {active_prep_dir}")
+    
+    # Initialize representation source tracking
+    representation_source = {
+        'structure_type': structure_type,
+        'prep_dir_used': str(active_prep_dir.resolve()),
+        'source': source,
+        'explicit_mapping': explicit_mapping,
+    }
+    
+    # Determine embedding dimension based on representation type
+    # Dual embeddings (ligand-only + full) = 1024D, standard = 512D
+    emb_dim = 1024 if use_environment_difference else 512
+    unimol_embeddings = torch.zeros((n_nodes, emb_dim), dtype=torch.float32)
     
     # Read core PDB once (needed for environment loading)
-    core_pdb = prep_dir / "core.pdb"
+    core_pdb = active_prep_dir / "core.pdb"
     if not core_pdb.exists():
         raise FileNotFoundError(f"Core PDB not found: {core_pdb}")
     
+    # Get solvent state from graph_info if available (for environment path selection)
+    solvent_state = graph_info.get('solvent_state', 'solv')
+    
+    # Determine custom search paths for this system
+    sub_custom_paths = None
+    if custom_search_paths is not None:
+        sub_custom_paths = custom_search_paths.get(solvent_state)
+    
     # Compute embedding for each substituent with environment context
+    prep_dir_str = str(prep_dir)  # Key for consensus lookup
+    
     for site_key, site_info in sites.items():
         site_id = site_info.get("site")
         sub_id = site_info.get("sub")
@@ -126,19 +504,52 @@ def _compute_unimol_embeddings_and_edges(run_dir: Path, graph_info_path: Path) -
             continue
         
         try:
-            sub_pdb = prep_dir / f"site{site_id}_sub{sub_id}_frag.pdb"
+            sub_pdb = active_prep_dir / f"site{site_id}_sub{sub_id}_frag.pdb"
             if not sub_pdb.exists():
                 print(f"  Warning: Sub PDB not found: {sub_pdb}, using zeros")
                 continue
             
-            # Get 512D Uni-Mol embedding with full environment context
-            emb = get_substituent_unimol_with_environment(
-                sub_pdb=str(sub_pdb),
-                core_pdb=str(core_pdb),
-                prep_dir=prep_dir,
-                env_cutoff=5.0,
-                atom_limit=256,
-            )
+            # Get consensus atoms for this site if available.
+            # consensus_dict is keyed by [prep_dir_str][site_name] where
+            # site_name is per-SITE (e.g. "site1"), NOT per-node like
+            # `site_key` (e.g. "site1_sub1") — derive the site-level lookup
+            # key from site_id instead of using site_key directly.
+            consensus_atoms = None
+            if consensus_dict is not None:
+                system_consensus = consensus_dict.get(prep_dir_str)
+                if system_consensus is not None:
+                    consensus_atoms = system_consensus.get(f"site{site_id}")
+            
+            # Compute Uni-Mol embeddings
+            if use_environment_difference:
+                # Compute dual embeddings: ligand-only and full
+                # Stack as [512 ligand + 512 full] = 1024D for edge computation
+                emb_ligand, emb_full = get_substituent_dual_embeddings(
+                    sub_pdb=str(sub_pdb),
+                    core_pdb=str(core_pdb),
+                    prep_dir=active_prep_dir,
+                    env_cutoff=env_cutoff,
+                    atom_limit=256,
+                    custom_search_paths=sub_custom_paths,
+                    skip_minimized=(structure_type == 'unrelaxed'),
+                    consensus_atoms=consensus_atoms,  # Filter by consensus if provided
+                )
+                # Concatenate for storage: UnimolPolicy._forward_edges() will split [ligand, full]
+                emb = np.concatenate([emb_ligand, emb_full])  # [1024]
+            else:
+                # Compute standard embedding with environment context (512D)
+                emb = get_substituent_unimol_with_environment(
+                    sub_pdb=str(sub_pdb),
+                    core_pdb=str(core_pdb),
+                    prep_dir=active_prep_dir,
+                    env_cutoff=env_cutoff,
+                    atom_limit=256,
+                    custom_search_paths=sub_custom_paths,
+                    cache_dir=cache_dir,
+                    save_cache=False,  # Save caching is optional; set by caller
+                    skip_minimized=(structure_type == 'unrelaxed'),
+                    consensus_atoms=consensus_atoms,  # Filter by consensus if provided
+                )
             global_idx = sub_to_global_idx[(site_id, sub_id)]
             unimol_embeddings[global_idx] = torch.from_numpy(emb).float()
             
@@ -151,91 +562,36 @@ def _compute_unimol_embeddings_and_edges(run_dir: Path, graph_info_path: Path) -
     dst_list = [p[1] for p in pairs]
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     
-    return unimol_embeddings, edge_index, nsubs_per_site
+    return unimol_embeddings, edge_index, nsubs_per_site, representation_source
+
+
+# ── Pretraining representation tracking ──────────────────────────────────────
+
+def read_representation_tracking(tracking_file: Path) -> List[Dict]:
+    """Read pretraining representation tracking CSV.
+    
+    Args:
+        tracking_file: Path to pretraining_representations_used.csv
+    
+    Returns:
+        List of dicts with tracking information
+    """
+    import csv
+    
+    tracking_file = Path(tracking_file)
+    if not tracking_file.exists():
+        return []
+    
+    results = []
+    with open(tracking_file, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            results.append(row)
+    
+    return results
 
 
 # ── per-system graph cache helpers ──────────────────────────────────────────
-
-def _build_graph_structure(prep_dir: str, graph_info_path: Path,
-                           toppar_dir, toppar_files, warn_missing_types,
-                           solvent_state) -> tuple:
-    """Build the *structure-only* part of a pretraining graph (node features + edges).
-
-    This is the expensive step.  All runs that share
-    the same prep directory will produce an identical structure, so we call this
-    once per prep_dir and reuse the result for every run in that group.
-
-    Returns (data_structure, extras, nsubs_per_site) where data_structure holds
-    node features, edge_index, edge_type, edge_attr but NO target-specific data.
-    """
-    import json
-    from torch_geometric.data import Data
-    from mllf.cb import graph_utils
-    from mllf.cb.graph import Graph
-    from mllf.cb.graph_utils import build_directed_pairs
-
-    with open(graph_info_path) as f:
-        graph_info = json.load(f)
-
-    g = Graph.from_graph_info(graph_info)
-
-    rtf_results = None
-
-    data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
-        g, toppar_dir=toppar_dir, toppar_files=toppar_files,
-        warn_missing_types=warn_missing_types,
-        pdb_dir=prep_dir,
-        pdb_pattern='site{site}_sub{sub}_frag.pdb',
-        rtf_results=rtf_results,
-        prep_dir=prep_dir,
-        solvent_state=solvent_state,
-    )
-
-    nsubs_per_site = graph_info.get('nsubs_per_site', [])
-    if not nsubs_per_site:
-        from collections import defaultdict
-        site_counts = defaultdict(int)
-        for _, node_info in graph_info.get('sites', {}).items():
-            s = node_info.get('site')
-            if s is not None:
-                site_counts[s] += 1
-        if site_counts:
-            nsubs_per_site = [site_counts[s] for s in sorted(site_counts)]
-        else:
-            raise ValueError(f"Could not determine nsubs_per_site from {graph_info_path}")
-
-    relation_names   = extras['relation_names']
-    base_relation_map = extras['base_relation_map']
-    rel_to_idx       = extras['relation_map']
-    pairs = build_directed_pairs(nsubs_per_site)
-
-    src_list, dst_list, edge_type_list, edge_attr_list = [], [], [], []
-    for (i, j) in pairs:
-        for bias in ['linear', 'quadratic', 'skew', 'end']:
-            fwd_name, bwd_name = base_relation_map[bias]
-            rel_name = fwd_name if i < j else bwd_name
-            rel_idx  = rel_to_idx[rel_name]
-            src_list.append(i)
-            dst_list.append(j)
-            edge_type_list.append(rel_idx)
-            k = len(relation_names)
-            one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot[rel_idx] = 1.0
-            edge_attr_list.append(one_hot)
-
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    edge_type  = torch.tensor(edge_type_list, dtype=torch.long)
-    edge_attr  = (torch.stack(edge_attr_list, dim=0) if edge_attr_list
-                  else torch.zeros((0, len(relation_names)), dtype=torch.get_default_dtype()))
-
-    data = Data(
-        x=data_sparse.x,
-        edge_index=edge_index,
-        edge_type=edge_type,
-        edge_attr=edge_attr,
-        site_index=data_sparse.site_index,
-    )
-    return data.cpu(), extras, nsubs_per_site, pairs
 
 
 def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
@@ -471,7 +827,6 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         warn_missing_types=warn_missing_types,
         pdb_dir=pdb_dir,
         pdb_pattern=pdb_pattern,
-        rtf_results=rtf_results,
         prep_dir=prep_dir,
         solvent_state=solvent_state,
     )
@@ -1635,27 +1990,36 @@ def pretrain_epoch(
     reward_weighted: bool = False,
     awr_temperature: float = 0.5,
     pairwise_weights_cache: Optional[List] = None,
+    unimol_config: Optional[Dict] = None,
+    consensus_dict: Optional[Dict[str, Optional[set]]] = None,
 ) -> Dict[str, float]:
     """Run one behavior cloning AWR epoch for UnimolPolicy with optional pairwise weighting.
-
+    
     Args:
-        policy: UnimolPolicy to train
+        policy: UnimolPolicy model
         optimizer: Optimizer
-        runs: List of pretraining run dicts (should be best runs only)
-        reward_config: Reward function configuration (used for reward-weighted loss)
-        device: Device for computation
-        graph_cache: Cached Uni-Mol embeddings and targets
-        groups: Group mapping for gradient accumulation (optional)
-        reward_weighted: If True, weight each run's loss by its reward
-        awr_temperature: Temperature for AWR weighting (default: 0.5)
-        pairwise_weights_cache: Optional list of pairwise confidence weight lists, one per run.
-                               If provided, applies per-edge confidence weighting based on
-                               population balance and DDG reliability. Edges with zero
-                               confidence are skipped entirely.
-
+        runs: List of run dicts with 'run_dir', targets, etc.
+        reward_config: Reward configuration dict
+        device: Torch device
+        toppar_dir: Optional toppar directory
+        toppar_files: Optional toppar files
+        warn_missing_types: Whether to warn about missing atom types
+        graph_cache: Optional pre-built graph cache (list of tuples)
+        groups: Optional run grouping for grouped updates
+        reward_weighted: Whether to use AWR weighting
+        awr_temperature: Temperature for AWR reweighting
+        pairwise_weights_cache: Optional per-run pairwise edge weights
+        unimol_config: Optional dict with 'environment_cutoff' and 'use_environment_difference'
+    
     Returns:
-        Dict with epoch statistics
+        Dict with 'loss', 'num_runs', 'num_updates' keys
     """
+    if unimol_config is None:
+        unimol_config = {}
+    
+    env_cutoff = unimol_config.get('environment_cutoff', 8.0)
+    use_environment_difference = unimol_config.get('use_environment_difference', True)
+    
     policy.train()
 
     # Build normalised reward weights (mean = 1.0) so the learning rate is unchanged.
@@ -1775,8 +2139,11 @@ def pretrain_epoch(
             run_dir = Path(run["run_dir"])
             gi_path = run_dir / "graph_info.json"
             try:
-                unimol_emb, edge_idx, nsubs_per_site = _compute_unimol_embeddings_and_edges(
-                    run_dir, gi_path
+                unimol_emb, edge_idx, nsubs_per_site, _ = _compute_unimol_embeddings_and_edges(
+                    run_dir, gi_path,
+                    env_cutoff=env_cutoff,
+                    use_environment_difference=use_environment_difference,
+                    consensus_dict=consensus_dict,
                 )
                 from mllf.cb.graph_utils import build_directed_pairs
                 pairs = build_directed_pairs(nsubs_per_site)
@@ -2076,15 +2443,27 @@ def pretrain_with_runs(
     train_config = config.get('training', {})
     policy_config = train_config.get('unimol', {})
     
+    # Extract Uni-Mol settings from top-level unimol config
+    unimol_cfg = config.get('unimol', {})
+    env_cutoff = unimol_cfg.get('environment_cutoff', 8.0)
+    use_environment_difference = unimol_cfg.get('use_environment_difference', True)
+    
     policy = UnimolPolicy(
         unimol_dim=policy_config.get('unimol_dim', 512),
         mlp_hidden=policy_config.get('mlp_hidden', 64),
         mlp_out_dim=len(sample_extras['relation_names']) // 2,
+        use_dual_embeddings=use_environment_difference,
     ).to(device)
     
     print(f"\nModel architecture:")
-    print(f"  Policy: UnimolPolicy (pre-computed Uni-Mol 512D embeddings)")
-    print(f"  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
+    if use_environment_difference:
+        print(f"  Policy: UnimolPolicy (dual embeddings: ligand-only + full)")
+        print(f"  Input: [diff_ligand(512D), mean_full(512D)] = 1024D edge features")
+        print(f"  diff_ligand captures substituent variation (sub-dependent)")
+        print(f"  mean_full captures environment effects (environment-dependent)")
+    else:
+        print(f"  Policy: UnimolPolicy (ligand+environment)")
+        print(f"  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
     print(f"  Total parameters: {sum(p.numel() for p in policy.parameters())}")
     
     # Optimizer: cosine-annealed Adam over all policy parameters.
@@ -2138,14 +2517,41 @@ def pretrain_with_runs(
     # All runs from the same system (prep directory) have identical substitutent
     # coordinates, so Uni-Mol embeddings and edge indices are identical.
     # Only the targets differ per run (different variables.py).
+    # 
+    # NOTE: When using 'random' structure selection, this cache is skipped
+    # and representations are computed per-run instead, allowing different structure types
+    # to be selected for each run. For 'minimized' and 'unrelaxed', per-system caching
+    # is used since the structure type is deterministic per system.
     # ------------------------------------------------------------------
-    print(f"\n{'='*60}")
-    print(f"Grouping {len(runs)} runs by system and building per-system graphs...")
-    print(f"{'='*60}")
-
+    
+    # Check structure selection strategy
+    unimol_cfg = config.get('unimol', {})
+    structure_selection = unimol_cfg.get('structure_selection', 'minimized').lower()
+    use_system_cache = (structure_selection in ['minimized', 'unrelaxed'])  # Use cache for deterministic structure types
+    unrelaxed_mappings = config.get('_unrelaxed_system_mappings', {})
+    skip_unrelaxed_for_systems = unimol_cfg.get('skip_unrelaxed_for_systems', [])
+    env_cutoff = unimol_cfg.get('environment_cutoff', 8.0)  # Distance cutoff for environment filtering
+    use_environment_difference = unimol_cfg.get('use_environment_difference', True)  # Use (env+lig)-(lig) representation
+    tracking_file = initialize_representation_tracker(output_dir)
+    
+    # Initialize consensus_dict - will be populated if consensus building is enabled
+    consensus_dict = None
+    
+    if structure_selection != 'minimized':
+        print(f"\n{'='*60}")
+        print(f"Structure selection: {structure_selection}")
+        print(f"Computing representations per-run (system cache disabled)")
+        print(f"Tracking: {tracking_file}")
+        print(f"{'='*60}\n")
+    else:
+        print(f"\n{'='*60}")
+        print(f"Grouping {len(runs)} runs by system and building per-system graphs...")
+        print(f"{'='*60}")
+    
     # Group runs by prep directory (system)
     system_to_runs = {}  # prep_dir -> list of run indices
     system_graph_cache = {}  # prep_dir -> (unimol_emb, edge_idx, nsubs_per_site)
+    system_structure_cache = {}  # prep_dir -> nsubs_per_site (always populated, for pairwise weights)
     
     for run_idx, run in enumerate(runs):
         run_dir = Path(run["run_dir"])
@@ -2158,49 +2564,198 @@ def pretrain_with_runs(
     
     print(f"Found {len(system_to_runs)} unique systems")
     
-    # Build graph cache per system
+    # Build environment consensus atoms if configured
+    # Structure: consensus_dict[prep_dir_str][site_name] = set of consensus atoms
+    use_consensus = unimol_cfg.get('use_environment_consensus', True)
+    consensus_dict = {}  # Will be populated per-system
+    
+    if use_consensus:
+        print("\nBuilding environment consensus atoms per system/site...")
+        from mllf.cb.environment_consensus import build_site_consensus
+        
+        # Build consensus for each unique system (prep_dir)
+        for prep_dir_str in sorted(system_to_runs.keys()):
+            prep_dir = Path(prep_dir_str)
+            
+            # Skip if prep directory doesn't exist
+            if not prep_dir.is_dir():
+                continue
+            
+            # Find all site_* PDB files in this system's prep directory
+            # Handle both regular files and combo subdirectories
+            site_to_subs = {}
+            
+            # Search for PDB files directly in prep_dir
+            for sub_pdb in sorted(prep_dir.glob('site*_sub*_frag.pdb')):
+                site_num = sub_pdb.stem.split('_')[0]  # e.g., "site1"
+                if site_num not in site_to_subs:
+                    site_to_subs[site_num] = []
+                if sub_pdb not in site_to_subs[site_num]:
+                    site_to_subs[site_num].append(sub_pdb)
+            
+            # Also search in combo subdirectories (for combo structures)
+            for comb_dir in sorted(prep_dir.glob('comb_*/')):
+                for sub_pdb in sorted(comb_dir.glob('site*_sub*_frag.pdb')):
+                    site_num = sub_pdb.stem.split('_')[0]  # e.g., "site1"
+                    if site_num not in site_to_subs:
+                        site_to_subs[site_num] = []
+                    if sub_pdb not in site_to_subs[site_num]:
+                        site_to_subs[site_num].append(sub_pdb)
+            
+            # Build consensus for each site in this system
+            if site_to_subs:
+                consensus_dict[prep_dir_str] = {}
+                
+                # Find core.pdb for this system (try direct path first, then combo)
+                core_pdb = None
+                if (prep_dir / 'core.pdb').exists():
+                    core_pdb = str(prep_dir / 'core.pdb')
+                else:
+                    # Try first combo directory
+                    for comb_dir in sorted(prep_dir.glob('comb_*/')):
+                        if (comb_dir / 'core.pdb').exists():
+                            core_pdb = str(comb_dir / 'core.pdb')
+                            break
+                
+                if core_pdb:
+                    # Extract system name for logging
+                    # Handle nested combos: system/comb_ID/prep or system/prep
+                    system_path = Path(prep_dir_str)
+                    if system_path.parent.name.startswith('comb_'):
+                        # Nested combo: .../system/comb_ID/prep
+                        system_label = system_path.parent.parent.name
+                    else:
+                        # Regular: .../system/prep
+                        system_label = system_path.parent.name
+                    
+                    # SKIP consensus building for vacuum systems (no environment to define)
+                    if 'vac' in system_label.lower() or 'vacuum' in system_label.lower():
+                        print(f"\n[CONSENSUS] Skipping consensus for vacuum system: {system_label} (no environment)")
+                        # Set all sites to None for this system
+                        for site_name in sorted(site_to_subs.keys()):
+                            consensus_dict[prep_dir_str][site_name] = None
+                    else:
+                        # Build consensus for solvent/protein systems
+                        for site_name in sorted(site_to_subs.keys()):
+                            sub_pdbs = [str(p) for p in sorted(site_to_subs[site_name])]
+                            try:
+                                consensus = build_site_consensus(
+                                    site_name,
+                                    sub_pdbs,
+                                    core_pdb,
+                                    prep_dir,
+                                    env_cutoff=env_cutoff,
+                                    system_name=system_label,
+                                )
+                                consensus_dict[prep_dir_str][site_name] = consensus
+                            except Exception as e:
+                                print(f"  Warning: Failed to build consensus for {prep_dir_str}/{site_name}: {e}")
+                                consensus_dict[prep_dir_str][site_name] = None
+        
+        # Save consensus atoms for reference/debugging
+        if consensus_dict:
+            import json
+            consensus_json = {}
+            for prep_dir_str, sites in consensus_dict.items():
+                if sites:
+                    consensus_json[prep_dir_str] = {}
+                    for site_key, atoms in sites.items():
+                        if atoms is not None:
+                            # Convert set of tuples to list of lists for JSON serialization
+                            consensus_json[prep_dir_str][site_key] = sorted([list(atom) for atom in atoms])
+                        else:
+                            consensus_json[prep_dir_str][site_key] = None
+            
+            if consensus_json:
+                consensus_file = output_dir / 'environment_consensus.json'
+                with open(consensus_file, 'w') as f:
+                    json.dump(consensus_json, f, indent=2)
+                print(f"  Saved consensus to {consensus_file.name}\n")
+        else:
+            print()
+    
+    # Build graph cache per system (only if using minimized mode)
     n_systems_ok = 0
     n_systems_fail = 0
     
-    for system_idx, (prep_dir_str, run_indices) in enumerate(sorted(system_to_runs.items())):
-        try:
-            prep_dir = Path(prep_dir_str)
+    if use_system_cache:
+        print(f"\nBuilding per-system graphs ({len(system_to_runs)} systems)...")
+        for system_idx, (prep_dir_str, run_indices) in enumerate(sorted(system_to_runs.items())):
+            try:
+                prep_dir = Path(prep_dir_str)
+                
+                # Use first run in system to get graph_info (all runs from same system have identical structure)
+                first_run_idx = run_indices[0]
+                first_run = runs[first_run_idx]
+                run_dir = Path(first_run["run_dir"])
+                gi_path = run_dir / "graph_info.json"
+                
+                if not gi_path.exists():
+                    n_systems_fail += 1
+                    continue
+                
+                # Compute Uni-Mol embeddings using configured structure selection
+                unimol_emb, edge_idx, nsubs_per_site, _ = _compute_unimol_embeddings_and_edges(
+                    run_dir, gi_path,
+                    structure_type=structure_selection,
+                    unrelaxed_system_mappings=unrelaxed_mappings,
+                    env_cutoff=env_cutoff,
+                    use_environment_difference=use_environment_difference,
+                    run_idx=0,
+                    consensus_dict=consensus_dict,
+                )
+                
+                # Cache the system graph (shared across all runs)
+                system_graph_cache[prep_dir_str] = (unimol_emb, edge_idx, nsubs_per_site)
+                system_structure_cache[prep_dir_str] = nsubs_per_site
+                n_systems_ok += 1
+                
+                # Handle nested combos: look TWO levels up if in comb_* directory
+                display_name = prep_dir.parent.name
+                if display_name.startswith('comb_'):
+                    display_name = prep_dir.parent.parent.name + '/' + display_name
+                print(f"  [{system_idx + 1}/{len(system_to_runs)}] {display_name}: "
+                      f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, {edge_idx.size(1)} edges")
             
-            # Use first run in system to get graph_info (all runs from same system have identical structure)
-            first_run_idx = run_indices[0]
-            first_run = runs[first_run_idx]
-            run_dir = Path(first_run["run_dir"])
-            gi_path = run_dir / "graph_info.json"
-            
-            if not gi_path.exists():
+            except Exception as e:
+                print(f"  System {prep_dir_str}: {e}")
                 n_systems_fail += 1
-                continue
-            
-            # Compute Uni-Mol embeddings and edge indices for this system
-            unimol_emb, edge_idx, nsubs_per_site = _compute_unimol_embeddings_and_edges(
-                run_dir, gi_path
-            )
-            
-            # Cache the system graph (shared across all runs)
-            system_graph_cache[prep_dir_str] = (unimol_emb, edge_idx, nsubs_per_site)
-            n_systems_ok += 1
-            
-            print(f"  [{system_idx + 1}/{len(system_to_runs)}] {prep_dir.parent.name}: "
-                  f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, {edge_idx.size(1)} edges")
         
-        except Exception as e:
-            print(f"  System {prep_dir_str}: {e}")
-            n_systems_fail += 1
+        print(f"\nPer-system graph cache ready: {n_systems_ok} systems built, {n_systems_fail} failed")
+    else:
+        print(f"Skipping system cache (using per-run structure selection)")
+        n_systems_ok = 0
+        for prep_dir_str in system_to_runs.keys():
+            n_systems_ok += 1
+        # Still build structure cache for pairwise weights calculation
+        print(f"Building per-system structure cache (for pairwise weights)...")
+        for prep_dir_str, run_indices in sorted(system_to_runs.items()):
+            try:
+                first_run_idx = run_indices[0]
+                first_run = runs[first_run_idx]
+                run_dir = Path(first_run["run_dir"])
+                gi_path = run_dir / "graph_info.json"
+                
+                if gi_path.exists():
+                    with open(gi_path) as f:
+                        gi = json.load(f)
+                    # Extract nsubs_per_site from graph_info
+                    nsubs_per_site = gi.get('nsubs_per_site', [])
+                    system_structure_cache[prep_dir_str] = nsubs_per_site
+            except Exception:
+                pass  # Graceful degradation
     
-    print(f"\nPer-system graph cache ready: {n_systems_ok} systems built, {n_systems_fail} failed")
-    
-    # Now build per-run targets cache (loads shared system embeddings + run-specific targets)
+    # Now build per-run targets cache
     graph_cache = [None] * len(runs)
     n_ok = 0
     n_fail = 0
     
     print(f"\n{'='*60}")
-    print(f"Pre-building per-run targets...")
+    if use_system_cache:
+        print(f"Pre-building per-run targets (using system cache)...")
+    else:
+        print(f"Pre-building per-run embeddings and targets...")
+        print(f"(structure selection: {structure_selection})")
     print(f"{'='*60}")
     
     for run_idx, run in enumerate(runs):
@@ -2208,36 +2763,81 @@ def pretrain_with_runs(
             run_dir = Path(run["run_dir"])
             prep_dir = run_dir.parent / "prep"
             prep_dir_str = str(prep_dir)
+            gi_path = run_dir / "graph_info.json"
             
-            # Get cached system graph
-            if prep_dir_str not in system_graph_cache:
+            if not gi_path.exists():
                 n_fail += 1
                 continue
             
-            unimol_emb, edge_idx, nsubs_per_site = system_graph_cache[prep_dir_str]
+            # Determine structure type for this run
+            if use_system_cache:
+                # Minimized mode: use cached system embeddings
+                if prep_dir_str not in system_graph_cache:
+                    n_fail += 1
+                    continue
+                
+                unimol_emb, edge_idx, nsubs_per_site = system_graph_cache[prep_dir_str]
+                struct_type_used = 'minimized'
+                source_info = 'system_cache'
+                
+            else:
+                # Random or unrelaxed mode: compute per-run with selected structure
+                # Handle nested combos: look TWO levels up if in comb_* directory
+                system_name = prep_dir.parent.name
+                if system_name.startswith('comb_'):
+                    system_name = prep_dir.parent.parent.name
+                struct_type_used = _select_structure_type_for_run(
+                    run_idx, 
+                    structure_selection,
+                    system_name=system_name,
+                    skip_patterns=skip_unrelaxed_for_systems
+                )
+                
+                unimol_emb, edge_idx, nsubs_per_site, rep_source = _compute_unimol_embeddings_and_edges(
+                    run_dir, gi_path,
+                    structure_type=struct_type_used,
+                    unrelaxed_system_mappings=unrelaxed_mappings,
+                    env_cutoff=env_cutoff,
+                    use_environment_difference=use_environment_difference,
+                    run_idx=run_idx,
+                    consensus_dict=consensus_dict,
+                )
+                
+                # Track representation choice
+                track_representation_choice(
+                    tracking_file,
+                    system_name=system_name,
+                    run_idx=run_idx,
+                    structure_type=struct_type_used,
+                    source=rep_source['source'],
+                    prep_dir_used=Path(rep_source['prep_dir_used']),
+                    explicit_mapping=rep_source['explicit_mapping'],
+                )
+                source_info = rep_source['source']
             
             # Extract run-specific targets from variables.py
             from mllf.cb.graph_utils import build_directed_pairs
             pairs = build_directed_pairs(nsubs_per_site)
-
             targets = _extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
             
             if targets and edge_idx.size(1) > 0:
                 # Cache: (unimol_embeddings [N, 512], edge_index [2, E], targets [E, 4])
-                # Note: unimol_emb and edge_idx are SHARED from system cache
                 graph_cache[run_idx] = (unimol_emb, edge_idx, targets)
                 n_ok += 1
             else:
                 n_fail += 1
             
             if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
-                print(f"  {run_idx + 1}/{len(runs)} runs ({n_ok} cached, {n_fail} failed)...")
+                pct = 100 * n_ok / (run_idx + 1) if (run_idx + 1) > 0 else 0
+                print(f"  {run_idx + 1}/{len(runs)} runs ({n_ok} cached, {n_fail} failed, {pct:.0f}%)...")
         
         except Exception as e:
             print(f"  Run {run_idx}: {e}")
             n_fail += 1
     
-    print(f"\nRun-specific targets cache ready: {n_ok} runs cached, {n_fail} failed")
+    print(f"\nRun cache ready: {n_ok} runs cached, {n_fail} failed")
+    if not use_system_cache:
+        print(f"Representation tracking: {tracking_file}")
     
     # Build per-run pairwise confidence weights cache (based on population balance and DDG reliability)
     print(f"\n{'='*60}")
@@ -2253,11 +2853,11 @@ def pretrain_with_runs(
             prep_dir = run_dir.parent / "prep"
             prep_dir_str = str(prep_dir)
             
-            # Get system graph to know the pairs
-            if prep_dir_str not in system_graph_cache:
+            # Get system structure info (always available)
+            if prep_dir_str not in system_structure_cache:
                 continue
             
-            unimol_emb, edge_idx, nsubs_per_site = system_graph_cache[prep_dir_str]
+            nsubs_per_site = system_structure_cache[prep_dir_str]
             
             # Build pairs for this system
             from mllf.cb.graph_utils import build_directed_pairs
@@ -2344,6 +2944,8 @@ def pretrain_with_runs(
             reward_weighted=reward_weighted,
             awr_temperature=awr_temperature,
             pairwise_weights_cache=pairwise_weights_cache,
+            unimol_config={'environment_cutoff': env_cutoff, 'use_environment_difference': use_environment_difference},
+            consensus_dict=consensus_dict,  # Pass consensus for environment filtering
         )
 
         print(f"  AWR Loss: {stats['loss']:.4f}")

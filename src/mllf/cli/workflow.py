@@ -337,10 +337,12 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     """Write a variables.py file from per-directed-edge policy actions.
 
     This function maps directed relation actions back to base biases (quadratic, skew,
-    end, linear). Quadratic (antisymmetric) uses upper triangle only (i < j). Skew and
-    end (NOT antisymmetric) store BOTH directions independently - each directed edge
-    (i→j) has its own value. Linear biases are aggregated into per-node 'b' vector by
-    averaging incident edges.
+    end, linear). Quadratic (symmetric) uses upper triangle only (i < j). Skew and
+    end (NOT symmetric) store BOTH directions independently - each directed edge
+    (i→j) has its own value. Linear predictions are antisymmetric (edge (i,j)
+    approximates b[j] - b[i], matching the pretraining target) and are inverted
+    relative to each site's reference substituent (b[ref] = 0) to recover the
+    per-node 'b' vector — they must NOT be averaged as if symmetric.
 
     Args:
         combo_dir: Path to combo directory where variables.py will be written.
@@ -355,9 +357,9 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     Returns:
         None. Writes a Python file containing a triple-quoted YAML bias_string with keys:
         - 'b': per-node linear bias vector (length N)
-        - 'c': NxN quadratic bias matrix (upper triangular only, antisymmetric)
-        - 'x': NxN skew bias matrix (full matrix, both directions, NOT antisymmetric)
-        - 's': NxN end bias matrix (full matrix, both directions, NOT antisymmetric)
+        - 'c': NxN quadratic bias matrix (upper triangular only, symmetric)
+        - 'x': NxN skew bias matrix (full matrix, both directions, NOT symmetric)
+        - 's': NxN end bias matrix (full matrix, both directions, NOT symmetric)
     """
     combo_dir = Path(combo_dir)
     N = int(data.x.shape[0])
@@ -382,8 +384,8 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     # Collect values for each base type
     # UnimolPolicy outputs all 4 bias types [linear, quadratic, skew, end] for each edge
     # We extract all dimensions and map them to the appropriate matrices
-    per_base_forward = {name: {} for name in base_order}  # For quadratic, linear: undirected pairs
-    per_base_directed = {'skew': {}, 'end': {}}  # For skew/end: directed pairs
+    per_base_forward = {'quadratic': {}}  # Quadratic is symmetric: undirected canonical pairs
+    per_base_directed = {'skew': {}, 'end': {}, 'linear': {}}  # NOT symmetric: directed pairs
     
     # Index into policy output for each base type: [linear, quadratic, skew, end]
     bias_type_index = {'linear': 0, 'quadratic': 1, 'skew': 2, 'end': 3}
@@ -432,27 +434,45 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         for base in ['linear', 'quadratic', 'skew', 'end']:
             val = action_vals.get(base, 0.0)
             
-            if base in ['skew', 'end']:
-                # Skew and end: store directed pairs (preserve both directions)
+            if base in ['skew', 'end', 'linear']:
+                # Skew, end, and linear are NOT symmetric — store directed pairs
+                # (preserve both directions independently). Linear predictions
+                # approximate b[dst] - b[src] (antisymmetric), so averaging
+                # forward/backward values here would wipe out the signal.
                 per_base_directed[base][(src, dst)] = val
             else:
-                # Quadratic and linear: use undirected canonical pairs
+                # Quadratic: undirected canonical pairs.
+                # This is a genuinely symmetric matrix, so predictions from BOTH
+                # directions (i→j and j→i) are averaged together. This matches
+                # pretraining where both edges share the same target value.
                 pair = (min(src, dst), max(src, dst))
-                # Always use the forward direction for canonical storage
-                # For undirected pairs, we only store once per unique pair
+                
                 if pair not in per_base_forward[base]:
-                    per_base_forward[base][pair] = val
+                    # First edge for this pair: initialize with (value, count)
+                    per_base_forward[base][pair] = (val, 1)
+                else:
+                    # Second edge for this pair: accumulate for averaging
+                    prev_val, prev_count = per_base_forward[base][pair]
+                    per_base_forward[base][pair] = (prev_val + val, prev_count + 1)
 
     # Assemble bias matrices for nonlinear terms
-    # IMPORTANT: Quadratic is antisymmetric, so we store ONLY the upper triangle (i < j).
-    # Skew and end are NOT antisymmetric - they need BOTH directions stored independently.
+    # IMPORTANT: Quadratic is symmetric, so we store ONLY the upper triangle (i < j).
+    # Skew and end are NOT symmetric - they need BOTH directions stored independently.
     def build_mat_for_quadratic():
-        """Build quadratic matrix (antisymmetric, upper triangle only)."""
+        """Build quadratic matrix (symmetric, upper triangle only).
+        
+        For each canonical pair, average predictions from both directions if available.
+        """
         mat = [[0.0 for _ in range(N)] for _ in range(N)]
         vals_map = per_base_forward.get('quadratic', {})
-        for (i, j), val in vals_map.items():
+        for (i, j), val_data in vals_map.items():
+            # val_data is either a float (legacy) or (value, count) tuple (new)
             try:
-                v = float(val)
+                if isinstance(val_data, tuple):
+                    sum_val, count = val_data
+                    v = sum_val / count  # Average both directions
+                else:
+                    v = float(val_data)
             except Exception:
                 v = 0.0
             # Clip to prevent extreme values
@@ -468,7 +488,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         return mat
     
     def build_mat_for_bidirectional(base_name: str):
-        """Build skew/end matrix (NOT antisymmetric, both directions stored)."""
+        """Build skew/end matrix (NOT symmetric, both directions stored)."""
         mat = [[0.0 for _ in range(N)] for _ in range(N)]
         directed_vals = per_base_directed.get(base_name, {})
         
@@ -487,34 +507,21 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
     x_mat = build_mat_for_bidirectional('skew')
     s_mat = build_mat_for_bidirectional('end')
 
-    # Derive per-node linear bias 'b' from per-edge linear values
-    # Strategy: average the linear values of all incident edges for each node
-    # This converts edge-level predictions into the node-level 'b' vector expected by the simulator
+    # Derive per-node linear bias 'b' from directed per-edge linear predictions.
+    #
+    # During pretraining the linear target for directed edge (i, j) is
+    # b[j] - b[i] — an ANTISYMMETRIC quantity (edge (j,i) targets b[i] - b[j] =
+    # -(b[j]-b[i])), unlike quadratic which is genuinely symmetric. Reconstructing
+    # 'b' therefore requires inverting this difference relative to each site's
+    # reference substituent (b[ref] = 0), NOT averaging raw forward/backward
+    # predictions together (that would cancel the antisymmetric signal to ~0).
     b_vec = [0.0 for _ in range(N)]
-    linear_vals = per_base_forward.get('linear', {})
-    if linear_vals:
-        sums = [0.0 for _ in range(N)]
-        counts = [0 for _ in range(N)]
-        # Accumulate contributions from each edge to both its endpoints
-        for (i, j), val in linear_vals.items():
-            try:
-                avg = float(val)
-            except Exception:
-                avg = 0.0
-            sums[i] += avg
-            sums[j] += avg
-            counts[i] += 1
-            counts[j] += 1
-        # Average the accumulated values and clip the final result
-        for idx in range(N):
-            if counts[idx] > 0:
-                b_vec[idx] = sums[idx] / counts[idx]
-                b_vec[idx] = max(-bias_clip, min(bias_clip, b_vec[idx]))
-            else:
-                b_vec[idx] = 0.0
-    
-    # Enforce constraint: first substituent of each site must have b=0.0
-    # Load graph_info.json to determine site structure
+    linear_directed = per_base_directed.get('linear', {})
+
+    # Determine site groups: ordered lists of node indices per site, with the
+    # reference substituent (sub == 1) first. Prefer graph_info.json (accurate
+    # site/sub metadata); fall back to contiguous nsubs_per_site blocks.
+    site_groups: List[List[int]] = []
     graph_info_path = combo_dir / 'graph_info.json'
     if graph_info_path.exists():
         import json
@@ -522,49 +529,54 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
             with open(graph_info_path, 'r') as f:
                 graph_info = json.load(f)
             sites_info = graph_info.get('sites', {})
-            
-            # Group nodes by site to find first sub of each site
-            site_to_nodes = {}
-            for key, node_info in sites_info.items():
-                site = node_info.get('site')
-                sub = node_info.get('sub')
-                if site is not None and sub is not None:
-                    site_to_nodes.setdefault(site, []).append((sub, key))
-            
-            # For each site, find the node with sub==1 and set its b value to 0.0
-            # Nodes are ordered as sorted (site, sub), so we need to count how many
-            # nodes come before each site's first sub
+
             all_nodes = []
             for key, node_info in sites_info.items():
                 site = node_info.get('site')
                 sub = node_info.get('sub')
                 if site is not None and sub is not None:
-                    all_nodes.append((site, sub, key))
+                    all_nodes.append((site, sub))
             all_nodes.sort(key=lambda x: (x[0], x[1]))  # Sort by (site, sub)
-            
-            # Find indices where sub == 1
-            for idx, (site, sub, key) in enumerate(all_nodes):
-                if sub == 1 and idx < len(b_vec):
-                    b_vec[idx] = 0.0
+
+            grouped: Dict[Any, List[int]] = {}
+            for idx, (site, sub) in enumerate(all_nodes):
+                if idx < N:
+                    grouped.setdefault(site, []).append(idx)
+            # Each group is already ordered by ascending sub, so sub==1 (the
+            # reference) is first.
+            site_groups = [grouped[s] for s in sorted(grouped.keys())]
         except Exception:
-            # If we can't load graph_info, fall back to setting b[0] = 0.0 only
-            if b_vec:
-                b_vec[0] = 0.0
-    else:
-        # Fallback: infer reference subs from linear edge topology.
-        # Linear edges are always sub1(src) → other_sub(dst), so the reference
-        # node of each site appears as the min-index end of every linear pair
-        # (i.e. it appears as `i` in canonical pairs but never as `j`).
-        linear_vals = per_base_forward.get('linear', {})
-        if linear_vals:
-            as_src = set(i for i, j in linear_vals)
-            as_dst = set(j for i, j in linear_vals)
-            ref_nodes = as_src - as_dst  # reference: src-only, never dst
-            for ref_idx in sorted(ref_nodes):
-                if ref_idx < len(b_vec):
-                    b_vec[ref_idx] = 0.0
-        elif b_vec:
-            b_vec[0] = 0.0  # last-resort: no linear edges at all
+            site_groups = []
+
+    if not site_groups:
+        nsubs_per_site = extras.get('nsubs_per_site') if isinstance(extras, dict) else None
+        if nsubs_per_site:
+            offset = 0
+            for nsubs in nsubs_per_site:
+                site_groups.append(list(range(offset, offset + nsubs)))
+                offset += nsubs
+        elif N > 0:
+            site_groups = [list(range(N))]
+
+    for site_nodes in site_groups:
+        if not site_nodes:
+            continue
+        ref = site_nodes[0]
+        b_vec[ref] = 0.0
+        for j in site_nodes[1:]:
+            fwd = linear_directed.get((ref, j))
+            bwd = linear_directed.get((j, ref))
+            if fwd is not None and bwd is not None:
+                # Average the two independent antisymmetric estimates:
+                # fwd ≈ b[j]-b[ref] = b[j],  -bwd ≈ b[j]-b[ref] = b[j]
+                val = 0.5 * (fwd - bwd)
+            elif fwd is not None:
+                val = fwd
+            elif bwd is not None:
+                val = -bwd
+            else:
+                val = 0.0
+            b_vec[j] = max(-bias_clip, min(bias_clip, val))
 
     # Format bias_string manually to match expected YAML structure
     # b: single row with first element using '- -' then rest using just '-'

@@ -280,12 +280,23 @@ class EdgePolicy(nn.Module):
 
 
 class UnimolPolicy(nn.Module):
-    """Direct policy using pre-computed Uni-Mol 512D embeddings.
+    """Direct policy using pre-computed Uni-Mol embeddings.
     
-    For each substituent node, a pre-computed 512D Uni-Mol representation
-    is provided (trained on 1.1B molecules from PubChem). For each directed
-    edge (i → j), the policy input is the concatenation [unimol_i, unimol_j]
-    = 1024D.
+    Supports two embedding modes:
+    
+    **Standard Mode** (use_dual_embeddings=False):
+    - Single 512D embedding per node (ligand + environment context)
+    - Edge input: [diff(512), mean(512)] = 1024D
+    - Backward compatible with original design
+    
+    **Dual Embedding Mode** (use_dual_embeddings=True):
+    - Two 512D embeddings per node stacked as [ligand_only, full]
+    - Ligand-only: core + sub (captures substituent-specific information)
+    - Full: core + sub + environment + ref_subs (captures ligand+environment context)
+    - Edge input: [diff_ligand(512), mean_full(512)] = 1024D
+      - diff_ligand captures how substituents differ (antisymmetric, sub-dependent)
+      - mean_full captures environmental context (symmetric, environment-dependent)
+    - Allows MLPs to simultaneously learn substituent-dependent and environment-dependent information
     
     Each edge is passed as 1024D directly to EdgeValueMLP, which contains four
     independent BiasHeadMLPs (one per bias type). Each BiasHeadMLP learns its
@@ -297,21 +308,26 @@ class UnimolPolicy(nn.Module):
     edge classification based on pre-trained molecular representations.
     
     Args:
-        unimol_dim: Dimension of Uni-Mol embeddings (default: 512).
+        unimol_dim: Dimension of each Uni-Mol embedding (default: 512).
         mlp_hidden: Hidden size for EdgeValueMLP (default: 64, unused in this design).
         mlp_out_dim: Number of bias types / output coefficients (default: 4).
+        use_dual_embeddings: If True, use dual embedding mode; if False, use standard mode (default: False).
     """
     
     def __init__(self, unimol_dim: int = 512, mlp_hidden: int = 64,
-                 mlp_out_dim: int = 4):
+                 mlp_out_dim: int = 4, use_dual_embeddings: bool = False):
         super().__init__()
         self.unimol_dim = unimol_dim
         self.mlp_out_dim = int(mlp_out_dim)
+        self.use_dual_embeddings = use_dual_embeddings
         
-        # Input: concatenation of two 512D Uni-Mol embeddings = 1024D
-        # EdgeValueMLP receives 1024D and passes to four independent BiasHeadMLPs
-        # Each BiasHeadMLP learns its own 1024→512→256→64→2 projection
-        in_dim = 2 * unimol_dim
+        # When using dual embeddings:
+        # - Input format: [N, 1024] where first 512 = ligand-only, last 512 = full system with environment
+        # - Edge input: [diff_ligand, mean_full] = 1024D
+        # Otherwise:
+        # - Input format: [N, 512] ligand+environment
+        # - Edge input: [diff, mean] = 1024D
+        in_dim = 2 * unimol_dim if not use_dual_embeddings else 1024
         self.edge_mlp = EdgeValueMLP(in_dim, hidden=mlp_hidden, num_bias_types=mlp_out_dim)
         
         # Scale factors for the 4 MSLD bias types: [linear, quadratic, skew, end].
@@ -328,7 +344,9 @@ class UnimolPolicy(nn.Module):
         """Compute (mean, log_std) tensors for all edges.
         
         Args:
-            unimol_embeddings: [N, unimol_dim] pre-computed Uni-Mol embeddings.
+            unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
+                - When use_dual_embeddings=False: [N, 512] ligand+environment
+                - When use_dual_embeddings=True: [N, 1024] stacked [ligand_only, full]
             edge_index: [2, E] directed edge index.
             edge_type: [E] integer relation index. When provided, each edge is
                 routed to mlps[edge_type // 2] for gradient isolation.
@@ -340,17 +358,31 @@ class UnimolPolicy(nn.Module):
         src = edge_index[0]
         dst = edge_index[1]
         
-        # Build edge input using symmetric-aware representation: concat([diff, mean])
-        # This handles the different symmetries of bias types correctly:
-        # - Linear biases are ANTISYMMETRIC: linear_ij = -linear_ji (uses diff)
-        # - Quadratic biases are SYMMETRIC: quadratic_ij = quadratic_ji (uses mean)
-        # - Skew/End biases have no symmetry (MLPs learn from both)
-        src_emb = unimol_embeddings[src]  # [E, unimol_dim]
-        dst_emb = unimol_embeddings[dst]  # [E, unimol_dim]
-        diff = src_emb - dst_emb                        # [E, unimol_dim] - antisymmetric component
-        mean = (src_emb + dst_emb) / 2.0                # [E, unimol_dim] - symmetric component
-        edge_input = torch.cat([diff, mean], dim=-1)    # [E, 2*unimol_dim] = [E, 1024]
-        
+        if self.use_dual_embeddings:
+            # Dual embedding mode: [ligand_only, full]
+            # Split the 1024D input into two 512D components
+            src_emb = unimol_embeddings[src]  # [E, 1024]
+            dst_emb = unimol_embeddings[dst]  # [E, 1024]
+            
+            src_ligand = src_emb[:, :512]      # [E, 512] ligand-only
+            src_full = src_emb[:, 512:]        # [E, 512] full
+            dst_ligand = dst_emb[:, :512]      # [E, 512] ligand-only
+            dst_full = dst_emb[:, 512:]        # [E, 512] full
+            
+            # Build edge input using:
+            # - Antisymmetric component from ligand (captures substituent variation)
+            # - Symmetric component from full (captures environment effects)
+            diff_ligand = src_ligand - dst_ligand     # [E, 512] - antisymmetric (sub-dependent)
+            mean_full = (src_full + dst_full) / 2.0   # [E, 512] - symmetric (environment-dependent)
+            edge_input = torch.cat([diff_ligand, mean_full], dim=-1)  # [E, 1024]
+        else:
+            # Standard mode: ligand+environment
+            # Symmetric-aware decomposition
+            src_emb = unimol_embeddings[src]  # [E, 512]
+            dst_emb = unimol_embeddings[dst]  # [E, 512]
+            diff = src_emb - dst_emb                        # [E, 512] - antisymmetric
+            mean = (src_emb + dst_emb) / 2.0                # [E, 512] - symmetric
+            edge_input = torch.cat([diff, mean], dim=-1)    # [E, 1024]
         
         # Forward through edge MLP with routing if edge_type is provided
         out = self.edge_mlp(edge_input, edge_type)  # [E, 2*mlp_out_dim]
@@ -368,7 +400,6 @@ class UnimolPolicy(nn.Module):
         log_std = torch.clamp(log_std, min=-20.0, max=2.0)
         
         return mean, log_std
-    
     def get_actions(self, unimol_embeddings: torch.Tensor,
                     edge_index: torch.LongTensor,
                     edge_type: Optional[torch.Tensor] = None,
