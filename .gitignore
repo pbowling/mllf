@@ -30,7 +30,7 @@ pretraining/
 old_files/
 models/
 training/
-examples/14benz/training_output/
+examples/
 *status.out
 *.tar.gz
 deepset_pretraining_output*

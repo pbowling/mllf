@@ -1,6 +1,4 @@
 """mllf package
-
-Expose convenient top-level symbols for the package and set package metadata.
 """
 
 __all__ = [

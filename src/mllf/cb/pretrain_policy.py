@@ -1685,7 +1685,7 @@ def filter_runs_by_reward(
             # Count substitutions per site
             site_counts = {}
             for block_name, block_data in sites.items():
-                site_num = block_data['site']
+                site_num = extract_site_number(block_name, block_data)
                 site_counts[site_num] = site_counts.get(site_num, 0) + 1
             
             num_sites = len(site_counts)
@@ -1825,6 +1825,44 @@ def filter_runs_by_min_transitions(
     return filtered_runs
 
 
+def extract_site_number(block_id: str, block_data: Dict) -> int:
+    """Extract site number from block data, handling missing 'site' key.
+    
+    Some multi-site systems have graph_info.json blocks without the 'site' key.
+    This function handles both cases:
+    1. If 'site' key exists, return it
+    2. If missing, extract from block_id format (e.g., "site1_sub2" → 1)
+    
+    Args:
+        block_id: Block identifier (e.g., "site1_sub1", "site2_sub3")
+        block_data: Block data dict (may or may not have 'site' key)
+    
+    Returns:
+        Site number as integer
+    
+    Raises:
+        KeyError: If 'site' key exists and is required but missing
+        ValueError: If extraction from block_id fails
+    """
+    # Try to use 'site' key if it exists
+    if 'site' in block_data:
+        return block_data['site']
+    
+    # Otherwise, extract from block_id format: "siteN_subM" → N
+    try:
+        # Split on underscore: ["siteN", "subM"]
+        parts = block_id.split('_')
+        if len(parts) >= 1 and parts[0].startswith('site'):
+            # Extract number from "siteN"
+            site_str = parts[0][4:]  # Remove "site" prefix
+            return int(site_str)
+    except (IndexError, ValueError):
+        pass
+    
+    # If we get here, we couldn't extract the site number
+    raise ValueError(f"Cannot extract site number from block_id '{block_id}' and block_data has no 'site' key")
+
+
 def sample_runs_stratified_negative(
     runs: List[Dict],
     fraction_per_bucket: float = 0.55,
@@ -1864,6 +1902,8 @@ def sample_runs_stratified_negative(
     # Compute reward for every run -----------------------------------------
     scored: List[tuple] = []  # (reward, run_dict)
     n_error = 0
+    error_log = []  # Track errors for detailed reporting
+    
     for run in runs:
         try:
             run_dir = Path(run['run_dir'])
@@ -1871,6 +1911,7 @@ def sample_runs_stratified_negative(
             sim_results_path = run_dir / "simulation_results.json"
             if not sim_results_path.exists():
                 n_error += 1
+                error_log.append((str(run_dir), "missing_simulation_results.json"))
                 continue
             with open(sim_results_path) as f:
                 sim_results = json.load(f)
@@ -1878,6 +1919,7 @@ def sample_runs_stratified_negative(
             graph_info_path = run_dir / "graph_info.json"
             if not graph_info_path.exists():
                 n_error += 1
+                error_log.append((str(run_dir), "missing_graph_info.json"))
                 continue
             with open(graph_info_path) as f:
                 graph_info = json.load(f)
@@ -1885,23 +1927,47 @@ def sample_runs_stratified_negative(
             sites = graph_info.get('sites', {})
             if not sites:
                 n_error += 1
+                error_log.append((str(run_dir), "empty_sites_dict"))
                 continue
 
             site_counts: Dict = {}
-            for block_data in sites.values():
-                s = block_data['site']
+            for block_id, block_data in sites.items():
+                s = extract_site_number(block_id, block_data)
                 site_counts[s] = site_counts.get(s, 0) + 1
             num_sites = len(site_counts)
             nsubs_per_site = [site_counts[s] for s in sorted(site_counts)]
 
             reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
             scored.append((reward, run))
-        except Exception:
+        except Exception as e:
             n_error += 1
+            error_log.append((str(run_dir), f"{type(e).__name__}: {str(e)[:80]}"))
 
     print(f"  Total runs scored: {len(scored):,}")
     if n_error:
         print(f"  Skipped (scoring error): {n_error:,}")
+        # Print top error types
+        error_types = {}
+        for run_path, error_msg in error_log:
+            if ":" in error_msg:
+                error_type = error_msg.split(":")[0]
+            else:
+                error_type = error_msg
+            error_types[error_type] = error_types.get(error_type, 0) + 1
+        
+        print(f"\n  Error Type Breakdown:")
+        for error_type in sorted(error_types.keys(), key=lambda x: error_types[x], reverse=True):
+            count = error_types[error_type]
+            print(f"    {error_type:<40} {count:>6,}")
+        
+        # Log to file for detailed analysis
+        error_log_path = Path("scoring_errors.log")
+        with open(error_log_path, 'w') as f:
+            f.write(f"Scoring Errors Log\n")
+            f.write(f"Total errors: {n_error}\n\n")
+            for run_path, error_msg in error_log[:20]:  # Log first 20
+                f.write(f"{run_path}\n  {error_msg}\n")
+        print(f"\n  Full error log saved to: {error_log_path}")
 
     # Separate positive runs (kept in full) and bucket negative ones ---------
     positive_runs = [r for rew, r in scored if rew >= 0]

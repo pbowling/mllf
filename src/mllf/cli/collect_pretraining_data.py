@@ -671,6 +671,31 @@ def collect_run_data(
     # Re-key graph_info['sites']:
     #   sequential key 'site1_sub1' ← master sub at position 0 (e.g. site1_sub3)
     all_rtf_sites = graph_info['sites']
+
+    # Safety net: validate that every master_sub referenced by active_subs_ordered
+    # actually has RTF data available (i.e. exists as a key in all_rtf_sites, the
+    # subs whose RTF files are physically present in prep/).  This guards against
+    # parse_active_subs_from_inp() mis-parsing a *stale* or master-template .inp
+    # file that was copied into a generated-combo prep directory unchanged (its
+    # "read rtf append" order no longer matches the combo's renamed/renumbered
+    # RTF files).  When that happens, the previous behaviour was to silently emit
+    # empty stub entries (missing 'site'/'atom_types'/etc.), corrupting graph
+    # construction downstream.  Generated-combo preps always have their RTF files
+    # renamed/renumbered sequentially 1:1 with the bias-variable ordering, so
+    # falling back to plain sequential naming is always correct for them.
+    def _is_fully_resolved(mapping: Dict[str, List[str]]) -> bool:
+        return all(
+            master_sub in all_rtf_sites
+            for ordered_masters in mapping.values()
+            for master_sub in ordered_masters
+        )
+
+    if not _is_fully_resolved(active_subs_ordered):
+        active_subs_ordered = {
+            f'site{s}': [f'site{s}_sub{i}' for i in range(1, n + 1)]
+            for s, n in enumerate(nsubs_per_site, start=1)
+        }
+
     graph_info['sites'] = {}
     for site_label, ordered_masters in active_subs_ordered.items():
         for seq_idx, master_sub in enumerate(ordered_masters):
