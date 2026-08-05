@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from mllf.cb.workflow_utils import compute_pair_reward
-from mllf.cb.value_net import QNetwork
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +94,19 @@ class TestComputePairReward:
         assert rewards[0, 0].item() == pytest.approx(10 / 100, abs=1e-4)
 
     def test_zero_populations_no_division_error(self):
-        """Both populations zero should not raise; linear dim should be ~0.0."""
+        """Both populations zero should not raise; signals should be penalized (-1.0).
+        
+        When both substituents have zero population, this indicates a sampling failure
+        (neither substituent was ever explored by REMD), so all dimensions are penalized
+        with -1.0.
+        """
         edge_index = self._ei([(0, 1)])
         ddg_pairs = {"2_3": 0.0}
         populations = [0, 0]
 
         rewards = compute_pair_reward(edge_index, ddg_pairs, populations)
-        # minority_frac ≈ 0 when both pops are 0 (epsilon denominator)
-        assert rewards[0, 0].item() == pytest.approx(0.0, abs=1e-4)
+        # Failure case: both pops are 0 → all dims get -1.0 penalty
+        assert rewards[0].tolist() == pytest.approx([-1.0, -1.0, -1.0, -1.0])
 
     # ------- key ordering (lo_hi convention) -------
 
@@ -166,118 +170,6 @@ class TestComputePairReward:
         rewards = compute_pair_reward(edge_index, ddg_pairs, populations)
         assert rewards.min().item() >= -1.0 - 1e-6
         assert rewards.max().item() <= 1.5 + 1e-6
-
-
-# ---------------------------------------------------------------------------
-# QNetwork
-# ---------------------------------------------------------------------------
-
-class TestQNetwork:
-    """Tests for value_net.QNetwork per-edge Q-value critic."""
-
-    def test_default_hidden_dims(self):
-        """Default hidden_dims=[64, 32]; MLP input = in_dim + action_dim."""
-        q = QNetwork(in_dim=200, action_dim=4)
-        layers = [m for m in q.mlp if isinstance(m, torch.nn.Linear)]
-        assert layers[0].in_features == 204   # 200 state + 4 actions
-        assert layers[0].out_features == 64
-        assert layers[1].in_features == 64
-        assert layers[1].out_features == 32
-        assert layers[2].in_features == 32
-        assert layers[2].out_features == 1
-
-    def test_custom_hidden_dims(self):
-        q = QNetwork(in_dim=100, action_dim=4, hidden_dims=[128, 64, 32])
-        layers = [m for m in q.mlp if isinstance(m, torch.nn.Linear)]
-        assert len(layers) == 4           # 3 hidden + 1 output
-        assert layers[0].in_features == 104  # 100 state + 4 actions
-        assert layers[-1].out_features == 1
-
-    def test_output_shape(self):
-        """forward() returns scalar per edge: [E]."""
-        E, D, A = 12, 200, 4
-        q = QNetwork(in_dim=D, action_dim=A)
-        edge_inputs = torch.randn(E, D)
-        actions = torch.randn(E, A)
-        out = q(edge_inputs, actions)
-        assert out.shape == (E,), f"Expected ({E},), got {out.shape}"
-
-    def test_single_edge(self):
-        q = QNetwork(in_dim=50, action_dim=4)
-        edge_inputs = torch.randn(1, 50)
-        actions = torch.randn(1, 4)
-        out = q(edge_inputs, actions)
-        assert out.shape == (1,)
-
-    def test_no_nan_in_output(self):
-        q = QNetwork(in_dim=64, action_dim=4)
-        edge_inputs = torch.randn(8, 64)
-        actions = torch.randn(8, 4)
-        out = q(edge_inputs, actions)
-        assert not torch.isnan(out).any()
-
-    def test_gradient_flow(self):
-        """Gradients should flow back through Q-network parameters."""
-        E, D, A = 8, 64, 4
-        q = QNetwork(in_dim=D, action_dim=A)
-        edge_inputs = torch.randn(E, D)
-        actions = torch.randn(E, A)
-        out = q(edge_inputs, actions)
-        loss = out.mean()
-        loss.backward()
-        for name, param in q.named_parameters():
-            assert param.grad is not None, f"Param {name} has no gradient"
-
-    def test_no_gradient_through_detached_q(self):
-        """When Q is detached (for advantage), its params get no grad from actor loss."""
-        E, D, A = 6, 32, 4
-        q = QNetwork(in_dim=D, action_dim=A)
-        edge_inputs = torch.randn(E, D)
-        actions = torch.randn(E, A)
-
-        q_values = q(edge_inputs, actions).detach()   # detach as in REINFORCE advantage
-        assert q_values.grad_fn is None, "Detached q_values should have no grad_fn"
-
-        # Simulate actor loss: logp (which has a grad_fn) weighted by advantage
-        # advantage = R - Q.detach() — no graph through Q
-        logp = torch.randn(E, requires_grad=True)   # stand-in for policy logp
-        advantage = torch.rand(E) - q_values        # advantage is leaf (no grad_fn through Q)
-        actor_loss = -(logp * advantage.detach()).sum()
-        actor_loss.backward()
-
-        # Q-network parameters should have no grad because they weren't
-        # in the computation graph of actor_loss.
-        for name, param in q.named_parameters():
-            assert param.grad is None, (
-                f"Q-network param {name} should have no grad when not in actor graph"
-            )
-
-    def test_deterministic_output(self):
-        """Same input should produce same output (no dropout in QNetwork)."""
-        q = QNetwork(in_dim=32, action_dim=4)
-        q.eval()
-        x = torch.randn(5, 32)
-        a = torch.randn(5, 4)
-        with torch.no_grad():
-            o1 = q(x, a)
-            o2 = q(x, a)
-        assert torch.allclose(o1, o2)
-
-    def test_advantage_computation(self):
-        """A = R - Q.detach() should be correct shape and finite."""
-        E, D, A = 10, 64, 4
-        q = QNetwork(in_dim=D, action_dim=A)
-        edge_inputs = torch.randn(E, D)
-        actions = torch.randn(E, A)
-        rewards = torch.rand(E) * 2 - 1   # in [-1, 1]
-
-        with torch.no_grad():
-            q_vals = q(edge_inputs, actions)
-
-        advantage = rewards - q_vals
-        assert advantage.shape == (E,)
-        assert not torch.isnan(advantage).any()
-        assert not torch.isinf(advantage).any()
 
 
 if __name__ == "__main__":

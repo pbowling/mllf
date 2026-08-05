@@ -28,344 +28,6 @@ def _find_protein_pdb(prep_path) -> Optional[str]:
     return None
 
 
-def compute_deepset_embedding_for_node(
-    node_idx: int,
-    g,
-    deepset_model,
-    pdb_dir: str,
-    pdb_pattern: str = "site{site}_sub{sub}.pdb",
-    rtf_results: Optional[Dict] = None,
-    prep_dir: Optional[str] = None,
-    protein_pdb: Optional[str] = None,
-    solvent_state: Optional[str] = None,
-    solvent_pdb: Optional[str] = None,
-    aev_cutoff: float = 5.1
-):
-    """Compute DeepSet embedding for a single node/substituent.
-    
-    This implements Steps 1-3 of the 4-step pipeline:
-    1. Extract atom-level features (AEV + charge + atom_id) from PDB
-    2. Pass through shared MLP
-    3. Max-pool to get fixed-size substituent embedding
-    
-    For multi-site systems, when prep_dir is provided, this uses spatial filtering
-    to include reference substituents from other sites and protein atoms within
-    the AEV cutoff distance for accurate molecular context.
-    
-    Args:
-        node_idx: Node index in graph
-        g: Graph object with node metadata
-        deepset_model: Trained DeepSetFeatureExtractor model
-        pdb_dir: Directory containing PDB files
-        pdb_pattern: Pattern for PDB filenames (default: "site{site}_sub{sub}.pdb")
-        rtf_results: Optional dict of RTF parsed data for extracting charges
-        prep_dir: Optional prep directory for multi-site spatial filtering
-        protein_pdb: Optional protein PDB file path (for protein phase systems)
-        solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
-        aev_cutoff: Distance cutoff in Angstroms for spatial filtering (default: 5.1 Å)
-        
-    Returns:
-        torch.Tensor: [embedding_dim] substituent embedding
-    """
-    from .aev_processor import (
-        get_atom_features, get_atom_features_with_context,
-        get_full_ligand_atom_features, build_full_ligand_bond_graph,
-        detect_minimized_pdb, extract_environment_atoms_from_minimized,
-    )
-    from pathlib import Path
-
-    # Get node metadata
-    node_info = g.get_node_info(node_idx) if hasattr(g, 'get_node_info') else {}
-    site = node_info.get('site')
-    sub  = node_info.get('sub')
-
-    if site is None or sub is None:
-        raise ValueError(f"Node {node_idx} missing site or sub metadata")
-
-    # Construct PDB paths
-    pdb_filename = pdb_pattern.format(site=site, sub=sub)
-    pdb_path = os.path.join(pdb_dir, pdb_filename)
-
-    if not os.path.exists(pdb_path):
-        raise FileNotFoundError(f"PDB file not found: {pdb_path}")
-
-    # Get RTF entry for charges if available
-    rtf_entry = None
-    if rtf_results is not None:
-        rtf_key = f"site{site}_sub{sub}"
-        rtf_entry = rtf_results.get(rtf_key)
-
-    # Determine if we should use context-aware AEV computation
-    use_context = prep_dir is not None
-
-    if use_context:
-        prep_path = Path(prep_dir)
-        core_pdb = prep_path / 'core.pdb'
-
-        if not core_pdb.exists():
-            warnings.warn(f"core.pdb not found in {prep_dir}, falling back to single-PDB AEV computation")
-            use_context = False
-        else:
-            # ------------------------------------------------------------------
-            # Try to build environment context from minimized.pdb first.
-            # This gives the most accurate AEV context for both protein and
-            # solvent phase systems because it uses the post-minimization
-            # coordinates of the entire simulated system.
-            # ------------------------------------------------------------------
-            sub_frag_pdb = prep_path / f'site{site}_sub{sub}_frag.pdb'
-            min_pdb = detect_minimized_pdb(prep_path)
-
-            protein_context   = None  # pre-parsed tuple for protein_pdb arg
-            solvent_ctx       = None  # pre-parsed tuple for solvent_context arg
-            effective_protein = protein_pdb  # fallback path string
-
-            if min_pdb and sub_frag_pdb.exists():
-                env_ctx = extract_environment_atoms_from_minimized(
-                    minimized_pdb=min_pdb,
-                    sub_pdb=sub_frag_pdb,
-                    core_pdb=core_pdb,
-                    aev_cutoff=aev_cutoff,
-                    prep_dir=prep_path,
-                )
-                if env_ctx is not None:
-                    if solvent_state == 'protein':
-                        protein_context   = env_ctx
-                        effective_protein = protein_context
-                    elif solvent_state in ('solvent', 'solv', 'water'):
-                        solvent_ctx = env_ctx
-                    # vacuum/gas: env_ctx not used (no extra environment atoms)
-                elif solvent_state == 'protein' and protein_pdb is None:
-                    # minimized.pdb gave nothing — look for standalone protein PDB
-                    _standalone = _find_protein_pdb(prep_path)
-                    if _standalone:
-                        effective_protein = _standalone
-                        warnings.warn(f"Using {_Path(_standalone).name} from prep directory for AEV spatial filtering")
-                    else:
-                        warnings.warn(
-                            f"solvent_state is 'protein' but no environment atoms found in "
-                            f"minimized structure and no protein PDB (protein.pdb/proa.pdb) in prep directory: {prep_dir}"
-                        )
-                elif solvent_state in ('solvent', 'solv', 'water'):
-                    # minimized.pdb gave no environment atoms — fall back to solvent PDB
-                    _default_solvent = _Path(solvent_pdb) if solvent_pdb else prep_path / 'solvent.pdb'
-                    if _default_solvent.exists():
-                        _ref_pdb = sub_frag_pdb if sub_frag_pdb.exists() else prep_path / pdb_filename
-                        solvent_ctx = extract_environment_atoms_from_minimized(
-                            minimized_pdb=_default_solvent,
-                            sub_pdb=_ref_pdb,
-                            core_pdb=core_pdb,
-                            aev_cutoff=aev_cutoff,
-                            prep_dir=prep_path,
-                        )
-                        if solvent_ctx is not None:
-                            warnings.warn(
-                                f"solvent_state is 'solvent' but minimized.pdb gave no environment atoms; "
-                                f"using {_default_solvent.name} from prep directory for AEV context: {_default_solvent}"
-                            )
-            elif solvent_state == 'protein' and protein_pdb is None:
-                # No minimized structure and no sub_frag — try standalone protein PDB
-                _standalone = _find_protein_pdb(prep_path)
-                if _standalone:
-                    effective_protein = _standalone
-                    warnings.warn(f"Using {_Path(_standalone).name} from prep directory for AEV spatial filtering: {prep_dir}")
-                else:
-                    warnings.warn(
-                        f"solvent_state is 'protein' but no protein PDB found in prep directory: {prep_dir}. "
-                        f"Specify protein_pdb in config or add protein.pdb/proa.pdb to prep directory."
-                    )
-            elif solvent_state in ('solvent', 'solv', 'water'):
-                # No minimized structure — fall back to solvent PDB for AEV context.
-                # This is the common case during RL training on a new combo before any
-                # simulation has run (minimized.pdb does not exist yet).
-                _default_solvent = _Path(solvent_pdb) if solvent_pdb else prep_path / 'solvent.pdb'
-                if _default_solvent.exists():
-                    _ref_pdb = sub_frag_pdb if sub_frag_pdb.exists() else Path(pdb_path)
-                    solvent_ctx = extract_environment_atoms_from_minimized(
-                        minimized_pdb=_default_solvent,
-                        sub_pdb=_ref_pdb,
-                        core_pdb=core_pdb,
-                        aev_cutoff=aev_cutoff,
-                        prep_dir=prep_path,
-                    )
-                    if solvent_ctx is not None:
-                        warnings.warn(
-                            f"Using {_default_solvent.name} from prep directory for AEV solvent context "
-                            f"(minimized.pdb not found): {_default_solvent}"
-                        )
-
-            atom_feats = get_atom_features_with_context(
-                substituent_pdb=pdb_path,
-                core_pdb=str(core_pdb),
-                protein_pdb=effective_protein,
-                solvent_context=solvent_ctx,
-                rtf_entry=rtf_entry,
-                include_charges=deepset_model.include_charge,
-                include_atom_ids=deepset_model.include_atom_id,
-                prep_dir=prep_dir,
-                aev_cutoff=aev_cutoff,
-            )
-    
-    if not use_context:
-        # Extract atom-level features (Step 1) - single PDB
-        atom_feats = get_atom_features(
-            pdb_path,
-            rtf_entry=rtf_entry,
-            include_charges=deepset_model.include_charge,
-            include_atom_ids=deepset_model.include_atom_id
-        )
-    
-    # Pass through DeepSet / AtomBondGNN model (Steps 2-3: MLP + pool)
-    from .deepset import AtomBondGNN as _AtomBondGNN
-    with torch.no_grad():
-        if isinstance(deepset_model, _AtomBondGNN):
-            from .aev_processor import get_bond_edge_index_from_pdb
-            from mllf.file_handling.read_rtf import parse_rtf_file as _parse_rtf
-
-            if use_context:
-                # Full-ligand mode: sub + core + ref subs from other sites
-                sub_frag = prep_path / f'site{site}_sub{sub}_frag.pdb'
-                sub_pdb_for_graph = str(sub_frag) if sub_frag.exists() else pdb_path
-
-                # Parse core RTF for bonds + charges
-                core_rtf_data = None
-                core_rtf_path = prep_path / 'core.rtf'
-                if core_rtf_path.exists():
-                    try:
-                        core_rtf_data = _parse_rtf(str(core_rtf_path))
-                    except Exception:
-                        pass
-                core_rtf_bonds = core_rtf_data.get('bonds', []) if core_rtf_data else []
-                sub_rtf_bonds = rtf_entry.get('bonds', []) if rtf_entry else []
-
-                # Discover reference substituents at other sites (sub1)
-                import re as _re
-                ref_sub_info_graph = []
-                for ref_pdb in sorted(prep_path.glob('site*_sub1_frag.pdb')):
-                    m_ref = _re.search(r'site(\d+)_sub1', ref_pdb.name)
-                    if m_ref and int(m_ref.group(1)) == site:
-                        continue  # skip active site
-                    ref_rtf_path = ref_pdb.parent / ref_pdb.name.replace('_frag.pdb', '_pres.rtf')
-                    ref_rtf = None
-                    if ref_rtf_path.exists():
-                        try:
-                            ref_rtf = _parse_rtf(str(ref_rtf_path))
-                        except Exception:
-                            pass
-                    ref_bonds = ref_rtf.get('bonds', []) if ref_rtf else []
-                    ref_sub_info_graph.append((str(ref_pdb), ref_rtf, ref_bonds))
-
-                # Compute full-ligand atom features (sub + core + ref subs)
-                protein_ctx_graph = protein_context if solvent_state == 'protein' else None
-                solvent_ctx_graph = solvent_ctx if solvent_state in ('solvent', 'solv', 'water') else None
-
-                ligand_feats = get_full_ligand_atom_features(
-                    sub_pdb=sub_pdb_for_graph,
-                    core_pdb=str(core_pdb),
-                    sub_rtf_data=rtf_entry,
-                    core_rtf_data=core_rtf_data,
-                    ref_sub_info=[(rp, rrtf) for rp, rrtf, _ in ref_sub_info_graph],
-                    protein_pdb=protein_ctx_graph,
-                    solvent_context=solvent_ctx_graph,
-                    aev_cutoff=aev_cutoff,
-                )
-
-                bond_ei, bond_ea, n_sub, _, _ = build_full_ligand_bond_graph(
-                    sub_pdb=sub_pdb_for_graph,
-                    core_pdb=str(core_pdb),
-                    sub_rtf_bonds=sub_rtf_bonds,
-                    core_rtf_bonds=core_rtf_bonds,
-                    ref_sub_info=[(rp, rbonds) for rp, _, rbonds in ref_sub_info_graph],
-                )
-
-                n_ligand = ligand_feats['aevs'].shape[0]
-                sub_mask = torch.zeros(n_ligand, dtype=torch.bool)
-                sub_mask[:n_sub] = True
-
-                embedding = deepset_model(
-                    aev_tensor=ligand_feats['aevs'],
-                    charges=ligand_feats['charges'],
-                    atom_ids=ligand_feats['atom_ids'],
-                    bond_edge_index=bond_ei,
-                    bond_edge_attr=bond_ea,
-                    sub_mask=sub_mask,
-                )
-            else:
-                # Fallback: sub-only mode (no prep_dir / core.pdb available)
-                rtf_bonds = rtf_entry.get('bonds') if rtf_entry else None
-                bond_ei, bond_ea = get_bond_edge_index_from_pdb(pdb_path, rtf_bonds=rtf_bonds)
-                embedding = deepset_model(
-                    aev_tensor=atom_feats['aevs'],
-                    charges=atom_feats.get('charges'),
-                    atom_ids=atom_feats.get('atom_ids'),
-                    bond_edge_index=bond_ei,
-                    bond_edge_attr=bond_ea,
-                )
-        else:
-            embedding = deepset_model(
-                aev_tensor=atom_feats['aevs'],
-                charges=atom_feats.get('charges'),
-                atom_ids=atom_feats.get('atom_ids')
-            )
-
-    return embedding
-
-
-def compute_deepset_embeddings_for_graph(
-    g,
-    deepset_model,
-    pdb_dir: str,
-    pdb_pattern: str = "site{site}_sub{sub}.pdb",
-    rtf_results: Optional[Dict] = None,
-    prep_dir: Optional[str] = None,
-    protein_pdb: Optional[str] = None,
-    solvent_state: Optional[str] = None,
-    solvent_pdb: Optional[str] = None,
-    aev_cutoff: float = 5.1
-) -> torch.Tensor:
-    """Compute DeepSet embeddings for all nodes in a graph.
-    
-    Args:
-        g: Graph object with node metadata
-        deepset_model: Trained DeepSetFeatureExtractor model
-        pdb_dir: Directory containing PDB files
-        pdb_pattern: Pattern for PDB filenames
-        rtf_results: Optional dict of RTF parsed data
-        prep_dir: Optional prep directory for multi-site spatial filtering
-        protein_pdb: Optional protein PDB file path or pre-parsed (coords, elements) tuple.
-        solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
-        solvent_pdb: Optional explicit path to solvent/water PDB for AEV context fallback.
-        aev_cutoff: Distance cutoff in Angstroms for spatial filtering (default: 5.1 Å)
-        
-    Returns:
-        torch.Tensor: [num_nodes, embedding_dim] embeddings for all substituents
-    """
-    embeddings = []
-    
-    for node_idx in range(g.num_nodes):
-        try:
-            embedding = compute_deepset_embedding_for_node(
-                node_idx, g, deepset_model, pdb_dir, pdb_pattern, rtf_results,
-                prep_dir=prep_dir,
-                protein_pdb=protein_pdb,
-                solvent_state=solvent_state,
-                solvent_pdb=solvent_pdb,
-                aev_cutoff=aev_cutoff
-            )
-            embeddings.append(embedding)
-        except Exception as e:
-            warnings.warn(f"Failed to compute DeepSet embedding for node {node_idx}: {e}")
-            # Use zero embedding as fallback
-            if hasattr(deepset_model, 'atom_mlp'):
-                embedding_dim = deepset_model.atom_mlp[-1].out_features
-            elif hasattr(deepset_model, 'embedding_dim'):
-                embedding_dim = deepset_model.embedding_dim
-            else:
-                embedding_dim = 64
-            embeddings.append(torch.zeros(embedding_dim))
-    
-    return torch.stack(embeddings, dim=0)
-
-
 def build_directed_pairs(nsubs_per_site: List[int]) -> List[Tuple[int, int]]:
     """Build list of directed pairs for all substituents within each site.
     
@@ -469,38 +131,23 @@ def build_pyg_graph_from_mllf_graph(
     toppar_dir: Optional[str] = None, 
     toppar_files: list = None, 
     warn_missing_types: bool = True,
-    deepset_model = None,
     pdb_dir: Optional[str] = None,
     pdb_pattern: str = "site{site}_sub{sub}.pdb",
     rtf_results: Optional[Dict] = None,
-    use_deepset_only: bool = False,
     prep_dir: Optional[str] = None,
     protein_pdb: Optional[str] = None,
     solvent_state: Optional[str] = None,
-    solvent_pdb: Optional[str] = None,
-    aev_cutoff: float = 5.1
+    solvent_pdb: Optional[str] = None
 ) -> Tuple[object, dict]:
     """Convert a Graph-like object `g` into a PyG Data object and metadata.
 
     We expand each undirected graph edge into up to four directed relation edges,
     one per bias type. The default `relation_names` is ['linear','quadratic','skw','end'].
     
-    Node features are constructed from metadata. There are two modes:
-    
-    1. Standard mode (deepset_model=None):
+    Standard mode:
        - Charge, environment type (solvent/protein)
        - Element count encoding (coarse chemical composition)
        - Atom type count encoding (fine CHARMM type composition)
-       
-    2. DeepSet mode (deepset_model provided):
-       - DeepSet substituent embedding (from 3D atomic structure + charges)
-       - Implements Step 4 of the 4-step pipeline
-       - Spatial context (protein atoms) already encoded in AEVs
-       - Charge already included in DeepSet atom features
-       - Solvent state NOT included (constant within graph, provides no differentiation)
-       
-    The use_deepset_only parameter is deprecated and has no effect (DeepSet mode
-    always uses only DeepSet embeddings).
     
     The vocabularies are loaded from CHARMM CGenFF toppar file by default.
 
@@ -511,15 +158,13 @@ def build_pyg_graph_from_mllf_graph(
         toppar_files: List of specific toppar filenames to include.
                      Default: ['top_all36_cgenff.rtf'] (CGenFF only)
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
-        deepset_model: Optional DeepSetFeatureExtractor model for 3D structural features
-        pdb_dir: Directory containing PDB files (required if deepset_model provided)
+        pdb_dir: Directory containing PDB files
         pdb_pattern: Pattern for PDB filenames (default: "site{site}_sub{sub}.pdb")
         rtf_results: Optional dict of RTF parsed data for charge extraction
-        use_deepset_only: DEPRECATED - has no effect (DeepSet mode always uses only embeddings)
         prep_dir: Optional prep directory for multi-site spatial filtering
         protein_pdb: Optional protein PDB file path (for protein phase systems)
         solvent_state: Optional solvent state ('solv', 'gas', or 'protein')
-        aev_cutoff: Distance cutoff in Angstroms for spatial filtering (default: 5.1 Å)
+        solvent_pdb: Optional solvent PDB file path
 
     Returns (pyg_data, extras) where extras contain:
         - relation_names: List of all relation type names
@@ -527,7 +172,6 @@ def build_pyg_graph_from_mllf_graph(
         - base_relation_map: Dict mapping base types to (fwd, bwd) relation names
         - atom_type_vocab: Dict mapping atom type strings to feature indices
         - element_vocab: Dict mapping element symbols to feature indices
-        - deepset_dim: Dimension of DeepSet embeddings (if used)
     """
 
     if relation_names is None:
@@ -575,21 +219,7 @@ def build_pyg_graph_from_mllf_graph(
     # collect node features
     node_feats = []
     site_ids = []  # 0-indexed site assignment per node
-    deepset_embeddings = None
     
-    # Compute DeepSet embeddings if model provided
-    if deepset_model is not None:
-        if pdb_dir is None:
-            raise ValueError("pdb_dir must be provided when using deepset_model")
-        
-        deepset_embeddings = compute_deepset_embeddings_for_graph(
-            g, deepset_model, pdb_dir, pdb_pattern, rtf_results,
-            prep_dir=prep_dir,
-            protein_pdb=protein_pdb,
-            solvent_state=solvent_state,
-            solvent_pdb=solvent_pdb,
-            aev_cutoff=aev_cutoff
-        )
     
     # Build node features
     for i in range(g.num_nodes):
@@ -597,15 +227,7 @@ def build_pyg_graph_from_mllf_graph(
         # site is 1-indexed in node metadata; store as 0-indexed for indexing
         site_ids.append(max(0, meta.get('site', 1) - 1))
         
-        if deepset_model is not None:
-            # DeepSet mode: Use only molecular embeddings
-            # Spatial context (including protein environment) is already encoded in AEVs
-            # Charge is already included in DeepSet atom features
-            # Solvent state is constant within a graph (provides no node differentiation)
-            node_feats.append(deepset_embeddings[i])
-        else:
-            # Standard mode: Use count-based compositional encoding
-            node_feats.append(_node_feature_from_meta(meta, atom_type_vocab, element_vocab, atom_to_element))
+        node_feats.append(_node_feature_from_meta(meta, atom_type_vocab, element_vocab, atom_to_element))
     
     x = torch.stack(node_feats, dim=0)
     site_index = torch.tensor(site_ids, dtype=torch.long)
@@ -711,12 +333,5 @@ def build_pyg_graph_from_mllf_graph(
         'element_vocab': element_vocab,
         'atom_to_element': atom_to_element,
     }
-    
-    # Add DeepSet info if used
-    if deepset_model is not None:
-        deepset_dim = deepset_model.atom_mlp[-1].out_features
-        extras['deepset_dim'] = deepset_dim
-        extras['use_deepset_only'] = True  # Always True now (parameter deprecated)
-        extras['node_feature_dim'] = deepset_dim  # Only DeepSet embeddings
     
     return data, extras

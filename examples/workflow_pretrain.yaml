@@ -1,29 +1,97 @@
-# Pretraining configuration for MSLD policy (Behavior Cloning)
-# This config is used for supervised pretraining on collected simulation data
-# Trains policy to predict bias coefficients from best runs using MSE loss
+# Pretraining configuration for MSLD policy using Uni-Mol embeddings
+# This config is used for supervised pretraining on collected simulation data.
+# Trains UnimolPolicy to predict bias coefficients from best runs using MSE loss.
 # After pretraining, use workflow_14benz.yaml or workflow_deepset.yaml with pretrain.model_path set
 
-# Training configuration (must match your main workflow config)
-# Architecture: Bias-type embeddings + separate heads for forced specialization
-# - Shared trunk: 1 layer (lightweight)
-# - Bias-type embeddings: Learnable 16-dim vectors providing unique context per head
-# - Separate heads: Deep 3-layer networks receiving [trunk_out, bias_embedding]
-# - Output scaling: tanh * [±305, ±520, ±85, ±30] (full coefficient range)
-#   (empirical maxima: linear 277, quadratic 470, skew 77, end 27; ~10% headroom)
-# - Exploration: log_std max = 2.0 (std up to ~7.4)
-# - Action clipping: policy clips actions to ±[320, 546, 89, 31.5] (scale_factors * 1.05)
-# mlp_out_dim is automatically computed from relation_names (typically 4: quadratic, skew, end, linear)
+# ============================================================================
+# STRUCTURE REPRESENTATION SETTINGS
+# ============================================================================
+# Controls which molecular structures are used to compute Uni-Mol embeddings
+# This allows training with diverse structural conformations (minimized vs unrelaxed)
+unimol:
+  structure_selection: unrelaxed
+    # Options:
+    # - 'minimized': Use minimized structures from pretraining (default, fastest, consistent)
+    # - 'unrelaxed': Use unrelaxed structures (auto-detected from pretraining directory)
+    # - 'random': Randomly select minimized or unrelaxed per run
+    #
+    # Unrelaxed structures are auto-detected in this priority:
+    # 1. Check unrelaxed_system_mappings (explicit config overrides)
+    # 2. Check pretraining/prep/unrelaxed/ subdirectory
+    # 3. Check pretraining/prep/original/ subdirectory
+    # 4. Use pretraining/prep/ directly if PDB files present
+  
+  unrelaxed_system_mappings: null
+    # Dict mapping pretraining system names to unrelaxed system paths
+    # OPTIONAL: Only needed if auto-detection fails
+    # Example:
+    #   indolizine_prot: /home/pbowling/mllf/training/systems/indolizine_prot/prep
+    #   indolizine_solv: /home/pbowling/mllf/training/systems/indolizine_solv/prep
+    # If null, automatic detection attempted
+  
+  skip_unrelaxed_for_systems: ['thrombin_solvent_group']
+    # List of system name patterns to skip unrelaxed structures for
+    # Useful when unrelaxed structures are not properly centered or prepared
+    # For these systems, only minimized structures will be used (even with structure_selection: random)
+    # Example: ['thrombin_solvent']  # Skip unrelaxed for all thrombin_solvent* systems
+    # Patterns are matched as: if pattern in system_name.lower()
+  
+  environment_cutoff: 8.0
+    # Distance cutoff for including environment atoms around the ligand
+    # Default: 8.0 Ångströms (increased from 5.0 for more environmental context)
+    # Larger values capture more molecular context but increase computation
+  
+  custom_environment_paths: null
+    # Dict mapping system solvent_state to custom environment PDB search paths
+    # Useful for systems with nested PDB structures (e.g., indolizine_prot)
+    # Example:
+    #   protein: ['pdb/protein.pdb']
+    #   solv: ['solvent.pdb']
+    # If null, standard fallback chain used (minimized.pdb → protein.pdb → solvent.pdb)
+  
+  cache_embeddings: false
+    # If true, save computed Uni-Mol embeddings to disk for fast reloading
+    # Useful if running multiple pretraining epochs to avoid recomputation
+    # Cache stored in: pretraining_dir/embeddings_cache/
+  
+  cache_dir: null
+    # Path to embedding cache directory (default: <pretraining_dir>/embeddings_cache/)
+  
+  use_environment_consensus: true
+    # If true, build consensus environment atoms for each site using the core scaffold
+    # to define which environment atoms are relevant. This ensures consistent environment
+    # representation across pretraining, analysis, and online training.
+    # Default: true (recommended for consistent environment filtering)
+    # 
+    # NOTE: Environment is now always defined by core scaffold coordinates (8Å cutoff),
+    # not by consensus across substituents. This provides stable, consistent filtering
+    # across all three pipelines.
+
+# ============================================================================
+# POLICY ARCHITECTURE
+# ============================================================================
+# UnimolPolicy: Pre-computed Uni-Mol 512D molecular representations
+#   Input: [unimol_sub, unimol_core] = 1024D per edge
+#   Projection: 1024D → 512D → 256D (progressive reduction)
+#   EdgeValueMLP: 256D → 64D hidden → 4 bias types
+#   
+# Uni-Mol model: unimol_tools.UniMolRepr with model_name='unimolv1', model_size='84m'
+# Trained on: 1.1B molecules from PubChem (rich learned representations)
+# No AtomBondGNN, no site pooling — pure pre-trained molecular context
+
+policy_type: unimol  # Fixed to unimol (only supported policy)
+
+# Training configuration
 training:
-  encoder:
-    hidden_dims: [64, 64]  # RGCN hidden layers
-    out_dim: 32             # Node embedding dimension
-  policy:
-    mlp_hidden: 64          # Hidden units in shared trunk (before separate heads)
-    # mlp_out_dim: 4        # Auto-computed: number of bias types (quadratic, skew, end, linear)
+  # UnimolPolicy hyperparameters
+  unimol:
+    unimol_dim: 512           # Uni-Mol embedding dimension (from pretrained model)
+    mlp_hidden: 64            # EdgeValueMLP hidden units (256 → 64 in BiasHeadMLP)
+  
+  # Shared optimizer settings
   optimizer:
-    lr: 0.001
-  bias_clip: 1000.0         # Safety net applied when writing variables.py at inference time;
-                            # clips coefficients to ±1000
+    lr: 0.0001                # Learning rate (reduced for gradient stability through projection layers)
+  bias_clip: 1000.0           # Safety net for coefficient clipping at inference
 
 # Reward configuration (improved reward function with graduated transition penalties)
 reward:

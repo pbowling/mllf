@@ -2503,7 +2503,6 @@ def pretrain_with_runs(
     print(f"  Relation names: {relation_names}")
     
     # Create policy using Uni-Mol representations only
-    # (AtomBondGNN and site pooling are not used)
     from mllf.cb.policy import UnimolPolicy
     
     train_config = config.get('training', {})

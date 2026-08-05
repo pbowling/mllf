@@ -9,12 +9,18 @@
 
 # SLURM script for running CB policy pretraining on collected MSLD simulation data.
 #
-# Uses the full AtomBondGNN (GINConv + GlobalAttentionPool) → RGCN pipeline by default:
-#   - Loads the pretrained AtomBondGNN encoder from pretraining/deepset_pretraining_output/
-#   - Replaces standard atom-type node features with 64-dim AEV-based embeddings
-#   - Trains the RGCN+EdgePolicy on behavior-cloning MSE loss
+# FEATURES:
 #
-# Automatic outlier filtering excludes runs with abnormal coefficient values.
+# • Behavior Cloning: Trains UnimolPolicy to predict bias coefficients from
+#   successful simulation runs using supervised learning (MSE loss)
+#
+# • Pairwise Population Weighting (NEW): Automatically weights edges by:
+#   - Population balance: min(pop_i, pop_j) / max(pop_i, pop_j)
+#   - DDG reliability: skips edges with NaN/inf DDG or zero populations
+#   - Antisymmetric DDG: uses reverse pair with sign flip if forward missing
+#   Result: high-confidence edges drive training, low-confidence edges skipped
+#
+# • Automatic outlier filtering: Excludes runs with abnormal coefficient values.
 #
 # Usage:
 #   sbatch pretrain_with_filtering.sh
@@ -30,12 +36,6 @@
 #
 # To disable stratified sampling and fall back to reward threshold filtering:
 #   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=0 pretrain_with_filtering.sh
-#
-# To disable DeepSet (standard atom-type features):
-#   sbatch --export=ALL,DEEPSET_ENCODER=none pretrain_with_filtering.sh
-#
-# To use a different encoder checkpoint:
-#   sbatch --export=ALL,DEEPSET_ENCODER=/path/to/best_encoder.pt pretrain_with_filtering.sh
 #
 # Default excluded datasets (EXCLUDE_DATASETS):
 #   14benz_pair_combos  - combo structure handled separately; exclude from normal scan
@@ -54,6 +54,11 @@ echo "MLLF Policy Pretraining with Filtering"
 echo "========================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Started: $(date)"
+echo ""
+echo "FEATURES ENABLED:"
+echo "  ✓ Behavior Cloning: MSE loss on simulation targets"
+echo "  ✓ Pairwise AWR Weighting: Automatic edge confidence scoring"
+echo "  ✓ Reverse Pair Handling: DDG antisymmetry (ΔG_ij = -ΔG_ji)"
 echo ""
 
 # Initialize conda for bash shell    
@@ -89,12 +94,9 @@ NO_FILTER="${NO_FILTER:-true}"
 USE_BEST_ONLY="${USE_BEST_ONLY:-false}"
 STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.55}"
 REWARD_WEIGHTED="${REWARD_WEIGHTED:-false}"
-DEEPSET_ENCODER="${DEEPSET_ENCODER:-$SLURM_SUBMIT_DIR/../pretraining/deepset_pretraining_output/trained_models/best_encoder.pt}"
+#INCLUDE_REVERSE_PAIRS="${INCLUDE_REVERSE_PAIRS:-false}"
 #EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos luis_cdk2_protein_group1 luis_cdk2_protein_group2 luis_cdk2_solvent_group1 luis_cdk2_solvent_group2 luis_ptp1b_protein_group1 luis_ptp1b_solvent_group1 p38_protein_groupA p38_protein_groupB p38_protein_groupC mup1_solvent_group2 luis_p38_protein_group2}"
-PATIENCE="${PATIENCE:-10}"
-Q_EPOCHS="${Q_EPOCHS:-0}"
-Q_LR="${Q_LR:-1e-3}"
-Q_STRATIFIED_FRACTION="${Q_STRATIFIED_FRACTION:-}"
+PATIENCE="${PATIENCE:-5}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -111,25 +113,11 @@ else
     echo "  Stratified negative sampling: DISABLED"
 fi
 echo "  Reward-weighted loss: $([ "$REWARD_WEIGHTED" = "true" ] && echo "ENABLED" || echo "disabled")"
-if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ] && [ -f "$DEEPSET_ENCODER" ]; then
-    echo "  DeepSet encoder: $DEEPSET_ENCODER"
-else
-    echo "  DeepSet encoder: DISABLED (standard atom-type node features)"
-fi
+#echo "  Reverse pair training: $([ "$INCLUDE_REVERSE_PAIRS" = "true" ] && echo "ENABLED" || echo "disabled")"
 if [ -n "$EXCLUDE_DATASETS" ]; then
     echo "  Excluded datasets: $EXCLUDE_DATASETS"
 fi
 echo "  Early stopping patience: $PATIENCE epochs"
-if [ "$Q_EPOCHS" != "0" ] && [ -n "$Q_EPOCHS" ]; then
-    if [ -n "$Q_STRATIFIED_FRACTION" ]; then
-        echo "  Q-network warmup: $Q_EPOCHS epochs (lr=$Q_LR, stratified fraction=$Q_STRATIFIED_FRACTION)"
-    else
-        echo "  Q-network warmup: $Q_EPOCHS epochs (lr=$Q_LR, uses BC runs)"
-    fi
-else
-    echo "  Q-network warmup: DISABLED"
-fi
-echo ""
 
 # Find pretraining directory
 PRETRAIN_DIR=""
@@ -147,71 +135,84 @@ echo "Scanning Pretraining Data"
 echo "========================================="
 echo ""
 
-# Auto-detect all subdirectories in pretraining/
-# Handle two structures:
-# 1. Normal: pretraining/system/run_*/ (e.g., 14benz_solv/run1/)
-# 2. Combos: pretraining/system/comb_*/run_*/ (e.g., 14benz_pair_combos/comb_0063.../run_046/)
+# Auto-detect all subdirectories in pretraining/ recursively.
+# Handle three scenarios:
+# 1. Top-level combos: pretraining/system_combos/ with comb_*/ subdirectories
+# 2. Nested combos: pretraining/system_name/comb_*/ at any depth
+# 3. Regular runs: pretraining/system_name/run_*/ (no combos)
+#
+# Strategy: For each system-level directory, recursively find all comb_* subdirectories
+# (at any depth) and add each. If a system has no combos, add the system directory itself.
 total_systems=0
 total_runs_available=0
 pretrain_dirs=""
 
-for dataset_dir in $PRETRAIN_DIR/*/; do
-    if [ -d "$dataset_dir" ]; then
-        dataset_name=$(basename "$dataset_dir")
+for dataset_dir in "$PRETRAIN_DIR"/*/; do
+    if [ ! -d "$dataset_dir" ]; then
+        continue
+    fi
+    
+    dataset_name=$(basename "$dataset_dir")
 
-        # Skip the DeepSet pretraining output directory — it holds encoder weights,
-        # not MSLD simulation runs, so it is not valid input for CB pretraining.
-        if [ "$dataset_name" = "deepset_pretraining_output" ]; then
-            continue
-        fi
+    # Skip special output directories
+    if [ "$dataset_name" = "deepset_pretraining_output" ] \
+    || [ "$dataset_name" = "atombondgnn_training_output" ] \
+    || [ "$dataset_name" = "1_analysis_scripts" ]; then
+        continue
+    fi
 
-        # Skip any datasets listed in EXCLUDE_DATASETS (space-separated names)
-        skip_dataset=false
-        for excl in $EXCLUDE_DATASETS; do
-            if [ "$dataset_name" = "$excl" ]; then
-                skip_dataset=true
-                break
-            fi
-        done
-        if [ "$skip_dataset" = "true" ]; then
-            echo "  - $dataset_name: EXCLUDED"
-            continue
+    # Skip excluded datasets
+    skip_dataset=false
+    for excl in $EXCLUDE_DATASETS; do
+        if [ "$dataset_name" = "$excl" ]; then
+            skip_dataset=true
+            break
         fi
-        
-        # Check if this has combo subdirectories (like 14benz_pair_combos)
-        has_combos=false
-        if [ -d "$dataset_dir" ]; then
-            # Look for directories starting with "comb_"
-            combo_dirs=$(find "$dataset_dir" -mindepth 1 -maxdepth 1 -type d -name "comb_*" 2>/dev/null | wc -l)
-            if [ $combo_dirs -gt 0 ]; then
-                has_combos=true
+    done
+    if [ "$skip_dataset" = "true" ]; then
+        echo "  - $dataset_name: EXCLUDED"
+        continue
+    fi
+    
+    # Find all comb_* directories recursively under this system
+    comb_dirs=$(find "$dataset_dir" -type d -name "comb_*" 2>/dev/null | sort)
+    
+    if [ -n "$comb_dirs" ]; then
+        # This system has nested or direct combo directories
+        echo "  - $dataset_name (combo structure):"
+        system_has_combos=false
+        while IFS= read -r comb_dir; do
+            if [ -z "$comb_dir" ]; then
+                continue
             fi
-        fi
-        
-        if [ "$has_combos" = true ]; then
-            # Handle combo structure: add each comb_* directory separately
-            echo "  - $dataset_name (combo structure):"
-            for comb_dir in "$dataset_dir"comb_*/; do
-                if [ -d "$comb_dir" ]; then
-                    comb_name=$(basename "$comb_dir")
-                    run_count=$(find "$comb_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-                    if [ $run_count -gt 0 ]; then
-                        total_systems=$((total_systems + 1))
-                        total_runs_available=$((total_runs_available + run_count))
-                        echo "      $comb_name: $run_count runs"
-                        pretrain_dirs="$pretrain_dirs --pretraining-dir $comb_dir"
-                    fi
-                fi
-            done
-        else
-            # Normal structure: add the system directory directly
-            count=$(find "$dataset_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-            if [ $count -gt 0 ]; then
+            comb_name=$(basename "$comb_dir")
+            run_count=$(find "$comb_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+            if [ $run_count -gt 0 ]; then
+                system_has_combos=true
                 total_systems=$((total_systems + 1))
-                total_runs_available=$((total_runs_available + count))
-                echo "  - $dataset_name: $count runs"
-                pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
+                total_runs_available=$((total_runs_available + run_count))
+                echo "      $comb_name: $run_count runs"
+                pretrain_dirs="$pretrain_dirs --pretraining-dir $comb_dir"
             fi
+        done <<< "$comb_dirs"
+        
+        # Check if there are also direct run directories at the system level
+        # Look for directories that contain graph_info.json (indicating they are runs)
+        direct_run_dirs=$(find "$dataset_dir" -maxdepth 1 -type d -exec test -f "{}/graph_info.json" \; -print 2>/dev/null | wc -l)
+        if [ $direct_run_dirs -gt 0 ]; then
+            total_systems=$((total_systems + 1))
+            total_runs_available=$((total_runs_available + direct_run_dirs))
+            echo "      [direct runs]: $direct_run_dirs runs"
+            pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
+        fi
+    else
+        # This system has no combo directories, check for direct runs
+        run_count=$(find "$dataset_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+        if [ $run_count -gt 0 ]; then
+            total_systems=$((total_systems + 1))
+            total_runs_available=$((total_runs_available + run_count))
+            echo "  - $dataset_name: $run_count runs"
+            pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
         fi
     fi
 done
@@ -269,17 +270,6 @@ else
     echo "Training mode: All valid runs"
 fi
 
-# Add DeepSet encoder if available
-if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ] && [ -f "$DEEPSET_ENCODER" ]; then
-    CMD="$CMD --deepset-encoder $DEEPSET_ENCODER"
-    echo "DeepSet encoder: ENABLED ($DEEPSET_ENCODER)"
-else
-    echo "DeepSet encoder: DISABLED"
-    if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ]; then
-        echo "  Warning: DEEPSET_ENCODER path not found: $DEEPSET_ENCODER"
-    fi
-fi
-
 # Add early stopping patience
 CMD="$CMD --patience $PATIENCE"
 echo "Early stopping patience: $PATIENCE epochs"
@@ -290,16 +280,11 @@ if [ "$REWARD_WEIGHTED" = "true" ]; then
     echo "Reward-weighted loss: ENABLED"
 fi
 
-# Add Q-network warmup if requested
-if [ "$Q_EPOCHS" != "0" ] && [ -n "$Q_EPOCHS" ]; then
-    CMD="$CMD --q-epochs $Q_EPOCHS --q-lr $Q_LR"
-    if [ -n "$Q_STRATIFIED_FRACTION" ]; then
-        CMD="$CMD --q-stratified-fraction $Q_STRATIFIED_FRACTION"
-        echo "Q-network warmup: ENABLED ($Q_EPOCHS epochs, lr=$Q_LR, stratified fraction=$Q_STRATIFIED_FRACTION)"
-    else
-        echo "Q-network warmup: ENABLED ($Q_EPOCHS epochs, lr=$Q_LR, uses BC run set)"
-    fi
-fi
+# Add reverse pair training if requested
+##if [ "$INCLUDE_REVERSE_PAIRS" = "true" ]; then
+#    CMD="$CMD --include-reverse-pairs"
+#    echo "Reverse pair training: ENABLED"
+#fi
 
 echo ""
 echo "Command:"
@@ -324,16 +309,19 @@ echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "✓ Pretraining successful!"
     echo ""
+    echo "Pairwise Weighting Summary:"
+    echo "  • High-confidence edges (balanced populations, valid DDG): full gradient"
+    echo "  • Low-confidence edges (imbalanced populations): reduced gradient"
+    echo "  • Zero-confidence edges (missing pop/DDG): skipped entirely"
+    echo ""
     echo "Output saved to: $OUTPUT_DIR"
     echo ""
     echo "Next steps:"
     echo "1. Check pretrain_status.out for filtering statistics and per-run losses"
-    echo "2. Update your workflow config to use the pretrained policy:"
+    echo "2. Review pairwise weighting report (run statistics)"
+    echo "3. Update your workflow config to use the pretrained policy:"
     echo "   pretrain:"
     echo "     model_path: $OUTPUT_DIR/best_policy.pt"
-    echo "3. If DeepSet was enabled, also set the encoder path in your workflow config:"
-    echo "   deepset:"
-    echo "     encoder_path: $DEEPSET_ENCODER"
     echo "4. Run the training workflow"
 else
     echo "✗ Pretraining failed with exit code $EXIT_CODE"

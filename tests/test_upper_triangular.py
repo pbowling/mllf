@@ -12,7 +12,12 @@ from mllf.cli.workflow import write_variables_from_actions
 
 
 def test_upper_triangular_bias_matrices():
-    """Test that nonlinear bias matrices only populate upper triangle."""
+    """Test that nonlinear bias matrices only populate upper triangle.
+    
+    For quadratic (symmetric) matrices, predictions from both edge directions
+    (forward and backward) are averaged together. This test verifies that
+    forward values are properly stored in the upper triangle.
+    """
     
     print("Testing upper-triangular bias matrix generation...")
     print("=" * 60)
@@ -21,6 +26,7 @@ def test_upper_triangular_bias_matrices():
     N = 3
     
     # Edge index: all directed edges (both directions for each pair)
+    # For symmetric matrices, both directions will be averaged
     edge_index = torch.tensor([
         [0, 0, 1, 1, 2, 2],  # source nodes
         [1, 2, 0, 2, 0, 1]   # target nodes
@@ -47,13 +53,17 @@ def test_upper_triangular_bias_matrices():
     }
     
     # Create test actions with distinct values for each edge
-    # Edge 0 (0->1, quadratic_fwd): 5.0
-    # Edge 1 (0->2, quadratic_fwd): 10.0
-    # Edge 2 (1->0, quadratic_bwd): -5.0 (should be ignored, we use fwd)
-    # Edge 3 (1->2, quadratic_fwd): 15.0
-    # Edge 4 (2->0, quadratic_bwd): -10.0 (should be ignored)
-    # Edge 5 (2->1, quadratic_bwd): -15.0 (should be ignored)
-    actions = torch.tensor([5.0, 10.0, -5.0, 15.0, -10.0, -15.0], dtype=torch.float32)
+    # Edge 0 (0->1, quadratic_fwd): 10.0
+    # Edge 1 (0->2, quadratic_fwd): 20.0
+    # Edge 2 (1->0, quadratic_bwd): 10.0 (will be averaged with fwd)
+    # Edge 3 (1->2, quadratic_fwd): 30.0
+    # Edge 4 (2->0, quadratic_bwd): 20.0 (will be averaged with fwd)
+    # Edge 5 (2->1, quadratic_bwd): 30.0 (will be averaged with fwd)
+    # After averaging:
+    # (0,1): (10+10)/2 = 10.0
+    # (0,2): (20+20)/2 = 20.0
+    # (1,2): (30+30)/2 = 30.0
+    actions = torch.tensor([10.0, 20.0, 10.0, 30.0, 20.0, 30.0], dtype=torch.float32)
     
     with tempfile.TemporaryDirectory() as tmpdir:
         combo_path = Path(tmpdir)
@@ -86,12 +96,13 @@ def test_upper_triangular_bias_matrices():
         errors = []
         
         # Check upper triangle has values (i < j)
-        if c_matrix[0][1] == 0.0:
-            errors.append("c[0][1] should be non-zero (from forward edge 0->1)")
-        if c_matrix[0][2] == 0.0:
-            errors.append("c[0][2] should be non-zero (from forward edge 0->2)")
-        if c_matrix[1][2] == 0.0:
-            errors.append("c[1][2] should be non-zero (from forward edge 1->2)")
+        # Values are averaged from forward and backward edges
+        if abs(c_matrix[0][1] - 10.0) > 0.01:
+            errors.append(f"c[0][1] should be ~10.0 (average of fwd/bwd), got {c_matrix[0][1]}")
+        if abs(c_matrix[0][2] - 20.0) > 0.01:
+            errors.append(f"c[0][2] should be ~20.0 (average of fwd/bwd), got {c_matrix[0][2]}")
+        if abs(c_matrix[1][2] - 30.0) > 0.01:
+            errors.append(f"c[1][2] should be ~30.0 (average of fwd/bwd), got {c_matrix[1][2]}")
         
         # Check lower triangle is zero (i > j)
         if c_matrix[1][0] != 0.0:
@@ -105,12 +116,6 @@ def test_upper_triangular_bias_matrices():
         for i in range(N):
             if c_matrix[i][i] != 0.0:
                 errors.append(f"c[{i}][{i}] should be 0.0 (diagonal), got {c_matrix[i][i]}")
-        
-        # Check that forward values are used (not antisymmetric)
-        # c[0][1] should be 5.0 (from action[0])
-        # c[1][0] should be 0.0 (NOT -5.0)
-        if abs(c_matrix[0][1] - 5.0) > 0.01:
-            errors.append(f"c[0][1] should be ~5.0, got {c_matrix[0][1]}")
         
         if errors:
             print("\n❌ FAILED:")

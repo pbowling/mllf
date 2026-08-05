@@ -25,7 +25,6 @@ from mllf.file_handling.generate_combinations import create_combination_dirs
 from mllf.cb.graph import Graph, EdgeCoeffs
 from mllf.file_handling.read_rtf import parse_rtf_dir
 from mllf.cb import graph_utils
-from mllf.cb.rgcn import RGCNEncoder
 from mllf.cb.policy import EdgePolicy
 from mllf.cli.sim import run_simulation_batch, parse_simulation_results
 
@@ -396,13 +395,28 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         src = int(ei[0, k].item())
         dst = int(ei[1, k].item())
         
+        # Determine which bias type this edge corresponds to based on edge_type
+        edge_base = None
+        if hasattr(et, '__len__') and et.numel() > k:
+            rel_idx = int(et[k].item())
+            if rel_idx < len(rel_names):
+                rel_name = rel_names[rel_idx]
+                edge_base = rel_to_base.get(rel_name)
+        
         # Extract action values for this edge
         try:
             a = actions[k]
             # Handle different action tensor shapes
             if hasattr(a, 'dim') and a.dim() == 0:
-                # Scalar action - only one output
-                action_vals = {'linear': float(a.item()), 'quadratic': 0.0, 'skew': 0.0, 'end': 0.0}
+                # Scalar action - route to the appropriate bias type based on edge_type
+                # If edge_type indicates a specific bias type, use that; otherwise default to quadratic
+                action_vals = {base_name: 0.0 for base_name in ['linear', 'quadratic', 'skew', 'end']}
+                scalar_val = float(a.item())
+                if edge_base and edge_base in action_vals:
+                    action_vals[edge_base] = scalar_val
+                else:
+                    # Fallback: default to quadratic for backwards compatibility
+                    action_vals['quadratic'] = scalar_val
             elif hasattr(a, 'shape') and len(a.shape) > 0 and a.shape[-1] == 4:
                 # Multi-output action: extract all 4 bias types
                 action_vals = {}
@@ -413,20 +427,28 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
                     except Exception:
                         action_vals[base_name] = 0.0
             else:
-                # Fallback: treat as scalar
+                # Fallback: treat as scalar or list
                 vlist = a.detach().cpu().numpy().tolist() if hasattr(a, 'detach') else list(a)
                 if isinstance(vlist, list) and len(vlist) == 4:
                     action_vals = {base_name: float(vlist[bias_type_index[base_name]]) 
                                    for base_name in ['linear', 'quadratic', 'skew', 'end']}
                 else:
                     scalar_val = float(vlist) if not isinstance(vlist, list) else float(vlist[0])
-                    action_vals = {base_name: (scalar_val if base_name == 'quadratic' else 0.0)
-                                   for base_name in ['linear', 'quadratic', 'skew', 'end']}
+                    action_vals = {base_name: 0.0 for base_name in ['linear', 'quadratic', 'skew', 'end']}
+                    if edge_base and edge_base in action_vals:
+                        action_vals[edge_base] = scalar_val
+                    else:
+                        # Fallback: default to quadratic
+                        action_vals['quadratic'] = scalar_val
         except Exception:
             try:
                 val = float(actions[k])
-                action_vals = {base_name: (val if base_name == 'quadratic' else 0.0)
-                               for base_name in ['linear', 'quadratic', 'skew', 'end']}
+                action_vals = {base_name: 0.0 for base_name in ['linear', 'quadratic', 'skew', 'end']}
+                if edge_base and edge_base in action_vals:
+                    action_vals[edge_base] = val
+                else:
+                    # Fallback: default to quadratic
+                    action_vals['quadratic'] = val
             except Exception:
                 action_vals = {base_name: 0.0 for base_name in ['linear', 'quadratic', 'skew', 'end']}
         
@@ -693,43 +715,6 @@ def split_manifest(manifest: str, train_frac: float = 0.8, seed: int = 0) -> Tup
     mval.write_text('\n'.join(val) + ('\n' if val else ''), encoding='utf-8')
     return str(mtrain), str(mval)
 
-
-def run_quick_epoch_for_combo(combo_dir: str, base_bias: str = 'quadratic') -> Dict[str, Any]:
-    """Run a single training epoch for demonstration/testing purposes.
-
-    This function builds a small RGCN encoder and EdgePolicy, performs one forward
-    pass with action sampling, computes a supervised reward (negative MSE vs targets),
-    and updates the policy with REINFORCE. It's intended for quick validation and
-    testing, not for full training runs.
-
-    Args:
-        combo_dir: Path to combo directory with RTF fragments or variables.py.
-        base_bias: Legacy parameter (currently unused, kept for compatibility).
-
-    Returns:
-        Dict with key 'reward' containing the scalar reward from the epoch.
-    """
-    data, targets, extras = build_data_and_targets_from_combo(combo_dir, base_bias=base_bias)
-    sample_data = data
-    in_dim = sample_data.x.shape[1]
-    num_rels = int(sample_data.edge_attr.shape[1]) if hasattr(sample_data, 'edge_attr') else 1
-    encoder = RGCNEncoder(in_dim=in_dim, hidden_dims=[32], out_dim=16, num_relations=num_rels)
-    base_map = extras.get('base_relation_map', {}) if isinstance(extras, dict) else {}
-    edge_out_dim = len(list(base_map.keys())) if isinstance(base_map, dict) else 1
-    policy = EdgePolicy.from_pyg_data(encoder, 16, sample_data, mlp_hidden=32, mlp_out_dim=edge_out_dim)
-    policy.train()
-    optim = torch.optim.Adam(policy.parameters(), lr=1e-3)
-
-    # one pass: sample actions, write variables, compute reward against targets, and update
-    node_emb = policy.forward_node_embeddings(sample_data.x, sample_data.edge_index, getattr(sample_data, 'edge_type', None))
-    edge_actions, edge_logp, edge_mean, edge_logstd = policy.get_actions(sample_data.x, sample_data.edge_index, getattr(sample_data, 'edge_type', None), getattr(sample_data, 'edge_attr', None), deterministic=False)
-    # write variables and run sim could be done here; for quick epoch compute reward from targets
-    reward = default_env_reward(edge_actions.detach(), targets)
-    loss = -(edge_logp.sum() * float(reward))
-    optim.zero_grad()
-    loss.backward()
-    optim.step()
-    return {'reward': float(reward)}
 
 
 def compress_runs(manifest: str, out_tar: str) -> str:

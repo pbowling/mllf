@@ -23,9 +23,9 @@ from mllf.cli.collect_pretraining_data import (
     parse_bias_from_inp,
     detect_solvent_state,
 )
-from mllf.cb.aev_processor import _read_box_from_prep_script
 from mllf.cb.pretrain_policy import filter_best_runs_per_system
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
+from mllf.cb.unimol_representation import _read_box_from_prep_script
 
 
 # ---------------------------------------------------------------------------

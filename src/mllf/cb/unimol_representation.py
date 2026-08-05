@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 import warnings
 import json
 import hashlib
+import re
 
 from unimol_tools import UniMolRepr
 
@@ -35,10 +36,6 @@ from mllf.file_handling.read_pdb import (
     find_reference_subs_from_other_sites,
     extract_site_number,
     calculate_min_distance,
-)
-from mllf.cb.aev_processor import (
-    get_full_ligand_atom_features,
-    _convert_crd_to_tmp_pdb,
 )
 
 
@@ -69,6 +66,153 @@ def _get_unimol_model(use_cuda: bool = False) -> UniMolRepr:
             max_atoms=256,  # Uni-Mol max atom capacity
         )
     return _unimol_model
+
+
+def _read_atom_names_from_pdb(pdb_path: Path) -> List[str]:
+    """Return ordered list of atom names from ATOM/HETATM records in a PDB file.
+
+    Uses fixed-column parsing (PDB cols 13–16, 0-indexed 12:16) which is
+    reliable for CHARMM-generated PDB files. Names are normalized to
+    uppercase so that mixed-case frag.pdb names (e.g., ``Br0B``) match the
+    all-uppercase names written by CHARMM into minimized.pdb (``BR0B``).
+    Returns an empty list on any error so callers can fall back gracefully.
+    
+    Args:
+        pdb_path: Path to PDB file
+        
+    Returns:
+        List of atom names (uppercase) in order from ATOM/HETATM records
+    """
+    names: List[str] = []
+    try:
+        with open(str(pdb_path)) as fh:
+            for line in fh:
+                if line.startswith(('ATOM', 'HETATM')):
+                    names.append(line[12:16].strip().upper())
+    except Exception:
+        pass
+    return names
+
+
+_BOX_RE = re.compile(r'^\s*box\s*=\s*([0-9]+(?:\.[0-9]+)?)')
+
+
+def _read_box_from_prep_script(prep_dir: Path) -> Optional[float]:
+    """Return the cubic box length from the system's prep Python script.
+
+    Searches for a ``box = <number>`` assignment in the main prep ``.py`` file
+    (any ``.py`` other than ``alf_info.py``) in prep_dir. Returns None
+    if no such file or line is found, so the caller can skip MIC gracefully.
+    
+    Args:
+        prep_dir: Path to prep directory
+        
+    Returns:
+        Cubic box length as float, or None if not found
+    """
+    for py_file in sorted(Path(prep_dir).glob('*.py')):
+        if py_file.name == 'alf_info.py':
+            continue
+        try:
+            for line in py_file.read_text().splitlines():
+                m = _BOX_RE.match(line)
+                if m:
+                    return float(m.group(1))
+        except OSError:
+            continue
+    return None
+
+
+def _convert_crd_to_tmp_pdb(crd_path: Path) -> Path:
+    """Convert a CHARMM extended CRD coordinate file to a temporary PDB file.
+
+    Parses CHARMM EXT format and writes minimal ATOM-record PDB to a temp
+    file so it can be consumed by parse_pdb_file.
+
+    CHARMM EXT CRD column layout (1-indexed, Fortran):
+      1-10:   atom serial (I10)
+      11-20:  residue sequence number (I10)
+      21-22:  spaces (2X)
+      23-30:  residue name (A8)
+      31-32:  spaces (2X)
+      33-40:  atom name (A8)
+      41-60:  X coordinate (F20.10)
+      61-80:  Y coordinate (F20.10)
+      81-100: Z coordinate (F20.10)
+      101-102: spaces (2X)
+      103-110: segment ID (A8)
+
+    Args:
+        crd_path: Path to the CHARMM EXT .crd file.
+
+    Returns:
+        Path to a newly-created temporary PDB file.
+
+    Raises:
+        ValueError: If no atoms were successfully parsed from the file.
+    """
+    import tempfile
+    
+    atoms = []
+    with open(crd_path, 'r') as fh:
+        for raw in fh:
+            line = raw.rstrip('\n')
+            # Skip CHARMM title / comment lines
+            if line.startswith('*'):
+                continue
+            # Skip the atom-count line (e.g. "     73018  EXT")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            if len(parts) <= 2 and parts[0].isdigit():
+                continue
+            # Need at least 100 chars to reach end of Z column
+            if len(line) < 100:
+                continue
+            try:
+                atom_no  = int(line[0:10])
+                res_no   = int(line[10:20])
+                resname  = line[22:30].strip()
+                atomname = line[32:40].strip()
+                x        = float(line[40:60])
+                y        = float(line[60:80])
+                z        = float(line[80:100])
+                segid    = line[102:110].strip() if len(line) > 110 else ''
+                # Derive single-char PDB chain from segid (PROA→A, PROB→B …)
+                chain    = segid[-1] if segid and segid[-1].isalpha() else 'A'
+                atoms.append((atom_no, res_no, resname, atomname, x, y, z, chain))
+            except (ValueError, IndexError):
+                continue
+
+    if not atoms:
+        raise ValueError(f"No atoms parsed from CRD file {crd_path}")
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode='w', suffix='.pdb', prefix='minimized_crd_', delete=False
+    )
+    try:
+        _TWO_CHAR_ELEMENTS = {'CL', 'BR', 'FE', 'MG', 'ZN', 'MN', 'NA', 'CU', 'CO', 'NI', 'SE', 'SI'}
+        for atom_no, res_no, resname, atomname, x, y, z, chain in atoms:
+            # PDB atom name: 4-char names fill cols 13-16; shorter get a leading space
+            aname_col = atomname[:4] if len(atomname) >= 4 else f' {atomname:<3}'
+            # Infer element symbol from alphabetic prefix of atom name
+            alpha = ''.join(c for c in atomname if c.isalpha())
+            if len(alpha) >= 2 and alpha[:2].upper() in _TWO_CHAR_ELEMENTS:
+                elem = alpha[:2].capitalize()
+            else:
+                elem = alpha[:1] if alpha else 'X'
+            serial  = atom_no % 100000
+            res_seq = res_no  % 10000
+            tmp.write(
+                f"ATOM  {serial:5d} {aname_col} {resname[:3]:3s} {chain}{res_seq:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2s}\n"
+            )
+        tmp.write("END\n")
+    finally:
+        tmp.close()
+
+    return Path(tmp.name)
 
 
 def _extract_atom_identifiers_from_pdb(
@@ -579,27 +723,15 @@ def _extract_ligand_from_pdb(
         matched by atom name, or None if not found
     """
     try:
-        # Read atom names from core, sub, and ref_subs (uppercase for matching)
-        def _read_atom_names(pdb_file: str) -> List[str]:
-            names = []
-            try:
-                with open(pdb_file, 'r') as f:
-                    for line in f:
-                        if line.startswith('ATOM') or line.startswith('HETATM'):
-                            atom_name = line[12:16].strip().upper()
-                            names.append(atom_name)
-            except Exception:
-                pass
-            return names
-        
+        # Read atom names from core, sub, and ref_subs using shared utility
         ligand_names = set()
-        ligand_names.update(_read_atom_names(core_pdb))
-        ligand_names.update(_read_atom_names(sub_pdb))
+        ligand_names.update(_read_atom_names_from_pdb(Path(core_pdb)))
+        ligand_names.update(_read_atom_names_from_pdb(Path(sub_pdb)))
         
         # Add ref_sub atom names
         if ref_sub_pdbs:
             for ref_pdb in ref_sub_pdbs:
-                ligand_names.update(_read_atom_names(ref_pdb))
+                ligand_names.update(_read_atom_names_from_pdb(Path(ref_pdb)))
         
         if not ligand_names:
             return None
@@ -644,24 +776,12 @@ def _get_all_ligand_atom_names(
     Returns:
         Set of atom names (uppercase) to exclude from environment
     """
-    def _read_atom_names(pdb_file: str) -> List[str]:
-        names = []
-        try:
-            with open(pdb_file, 'r') as f:
-                for line in f:
-                    if line.startswith('ATOM') or line.startswith('HETATM'):
-                        atom_name = line[12:16].strip().upper()
-                        names.append(atom_name)
-        except Exception:
-            pass
-        return names
-    
     atom_names = set()
-    atom_names.update(_read_atom_names(core_pdb))
-    atom_names.update(_read_atom_names(sub_pdb))
+    atom_names.update(_read_atom_names_from_pdb(Path(core_pdb)))
+    atom_names.update(_read_atom_names_from_pdb(Path(sub_pdb)))
     if ref_sub_pdbs:
         for ref_pdb in ref_sub_pdbs:
-            atom_names.update(_read_atom_names(ref_pdb))
+            atom_names.update(_read_atom_names_from_pdb(Path(ref_pdb)))
     
     return atom_names
 
