@@ -137,14 +137,18 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
           'transitions': list of transition counts per site at highest lambda
           'ddg_pairs': dict mapping "blk_i_blk_j" → float|None at highest lambda
                        (None = NaN = no crossings between that pair)
+          'fraction_physical': float|None, fraction of trajectory spent in a
+                       fully-resolved ("physical") ligand state at highest
+                       lambda (None if the diagnostic isn't in the output)
     """
     from mllf.file_handling.read_output import (
         parse_single_population,
         parse_transitions_and_rates,
         parse_single_ddg,
+        parse_fraction_physical_ligand,
     )
     
-    raw_metrics = {'populations': [], 'transitions': [], 'ddg_pairs': {}}
+    raw_metrics = {'populations': [], 'transitions': [], 'ddg_pairs': {}, 'fraction_physical': None}
     
     try:
         with open(output_file, 'r') as f:
@@ -153,6 +157,7 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         population_data = parse_single_population(output_text)
         transitions_data, _ = parse_transitions_and_rates(output_text)
         ddg_data = parse_single_ddg(output_text)
+        raw_metrics['fraction_physical'] = parse_fraction_physical_ligand(output_text)
         
         # Extract populations per block - use only HIGHEST lambda value (0.990)
         for block_id, block_info in population_data.items():
@@ -233,6 +238,7 @@ def compute_pair_reward(
     total_transitions: int = 0,
     t_baseline: float = 50.0,
     block_offset: int = 2,
+    fraction_physical: Optional[float] = None,
 ) -> torch.Tensor:
     """Compute per-edge, per-dimension reward tensor for credit assignment.
 
@@ -253,10 +259,23 @@ def compute_pair_reward(
                      when the pair was visited, giving both per-pair resolution and
                      a continuous quality gradient.
       2  skew      — barrier asymmetry from soft-core introduction.
-                     Signal: mean of the above two signals (cannot be further
-                     isolated from available data).
+                     Signal: ``min(1.0, fraction_physical * total_pairs)`` — the
+                     combo-level FRACTION PHYSICAL LIGAND diagnostic (fraction
+                     of the trajectory spent in a fully-resolved, single-
+                     substituent-per-site state) scaled by the number of
+                     possible substituent pairs in the combo. Scaling
+                     counteracts the combinatorial shrinkage of "physical"
+                     time as more substituents compete for occupancy, so
+                     combos of different sizes are graded comparably. This is
+                     a genuinely distinct observable from the population/
+                     transition signals driving linear and quadratic. Falls
+                     back to the ``combined`` proxy (see dim 3) when
+                     ``fraction_physical`` is unavailable (e.g. a cached
+                     epoch_results.pt from before this diagnostic was parsed).
       3  end       — entropic / surface-tension cost of creating substituent space.
-                     Signal: same combined proxy as skew.
+                     Signal: ``combined`` — mean of the population-balance and
+                     quadratic-quality proxies (previously shared with skew;
+                     cannot yet be further isolated from available data).
 
     For all dimensions: ``-1.0`` when this specific pair was not visited
     (DDG is None/NaN/Inf) OR when both substituents have zero population
@@ -278,6 +297,9 @@ def compute_pair_reward(
         t_baseline: normalization constant for transition rate (default 50.0,
                     matching ``T_baseline`` in the reward config).
         block_offset: integer offset from node index to block ID (default 2).
+        fraction_physical: combo-level FRACTION PHYSICAL LIGAND value at the
+                    highest lambda (0.990), from ``parse_simulation_metrics``.
+                    None if the diagnostic wasn't present in the output.
 
     Returns:
         Float tensor of shape ``[E, 4]`` with per-dimension per-edge rewards.
@@ -287,6 +309,9 @@ def compute_pair_reward(
 
     # Combo-level transition quality: continuous, shared across all edges.
     trans_quality = float(min(total_transitions, t_baseline)) / float(t_baseline)
+    # Combo-level pair count: build_directed_pairs() emits both (i,j) and
+    # (j,i) per unordered pair, so undirected pairs = directed edges / 2.
+    total_pairs = num_edges // 2
 
     for k in range(num_edges):
         src = int(edge_index[0, k].item())
@@ -319,13 +344,23 @@ def compute_pair_reward(
             pair_visited = 1.0
             quad_signal = (pair_visited + trans_quality) / 2.0
 
-            # Combined proxy for skew/end: population balance (normalised to
+            # Combined proxy for end: population balance (normalised to
             # [0,1]) and quad_signal averaged.
             combined = (minority_frac * 2.0 + quad_signal) / 2.0
 
+            # Skew: distinct signal from the FRACTION PHYSICAL LIGAND
+            # diagnostic, scaled by the combo's total possible substituent
+            # pairs (clamped to 1.0 since the scaling can overshoot for
+            # combos with many pairs). Falls back to `combined` when the
+            # diagnostic wasn't parsed (older cached runs).
+            if fraction_physical is not None:
+                skew_signal = min(1.0, float(fraction_physical) * total_pairs)
+            else:
+                skew_signal = combined
+
             rewards[k, 0] = minority_frac   # linear:    population balance ∈ [0, 0.5]
             rewards[k, 1] = quad_signal     # quadratic: per-pair visited + quality ∈ [0.5, 1]
-            rewards[k, 2] = combined        # skew:      combined proxy
+            rewards[k, 2] = skew_signal     # skew:      fraction-physical-based proxy
             rewards[k, 3] = combined        # end:       combined proxy
 
     return rewards

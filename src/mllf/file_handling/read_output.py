@@ -188,6 +188,51 @@ def parse_transitions_and_rates(text: str) -> Tuple[Dict[int, Dict[float, int]],
     return transitions, rates
 
 
+def parse_fraction_physical_ligand(text: str) -> Optional[float]:
+    """Parse the FRACTION PHYSICAL LIGAND diagnostic and return the
+    highest-lambda (rightmost / 0.990) value.
+
+    This metric estimates the fraction of the trajectory spent in a fully
+    resolved ("physical") ligand state -- exactly one substituent dominant
+    at each site -- as opposed to alchemical intermediate/superposition
+    states. Single-site combos print one unprefixed line:
+
+        FRACTION PHYSICAL LIGAND>    0.03891    0.01248
+
+    Multi-site combos print an earlier combo-level line:
+
+        MULTI-SITE FRACTION PHYSICAL LIGAND>    0.99445    0.90200
+
+    followed later by a second, near-duplicate unprefixed line computed at
+    the hybrid-ligand-pair level. This returns the value from whichever
+    line appears FIRST in the output -- for multi-site combos that's the
+    'MULTI-SITE' line, which sits immediately after the per-site SINGLE DDG
+    blocks that our reward system's ddg_pairs actually key off of; for
+    single-site combos it's the only line present.
+
+    Each line has two numeric columns (0.950, 0.990); the last (rightmost)
+    column is always the higher/stricter lambda cutoff, matching the
+    convention used by parse_single_population/parse_transitions_and_rates/
+    parse_single_ddg elsewhere in this module.
+
+    Returns:
+        The 0.990-lambda fraction as a float, or None if the line isn't
+        present in this output (e.g. older CHARMM builds without this
+        diagnostic).
+    """
+    pattern = re.compile(r"(?:MULTI-SITE\s+)?FRACTION PHYSICAL LIGAND>\s*([^\n]+)")
+    m = pattern.search(text)
+    if not m:
+        return None
+    nums = re.findall(r"\d*\.\d+|\d+", m.group(1))
+    if not nums:
+        return None
+    try:
+        return float(nums[-1])
+    except ValueError:
+        return None
+
+
 def parse_single_ddg(text: str) -> Dict[Tuple[int, int], Optional[float]]:
     """Parse SINGLE DDG table to discover which substituent pairs had transitions.
 
@@ -269,4 +314,5 @@ __all__ = [
     "parse_single_population",
     "parse_transitions_and_rates",
     "parse_single_ddg",
+    "parse_fraction_physical_ligand",
 ]

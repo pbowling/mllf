@@ -20,6 +20,12 @@
 #   - Antisymmetric DDG: uses reverse pair with sign flip if forward missing
 #   Result: high-confidence edges drive training, low-confidence edges skipped
 #
+# • Per-Pair AWR (Advantage-Weighted Regression) (NEW): Switches from whole-run 
+#   scalar weighting to per-edge, per-dimension weighting. Well-resolved pairs
+#   (high DDG quality, good population balance, high FRACTION PHYSICAL) within a
+#   successful run drive more gradient than poorly-resolved pairs in that run.
+#   Enabled by default; disable with --no-per-pair-awr or USE_PER_PAIR_AWR=false.
+#
 # • Automatic outlier filtering: Excludes runs with abnormal coefficient values.
 #
 # Usage:
@@ -33,6 +39,12 @@
 #
 # To enable reward-weighted loss (high-reward runs get proportionally more gradient signal):
 #   sbatch --export=ALL,REWARD_WEIGHTED=true pretrain_with_filtering.sh
+#
+# To disable per-pair AWR (fall back to whole-run scalar weighting):
+#   sbatch --export=ALL,USE_PER_PAIR_AWR=false pretrain_with_filtering.sh
+#
+# To tune AWR temperature (higher → more uniform, lower → sharper emphasis; default 1.0):
+#   sbatch --export=ALL,AWR_TEMPERATURE=0.5 pretrain_with_filtering.sh
 #
 # To disable stratified sampling and fall back to reward threshold filtering:
 #   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=0 pretrain_with_filtering.sh
@@ -97,6 +109,8 @@ REWARD_WEIGHTED="${REWARD_WEIGHTED:-false}"
 #INCLUDE_REVERSE_PAIRS="${INCLUDE_REVERSE_PAIRS:-false}"
 #EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos luis_cdk2_protein_group1 luis_cdk2_protein_group2 luis_cdk2_solvent_group1 luis_cdk2_solvent_group2 luis_ptp1b_protein_group1 luis_ptp1b_solvent_group1 p38_protein_groupA p38_protein_groupB p38_protein_groupC mup1_solvent_group2 luis_p38_protein_group2}"
 PATIENCE="${PATIENCE:-5}"
+USE_PER_PAIR_AWR="${USE_PER_PAIR_AWR:-true}"
+AWR_TEMPERATURE="${AWR_TEMPERATURE:-1.0}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -118,6 +132,8 @@ if [ -n "$EXCLUDE_DATASETS" ]; then
     echo "  Excluded datasets: $EXCLUDE_DATASETS"
 fi
 echo "  Early stopping patience: $PATIENCE epochs"
+echo "  Per-pair AWR: $([ "$USE_PER_PAIR_AWR" = "true" ] && echo "ENABLED" || echo "disabled")"
+echo "  AWR temperature: $AWR_TEMPERATURE"
 
 # Find pretraining directory
 PRETRAIN_DIR=""
@@ -280,11 +296,18 @@ if [ "$REWARD_WEIGHTED" = "true" ]; then
     echo "Reward-weighted loss: ENABLED"
 fi
 
-# Add reverse pair training if requested
-##if [ "$INCLUDE_REVERSE_PAIRS" = "true" ]; then
-#    CMD="$CMD --include-reverse-pairs"
-#    echo "Reverse pair training: ENABLED"
-#fi
+# Add per-pair AWR control
+if [ "$USE_PER_PAIR_AWR" = "false" ]; then
+    CMD="$CMD --no-per-pair-awr"
+    echo "Per-pair AWR: DISABLED (falling back to whole-run scalar weighting)"
+else
+    echo "Per-pair AWR: ENABLED (well-resolved pairs drive more gradient)"
+fi
+
+# Add AWR temperature if not default
+if [ "$AWR_TEMPERATURE" != "1.0" ]; then
+    CMD="$CMD --awr-temperature $AWR_TEMPERATURE"
+fi
 
 echo ""
 echo "Command:"

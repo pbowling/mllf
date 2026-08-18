@@ -2058,6 +2058,10 @@ def pretrain_epoch(
     pairwise_weights_cache: Optional[List] = None,
     unimol_config: Optional[Dict] = None,
     consensus_dict: Optional[Dict[str, Optional[set]]] = None,
+    pair_reward_cache: Optional[List] = None,
+    baseline_mean: Optional[torch.Tensor] = None,
+    baseline_std: Optional[torch.Tensor] = None,
+    success_floor: Optional[float] = None,
 ) -> Dict[str, float]:
     """Run one behavior cloning AWR epoch for UnimolPolicy with optional pairwise weighting.
     
@@ -2074,8 +2078,23 @@ def pretrain_epoch(
         groups: Optional run grouping for grouped updates
         reward_weighted: Whether to use AWR weighting
         awr_temperature: Temperature for AWR reweighting
-        pairwise_weights_cache: Optional per-run pairwise edge weights
+        pairwise_weights_cache: Optional per-run pairwise edge weights (confidence in [0,1])
         unimol_config: Optional dict with 'environment_cutoff' and 'use_environment_difference'
+        pair_reward_cache: Optional per-run [E, 4] per-edge, per-dimension reward tensor
+                        (from compute_pair_reward(), same reward used by online REINFORCE
+                        training). When provided (together with baseline_mean/baseline_std),
+                        the AWR weight is computed per-edge/per-dimension instead of as a
+                        single scalar for the whole run, so pairs with better bias
+                        coefficients within an otherwise-successful run get emphasised more
+                        than pairs that were poorly resolved. Runs whose entry is None fall
+                        back to the whole-run scalar ``_bc_reward`` weight.
+        baseline_mean: [4] global per-dimension reward mean (weighted across all cached
+                        pair rewards) used to normalise ``pair_reward_cache`` into an
+                        advantage. Required (with baseline_std) to enable per-pair AWR.
+        baseline_std: [4] global per-dimension reward std, paired with baseline_mean.
+        success_floor: Optional floor to clamp the per-pair advantage from below (mirrors
+                        ``reward.success_advantage_floor`` in online training), so a single
+                        badly-scored pair can't dominate the run's loss.
     
     Returns:
         Dict with 'loss', 'num_runs', 'num_updates' keys
@@ -2085,6 +2104,7 @@ def pretrain_epoch(
     
     env_cutoff = unimol_config.get('environment_cutoff', 8.0)
     use_environment_difference = unimol_config.get('use_environment_difference', True)
+    per_pair_awr_enabled = pair_reward_cache is not None and baseline_mean is not None and baseline_std is not None
     
     policy.train()
 
@@ -2135,41 +2155,45 @@ def pretrain_epoch(
                 if not active_mask.any():
                     continue
                 
-                # AWR loss: -exp(r/β) · log π(a | s) over active elements
+                # AWR loss: -exp(A/β) · log π(a | s) over active elements.
                 std = torch.exp(log_std)
                 logp_per = torch.distributions.Normal(mean, std).log_prob(targets)  # [E, D]
-                raw_r = runs[run_idx].get("_bc_reward", 0.0)
-                awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
-                
-                # Apply per-edge pairwise confidence weighting if available
+
+                # Per-edge confidence weight (population balance + DDG validity).
                 if pairwise_weights_cache is not None and pairwise_weights_cache[run_idx] is not None:
-                    edge_weights = torch.tensor(
-                        pairwise_weights_cache[run_idx],
-                        dtype=torch.float32,
-                        device=device
-                    )  # [E]
-                    
-                    # Apply edge weights: zero out low-confidence edges
-                    # Only include edges with non-zero confidence
-                    edge_mask = edge_weights > 1e-8
-                    
-                    if edge_mask.any():
-                        # Weight loss by pairwise confidence (normalized per edge)
-                        # Shape: logp_per is [E, D], edge_weights is [E]
-                        weighted_logp = logp_per * edge_weights.unsqueeze(-1)  # [E, D]
-                        
-                        # Apply both active_mask and edge_mask
-                        combined_mask = active_mask & edge_mask.unsqueeze(-1)
-                        if combined_mask.any():
-                            run_loss = -awr_w * weighted_logp[combined_mask].mean() / n_valid
-                        else:
-                            continue
-                    else:
-                        # No edges with sufficient confidence, skip this run
-                        continue
+                    edge_conf = torch.tensor(
+                        pairwise_weights_cache[run_idx], dtype=torch.float32, device=device
+                    ).unsqueeze(-1)  # [E, 1]
                 else:
-                    # No pairwise weighting, use original computation
-                    run_loss = -awr_w * logp_per[active_mask].mean() / n_valid
+                    edge_conf = torch.ones((logp_per.size(0), 1), dtype=torch.float32, device=device)
+
+                r_pair = pair_reward_cache[run_idx] if per_pair_awr_enabled else None
+                if r_pair is not None and r_pair.shape[0] == logp_per.shape[0]:
+                    # Per-edge, per-dimension AWR advantage -- consistent with the
+                    # per-pair REINFORCE advantage used by online training
+                    # (compute_pair_reward() + batch-level (r-mean)/std in
+                    # train_epoch()). This lets pairs with better bias
+                    # coefficients within an otherwise-successful run get
+                    # emphasised more than pairs that were poorly resolved,
+                    # instead of every pair in the run sharing one scalar weight.
+                    advantage = (r_pair.to(device) - baseline_mean.to(device)) / baseline_std.to(device)
+                    if success_floor is not None:
+                        advantage = advantage.clamp(min=float(success_floor))
+                    awr_w = torch.clamp(torch.exp(advantage / awr_temperature), max=20.0)  # [E, D]
+                else:
+                    # Fall back to the whole-run scalar reward when per-pair
+                    # data is unavailable for this run (e.g. older collected
+                    # runs missing ddg_pairs/populations).
+                    raw_r = runs[run_idx].get("_bc_reward", 0.0)
+                    awr_w = torch.full_like(logp_per, min(math.exp(raw_r / awr_temperature), 20.0))
+
+                w = awr_w * edge_conf  # [E, D]
+                combined_mask = active_mask & (edge_conf > 1e-8)
+                w_sum = w[combined_mask].sum() if combined_mask.any() else torch.tensor(0.0, device=device)
+                if combined_mask.any() and w_sum > 1e-8:
+                    run_loss = -(w * logp_per)[combined_mask].sum() / w_sum / n_valid
+                else:
+                    continue
                 
                 if torch.isnan(run_loss) or torch.isinf(run_loss):
                     continue
@@ -2236,33 +2260,32 @@ def pretrain_epoch(
         optimizer.zero_grad()
         std = torch.exp(log_std)
         logp_per = torch.distributions.Normal(mean, std).log_prob(targets)
-        raw_r = run.get("_bc_reward", 0.0)
-        awr_w = min(math.exp(raw_r / awr_temperature), 20.0)
-        
-        # Apply per-edge pairwise confidence weighting if available
+
+        # Per-edge confidence weight (population balance + DDG validity).
         if pairwise_weights_cache is not None and pairwise_weights_cache[run_idx] is not None:
-            edge_weights = torch.tensor(
-                pairwise_weights_cache[run_idx],
-                dtype=torch.float32,
-                device=device
-            )  # [E]
-            
-            # Apply edge weights: zero out low-confidence edges
-            edge_mask = edge_weights > 1e-8
-            
-            if edge_mask.any():
-                weighted_logp = logp_per * edge_weights.unsqueeze(-1)  # [E, D]
-                combined_mask = active_mask & edge_mask.unsqueeze(-1)
-                if combined_mask.any():
-                    loss = -awr_w * weighted_logp[combined_mask].mean()
-                else:
-                    continue
-            else:
-                # No edges with sufficient confidence, skip this run
-                continue
+            edge_conf = torch.tensor(
+                pairwise_weights_cache[run_idx], dtype=torch.float32, device=device
+            ).unsqueeze(-1)  # [E, 1]
         else:
-            # No pairwise weighting, use original computation
-            loss = -awr_w * logp_per[active_mask].mean()
+            edge_conf = torch.ones((logp_per.size(0), 1), dtype=torch.float32, device=device)
+
+        r_pair = pair_reward_cache[run_idx] if per_pair_awr_enabled else None
+        if r_pair is not None and r_pair.shape[0] == logp_per.shape[0]:
+            advantage = (r_pair.to(device) - baseline_mean.to(device)) / baseline_std.to(device)
+            if success_floor is not None:
+                advantage = advantage.clamp(min=float(success_floor))
+            awr_w = torch.clamp(torch.exp(advantage / awr_temperature), max=20.0)  # [E, D]
+        else:
+            raw_r = run.get("_bc_reward", 0.0)
+            awr_w = torch.full_like(logp_per, min(math.exp(raw_r / awr_temperature), 20.0))
+
+        w = awr_w * edge_conf  # [E, D]
+        combined_mask = active_mask & (edge_conf > 1e-8)
+        w_sum = w[combined_mask].sum() if combined_mask.any() else torch.tensor(0.0, device=device)
+        if combined_mask.any() and w_sum > 1e-8:
+            loss = -(w * logp_per)[combined_mask].sum() / w_sum
+        else:
+            continue
         
         if not (torch.isnan(loss) or torch.isinf(loss)):
             loss.backward()
@@ -2322,6 +2345,77 @@ def _extract_highest_lambda_counts(populations) -> list:
     return result
 
 
+def _extract_total_transitions(transitions) -> int:
+    """Sum per-site highest-lambda transition counts from a
+    ``simulation_results.json`` 'transitions' dict::
+
+        {"1": {"0.95": a, "0.99": b}, "2": {...}, ...}
+
+    Mirrors the per-site highest-lambda selection used elsewhere in this
+    module (``compute_reward_from_sim_results``) and in online training
+    (``parse_transitions_and_rates`` / ``parse_simulation_metrics``).
+
+    Returns 0 if *transitions* is empty or malformed.
+    """
+    if not transitions:
+        return 0
+    total = 0
+    for site_data in transitions.values():
+        if isinstance(site_data, dict) and site_data:
+            max_lambda = max(site_data.keys(), key=lambda x: float(x))
+            try:
+                total += int(site_data[max_lambda])
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def _compute_run_pair_reward(
+    run: Dict,
+    edge_index: torch.Tensor,
+    reward_config: Dict,
+) -> Optional[torch.Tensor]:
+    """Compute the per-edge, per-dimension reward tensor for one pretraining run.
+
+    Uses the SAME ``compute_pair_reward()`` that online REINFORCE training
+    uses (``training/workflow.py`` / ``mllf.cb.workflow_utils``), so BC/AWR
+    pretraining and online training score individual substituent pairs on
+    identical criteria: per-pair population balance (linear), per-pair DDG
+    existence + transition quality (quadratic), the FRACTION PHYSICAL LIGAND
+    proxy scaled by pair count (skew), and the population/quality combined
+    proxy (end). Without this, every pair within an otherwise-successful run
+    would share one whole-run scalar reward, even though some pairs are
+    typically much better resolved (more transitions, cleaner DDG) than
+    others in the same run.
+
+    Returns None if the run's ``sim_results`` lacks the population or
+    per-pair DDG data needed (e.g. older collected runs, or a
+    ``simulation_results.json`` that predates per-pair DDG collection) --
+    callers should fall back to the whole-run scalar reward in that case.
+    """
+    sim_results = run.get("sim_results", {})
+    populations_raw = sim_results.get("populations", {})
+    if not populations_raw:
+        return None
+    ddg_pairs = sim_results.get("ddg_pairs", {})
+    if not ddg_pairs:
+        return None
+    try:
+        populations = _extract_highest_lambda_counts(populations_raw)
+        total_transitions = _extract_total_transitions(sim_results.get("transitions", {}))
+        t_baseline = reward_config.get("T_baseline", 50.0)
+        fraction_physical = sim_results.get("fraction_physical")
+        from mllf.cb.workflow_utils import compute_pair_reward
+        return compute_pair_reward(
+            edge_index.detach().cpu(), ddg_pairs, populations,
+            total_transitions=total_transitions,
+            t_baseline=t_baseline,
+            fraction_physical=fraction_physical,
+        )
+    except Exception:
+        return None
+
+
 def pretrain(
     pretraining_dir: Path,
     output_dir: Path,
@@ -2370,6 +2464,7 @@ def pretrain_with_runs(
     q_lr: float = 1e-3,
     q_stratified_fraction: Optional[float] = None,
     awr_temperature: float = 0.5,
+    use_per_pair_awr: bool = True,
 ):
     """Run policy pretraining with provided runs.
     
@@ -2396,6 +2491,16 @@ def pretrain_with_runs(
         reward_weighted: If True, weight each run's MSE loss by its reward (clamped >= 0
                         and normalised so the mean weight = 1.0).  High-reward runs drive
                         more of the gradient signal; zero-reward runs are skipped entirely.
+        use_per_pair_awr: If True (default), compute a per-edge, per-dimension AWR
+                        advantage via compute_pair_reward() (the same reward function
+                        online REINFORCE training uses), instead of one scalar
+                        exp(reward/temperature) weight shared by every pair in a run.
+                        This lets well-resolved pairs (good transitions/DDG/physical
+                        fraction) within an otherwise-successful run drive more of the
+                        gradient than poorly-resolved pairs in that same run. Runs
+                        missing per-pair data (ddg_pairs/populations) automatically fall
+                        back to the whole-run scalar weight. Set False to fully restore
+                        the previous whole-run-only AWR behaviour.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2948,6 +3053,62 @@ def pretrain_with_runs(
     if n_weights_ok > 0:
         print(f"  Pairwise AWR weighting: ENABLED")
     
+    # Build per-pair reward cache if requested (enables per-edge, per-dimension AWR in pretrain_epoch)
+    pair_reward_cache = [None] * len(runs)
+    baseline_mean = None
+    baseline_std = None
+    success_floor = None
+    
+    if use_per_pair_awr:
+        print(f"\n{'='*60}")
+        print(f"Building per-pair reward cache for per-edge, per-dimension AWR...")
+        print(f"{'='*60}")
+        
+        n_pair_ok = 0
+        all_pair_rewards = []  # Collect [E, D] rewards to compute global baseline/std
+        
+        for run_idx, run in enumerate(runs):
+            try:
+                run_dir = Path(run["run_dir"])
+                prep_dir = run_dir.parent / "prep"
+                prep_dir_str = str(prep_dir)
+                
+                # Get the edge_index for this run from graph_cache
+                if graph_cache[run_idx] is None:
+                    continue
+                unimol_emb, edge_idx, targets_list = graph_cache[run_idx]
+                
+                # Compute per-edge, per-dimension reward
+                r_pair = _compute_run_pair_reward(run, edge_idx, reward_config)
+                if r_pair is not None:
+                    pair_reward_cache[run_idx] = r_pair
+                    all_pair_rewards.append(r_pair.flatten())
+                    n_pair_ok += 1
+            
+            except Exception as e:
+                # Graceful degradation: run will fall back to scalar reward
+                pass
+            
+            if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
+                print(f"  {run_idx + 1}/{len(runs)} runs ({n_pair_ok} with pair rewards)...")
+        
+        if all_pair_rewards:
+            all_pair_rewards_tensor = torch.cat(all_pair_rewards)  # [N*E*D,]
+            # Reshape to [N*E, D] to compute per-dimension baseline/std
+            n_total = sum(len(p) for p in all_pair_rewards) // 4
+            all_pair_rewards_stacked = all_pair_rewards_tensor.view(-1, 4)
+            baseline_mean = all_pair_rewards_stacked.mean(dim=0)  # [4]
+            baseline_std = all_pair_rewards_stacked.std(dim=0)  # [4]
+            # Clamp std to avoid division by zero
+            baseline_std = baseline_std.clamp(min=1e-6)
+            
+            success_floor = reward_config.get("success_advantage_floor", -2.0)
+            print(f"\nPer-pair reward baseline computed:")
+            print(f"  Runs with per-pair rewards: {n_pair_ok}/{len(runs)}")
+            print(f"  Baseline mean [lin, quad, skew, end]: {baseline_mean.numpy()}")
+            print(f"  Baseline  std [lin, quad, skew, end]: {baseline_std.numpy()}")
+            print(f"  Success floor: {success_floor}")
+    
     # For compatibility with pretrain_epoch, use a simple grouping (one run per group)
     # This allows us to reuse the per-graph gradient accumulation logic if needed
     epoch_groups = {f"run_{i}": [i] for i in range(len(runs)) if graph_cache[i] is not None}
@@ -3011,6 +3172,10 @@ def pretrain_with_runs(
             pairwise_weights_cache=pairwise_weights_cache,
             unimol_config={'environment_cutoff': env_cutoff, 'use_environment_difference': use_environment_difference},
             consensus_dict=consensus_dict,  # Pass consensus for environment filtering
+            pair_reward_cache=pair_reward_cache,
+            baseline_mean=baseline_mean,
+            baseline_std=baseline_std,
+            success_floor=success_floor,
         )
 
         print(f"  AWR Loss: {stats['loss']:.4f}")
@@ -3214,6 +3379,17 @@ def main():
              "more uniform weighting; lower β → sharper emphasis on high-reward runs. "
              "Default: 0.5.",
     )
+    parser.add_argument(
+        "--no-per-pair-awr",
+        action="store_true",
+        default=False,
+        help="Disable per-edge, per-dimension AWR (enabled by default). When enabled, "
+             "each pair gets its own reward computed via compute_pair_reward() (same as "
+             "online training), and pairs with better DDG/population/physical-fraction "
+             "within a successful run drive more of the gradient than poorly-resolved "
+             "pairs. When disabled, every pair in a run shares one scalar exp(run_reward/β) "
+             "weight (legacy behaviour).",
+    )
     args = parser.parse_args()
     
     # Load config
@@ -3250,6 +3426,7 @@ def main():
         reward_weighted=args.reward_weighted,
         freeze_encoder_after=args.freeze_encoder_after,
         awr_temperature=args.awr_temperature,
+        use_per_pair_awr=not args.no_per_pair_awr,  # Default to True (per-pair enabled)
     )
 
 
