@@ -2443,6 +2443,116 @@ def pretrain(
     pretrain_with_runs(runs, output_dir, config, epochs, learning_rate, device)
 
 
+# ── NeuralLinear + Thompson Sampling: Bayesian head warm-start ──────────────
+
+def estimate_reward_noise_variance(
+    policy_det,
+    graph_cache: List,
+    device,
+    max_runs: int = 200,
+    floor: float = 0.05,
+) -> List[float]:
+    """Estimate per-bias-type observation noise variance from BC residuals.
+
+    Runs the trained deterministic policy's forward pass over a sample of
+    cached pretraining graphs and computes the residual variance between its
+    mean prediction and the actual BC target, per bias type. This becomes each
+    ``BayesianLinearHead``'s ``noise_var`` (sigma^2) — NeuralLinear's posterior
+    update needs this to correctly weigh how much a new observation should move
+    the mean vs. how much predictive uncertainty should remain.
+
+    Args:
+        policy_det: Trained deterministic UnimolPolicy (use_bayesian_heads=False).
+        graph_cache: Per-run cache of ``(unimol_emb, edge_index, targets_list)``
+            or ``None``, as built during the main BC loop (see ``pretrain_with_runs``).
+        device: torch device.
+        max_runs: Cap on how many cached runs to sample — residual-variance
+            estimation doesn't need the full dataset; keeps this fast.
+        floor: Minimum returned variance, so a small/lucky sample can't make the
+            posterior overconfident with a near-zero sigma^2.
+
+    Returns:
+        List of 4 floats: ``[linear, quadratic, skew, end]`` noise variances.
+    """
+    policy_det.eval()
+    residuals = [[] for _ in range(4)]
+    n_used = 0
+    with torch.no_grad():
+        for cached in graph_cache:
+            if cached is None:
+                continue
+            if n_used >= max_runs:
+                break
+            unimol_emb, edge_idx, targets_list = cached
+            if not targets_list:
+                continue
+            try:
+                unimol_emb = unimol_emb.to(device)
+                edge_idx = edge_idx.to(device)
+                targets = torch.tensor(targets_list, dtype=torch.float32, device=device)  # [E, 4]
+                mean, _ = policy_det._forward_edges(unimol_emb, edge_idx, edge_type=None)
+                if mean.shape != targets.shape:
+                    continue
+                resid = (targets - mean).detach().cpu().numpy()
+                for d in range(4):
+                    residuals[d].extend(resid[:, d].tolist())
+                n_used += 1
+            except Exception:
+                continue
+
+    noise_vars = []
+    for d in range(4):
+        if len(residuals[d]) >= 5:
+            noise_vars.append(max(float(np.var(residuals[d])), floor))
+        else:
+            noise_vars.append(1.0)  # too little data — fall back to a neutral hyperparameter
+    dim_names = ['linear', 'quadratic', 'skew', 'end']
+    print(f"  Estimated reward noise variance (sigma^2) from {n_used} sampled runs: "
+          + ', '.join(f'{n}={v:.4f}' for n, v in zip(dim_names, noise_vars)))
+    return noise_vars
+
+
+def initialize_bayesian_heads_from_pretrained(policy_det, bayesian_prior_precision: float = 1.0):
+    """Build a ``use_bayesian_heads=True`` sibling of a trained deterministic policy.
+
+    Copies each bias type's trunk (feature extractor) weights 1:1 — the trunk
+    architecture is identical between the two modes — and warm-starts each
+    ``BayesianLinearHead``'s posterior *mean* at the deterministic head's
+    trained readout weight/bias, leaving posterior *uncertainty* at the
+    (uninformed) prior so it is genuinely narrowed by real online observations.
+
+    Args:
+        policy_det: Trained deterministic UnimolPolicy (use_bayesian_heads=False).
+        bayesian_prior_precision: Prior precision for each BayesianLinearHead.
+
+    Returns:
+        A new UnimolPolicy with use_bayesian_heads=True, same architecture/
+        dims as policy_det, trunks copied, posterior means seeded.
+    """
+    from mllf.cb.policy import UnimolPolicy
+
+    policy_bayes = UnimolPolicy(
+        unimol_dim=policy_det.unimol_dim,
+        mlp_out_dim=policy_det.mlp_out_dim,
+        use_dual_embeddings=policy_det.use_dual_embeddings,
+        use_bayesian_heads=True,
+        bayesian_prior_precision=bayesian_prior_precision,
+    ).to(next(policy_det.parameters()).device)
+
+    for d in range(policy_det.mlp_out_dim):
+        det_mlp = policy_det.edge_mlp.mlps[d]
+        bayes_mlp = policy_bayes.edge_mlp.mlps[d]
+        bayes_mlp.trunk.load_state_dict(det_mlp.trunk.state_dict())
+        # readout: Linear(64, 2) -> row 0 is the mean branch (row 1 is log_std,
+        # which has no Bayesian-mode analogue — uncertainty now comes from the
+        # posterior instead).
+        weight = det_mlp.readout.weight.data[0]  # [64]
+        bias = float(det_mlp.readout.bias.data[0])
+        bayes_mlp.bayesian_head.seed_mean(weight, bias)
+
+    return policy_bayes
+
+
 def pretrain_with_runs(
     runs: List[Dict],
     output_dir: Path,
@@ -2465,6 +2575,8 @@ def pretrain_with_runs(
     q_stratified_fraction: Optional[float] = None,
     awr_temperature: float = 0.5,
     use_per_pair_awr: bool = True,
+    bayesian_heads: bool = False,
+    bayesian_prior_precision: float = 1.0,
 ):
     """Run policy pretraining with provided runs.
     
@@ -2501,6 +2613,17 @@ def pretrain_with_runs(
                         missing per-pair data (ddg_pairs/populations) automatically fall
                         back to the whole-run scalar weight. Set False to fully restore
                         the previous whole-run-only AWR behaviour.
+        bayesian_heads: If True, after the (unchanged) BC loop finishes, run a
+                        post-pass that builds a use_bayesian_heads=True sibling
+                        policy — trunks copied, each BayesianLinearHead's
+                        posterior mean warm-started from the trained
+                        deterministic readout, noise_var estimated from BC
+                        residuals — and saves it alongside the normal
+                        checkpoints as best_policy_bayesian.pt /
+                        final_policy_bayesian.pt. Does not change the BC loop
+                        or the original deterministic checkpoints at all.
+        bayesian_prior_precision: Prior precision for each BayesianLinearHead
+                        when bayesian_heads=True. Unused otherwise.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3217,7 +3340,49 @@ def pretrain_with_runs(
     final_path = output_dir / "final_policy.pt"
     _final_ckpt = {'policy_state': policy.state_dict(), 'epoch': epochs}
     torch.save(_final_ckpt, final_path)
-    
+
+    # ── NeuralLinear + Thompson Sampling: Bayesian-head sibling checkpoints ──
+    # Purely additive: the deterministic best_policy.pt/final_policy.pt above
+    # are untouched. Produces best_policy_bayesian.pt/final_policy_bayesian.pt
+    # with trunks copied from the deterministic policy and each
+    # BayesianLinearHead's posterior mean warm-started from the deterministic
+    # readout (see initialize_bayesian_heads_from_pretrained).
+    if bayesian_heads:
+        print(f"\n{'='*60}")
+        print("NeuralLinear + TS: building Bayesian-head sibling checkpoint(s)")
+        print(f"{'='*60}")
+        try:
+            noise_vars = estimate_reward_noise_variance(policy, graph_cache, device)
+
+            def _save_bayesian_sibling(det_policy, out_path, extra_ckpt_fields):
+                bayes_policy = initialize_bayesian_heads_from_pretrained(
+                    det_policy, bayesian_prior_precision=bayesian_prior_precision)
+                for d, sigma2 in enumerate(noise_vars):
+                    bayes_policy.edge_mlp.mlps[d].bayesian_head.set_noise_var(sigma2)
+                ckpt = {'policy_state': bayes_policy.state_dict(), 'noise_var': noise_vars}
+                ckpt.update(extra_ckpt_fields)
+                torch.save(ckpt, out_path)
+                print(f"  Saved {out_path}")
+
+            _save_bayesian_sibling(
+                policy, output_dir / "final_policy_bayesian.pt", {'epoch': epochs})
+
+            best_path = output_dir / "best_policy.pt"
+            if best_path.exists():
+                _best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
+                policy_best_det = UnimolPolicy(
+                    unimol_dim=policy_config.get('unimol_dim', 512),
+                    mlp_hidden=policy_config.get('mlp_hidden', 64),
+                    mlp_out_dim=len(sample_extras['relation_names']) // 2,
+                    use_dual_embeddings=use_environment_difference,
+                ).to(device)
+                policy_best_det.load_state_dict(_best_ckpt['policy_state'])
+                _save_bayesian_sibling(
+                    policy_best_det, output_dir / "best_policy_bayesian.pt",
+                    {'epoch': _best_ckpt.get('epoch'), 'loss': _best_ckpt.get('loss')})
+        except Exception as e:
+            print(f"  Warning: Bayesian-head post-pass failed: {e}")
+
     # Save metadata
     metadata = {
         'policy_type': 'unimol',
@@ -3390,6 +3555,26 @@ def main():
              "pairs. When disabled, every pair in a run shares one scalar exp(run_reward/β) "
              "weight (legacy behaviour).",
     )
+    parser.add_argument(
+        "--bayesian-heads",
+        action="store_true",
+        default=False,
+        help="After the normal BC loop finishes, also build and save a "
+             "use_bayesian_heads=True sibling policy for NeuralLinear + "
+             "Thompson Sampling online training (best_policy_bayesian.pt / "
+             "final_policy_bayesian.pt). Trunks are copied from the trained "
+             "deterministic policy and each BayesianLinearHead's posterior "
+             "mean is warm-started from the deterministic readout; the "
+             "deterministic BC loop and its own checkpoints are unaffected.",
+    )
+    parser.add_argument(
+        "--bayesian-prior-precision",
+        type=float,
+        default=1.0,
+        help="Prior precision (ridge strength) for each BayesianLinearHead "
+             "when --bayesian-heads is set. Higher = stronger shrinkage "
+             "toward zero and lower initial posterior variance. Default: 1.0.",
+    )
     args = parser.parse_args()
     
     # Load config
@@ -3427,6 +3612,8 @@ def main():
         freeze_encoder_after=args.freeze_encoder_after,
         awr_temperature=args.awr_temperature,
         use_per_pair_awr=not args.no_per_pair_awr,  # Default to True (per-pair enabled)
+        bayesian_heads=args.bayesian_heads,
+        bayesian_prior_precision=args.bayesian_prior_precision,
     )
 
 

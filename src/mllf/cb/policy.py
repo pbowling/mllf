@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mllf.cb.bayesian_head import BayesianLinearHead
+
 
 class BiasHeadMLP(nn.Module):
     """Single fully-independent MLP for one MSLD bias type.
@@ -21,30 +23,62 @@ class BiasHeadMLP(nn.Module):
     for one bias coefficient.  Because each bias type has its own complete
     stack — input → hidden → output — gradient from one type cannot
     physically corrupt the weights used by any other type.
+
+    In **Bayesian mode** (``bayesian=True``, for NeuralLinear + Thompson
+    Sampling) the same ``trunk`` feature extractor is kept, but the final
+    deterministic ``Linear(64, 2)`` readout is replaced by a
+    :class:`~mllf.cb.bayesian_head.BayesianLinearHead`: a closed-form Bayesian
+    linear regression on the trunk's 64-D output. ``forward()`` still returns
+    an ``[E, 2]`` tensor for drop-in compatibility with existing callers
+    (column 0 = posterior mean, column 1 = ``0.5*log(var)`` in place of
+    ``log_std``), but the head is intended to be driven through
+    ``forward_features`` / the ``BayesianLinearHead`` API directly for
+    Thompson-sampled actions and closed-form posterior updates.
     """
 
-    def __init__(self, in_dim: int):
+    def __init__(self, in_dim: int, bayesian: bool = False, prior_precision: float = 1.0):
         super().__init__()
+        self.bayesian = bool(bayesian)
+        self.feat_dim = 64
         # Every single bias head gets its own private projection layers.
         # No cross-talk or gradient pollution can occur between bias types.
-        self.net = nn.Sequential(
+        # This trunk ("phi") is shared by both the legacy deterministic
+        # readout and the Bayesian last layer — it is the feature extractor
+        # a NeuralLinear model sits its Bayesian linear regression on top of.
+        self.trunk = nn.Sequential(
             nn.Linear(in_dim, in_dim // 2),           # 1024 → 512
             nn.ReLU(),
             nn.Linear(in_dim // 2, in_dim // 4),       # 512 → 256
             nn.ReLU(),
-            nn.Linear(in_dim // 4, 64),               # 256 → 64
+            nn.Linear(in_dim // 4, self.feat_dim),    # 256 → 64
             nn.ReLU(),
-            nn.Linear(64, 2),                         # 64 → 2 (mean, log_std)
         )
+        if self.bayesian:
+            self.bayesian_head = BayesianLinearHead(feat_dim=self.feat_dim,
+                                                      prior_precision=prior_precision)
+            self.readout = None
+        else:
+            self.bayesian_head = None
+            self.readout = nn.Linear(self.feat_dim, 2)  # 64 → 2 (mean, log_std)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``[E, 64]`` trunk features ``z = phi(x)`` (pre-readout)."""
+        return self.trunk(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return [E, 2] tensor of (mean_raw, log_std_raw)."""
-        return self.net(x)
+        z = self.trunk(x)
+        if self.bayesian:
+            mean, var = self.bayesian_head.predict(z)
+            log_std = 0.5 * torch.log(var.clamp(min=1e-12))
+            return torch.stack([mean, log_std], dim=-1)
+        return self.readout(z)
 
 
 class EdgeValueMLP(nn.Module):
     def __init__(self, in_dim: int, hidden: int = 64, num_bias_types: int = 4,
-                 bias_embed_dim: int = 16):
+                 bias_embed_dim: int = 16, bayesian: bool = False,
+                 prior_precision: float = 1.0):
         """Four completely independent MLPs, one per MSLD bias type.
 
         Replaces the previous shared-trunk + 4-heads design.  Each
@@ -60,14 +94,42 @@ class EdgeValueMLP(nn.Module):
             hidden: Unused; kept for API compatibility with old constructor.
             num_bias_types: Number of bias types (default 4).
             bias_embed_dim: Unused; kept for API compatibility.
+            bayesian: If True, each :class:`BiasHeadMLP` uses a
+                :class:`~mllf.cb.bayesian_head.BayesianLinearHead` last layer
+                instead of a deterministic ``Linear(64, 2)`` (NeuralLinear mode).
         """
         super().__init__()
         self.num_bias_types = num_bias_types
+        self.bayesian = bool(bayesian)
         # One fully-independent MLP per bias type.
         # Exposed as ``mlps`` so the optimizer can create per-head param groups.
         self.mlps = nn.ModuleList([
-            BiasHeadMLP(in_dim) for _ in range(num_bias_types)
+            BiasHeadMLP(in_dim, bayesian=self.bayesian, prior_precision=prior_precision)
+            for _ in range(num_bias_types)
         ])
+
+    def forward_features(self, x: torch.Tensor,
+                          edge_type: torch.Tensor) -> torch.Tensor:
+        """Route each edge to its bias type's trunk and return its features.
+
+        Args:
+            x: ``[E, in_dim]`` edge input features.
+            edge_type: ``[E]`` integer relation-type index; required (unlike
+                ``forward``'s legacy no-routing path — a NeuralLinear head's
+                features are only meaningful for its own bias type).
+
+        Returns:
+            ``[E, 64]``: ``z = phi(x)`` from the routed trunk for each edge.
+        """
+        D = self.num_bias_types
+        bias_type = edge_type // 2  # [E], values 0..D-1
+        feat_dim = self.mlps[0].feat_dim
+        out = torch.zeros(x.size(0), feat_dim, dtype=x.dtype, device=x.device)
+        for i, mlp in enumerate(self.mlps):
+            mask = (bias_type == i)
+            if mask.any():
+                out[mask] = mlp.forward_features(x[mask])
+        return out
 
     def forward(self, x: torch.Tensor,
                 edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -312,14 +374,24 @@ class UnimolPolicy(nn.Module):
         mlp_hidden: Hidden size for EdgeValueMLP (default: 64, unused in this design).
         mlp_out_dim: Number of bias types / output coefficients (default: 4).
         use_dual_embeddings: If True, use dual embedding mode; if False, use standard mode (default: False).
+        use_bayesian_heads: If True (NeuralLinear + Thompson Sampling mode), each
+            bias head's final layer is a :class:`~mllf.cb.bayesian_head.BayesianLinearHead`
+            instead of a deterministic ``Linear(64, 2)``. The trunk feature extractor
+            (shared with the deterministic mode) is unchanged. Default False keeps the
+            original REINFORCE-compatible architecture exactly as before.
+        bayesian_prior_precision: Prior precision (ridge strength) for each
+            ``BayesianLinearHead`` when ``use_bayesian_heads=True``. Unused otherwise.
     """
-    
+
     def __init__(self, unimol_dim: int = 512, mlp_hidden: int = 64,
-                 mlp_out_dim: int = 4, use_dual_embeddings: bool = False):
+                 mlp_out_dim: int = 4, use_dual_embeddings: bool = False,
+                 use_bayesian_heads: bool = False,
+                 bayesian_prior_precision: float = 1.0):
         super().__init__()
         self.unimol_dim = unimol_dim
         self.mlp_out_dim = int(mlp_out_dim)
         self.use_dual_embeddings = use_dual_embeddings
+        self.use_bayesian_heads = bool(use_bayesian_heads)
         
         # When using dual embeddings:
         # - Input format: [N, 1024] where first 512 = ligand-only, last 512 = full system with environment
@@ -328,7 +400,9 @@ class UnimolPolicy(nn.Module):
         # - Input format: [N, 512] ligand+environment
         # - Edge input: [diff, mean] = 1024D
         in_dim = 2 * unimol_dim if not use_dual_embeddings else 1024
-        self.edge_mlp = EdgeValueMLP(in_dim, hidden=mlp_hidden, num_bias_types=mlp_out_dim)
+        self.edge_mlp = EdgeValueMLP(in_dim, hidden=mlp_hidden, num_bias_types=mlp_out_dim,
+                                      bayesian=self.use_bayesian_heads,
+                                      prior_precision=bayesian_prior_precision)
         
         # Scale factors for the 4 MSLD bias types: [linear, quadratic, skew, end].
         # Empirical max across 20K+ pretraining runs with ~10% headroom.
@@ -338,43 +412,43 @@ class UnimolPolicy(nn.Module):
             persistent=False,
         )
     
-    def _forward_edges(self, unimol_embeddings: torch.Tensor,
-                       edge_index: torch.LongTensor,
-                       edge_type: Optional[torch.Tensor] = None):
-        """Compute (mean, log_std) tensors for all edges.
-        
+    def _build_edge_input(self, unimol_embeddings: torch.Tensor,
+                          edge_index: torch.LongTensor) -> torch.Tensor:
+        """Build the raw ``[E, in_dim]`` per-edge input from node embeddings.
+
+        Shared by ``_forward_edges`` (legacy deterministic/REINFORCE path) and
+        ``forward_features`` (NeuralLinear path) so the edge-input construction
+        logic exists in exactly one place.
+
         Args:
             unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
                 - When use_dual_embeddings=False: [N, 512] ligand+environment
                 - When use_dual_embeddings=True: [N, 1024] stacked [ligand_only, full]
             edge_index: [2, E] directed edge index.
-            edge_type: [E] integer relation index. When provided, each edge is
-                routed to mlps[edge_type // 2] for gradient isolation.
-        
+
         Returns:
-            mean: [E, mlp_out_dim] softsign-scaled bias coefficient means.
-            log_std: [E, mlp_out_dim] clamped log standard deviations.
+            [E, in_dim] edge input tensor (in_dim = 1024 either way).
         """
         src = edge_index[0]
         dst = edge_index[1]
-        
+
         if self.use_dual_embeddings:
             # Dual embedding mode: [ligand_only, full]
             # Split the 1024D input into two 512D components
             src_emb = unimol_embeddings[src]  # [E, 1024]
             dst_emb = unimol_embeddings[dst]  # [E, 1024]
-            
+
             src_ligand = src_emb[:, :512]      # [E, 512] ligand-only
             src_full = src_emb[:, 512:]        # [E, 512] full
             dst_ligand = dst_emb[:, :512]      # [E, 512] ligand-only
             dst_full = dst_emb[:, 512:]        # [E, 512] full
-            
+
             # Build edge input using:
             # - Antisymmetric component from ligand (captures substituent variation)
             # - Symmetric component from full (captures environment effects)
             diff_ligand = src_ligand - dst_ligand     # [E, 512] - antisymmetric (sub-dependent)
             mean_full = (src_full + dst_full) / 2.0   # [E, 512] - symmetric (environment-dependent)
-            edge_input = torch.cat([diff_ligand, mean_full], dim=-1)  # [E, 1024]
+            return torch.cat([diff_ligand, mean_full], dim=-1)  # [E, 1024]
         else:
             # Standard mode: ligand+environment
             # Symmetric-aware decomposition
@@ -382,8 +456,27 @@ class UnimolPolicy(nn.Module):
             dst_emb = unimol_embeddings[dst]  # [E, 512]
             diff = src_emb - dst_emb                        # [E, 512] - antisymmetric
             mean = (src_emb + dst_emb) / 2.0                # [E, 512] - symmetric
-            edge_input = torch.cat([diff, mean], dim=-1)    # [E, 1024]
-        
+            return torch.cat([diff, mean], dim=-1)          # [E, 1024]
+
+    def _forward_edges(self, unimol_embeddings: torch.Tensor,
+                       edge_index: torch.LongTensor,
+                       edge_type: Optional[torch.Tensor] = None):
+        """Compute (mean, log_std) tensors for all edges.
+
+        Args:
+            unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
+                - When use_dual_embeddings=False: [N, 512] ligand+environment
+                - When use_dual_embeddings=True: [N, 1024] stacked [ligand_only, full]
+            edge_index: [2, E] directed edge index.
+            edge_type: [E] integer relation index. When provided, each edge is
+                routed to mlps[edge_type // 2] for gradient isolation.
+
+        Returns:
+            mean: [E, mlp_out_dim] softsign-scaled bias coefficient means.
+            log_std: [E, mlp_out_dim] clamped log standard deviations.
+        """
+        edge_input = self._build_edge_input(unimol_embeddings, edge_index)
+
         # Forward through edge MLP with routing if edge_type is provided
         out = self.edge_mlp(edge_input, edge_type)  # [E, 2*mlp_out_dim]
         if out.dim() == 1:
@@ -398,8 +491,146 @@ class UnimolPolicy(nn.Module):
         
         # Clamp log_std: exp(-20) ≈ 2e-9, exp(2.0) ≈ 7.4
         log_std = torch.clamp(log_std, min=-20.0, max=2.0)
-        
+
         return mean, log_std
+
+    # ------------------------------------------------------------------
+    # NeuralLinear + Thompson Sampling API (only meaningful when
+    # use_bayesian_heads=True; each method routes every edge to its own
+    # bias type's BayesianLinearHead via edge_type // 2, exactly like the
+    # deterministic routing above).
+    # ------------------------------------------------------------------
+
+    def forward_features(self, unimol_embeddings: torch.Tensor,
+                         edge_index: torch.LongTensor,
+                         edge_type: torch.Tensor) -> torch.Tensor:
+        """Return per-edge trunk features ``z = phi(x)``, routed by bias type.
+
+        Args:
+            unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
+            edge_index: [2, E] directed edge index.
+            edge_type: [E] integer relation index (required — features are only
+                meaningful for an edge's own routed bias type).
+
+        Returns:
+            [E, 64] feature tensor, one row per edge from its routed trunk.
+        """
+        edge_input = self._build_edge_input(unimol_embeddings, edge_index)
+        return self.edge_mlp.forward_features(edge_input, edge_type)
+
+    def predict_uncertainty(self, unimol_embeddings: torch.Tensor,
+                            edge_index: torch.LongTensor,
+                            edge_type: torch.Tensor) -> tuple:
+        """Posterior predictive mean/variance for every edge's routed bias head.
+
+        Used for uncertainty-driven combo selection: average/max predictive
+        variance over a combo's edges ranks how much this combo would teach the
+        model if simulated next.
+
+        Returns:
+            mean: [E] posterior predictive mean (routed head's ``z @ mu``).
+            var: [E] posterior predictive variance (``z^T Lambda_inv z + noise_var``).
+        """
+        z = self.forward_features(unimol_embeddings, edge_index, edge_type)
+        bias_type = edge_type // 2
+        E = z.size(0)
+        mean = torch.zeros(E, device=z.device, dtype=z.dtype)
+        var = torch.zeros(E, device=z.device, dtype=z.dtype)
+        for d in range(self.mlp_out_dim):
+            mask = bias_type == d
+            if not mask.any():
+                continue
+            head = self.edge_mlp.mlps[d].bayesian_head
+            m_d, v_d = head.predict(z[mask])
+            mean[mask] = m_d
+            var[mask] = v_d
+        return mean, var
+
+    def get_actions_thompson(self, unimol_embeddings: torch.Tensor,
+                             edge_index: torch.LongTensor,
+                             edge_type: torch.Tensor,
+                             deterministic: bool = False) -> tuple:
+        """Sample actions via Thompson sampling from each bias head's posterior.
+
+        One weight vector is sampled per bias type per call (i.e. one Thompson
+        sample per decision/combo — not per edge), matching how a single
+        REINFORCE ``get_actions`` call produces one policy query per combo.
+
+        Args:
+            unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
+            edge_index: [2, E] directed edge index.
+            edge_type: [E] integer relation index (required).
+            deterministic: If True, use the posterior mean ``mu`` instead of a
+                sample (no exploration — for eval/replay).
+
+        Returns:
+            actions: [E, mlp_out_dim] bias coefficients (only the routed column
+                per edge is meaningful; other columns are 0 — same convention
+                as ``get_actions``'s routed path).
+            mean: [E] posterior predictive mean for each edge's routed head.
+            var: [E] posterior predictive variance for each edge's routed head.
+        """
+        z = self.forward_features(unimol_embeddings, edge_index, edge_type)
+        bias_type = edge_type // 2
+        D = self.mlp_out_dim
+        E = z.size(0)
+        actions = torch.zeros(E, D, device=z.device, dtype=z.dtype)
+        mean = torch.zeros(E, device=z.device, dtype=z.dtype)
+        var = torch.zeros(E, device=z.device, dtype=z.dtype)
+        for d in range(D):
+            mask = bias_type == d
+            if not mask.any():
+                continue
+            head = self.edge_mlp.mlps[d].bayesian_head
+            z_d = z[mask]
+            w = head.mu if deterministic else head.sample_weights()
+            actions[mask, d] = head.act(z_d, w)
+            m_d, v_d = head.predict(z_d)
+            mean[mask] = m_d
+            var[mask] = v_d
+
+        # Safety clip, matching the REINFORCE path's margin around scale_factors
+        # (write_variables_from_actions/bias_clip assume bounded values).
+        clip_limits = (self.scale_factors * 1.05).unsqueeze(0)
+        actions = torch.clamp(actions, -clip_limits, clip_limits)
+        return actions, mean, var
+
+    def update_bayesian_posteriors(self, unimol_embeddings: torch.Tensor,
+                                   edge_index: torch.LongTensor,
+                                   edge_type: torch.Tensor,
+                                   targets: torch.Tensor,
+                                   weights: Optional[torch.Tensor] = None) -> None:
+        """Fold observed ``(z, target)`` pairs into each routed head's posterior.
+
+        No gradient, no optimizer — this is the closed-form replacement for
+        ``policy_loss.backward(); optimizer.step()``.
+
+        Args:
+            unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
+            edge_index: [2, E] directed edge index.
+            edge_type: [E] integer relation index (required).
+            targets: [E] or [E, mlp_out_dim] regression targets — the observed
+                action (bias coefficient) each edge actually submitted. Only the
+                column matching each edge's routed bias type is used.
+            weights: Optional [E] per-edge confidence weight for the update
+                (e.g. reward-derived AWR weight combined with the existing
+                DDG-transition confidence weight). Defaults to all-ones.
+        """
+        z = self.forward_features(unimol_embeddings, edge_index, edge_type)
+        bias_type = edge_type // 2
+        D = self.mlp_out_dim
+        if targets.dim() == 1:
+            targets = targets.unsqueeze(-1).expand(-1, D)
+        for d in range(D):
+            mask = bias_type == d
+            if not mask.any():
+                continue
+            head = self.edge_mlp.mlps[d].bayesian_head
+            z_d = z[mask]
+            r_d = targets[mask, d]
+            w_d = weights[mask] if weights is not None else None
+            head.update(z_d, r_d, weights=w_d)
+
     def get_actions(self, unimol_embeddings: torch.Tensor,
                     edge_index: torch.LongTensor,
                     edge_type: Optional[torch.Tensor] = None,

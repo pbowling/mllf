@@ -46,6 +46,13 @@
 # To tune AWR temperature (higher → more uniform, lower → sharper emphasis; default 1.0):
 #   sbatch --export=ALL,AWR_TEMPERATURE=0.5 pretrain_with_filtering.sh
 #
+# To also produce a NeuralLinear + Thompson Sampling checkpoint (best_policy_bayesian.pt /
+# final_policy_bayesian.pt) alongside the normal deterministic one, for use with
+# training/workflow_instructions_neurallinear_ts.yaml (bandit.algorithm: neurallinear_ts):
+#   sbatch --export=ALL,BAYESIAN_HEADS=true pretrain_with_filtering.sh
+#   (optionally tune BAYESIAN_PRIOR_PRECISION, default 1.0 — must match the
+#    bandit.prior_precision used in the online-training config)
+#
 # To disable stratified sampling and fall back to reward threshold filtering:
 #   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=0 pretrain_with_filtering.sh
 #
@@ -111,6 +118,8 @@ REWARD_WEIGHTED="${REWARD_WEIGHTED:-false}"
 PATIENCE="${PATIENCE:-5}"
 USE_PER_PAIR_AWR="${USE_PER_PAIR_AWR:-true}"
 AWR_TEMPERATURE="${AWR_TEMPERATURE:-1.0}"
+BAYESIAN_HEADS="${BAYESIAN_HEADS:-false}"
+BAYESIAN_PRIOR_PRECISION="${BAYESIAN_PRIOR_PRECISION:-1.0}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -134,6 +143,7 @@ fi
 echo "  Early stopping patience: $PATIENCE epochs"
 echo "  Per-pair AWR: $([ "$USE_PER_PAIR_AWR" = "true" ] && echo "ENABLED" || echo "disabled")"
 echo "  AWR temperature: $AWR_TEMPERATURE"
+echo "  NeuralLinear+TS Bayesian-head checkpoint: $([ "$BAYESIAN_HEADS" = "true" ] && echo "ENABLED (prior_precision=$BAYESIAN_PRIOR_PRECISION)" || echo "disabled")"
 
 # Find pretraining directory
 PRETRAIN_DIR=""
@@ -309,6 +319,12 @@ if [ "$AWR_TEMPERATURE" != "1.0" ]; then
     CMD="$CMD --awr-temperature $AWR_TEMPERATURE"
 fi
 
+# Add NeuralLinear + Thompson Sampling Bayesian-head checkpoint generation
+if [ "$BAYESIAN_HEADS" = "true" ]; then
+    CMD="$CMD --bayesian-heads --bayesian-prior-precision $BAYESIAN_PRIOR_PRECISION"
+    echo "NeuralLinear+TS: ENABLED (will also save best_policy_bayesian.pt / final_policy_bayesian.pt)"
+fi
+
 echo ""
 echo "Command:"
 echo "$CMD"
@@ -345,6 +361,19 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "3. Update your workflow config to use the pretrained policy:"
     echo "   pretrain:"
     echo "     model_path: $OUTPUT_DIR/best_policy.pt"
+    if [ "$BAYESIAN_HEADS" = "true" ]; then
+        echo ""
+        echo "   ...or, for NeuralLinear + Thompson Sampling online training"
+        echo "   (training/workflow_instructions_neurallinear_ts.yaml), point at the"
+        echo "   Bayesian-head sibling checkpoint instead:"
+        echo "     pretrain:"
+        echo "       model_path: $OUTPUT_DIR/best_policy_bayesian.pt"
+        echo "     training:"
+        echo "       policy:"
+        echo "         use_bayesian_heads: true"
+        echo "     bandit:"
+        echo "       algorithm: neurallinear_ts"
+    fi
     echo "4. Run the training workflow"
 else
     echo "✗ Pretraining failed with exit code $EXIT_CODE"

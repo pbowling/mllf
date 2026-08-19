@@ -259,23 +259,21 @@ def compute_pair_reward(
                      when the pair was visited, giving both per-pair resolution and
                      a continuous quality gradient.
       2  skew      — barrier asymmetry from soft-core introduction.
-                     Signal: ``min(1.0, fraction_physical * total_pairs)`` — the
+                     Signal: ``combined`` — mean of the population-balance and
+                     quadratic-quality proxies (previously shared with end;
+                     cannot yet be further isolated from available data).
+      3  end       — entropic / surface-tension cost of creating substituent space.
+                    Signal: ``min(1.0, fraction_physical * total_pairs)`` — the
                      combo-level FRACTION PHYSICAL LIGAND diagnostic (fraction
                      of the trajectory spent in a fully-resolved, single-
                      substituent-per-site state) scaled by the number of
                      possible substituent pairs in the combo. Scaling
                      counteracts the combinatorial shrinkage of "physical"
                      time as more substituents compete for occupancy, so
-                     combos of different sizes are graded comparably. This is
-                     a genuinely distinct observable from the population/
-                     transition signals driving linear and quadratic. Falls
+                     combos of different sizes are graded comparably. Falls
                      back to the ``combined`` proxy (see dim 3) when
                      ``fraction_physical`` is unavailable (e.g. a cached
                      epoch_results.pt from before this diagnostic was parsed).
-      3  end       — entropic / surface-tension cost of creating substituent space.
-                     Signal: ``combined`` — mean of the population-balance and
-                     quadratic-quality proxies (previously shared with skew;
-                     cannot yet be further isolated from available data).
 
     For all dimensions: ``-1.0`` when this specific pair was not visited
     (DDG is None/NaN/Inf) OR when both substituents have zero population
@@ -344,26 +342,160 @@ def compute_pair_reward(
             pair_visited = 1.0
             quad_signal = (pair_visited + trans_quality) / 2.0
 
-            # Combined proxy for end: population balance (normalised to
+            # Combined proxy for skew: population balance (normalised to
             # [0,1]) and quad_signal averaged.
             combined = (minority_frac * 2.0 + quad_signal) / 2.0
 
-            # Skew: distinct signal from the FRACTION PHYSICAL LIGAND
+            # End: distinct signal from the FRACTION PHYSICAL LIGAND
             # diagnostic, scaled by the combo's total possible substituent
             # pairs (clamped to 1.0 since the scaling can overshoot for
             # combos with many pairs). Falls back to `combined` when the
             # diagnostic wasn't parsed (older cached runs).
             if fraction_physical is not None:
-                skew_signal = min(1.0, float(fraction_physical) * total_pairs)
+                end_signal = min(1.0, float(fraction_physical) * total_pairs)
             else:
-                skew_signal = combined
+                end_signal = combined
 
             rewards[k, 0] = minority_frac   # linear:    population balance ∈ [0, 0.5]
             rewards[k, 1] = quad_signal     # quadratic: per-pair visited + quality ∈ [0.5, 1]
-            rewards[k, 2] = skew_signal     # skew:      fraction-physical-based proxy
-            rewards[k, 3] = combined        # end:       combined proxy
+            rewards[k, 2] = combined        # skew:      combined proxy
+            rewards[k, 3] = end_signal      # end:       fraction-physical-based proxy
 
     return rewards
+
+
+def load_bandit_state(path: Path) -> Dict[str, Dict]:
+    """Load the per-combo NeuralLinear+TS bookkeeping state (retries/deferrals).
+
+    The state tracks, per combo, how many times it has failed for
+    infrastructure/software reasons (not simulator-sampling reasons — those are
+    already filtered out before this function's caller sees them; see
+    ``record_combo_failure``) so uncertainty-driven combo selection can stop
+    repeatedly re-selecting a combo that simply cannot be simulated.
+
+    Args:
+        path: Path to the JSON state file (created on first save if missing).
+
+    Returns:
+        Dict mapping combo key (``str(combo_path)``) -> {"software_failures":
+        int, "deferred": bool}. Empty dict if the file doesn't exist yet.
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_bandit_state(path: Path, state: Dict[str, Dict]) -> None:
+    """Persist the per-combo NeuralLinear+TS bookkeeping state to JSON."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(state, f, indent=2)
+
+
+def record_combo_failure(state: Dict[str, Dict], combo_key: str, cap: int = 3) -> None:
+    """Record one infrastructure/software failure for a combo, deferring it past ``cap``.
+
+    Mutates *state* in place. Once a combo has failed ``cap`` or more times it
+    is marked ``deferred`` — excluded from uncertainty-driven selection (see
+    ``select_combos_by_uncertainty``) without being discarded outright, so the
+    active-learning loop doesn't spend its whole budget retrying one broken
+    combo (guardrail from the NeuralLinear+TS design note: a software failure
+    is a missing observation, not evidence the combo is a bad arm).
+
+    Args:
+        state: Bandit state dict (as returned by ``load_bandit_state``).
+        combo_key: Combo identifier (``str(combo_path)``).
+        cap: Number of failures after which the combo is deferred (default 3).
+    """
+    entry = state.setdefault(combo_key, {"software_failures": 0, "deferred": False})
+    entry["software_failures"] = entry.get("software_failures", 0) + 1
+    if entry["software_failures"] >= cap:
+        entry["deferred"] = True
+
+
+def select_combos_by_uncertainty(
+    candidates: List[str],
+    policy,
+    combo_system_map: Dict[str, Dict],
+    config: Dict,
+    n_select: int,
+    bandit_state: Dict[str, Dict],
+    device: str,
+    build_graph_fn,
+) -> List[str]:
+    """Rank candidate combos by predictive uncertainty and return the top ``n_select``.
+
+    Implements the "uncertainty-driven selection" half of NeuralLinear + Thompson
+    Sampling: train next on the combos the model is least sure about. Callers are
+    expected to have already applied the simulator-tractability gate (the
+    existing curriculum/transition filters) to *candidates* — this function only
+    ranks within whatever pool it's given, plus the deferred-backfill fallback
+    below.
+
+    Args:
+        candidates: Combo path strings to rank (already curriculum/transition
+            filtered — the "simulator-tractability gate").
+        policy: A ``UnimolPolicy`` with ``use_bayesian_heads=True``.
+        combo_system_map: combo path str -> per-system config dict.
+        config: Full workflow config (used to build each candidate's graph).
+        n_select: Number of combos to return.
+        bandit_state: Per-combo failure/defer tracker (see ``load_bandit_state``);
+            deferred combos are skipped unless needed as a last-resort backfill.
+        device: torch device string for graph building / inference.
+        build_graph_fn: Callable ``(combo_dir_str, sys_cfg, config, device) ->
+            (data, extras)`` — injected rather than imported directly to avoid a
+            circular import with ``training/workflow.py`` (typically
+            ``build_graph_and_data``).
+
+    Returns:
+        List of up to ``n_select`` combo path strings, highest predictive
+        variance first. If fewer than ``n_select`` non-deferred candidates are
+        eligible, backfills from the deferred pool (oldest-first by failure
+        count) and logs how many were backfilled rather than silently
+        truncating the epoch's combo pool.
+    """
+    eligible = [c for c in candidates if not bandit_state.get(c, {}).get('deferred', False)]
+    deferred = [c for c in candidates if bandit_state.get(c, {}).get('deferred', False)]
+
+    scored: List[tuple] = []
+    n_skipped = 0
+    with torch.no_grad():
+        for combo_dir in eligible:
+            sys_cfg = combo_system_map.get(combo_dir, {})
+            try:
+                data, _ = build_graph_fn(combo_dir, sys_cfg, config, device)
+                _, var = policy.predict_uncertainty(data.x, data.edge_index, data.edge_type)
+                score = float(var.mean().item())
+            except Exception:
+                n_skipped += 1
+                continue
+            scored.append((score, combo_dir))
+
+    if n_skipped:
+        print(f"  select_combos_by_uncertainty: {n_skipped}/{len(eligible)} candidates "
+              f"could not be scored (graph build failed) — excluded from ranking")
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    selected = [c for _, c in scored[:n_select]]
+
+    if len(selected) < n_select and deferred:
+        n_backfill = min(n_select - len(selected), len(deferred))
+        backfilled = sorted(
+            deferred,
+            key=lambda c: bandit_state.get(c, {}).get('software_failures', 0),
+        )[:n_backfill]
+        print(f"  select_combos_by_uncertainty: only {len(selected)} eligible combos "
+              f"scored; backfilling {len(backfilled)} deferred combo(s) to reach "
+              f"n_select={n_select}: {[Path(c).name for c in backfilled]}")
+        selected.extend(backfilled)
+
+    return selected
 
 
 def compute_failure_reward(
