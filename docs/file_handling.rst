@@ -92,8 +92,9 @@ PDB File Parsing
 
 PDB files contain 3D atomic coordinates and are used for:
 
-* Computing AEVs (Atomic Environment Vectors) for DeepSet embeddings
-* Spatial filtering in multi-site systems (finding nearby substituents)
+* Assembling the full ligand system (core + substituent + environment) for Uni-Mol
+  embedding computation (see :doc:`unimol_representation`)
+* Spatial filtering in multi-site systems (finding nearby substituents, environment atoms)
 * Validating element identification against CGenFF atom types
 
 **Fragment Structure**:
@@ -105,7 +106,7 @@ msld-py-prep generates fragment PDB files (``site#_sub#_frag.pdb``) that include
 
 The anchor atoms ensure proper bonding when fragments are combined with the core during
 MSLD simulations. These atoms appear in both the core and fragment PDB files, so
-duplicate detection is important when combining structures for AEV computation.
+duplicate detection is important when combining structures for embedding computation.
 
 **Three-Tier Parsing Strategy**:
 
@@ -200,7 +201,8 @@ bias matrices (b, c, x, s). These files are read by the MSLD simulator.
 **Matrix Conventions**:
 
 * **b (linear)**: 1D vector, one value per substituent
-* **c (quadratic)**: Antisymmetric matrix where ``c[i][j] = -c[j][i]``
+* **c (quadratic)**: Symmetric matrix where ``c[i][j] = c[j][i]`` (only the upper triangle
+  is written; the value is shared, not negated, in the lower triangle)
 * **x (skew)**: Full matrix, forward/backward directions independent
 * **s (end)**: Full matrix, forward/backward directions independent
 
@@ -373,7 +375,7 @@ See Also
 --------
 
 * :doc:`cb_setup` - CB infrastructure and graph construction
-* :doc:`deepset_pretraining` - AEV computation and atom features
+* :doc:`unimol_representation` - Uni-Mol embedding computation from PDB coordinates
 * :doc:`workflow` - Complete training workflow
 * :doc:`api` - API reference for file handling modules
 

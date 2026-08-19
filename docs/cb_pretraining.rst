@@ -16,6 +16,48 @@ Behavior cloning learns to imitate expert bias coefficients by supervised learni
 (graph structure → bias coefficients) pairs collected from pretraining systems.
 
 
+Running Pretraining
+--------------------
+
+Pretraining is invoked via ``mllf.cb.pretrain_policy``'s CLI:
+
+.. code-block:: bash
+
+   python -m mllf.cb.pretrain_policy \
+       --pretraining-dir pretraining/ \
+       --output-dir models/my_pretrain_run \
+       --config examples/workflow_pretrain.yaml \
+       --epochs 50
+
+``--pretraining-dir`` may be repeated to combine multiple collected-data directories into
+one training set. Key flags (all optional, sensible defaults shown):
+
+* ``--use-best-only`` — keep only the highest-reward run per system (default: use all valid runs)
+* ``--no-per-pair-awr`` — disable per-pair AWR weighting and fall back to one scalar weight
+  per run (see "Per-Pair AWR Weighting" above; per-pair is the default)
+* ``--awr-temperature`` (default 0.5) — AWR temperature :math:`\beta`
+* ``--min-transitions N`` / ``--min-reward-threshold`` / ``--stratified-negative-fraction`` —
+  quality filters, see "Quality Filtering" below (mutually exclusive; ``--min-transitions``
+  takes precedence)
+* ``--no-filter-outliers`` / ``--outlier-std-threshold`` — statistical outlier filtering
+  (enabled by default at ±3σ)
+* ``--reward-weighted`` — additionally weight each run's loss by its (clamped, normalized)
+  reward
+* ``--bayesian-heads`` / ``--bayesian-prior-precision`` — after the normal behavior-cloning
+  loop, also save a ``use_bayesian_heads=True`` sibling policy
+  (``best_policy_bayesian.pt`` / ``final_policy_bayesian.pt``) for NeuralLinear + Thompson
+  Sampling online training (see :doc:`cb_setup`), warm-started from the trained
+  deterministic readout
+
+The ``--config`` file (e.g. ``examples/workflow_pretrain.yaml``) controls the Uni-Mol
+representation settings — ``unimol.structure_selection`` (minimized vs. unrelaxed
+structures), ``unimol.environment_cutoff``, ``unimol.cache_embeddings`` — and the reward
+function weights used to compute the per-run/per-pair AWR weights described above; it does
+**not** control filtering or optimizer flags, which are CLI-only. See
+``examples/pretrain_wUnimol.sh`` for a complete SLURM submission example (which sources
+``examples/pretrain_with_filtering.sh`` and sets these flags via environment variables), and
+:doc:`examples` for a walkthrough.
+
 Behavior Cloning Training
 --------------------------
 
@@ -66,16 +108,38 @@ exploratory freedom in RL fine-tuning; the learned :math:`\sigma` is a useful pr
 initialising the exploration scale.
 
 
+**Per-Pair AWR Weighting** (default):
+
+By default (``--no-per-pair-awr`` to disable), the AWR weight above is not a single scalar
+per run — it is computed **per edge, per dimension** via
+``compute_pairwise_confidence_weights`` / ``compute_pair_reward`` (the same reward function
+used by online REINFORCE, see :doc:`cb_setup`). Concretely, each pair's confidence weight
+combines:
+
+* **Population balance**: :math:`\min(p_i, p_j) / \max(p_i, p_j)` — zero if either
+  substituent was never sampled
+* **DDG reliability**: zero weight if the pair's ΔΔG is missing, NaN, or infinite (no usable
+  λ-space crossing was observed for that specific pair)
+* **Antisymmetric handling**: a missing forward-direction DDG is filled in from the reverse
+  direction's negation when available, rather than being treated as unobserved
+
+This means that within one run, well-resolved pairs (balanced populations, a clean DDG)
+drive more gradient than poorly-resolved pairs, instead of every pair in the run sharing one
+flat run-level weight. This keeps the pretraining signal consistent with what online
+REINFORCE later optimizes against. The AWR temperature :math:`\beta` (``--awr-temperature``,
+default 0.5) still controls how sharply confidence is weighted.
+
 **Graph Caching**:
 
 Before training begins, all pretraining graphs are built once and stored in an in-memory
-cache. Each subsequent epoch iterates over the cached graphs instead of re-parsing RTF
-files and recomputing DeepSet embeddings on every pass. This is the dominant source of
-training speedup: for example, the current dataset of ~25,000 runs spans only ~250
-unique graph structures (many runs share the same prep directory). The AEV computation
-runs ~250 times (~8 minutes) rather than ~25,000 times (~14 hours) as it would
-without structure sharing. Rebuilding on every epoch would cost hundreds of hours over
-a full training run.
+cache. Each subsequent epoch iterates over the cached graphs instead of re-parsing RTF/PDB
+files and recomputing Uni-Mol embeddings on every pass. This is the dominant source of
+training speedup: for example, a dataset of ~25,000 runs may span only ~250 unique prep
+directories (many runs share the same prep). Embedding computation then runs ~250 times
+rather than ~25,000 times as it would without structure sharing. Rebuilding on every epoch
+would cost many hours over a full training run. Set ``unimol.cache_embeddings: true`` in the
+``--config`` file (see "Running Pretraining" above) to additionally persist computed
+embeddings to disk across separate pretraining invocations.
 
 **Learning Rate Schedule**:
 
@@ -122,7 +186,7 @@ Both are stored in ``variables.py`` files in prep directories:
    - 0.245
    - -0.132
    - 0.089
-   c:  # Quadratic bias (antisymmetric)
+   c:  # Quadratic bias (symmetric, upper triangle stored)
    - [0.0, 2.34, -1.56]
    - [0.0, 0.0, 3.12]
    - [0.0, 0.0, 0.0]
@@ -268,29 +332,33 @@ worst bucket retains 0% and the best negative bucket retains at most
 :math:`f_i = f_{\max} \times (i / (N-1))^2`, concentrating sampling on near-zero runs
 whose coefficients were almost correct.
 
-*Why this matters:* Pure best-only cloning can leave the Q-critic with an impoverished view
-of the reward distribution, making it hard to distinguish near-success from complete failure.
-Stratified sampling exposes the Q-critic to the full reward landscape while still
-over-representing higher-quality runs, enabling better-calibrated value estimates during
-RL warmup. Positive-reward runs are always retained in full.
+*Why this matters:* Pure best-only cloning can give the policy an impoverished view of the
+reward distribution, making it hard to distinguish near-success from complete failure.
+Stratified sampling exposes it to the full reward landscape while still over-representing
+higher-quality runs. Positive-reward runs are always retained in full. (Current training
+has no separate Q-critic or value network — see :doc:`cb_setup` — so this filter shapes the
+data the single behavior-cloned policy sees, not a critic's warmup data.)
 
 **Combined Filtering Strategy**:
 
-Filters can be combined to implement sophisticated data selection policies. The typical
-production configuration uses **outlier filtering** + **best-only BC** + **stratified
-negative sampling for Q-warmup** (controlled by ``--q-stratified-fraction``): BC clones
-only the best-run behavior while the Q-critic sees the full reward distribution.
+Filters can be combined to implement sophisticated data selection policies. A typical
+production configuration uses **outlier filtering** (default, ±3σ) + **per-pair AWR**
+(default) + either **best-only** (``--use-best-only``, narrow but clean) or **stratified
+negative sampling** (``--stratified-negative-fraction``, broader reward coverage), depending
+on how much exploratory/failed data the pretraining set contains.
 
 
 See Also
 --------
 
 * :doc:`file_handling` - Bias coefficient file formats, ``parse_single_ddg`` reference
-* :doc:`deepset_pretraining` - Pretrained AtomBondGNN node embeddings
+* :doc:`unimol_representation` - Pretrained Uni-Mol node embeddings pretraining trains on top of
 * :doc:`cb_setup` - CB infrastructure and policy architecture
 * :doc:`workflow` - Complete CB training workflow
 * :doc:`examples` - Running pretraining and workflows
-* ``examples/pretrain_with_filtering.sh`` - Pretraining SLURM script
+* ``examples/pretrain_wUnimol.sh`` / ``examples/pretrain_with_filtering.sh`` - Pretraining SLURM scripts
+* ``examples/workflow_pretrain.yaml`` - Pretraining ``--config`` file template
 * ``src/mllf/cb/pretrain_policy.py`` - Behavior cloning implementation
 * ``src/mllf/cb/policy.py`` - Policy network architecture
+* ``src/mllf/cb/bayesian_head.py`` - NeuralLinear + Thompson Sampling head, used by ``--bayesian-heads``
 * ``src/mllf/cb/workflow_utils.py`` - ``compute_pair_reward``, ``parse_simulation_metrics``

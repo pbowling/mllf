@@ -22,7 +22,7 @@ What you'll find in these docs
   λ-dynamics and Adaptive Landscape Flattening (ALF)
 - **Installation**: how to install the package and dependencies
 - **File Handling**: parsers and writers for RTF, PDB, bias coefficients, and output files
-- **DeepSet Pretraining**: learned physical representations from atomic structure
+- **Uni-Mol Representation**: pretrained molecular embeddings with environment context
 - **CB Behavior Cloning**: transfer learning from expert bias coefficients
 - **Contextual Bandit Setup**: graph neural network architecture for bias prediction
 - **Workflow System**: complete pipeline from combination generation to training
@@ -37,7 +37,7 @@ Quick start (recommended)
 2. Follow **Installation** to set up the environment
 3. Review **File Handling** to understand input/output formats
 4. Review **Workflow System** for the complete pipeline overview
-5. (Optional) Read **DeepSet Pretraining** and **CB Behavior Cloning** for advanced features
+5. (Optional) Read **Uni-Mol Representation** and **CB Behavior Cloning** for advanced features
 6. Check **Examples** for running the training workflow
 7. Inspect the **API** reference for integration details
 
@@ -53,7 +53,7 @@ Contents (top-level)
    file_handling
    workflow
    cb_setup
-   deepset_pretraining
+   unimol_representation
    cb_pretraining
    examples
    references

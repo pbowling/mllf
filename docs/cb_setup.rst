@@ -6,88 +6,90 @@ Overview
 
 The contextual bandit (CB) training framework provides a reinforcement learning approach to
 optimizing bias coefficients for multisite λ-dynamics simulations. Instead of hand-tuning
-bias parameters, we use graph neural networks to predict optimal coefficients based on the
-molecular graph structure.
+bias parameters, a policy network predicts optimal coefficients directly from pretrained
+molecular representations of each substituent.
 
-**Architecture Pipeline**:
+**Architecture**:
 
-The policy network uses a two-stage architecture to predict bias coefficients:
+``UnimolPolicy`` (``mllf.cb.policy``) is a single-stage, feed-forward policy with **no
+graph encoder**:
 
-1. **AtomBondGNN (Phase 1, frozen)**: A graph neural network pretrained on diverse molecular
-   data that encodes each substituent's 3D atomic structure into a 64-dimensional vector.
-   It uses a dual-stream GINEConv architecture — a substituent stream and a scaffold-context
-   (core) stream — with scaffold-aware attentional pooling. Weights are loaded from a
-   pre-trained checkpoint and held fixed during all CB training.
+1. **Node features**: Each substituent's node feature is a pretrained, frozen **Uni-Mol**
+   embedding (see :doc:`unimol_representation`) — 512D in standard mode, or 1024D
+   (``[ligand_only, full]``) in **dual embedding mode**, which is what online training and
+   pretraining both use by default. Uni-Mol is never fine-tuned; only the policy heads
+   downstream of it are trained.
 
-2. **SitePoolMLPPolicy (Phase 2, trained by RL)**: A pairwise edge MLP that receives the
-   AtomBondGNN P1 embeddings for both endpoint substituents plus a site-level mean-pool
-   context vector — 192D total — and outputs independent Gaussian distributions over bias
-   coefficients via four completely decoupled ``BiasHeadMLP`` networks (one per bias type).
-   Each edge is routed exclusively to the MLP for its bias type (``edge_type // 2``),
-   preventing gradient cross-contamination between bias types.
-
-This design eliminates the intermediate RGCN encoder, using instead a lightweight
-site-pool context signal computed directly from the frozen Phase 1 embeddings.
+2. **Per-edge policy heads**: For every directed pair of substituents at the same λ-site,
+   the node embeddings are combined into a 1024D edge input and passed to four completely
+   independent ``BiasHeadMLP`` networks (one per MSLD bias type: linear, quadratic, skew,
+   end), each producing a ``(mean, log_std)`` pair. There is no shared trunk across bias
+   types and no intermediate graph convolution — this eliminates the RGCN encoder and
+   AtomBondGNN/DeepSet pretraining stage used by earlier versions of this framework (see
+   :doc:`unimol_representation` for that history).
 
 .. _Architecture Diagram:
 
-**Full Architecture**:
+**Full Architecture** (dual embedding mode):
 
 .. code-block:: text
 
    ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PHASE 1 — AtomBondGNN  [FROZEN in all training phases]                ║
+   ║  Uni-Mol  [FROZEN, pretrained on 1.1B PubChem molecules]                ║
    ║                                                                          ║
-   ║  Per substituent (dual-stream):                                          ║
-   ║  AEV[2288] + charge[1] + atom_id[11] = 2300D per atom                  ║
-   ║      │  sub_input_proj: 2300 → 256 → 256 + ReLU (sub atoms)            ║
-   ║      │  core_input_proj: 2300 → 256 → 256 + ReLU (core+ref atoms)      ║
-   ║      │  sub_gin_layers: 4× GINEConv(256→256, edge_dim=1) + ReLU        ║
-   ║      │  core_gin_layers: 4× GINEConv(256→256, edge_dim=1) + ReLU       ║
-   ║      │  core_summary = mean-pool(core_gin_layers output)                ║
-   ║      │  gate = σ(Linear(concat(sub_h, core_summary), 1))               ║
-   ║      │  GlobalAttentionPool: weighted sum of pool_nn(sub_h)             ║
-   ║      ▼                                                                   ║
-   ║   64D  P1 embedding  (data.x)                                           ║
+   ║  Per substituent, two embeddings:                                       ║
+   ║    ligand-only   = UniMol(core + sub)                        [512]     ║
+   ║    full          = UniMol(core + sub + ref_subs + env)       [512]     ║
+   ║  node feature = [ligand_only, full]                          [1024]    ║
    ╚══════════════════════════════════════════════════════════════════════════╝
-                       │
-                       │  data.x [N, 64]  (one row per substituent node)
-                       │  data.site_index [N]  (which λ-site each node belongs to)
+                       │  data.x [N, 1024]  (one row per substituent node)
                        ▼
    ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PHASE 2 — SitePoolMLPPolicy  [trained by BC pretraining and RL]       ║
+   ║  UnimolPolicy._build_edge_input   (per directed edge A → B)             ║
    ║                                                                          ║
-   ║  site_pool = mean(P1 embeddings at the same λ-site)  [N, 64]           ║
+   ║  diff_ligand = ligand_only_A − ligand_only_B    (antisymmetric)  [512]  ║
+   ║  mean_full   = (full_A + full_B) / 2            (symmetric)      [512]  ║
+   ║  edge_input  = [diff_ligand, mean_full]                         [1024]  ║
+   ╚══════════════════════════════════════════════════════════════════════════╝
+                       ▼
+   ╔══════════════════════════════════════════════════════════════════════════╗
+   ║  EdgeValueMLP — four independent BiasHeadMLP  [trained by BC + RL]      ║
    ║                                                                          ║
-   ║  Per directed edge (Sub_A → Sub_B):                                     ║
-   ║  concat(P1_A[64], P1_B[64], site_pool_A[64]) = 192D                    ║
-   ║      │   block dropout on site_pool_A slice (p=0.3) during training     ║
-   ║      │   edge_type // 2 → routes edge to its own BiasHeadMLP            ║
+   ║  ┌── BiasHeadMLP (linear) ─────┐  ┌── BiasHeadMLP (quadratic) ────┐    ║
+   ║  │ trunk: 1024→512→256→64+ReLU│  │ trunk: 1024→512→256→64+ReLU  │    ║
+   ║  │ readout: Linear(64, 2)      │  │ readout: Linear(64, 2)        │    ║
+   ║  └──────────────────────────────┘  └────────────────────────────────┘    ║
+   ║  ┌── BiasHeadMLP (skew) ───────┐  ┌── BiasHeadMLP (end) ──────────┐    ║
+   ║  │ trunk: 1024→512→256→64+ReLU│  │ trunk: 1024→512→256→64+ReLU  │    ║
+   ║  │ readout: Linear(64, 2)      │  │ readout: Linear(64, 2)        │    ║
+   ║  └──────────────────────────────┘  └────────────────────────────────┘    ║
    ║      ▼                                                                   ║
-   ║  ┌── BiasHeadMLP (linear) ──┐  ┌── BiasHeadMLP (quadratic) ──┐        ║
-   ║  │  192 → 128 → 64 → 32 → 2│  │  192 → 128 → 64 → 32 → 2   │        ║
-   ║  └──────────────────────────┘  └─────────────────────────────┘        ║
-   ║  ┌── BiasHeadMLP (skew) ────┐  ┌── BiasHeadMLP (end) ─────────┐       ║
-   ║  │  192 → 128 → 64 → 32 → 2│  │  192 → 128 → 64 → 32 → 2    │       ║
-   ║  └──────────────────────────┘  └──────────────────────────────┘       ║
-   ║      ▼                                                                   ║
-   ║  (μ_d, log σ_d) for the relevant bias type d of each edge               ║
-   ║  Output scaled: tanh(μ_d) × scale_d                                     ║
-   ║    scale: [305, 520, 85, 30] for [linear, quadratic, skew, end]         ║
+   ║  (μ_d, log σ_d) per bias type d, for every edge                          ║
+   ║  Output scaled: softsign(μ_d) × scale_d                                  ║
+   ║    scale: [305, 520, 85, 30] for [linear, quadratic, skew, end]          ║
+   ║  log σ_d clamped to [-20, 2.0]                                           ║
    ╚══════════════════════════════════════════════════════════════════════════╝
                                ▼
    ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PER-EDGE PER-DIM REWARD  (from simulation output)  [E, 4]             ║
+   ║  PER-EDGE PER-DIM REWARD  (compute_pair_reward, from sim output) [E, 4] ║
    ║                                                                          ║
-   ║  Unvisited pair (DDG None/NaN/Inf):  all 4 dims = -1.0                 ║
-   ║  Visited pair (finite DDG):                                              ║
-   ║    dim 0 (linear):    minority_frac = min(p_i,p_j)/(p_i+p_j) ∈[0,0.5] ║
-   ║    dim 1 (quadratic): (pair_visited + trans_quality) / 2  ∈[0.5,1.0]  ║
-   ║    dim 2 (skew):      combined proxy ∈[0.5,0.75]                       ║
-   ║    dim 3 (end):       combined proxy ∈[0.5,0.75]                       ║
+   ║  Unvisited pair (no lambda-space crossing, or both subs unsampled):     ║
+   ║      all 4 dims = -1.0                                                  ║
+   ║  Visited pair:                                                           ║
+   ║    dim 0 (linear):    minority_frac = min(p_i,p_j)/(p_i+p_j) ∈ [0,0.5] ║
+   ║    dim 1 (quadratic): (pair_visited + trans_quality) / 2   ∈ [0.5,1.0] ║
+   ║    dim 2 (skew):      combined population/quality proxy                ║
+   ║    dim 3 (end):       fraction-physical-ligand proxy (or combined       ║
+   ║                       fallback if not available)                        ║
    ║                                                                          ║
-   ║  policy_loss = -∑_e R_pair[e, d_e] × logp_e[d_e]   per-head REINFORCE ║
+   ║  policy_loss = -∑_e R[e, :] · logp_e[:]     each head trained only on   ║
+   ║                                              its own reward dimension    ║
    ╚══════════════════════════════════════════════════════════════════════════╝
+
+**NeuralLinear + Thompson Sampling (optional)**: setting ``use_bayesian_heads=True`` swaps
+each ``BiasHeadMLP``'s deterministic ``readout`` for a
+:class:`~mllf.cb.bayesian_head.BayesianLinearHead` — a closed-form Bayesian linear
+regression on the same 64D trunk features. See `NeuralLinear + Thompson Sampling`_ below.
 
 Core Components
 ---------------
@@ -101,8 +103,24 @@ Molecular systems are represented as directed graphs where:
 * **Edges** represent transitions between substituents with associated bias coefficients
 
 For a 2-site system with 3 substituents at site 1 and 2 substituents at site 2, the graph
-contains 5 nodes total (one per substituent). Edges connect substituents within the same site,
-allowing the model to predict bias coefficients for all possible transitions.
+contains 5 nodes total (one per substituent). ``build_directed_pairs()``
+(``mllf.cb.graph_utils``) generates **both directions** (i→j and j→i) for every pair of
+substituents *within the same site* — no cross-site edges. This "fully-connected within
+site" scheme is what both online training (``examples/run_workflow.py``'s
+``build_graph_and_data``) and pretraining (``build_fully_connected_graph_for_pretraining``)
+use: one edge per ordered pair, each edge carrying predictions for **all four** bias types
+at once (``UnimolPolicy`` outputs ``[E, 4]`` means/log-stds per call, since the current
+graph construction passes ``edge_type=None`` and lets every ``BiasHeadMLP`` process every
+edge — there is no per-relation-type edge subset to route).
+
+.. note::
+   An older, sparser graph construction still exists in the codebase
+   (``mllf.cb.graph_utils.build_pyg_graph_from_mllf_graph``) that expands each undirected
+   pair into up to eight *relation-typed* directed edges (``linear_fwd``/``bwd``,
+   ``quadratic_fwd``/``bwd``, etc.) and routes each edge to a single ``BiasHeadMLP`` via
+   ``edge_type // 2``. This is used by the legacy, encoder-agnostic ``EdgePolicy`` class
+   (paired with ``mllf.cli.workflow.build_data_and_targets_from_combo``) for callers that
+   supply their own node encoder. Current examples do not use this path.
 
 **Bias Types**:
 
@@ -111,9 +129,11 @@ Each edge can have multiple bias coefficient types:
 * **Linear (b)**: Per-node bias ensuring equal population of all substituents at each site
   when correctly parameterized.
 
-* **Quadratic (c)**: Pairwise interaction bias removing alchemical barriers due to 
-  electrostatic interactions between sites. Antisymmetric: :math:`c_{ij} = -c_{ji}`, 
-  meaning the forward and backward transitions have equal magnitude but opposite sign.
+* **Quadratic (c)**: Pairwise interaction bias removing alchemical barriers due to
+  electrostatic interactions between sites. Symmetric: :math:`c_{ij} = c_{ji}`, meaning
+  the forward and backward transitions share the same value (only the upper triangle
+  ``i < j`` is stored; the lower triangle is understood to hold the same value, not its
+  negation).
 
 * **Skew (x)**: Asymmetry correction fitting residuals beyond quadratic and end biases,
   particularly important after soft-core introduction. Forward and backward transitions
@@ -126,365 +146,226 @@ Each edge can have multiple bias coefficient types:
 Graph Construction
 ^^^^^^^^^^^^^^^^^^
 
-Graphs are constructed with **AtomBondGNN embeddings** as the primary node features, representing
-each substituent's 3D atomic structure and chemical composition as a learned 64-dimensional
-vector. These embeddings replace manual feature engineering with neural representations
-pretrained on diverse molecular data.
+For each combination directory, graph construction:
 
-**AtomBondGNN-Based Construction**:
+1. Parses RTF/PDB files to identify substituents at each site and locate the core scaffold
+2. Builds a per-site consensus environment atom set from the core (see `Environment
+   Consensus <unimol_representation.html#environment-consensus>`__ in
+   :doc:`unimol_representation`), skipped for gas-phase systems
+3. Computes a dual Uni-Mol embedding ``[ligand_only (512), full (512)]`` for every
+   substituent at every site (not just the "active" ones in the combo name)
+4. Builds directed edges within each site via ``build_directed_pairs()``
+5. Stores node embeddings (``data.x``), ``edge_index``, and ``site_index`` (which λ-site
+   each node belongs to) for the policy forward pass
 
-The standard construction pipeline:
+**Environmental Context Encoding**: the environment type (``solvent_state``: ``solv``,
+``protein``, or ``gas``/``vacuum``) controls what — if anything — is included as
+environment atoms during embedding computation (protein atoms, solvent atoms, or none).
+See :doc:`unimol_representation` for the full fallback chain and periodic-boundary
+handling. This eliminates the need for explicit environment flags as node features — the
+environmental information is implicitly encoded in the embeddings themselves.
 
-1. Parse RTF files to identify substituents and extract metadata (site numbers, charges, atom types)
-2. Build graph topology: one node per substituent, edges connecting substituents within each site
-3. Compute AtomBondGNN embeddings for each node from PDB coordinates, RTF charges, and bond topology
-4. Store embeddings as node features for neural network input
-
-The AtomBondGNN embeddings capture rich molecular information automatically:
-
-* **Spatial structure**: Bond lengths, angles, 3D conformations from atomic coordinates
-* **Chemical composition**: Element types, functional groups, charge distributions
-* **Bond-topology context**: GINEConv message passing propagates bonded-neighbor information before pooling
-* **Scaffold-aware context**: A parallel core stream processes the shared ligand core, and its
-  mean-pooled summary modulates the attention gate — encoding scaffold identity without
-  contaminating the substituent feature path
-* **Environmental context**: Nearby protein atoms and core structure atoms (via context-aware AEV computation)
-
-See :doc:`deepset_pretraining` for technical details on the AtomBondGNN pretraining
-pipeline (atom-level AEV features + bond topology → dual GINEConv streams → scaffold-aware AttentionPool).
-
-**Environmental Context Encoding**:
-
-The environment type influences how DeepSet embeddings are computed. When a
-``minimized.pdb`` file is present in the prep directory, post-minimization coordinates
-are used to provide the most accurate representation of each atom's environment—the
-minimized geometry reflects the actual sampled ensemble rather than the initial placement.
-
-* **Protein systems**: All protein atoms within 5.1 Å of the substituent are extracted
-  from ``minimized.pdb`` and included in AEV computation. This encodes protein-specific
-  interactions (hydrogen bonds, hydrophobic contacts, electrostatics) directly into the
-  molecular representation. Falls back to a standalone ``protein.pdb`` if no
-  ``minimized.pdb`` is found.
-
-* **Solvent systems**: Water molecules within 5.1 Å of the substituent are extracted
-  from ``minimized.pdb`` and included as solvent context, capturing the immediate
-  solvation shell. Without ``minimized.pdb``, only the core and nearby substituents
-  from other sites contribute.
-
-* **Vacuum systems**: No additional environment atoms (core + other-site substituents
-  within cutoff only). ``minimized.pdb`` is checked but not used for extra context.
-
-
-This context-aware approach eliminates the need for explicit environment flags as node
-features—the environmental information is implicitly encoded in the embeddings themselves.
-
-**Legacy RTF-Only Construction**:
-
-Graphs can also be built directly from RTF topology fragments without DeepSet embeddings,
-using manually engineered features (atom counts, charge, element compositions). This approach
-is maintained for backward compatibility and systems where PDB coordinates are unavailable,
-but the DeepSet-based method is strongly preferred for production use due to its superior
-representation quality.
-
-
-Neural Network Graph Format
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-For neural network processing, the molecular graph (with its DeepSet node embeddings) is
-converted to PyTorch Geometric format. This conversion handles the technical details of
-edge expansion and relation type encoding for the RGCN policy network.
-
-**Node Features**:
-
-The 64-dimensional AtomBondGNN embeddings computed during graph construction become the
-node feature matrix. Each row represents one substituent with its learned molecular
-representation encoding structure, chemistry, and environment. A ``site_index`` tensor
-(one integer per node identifying its λ-site) is stored alongside the embeddings and
-provides the ``SitePoolMLPPolicy`` with its system-context signal via mean-pooling.
-
-**Edge Expansion**:
-
-Each undirected molecular edge is expanded into **directed relation edges** based on bias type:
-
-* **Linear bias**: Only edges FROM reference substituent (sub1) TO others
-  
-  - Creates one directed edge per transition (e.g., sub1→sub2, sub1→sub3)
-  - No backward edges (sub2→sub1, sub3→sub1) since linear bias is node-level
-
-* **Quadratic bias**: Only upper-triangle edges (i→j where i < j)
-  
-  - Creates one directed edge per undirected pair
-  - Antisymmetry enforced during coefficient mapping (forward value negated for backward)
-
-* **Skew and End biases**: Both forward AND backward edges (i→j and j→i)
-  
-  - Creates two directed edges per undirected pair
-  - Independent values for each direction (no symmetry constraint)
-
-Each directed edge has a relation type (``linear_fwd``, ``quadratic_fwd``, ``skew_bwd``, etc.)
-that identifies which bias type and direction it represents. The RGCN learns separate
-transformation matrices for each relation type, allowing bias-specific edge processing.
+**Legacy RTF-Only Construction**: graphs can also be built directly from RTF topology
+fragments without Uni-Mol embeddings, using manually engineered features (atom type/element
+counts, charge) via ``build_pyg_graph_from_mllf_graph`` and ``mllf.cb.atom_vocab``. This
+path is what feeds the legacy ``EdgePolicy``/relation-typed-edge pipeline described above,
+and remains available for systems where PDB coordinates are unavailable, but Uni-Mol-based
+``UnimolPolicy`` is what production training uses.
 
 Policy Network Architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-SitePoolMLPPolicy
+UnimolPolicy
+^^^^^^^^^^^^
+
+``UnimolPolicy`` (``mllf.cb.policy``) takes pre-computed Uni-Mol node embeddings directly —
+there is no graph encoder or site-pooling step. For each directed edge :math:`(A \to B)`:
+
+.. math::
+
+   \mathbf{e}_{AB} = [\,\text{ligand}_A - \text{ligand}_B,\;\; \tfrac{1}{2}(\text{full}_A + \text{full}_B)\,]
+   \in \mathbb{R}^{1024}
+
+(standard, non-dual mode instead concatenates ``[emb_A - emb_B, (emb_A + emb_B)/2]`` from a
+single 512D embedding per node). The antisymmetric half captures how the two substituents
+differ; the symmetric half captures the environment they share.
+
+Edge Policy Heads
 ^^^^^^^^^^^^^^^^^
 
-Node embeddings from the frozen AtomBondGNN are used directly by the policy without
-an intermediate graph convolution step. The ``SitePoolMLPPolicy`` computes a
-site-level mean-pool context on the fly:
-
-.. math::
-
-   \text{site\_pool}_i = \frac{1}{|\mathcal{S}_{\text{site}(i)}|}
-   \sum_{j \in \mathcal{S}_{\text{site}(i)}} \mathbf{P1}_j
-
-where :math:`\mathcal{S}_{\text{site}(i)}` is the set of all substituent nodes at the
-same λ-site as node :math:`i`. For each directed edge :math:`(A \to B)` the input is:
-
-.. math::
-
-   \mathbf{e}_{AB} = [\mathbf{P1}_A,\; \mathbf{P1}_B,\; \text{site\_pool}_A] \in \mathbb{R}^{192}
-
-During training, the entire ``site_pool`` block is zeroed with probability 0.3
-(**block dropout**), forcing the policy to remain useful without context and
-preventing over-reliance on the site-pool signal.
-
-Edge Policy
-^^^^^^^^^^^
-
 Per-edge coefficients are predicted by four **completely independent** ``BiasHeadMLP``
-networks, one per MSLD bias type. Each head owns its entire feature-extraction stack
-so that gradient from one bias type (e.g. the noisy end-state signal) cannot overwrite
-features learned by another type (e.g. the linear population-balance signal).
-
-**Architecture Overview**:
-
-Each ``BiasHeadMLP`` maps the 192D edge input directly to a (mean, log_std) pair:
+networks, one per MSLD bias type. Each head owns its entire feature-extraction stack (a
+"trunk") so that gradient from one bias type cannot overwrite features learned by another.
 
 .. code-block:: text
 
-   Input [E, 192]
-       Linear(192 → 128) + ReLU
-       Linear(128 →  64) + ReLU
-       Linear( 64 →  32) + ReLU
-       Linear( 32 →   2)          → (mean_raw, log_std_raw) per edge
+   Input [E, 1024]
+       Linear(1024 → 512) + ReLU
+       Linear( 512 → 256) + ReLU
+       Linear( 256 →  64) + ReLU        ← trunk output z = phi(x), 64D
+       Linear(  64 →   2)               → (mean_raw, log_std_raw) per edge   [deterministic mode]
+       — or —
+       BayesianLinearHead(64 → 1)       → (posterior mean, 0.5·log(var))     [NeuralLinear mode]
 
-The ``EdgeValueMLP`` container holds all four heads and routes each edge to the
-correct head via ``edge_type // 2``:
-
-* ``edge_type`` 0 or 1 (linear fwd/bwd) → ``mlps[0]``
-* ``edge_type`` 2 or 3 (quadratic fwd/bwd) → ``mlps[1]``
-* ``edge_type`` 4 or 5 (skew fwd/bwd) → ``mlps[2]``
-* ``edge_type`` 6 or 7 (end fwd/bwd) → ``mlps[3]``
-
-In the routed forward pass only the matching head processes each edge; output slots
-for other heads remain zero so the zero-gradient property is enforced by construction.
+``EdgeValueMLP`` holds all four heads. When ``edge_type`` is supplied (the legacy
+relation-typed path), each edge is routed to exactly one head via ``edge_type // 2``; when
+``edge_type`` is ``None`` (the current fully-connected pairwise scheme), every head
+processes every edge and the results are stacked into one ``[E, 4]`` mean/log-std tensor —
+credit assignment per bias type then comes entirely from ``compute_pair_reward``'s
+per-dimension reward (see `Training and Optimization`_), not from edge masking.
 
 **Key Features**:
 
-* **Full gradient isolation**: Four separate parameter stacks; no shared weights that
-  could mix reward signals between bias types.
+* **Full gradient isolation between bias types**: four separate parameter stacks, no shared
+  weights.
+* **Output scaling**: mean predictions scaled via ``softsign(mean_raw) * scale_factors``
+  (softsign, not tanh — its gradient ``1/(1+|z|)^2`` stays alive at large ``|z|``, avoiding
+  the "dead head" saturation collapse tanh could produce after many training epochs).
 
-* **Output scaling**: Mean predictions scaled via ``tanh(mean_raw) * scale_factors``
-  
   - **Linear**: ±305, **Quadratic**: ±520, **Skew**: ±85, **End**: ±30
-  - Covers the empirical maximum from 20,000+ pretraining runs with ~10% headroom.
+  - Empirical maximum from 20,000+ pretraining runs with ~10% headroom.
 
-* **Enhanced exploration**: Log standard deviation clamped to [-20, 2.0]
-  (standard deviation range: [~0, 7.4])
+* **Exploration**: ``log_std`` clamped to ``[-20, 2.0]`` (std range ``[~0, 7.4]``); sampled
+  actions are additionally clamped to ``scale_factors × 1.05``.
 
 The policy outputs:
 
-* ``actions``: Sampled coefficient values (shape: [E, 4])
-* ``logp``: Log-probabilities for REINFORCE updates
-* ``mean``: Mean of the Gaussian distribution per edge per bias type
-* ``log_std``: Log standard deviation per edge per bias type
+* ``actions``: sampled coefficient values, shape ``[E, 4]``
+* ``mean`` / ``log_std``: Gaussian parameters per edge per bias type
+* ``logp``: only for REINFORCE mode (``None`` when ``use_bayesian_heads=True`` — Thompson
+  sampling has no log-prob concept)
 
-Each directed edge receives one Gaussian distribution for its relevant bias type.
-Actions are sampled and log-probabilities are computed with dimension masking so
-that only the head responsible for an edge's bias type contributes a gradient:
+NeuralLinear + Thompson Sampling
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-.. math::
+As an alternative to REINFORCE, each ``BiasHeadMLP`` can use a
+:class:`~mllf.cb.bayesian_head.BayesianLinearHead` in place of its deterministic
+``readout``: a closed-form Bayesian linear regression ``r ~ N(z @ w, σ²)`` on the trunk's
+64D features ``z``, maintaining a full Gaussian posterior ``w ~ N(μ, Λ⁻¹)`` that is updated
+analytically from observed ``(z, r)`` pairs — no backward pass or optimizer step for the
+head's last layer. Acting draws one weight sample per decision (Thompson sampling) via
+``UnimolPolicy.get_actions_thompson``; the trunk itself is still a regular ``nn.Module``
+(shared with the deterministic mode).
 
-   v_{ij}^{(d_{ij})} \sim \mathcal{N}(\mu_{ij}^{(d_{ij})}, (\sigma_{ij}^{(d_{ij})})^2)
-
-where :math:`d_{ij} = \text{edge\_type}_{ij} // 2` is the bias-type index for edge :math:`(i,j)`.
+This mode is opt-in: set ``training.policy.use_bayesian_heads: true`` and
+``bandit.algorithm: neurallinear_ts`` in the workflow config (see :doc:`workflow`). It is
+intended for online fine-tuning where posterior uncertainty can drive combo selection
+(``select_combos_by_uncertainty`` in ``mllf.cb.workflow_utils``) rather than pure random or
+curriculum sampling. A deterministic pretrained policy can be converted to a Bayesian
+sibling via ``pretrain_policy.py --bayesian-heads`` (see :doc:`cb_pretraining`), which
+warm-starts each posterior mean from the trained deterministic readout.
 
 Training and Optimization
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The policy network is trained using **REINFORCE** with per-edge per-dimension reward
-signals. Each ``BiasHeadMLP`` receives gradient only from simulations where the
-corresponding bias type was responsible for the edge, providing clean per-type credit
-assignment without a value network.
+The policy network is trained using **REINFORCE** (or, in NeuralLinear + TS mode, by
+folding observed rewards directly into each head's Bayesian posterior — no REINFORCE
+gradient at all for that mode). Each ``BiasHeadMLP`` receives gradient only from the reward
+dimension matching its bias type, providing clean per-type credit assignment without a
+value network or Q-critic.
 
-**REINFORCE Components**:
-
-* **Policy (SitePoolMLPPolicy)**: Predicts independent Gaussian distributions for each
-  bias type from 192D per-edge inputs. Only the SitePoolMLPPolicy has its weights
-  updated by RL; the AtomBondGNN (Phase 1) is frozen throughout.
-* **No Q-Critic or value baseline**: The per-bias-type reward tensor (``compute_pair_reward``
-  returning ``[E, 4]``) provides direct per-head reward signals, making a separate
-  critic unnecessary. Dimension masking in ``evaluate_logp`` ensures each MLP head
-  receives gradient only from its own reward dimension.
-
-**Per-Edge Per-Dimension Reward**:
+**Per-Edge Per-Dimension Reward** (``compute_pair_reward`` in ``mllf.cb.workflow_utils``):
 
 Rather than a single scalar reward, each directed edge :math:`(i, j)` receives a
-4-dimensional reward vector matching the four bias types. Each dimension captures a
-different physical signal from the simulation:
+4-dimensional reward vector, one entry per bias type:
 
 .. math::
 
    R_{ij}^{(d)} = \begin{cases}
-     -1.0 & \text{if } \Delta\Delta G_{ij} \text{ is None, NaN, or } \pm\infty \\
-     \text{dim-specific signal} & \text{if } \Delta\Delta G_{ij} \text{ is finite}
+     -1.0 & \text{pair not visited (DDG None/NaN/}\pm\infty\text{), or both subs unsampled} \\
+     \text{dim-specific signal (below)} & \text{otherwise}
    \end{cases}
 
-For visited pairs (finite DDG):
+For visited pairs:
 
 * **dim 0 (linear)**: ``minority_frac`` = :math:`\min(p_i, p_j)/(p_i + p_j)` ∈ [0, 0.5] —
   rewards population balance
-* **dim 1 (quadratic)**: ``(pair_visited + trans_quality) / 2`` ∈ [0.5, 1.0] — rewards
-  barrier removal (per-pair crossing + combo-level transition quality)
-* **dim 2 (skew)**: combined proxy from linear and quadratic signals
-* **dim 3 (end)**: same combined proxy as skew
+* **dim 1 (quadratic)**: ``(pair_visited + trans_quality) / 2`` ∈ [0.5, 1.0], where
+  ``trans_quality = min(total_transitions, T_baseline) / T_baseline`` — rewards barrier
+  removal via per-pair DDG existence plus a combo-level transition-count quality signal
+* **dim 2 (skew)**: the mean of the (normalized) population-balance and quadratic-quality
+  signals above — a combined proxy, since no simulation observable yet isolates barrier
+  asymmetry specifically
+* **dim 3 (end)**: ``min(1.0, fraction_physical × total_pairs)`` — the combo-level
+  "fraction physical ligand" diagnostic (fraction of the trajectory in a fully-resolved,
+  single-substituent-per-site state) scaled by the combo's substituent-pair count so combos
+  of different sizes are graded comparably; falls back to the dim-2 ``combined`` proxy when
+  the diagnostic wasn't parsed (e.g. older cached results)
+
+Edges whose pair had no observed λ-space transition at all (as opposed to a *finite* DDG)
+can additionally be down-weighted via ``build_edge_weights`` /
+``reward.no_transition_weight`` (default 0.15) rather than fully zeroed, so unvisited pairs
+still contribute a little training signal without dominating the gradient.
 
 **Policy Loss**:
 
-The loss uses dimension masking so each head's gradient comes exclusively from its
-own reward dimension:
-
 .. math::
 
-   \mathcal{L}_{\text{policy}} = -\sum_{e} R_{e}^{(d_e)} \cdot \log \pi_\theta(a_e^{(d_e)} \mid s)
+   \mathcal{L}_{\text{policy}} = -\sum_{e} \sum_{d} R_{e}^{(d)} \cdot \log \pi_\theta(a_e^{(d)} \mid s)
 
-where :math:`d_e = \text{edge\_type}_e // 2` is the bias-type index for edge :math:`e`.
+Because each dimension :math:`d` is produced by an independent ``BiasHeadMLP``, this sum
+naturally isolates gradient per head — no additional masking is required when
+``edge_type=None`` (see `Edge Policy Heads`_).
 
-**Training Updates**:
+**Training Updates** (one combination, REINFORCE mode):
 
-For each combination:
+1. Compute dual Uni-Mol embeddings for every substituent → ``[N, 1024]`` node features
+2. Build directed edges within each site via ``build_directed_pairs``
+3. Sample bias coefficients :math:`a \sim \pi_\theta(\cdot \mid s)` from ``UnimolPolicy``
+4. Write ``variables.py`` and run the MSLD simulation
+5. Parse per-pair DDG and per-substituent populations from the simulation output
+6. Compute per-edge, per-dimension rewards via ``compute_pair_reward`` → ``[E, 4]``
+7. Evaluate :math:`\log \pi_\theta(a \mid s)` for the actions actually submitted
+8. Update ``UnimolPolicy``: maximise :math:`\sum_e \sum_d R_e^{(d)} \cdot \log \pi_\theta(a_e^{(d)} \mid s)`
 
-1. Encode graph via AtomBondGNN (frozen) → 64D P1 node embeddings
-2. Compute site-pool context: mean-pool P1 embeddings per λ-site → [N, 64]
-3. Build 192D per-edge inputs: ``[P1_src, P1_dst, site_pool_src]``
-4. Route each edge to its ``BiasHeadMLP`` via ``edge_type // 2``
-5. Sample bias coefficients :math:`a \sim \pi_\theta(\cdot | s)` from ``SitePoolMLPPolicy``
-6. Run simulation; parse DDG pairs and block populations
-7. Compute per-edge, per-dim rewards via ``compute_pair_reward`` → ``[E, 4]``
-8. Evaluate ``log π_θ(a | s)`` with dimension masking (each edge contributes gradient
-   only to its own ``BiasHeadMLP``)
-9. Update ``SitePoolMLPPolicy``: maximise
-   :math:`\sum_e R_e^{(d_e)} \cdot \log \pi_\theta(a_e^{(d_e)} \mid s)`
-
-For details on reward function components, curriculum learning, and workflow configuration,
-see :doc:`workflow`.
+For reward hyperparameters, curriculum learning, and full workflow configuration, see
+:doc:`workflow`.
 
 Variables.py Format
 ~~~~~~~~~~~~~~~~~~~
 
-MSLD simulation setup files read bias coefficients from ``variables.py`` files containing YAML-formatted
-bias matrices. The policy network's per-edge predictions are assembled into these matrices
-following specific composition rules for each bias type.
+MSLD simulation setup files read bias coefficients from ``variables.py`` files containing
+YAML-formatted bias matrices. ``write_variables_from_actions`` (``mllf.cli.workflow``)
+assembles the policy's per-edge predictions into these matrices.
 
 **Matrix Format**:
 
-Bias coefficients are organized as:
-
 * **b (linear)**: 1D vector of length N (one value per substituent)
-* **c (quadratic)**: N×N antisymmetric matrix (upper triangle stored)
+* **c (quadratic)**: N×N symmetric matrix (upper triangle stored; ``c[j][i]`` is understood
+  to equal ``c[i][j]``, not its negation)
 * **x (skew)**: N×N full matrix (both triangles stored independently)
 * **s (end)**: N×N full matrix (both triangles stored independently)
 
-For a system with N=5 substituents (e.g., 3 at site 1, 2 at site 2), the matrices have
-shapes [5], [5×5], [5×5], and [5×5] respectively.
+**Quadratic Composition**: quadratic is genuinely symmetric (:math:`c_{ij} = c_{ji}`), so
+forward and backward predictions for the same undirected pair are **averaged**, and the
+result is stored once as ``c[i][j] = v`` (upper triangle only; ``c[j][i]`` is left at 0.0
+in the file, with the simulator treating the stored upper-triangle value as shared by both
+directions — not negated for the lower triangle, unlike the genuinely antisymmetric linear
+case below).
 
-**Example Structure**:
+**Skew and End Composition**: these are *not* antisymmetric — forward and backward
+transitions are physically independent, so both directed predictions are stored directly:
+``x[i][j] = v_fwd``, ``x[j][i] = v_bwd``.
 
-.. code-block:: python
-
-   # Auto-generated variables.py
-   bias_string = '''
-   b:  # Per-node linear bias vector (length N)
-   - 0.1
-   - 0.2
-   - -0.05
-   c:  # NxN quadratic bias matrix (antisymmetric: c[j][i] = -c[i][j])
-   - [0.0, 0.3, -0.1]
-   - [0.0, 0.0, 0.2]
-   - [0.0, 0.0, 0.0]
-   x:  # NxN skew bias matrix (both directions independent)
-   - [0.0, 0.05, -0.02]
-   - [-0.05, 0.0, 0.03]
-   - [0.02, -0.03, 0.0]
-   s:  # NxN end bias matrix (both directions independent)
-   - [0.0, 0.1, -0.05]
-   - [-0.1, 0.0, 0.08]
-   - [0.05, -0.08, 0.0]
-   '''
-
-Edge-to-Matrix Mapping
-^^^^^^^^^^^^^^^^^^^^^^
-
-The policy network operates on directed graph edges and predicts coefficients for each
-edge-bias type combination. These per-edge predictions are assembled into simulation-ready
-matrices using bias-specific composition rules:
-
-**Linear Bias Composition**:
-
-Linear bias values are predicted for edges FROM the reference substituent (sub1 at each site)
-TO other substituents at the same site. Since linear bias is fundamentally per-node rather
-than per-edge, the individual edge predictions are averaged at each target node:
-
-* Edge sub1→sub2 predicts value v₁₂
-* Edge sub1→sub3 predicts value v₁₃  
-* Node 2 receives: b[2] = mean(v₁₂)
-* Node 3 receives: b[3] = mean(v₁₃)
-
-This averaging provides robustness when multiple edges target the same node in complex graphs.
-
-**Quadratic Bias Composition**:
-
-Quadratic bias is antisymmetric: forward and backward transitions have equal magnitude but
-opposite sign. Only upper-triangle edges (i→j where i<j) are created in the graph. The
-predicted forward value defines both matrix entries:
-
-* Edge i→j predicts forward value v
-* Matrix stores: c[i][j] = v and c[j][i] = -v
-
-
-**Skew and End Bias Composition**:
-
-Skew and end biases are NOT antisymmetric—forward and backward transitions are physically
-independent. Both directed edges exist in the graph, and predictions are stored directly:
-
-* Edge i→j predicts forward value v_fwd
-* Edge j→i predicts backward value v_bwd
-* Matrix stores: x[i][j] = v_fwd and x[j][i] = v_bwd
-
-This allows the model to learn asymmetric transition barriers without symmetry constraints.
-
-**Matrix Assembly**:
-
-During simulation preparation:
-
-1. Policy network samples coefficients for all directed edges
-2. Edge coefficients are grouped by bias type
-3. Each bias type is assembled into its matrix format using the rules above
-4. Matrices are serialized to YAML in ``variables.py``
-5. CHARMM reads the file and applies biases during λ-dynamics simulation
+**Linear Composition**: linear predictions for a directed edge :math:`(i \to j)`
+approximate :math:`b_j - b_i` — an **antisymmetric** quantity, unlike quadratic. The
+per-node vector :math:`b` is reconstructed relative to each site's reference substituent
+(``sub1``, with :math:`b_{\text{ref}} = 0`): for each other substituent :math:`j` at that
+site, the forward prediction :math:`v_{\text{fwd}} \approx b_j - b_{\text{ref}}` and
+backward prediction :math:`v_{\text{bwd}} \approx b_{\text{ref}} - b_j` are combined as
+:math:`b_j = \tfrac{1}{2}(v_{\text{fwd}} - v_{\text{bwd}})` when both are available (falling
+back to whichever single direction exists). Averaging the *raw* forward/backward values
+together (as if linear were symmetric like quadratic) would cancel this antisymmetric
+signal to ~0, so it must be inverted relative to the reference, not averaged directly.
 
 See Also
 --------
 
 * :doc:`file_handling` - File format documentation (RTF, PDB, bias coefficients)
-* :doc:`deepset_pretraining` - DeepSet pretraining for node embeddings
+* :doc:`unimol_representation` - Uni-Mol embeddings and environment consensus
 * :doc:`cb_pretraining` - Behavior cloning from expert bias coefficients
 * :doc:`workflow` - Complete workflow from combo generation to training
 * :doc:`examples` - Running the full training workflow
 * :doc:`api` - API reference for CB modules
-* ``examples/run_workflow_deepset.py`` - Full training implementation
-* ``examples/workflow_14benz.yaml`` - Configuration file for the 14benz system
-* ``examples/workflow_deepset.yaml`` - Alternate configuration file template
+* ``examples/run_workflow.py`` - Full online-training implementation
+* ``examples/workflow_14benz.yaml`` - Minimal configuration file for the 14benz system

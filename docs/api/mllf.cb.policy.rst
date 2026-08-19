@@ -11,5 +11,5 @@
       BiasHeadMLP
       EdgePolicy
       EdgeValueMLP
-      SitePoolMLPPolicy
+      UnimolPolicy
    

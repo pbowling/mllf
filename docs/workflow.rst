@@ -19,34 +19,40 @@ Running the Workflow
 Basic Usage
 ~~~~~~~~~~~
 
-The workflow is driven by a YAML configuration file:
+Online (REINFORCE) training is driven by a YAML configuration file and
+``examples/run_workflow.py`` — a tracked copy of the multi-system UniMol CB training driver:
 
 .. code-block:: bash
 
-   python -m mllf.cli.workflow --config examples/workflow_14benz.yaml
+   cd mllf   # repository root
+   python examples/run_workflow.py examples/workflow_14benz.yaml
+   python examples/run_workflow.py my_config.yaml  # Use a custom config
 
-Or using the convenience wrapper:
-
-.. code-block:: bash
-
-   cd examples
-   python run_workflow_deepset.py workflow_14benz.yaml
-   python run_workflow_deepset.py my_config.yaml  # Use custom config
+See :doc:`examples` for a full walkthrough of the 1,4-benzene (14benz) example. Combination
+generation and manifest splitting can also be driven directly from
+``mllf.file_handling.generate_combinations`` / ``mllf.cli.workflow`` for scripting outside
+the full training loop; the low-level ``mllf.cli.workflow.run_from_config`` entry point
+handles a lighter-weight subset (combo generation, split, a single-combo sanity check,
+optional simulation batch, archiving) without the policy training loop.
 
 Configuration Format
 ~~~~~~~~~~~~~~~~~~~~
 
 A workflow config is a YAML file specifying which operations to run and their parameters.
-Key sections include:
+Unlike a single ``create_combos:`` block, the top-level key is a **list of systems** —
+``systems:`` — even when training on just one system, since the driver is designed to train
+one shared policy across any number of systems simultaneously:
 
-* **system**: Environment type (solvent, gas, protein)
-* **create_combos**: Generate combinations from fragment files
-* **split**: Divide combinations into train/val/test sets
-* **pretrain**: Optional pretraining from existing simulations
+* **systems**: List of systems to train on, each with its own ``name``, ``input_dir``,
+  ``out_dir``, ``solvent_state``, and optional per-system overrides (e.g.
+  ``max_subs_per_site``, ``protein_pdbs``, ``solvent_pdb``)
+* **pretrain**: Optional warm-start from a behavior-cloned checkpoint (see :doc:`cb_pretraining`)
 * **curriculum**: Progressive training stages (see :ref:`Curriculum Learning`)
-* **training**: Model architecture and hyperparameters
+* **training**: Policy architecture and optimizer hyperparameters
+* **bandit**: Optional NeuralLinear + Thompson Sampling configuration (see :doc:`cb_setup`)
 * **reward**: Reward function weights and thresholds
 * **output**: Checkpointing and output organization
+* **slurm**: Cluster submission settings (partition, gres, time, module)
 * **archive**: Automatic compression of completed runs
 
 See the :ref:`Complete Configuration Example` for a full annotated YAML file.
@@ -232,13 +238,14 @@ are constructed by prepending the ``out_dir`` from the configuration:
 Graph Construction
 ------------------
 
-During training, molecular graphs are constructed from combination directories to provide 
-input for the policy network. Graphs are built from RTF topology files with DeepSet 
-embeddings as node features, representing each substituent's 3D structure and chemistry 
-as learned 64-dimensional vectors.
+During training, molecular graphs are constructed from combination directories to provide
+input for the policy network. Nodes are pretrained, frozen Uni-Mol embeddings (see
+:doc:`unimol_representation`) representing each substituent's 3D structure, chemistry, and
+environment as learned 512D (or 1024D dual) vectors; edges connect every ordered pair of
+substituents within the same λ-site.
 
-For complete details on graph construction, node features, edge expansion, and the 
-RGCN/policy architecture, see :doc:`cb_setup`.
+For complete details on graph construction, node features, edge expansion, and the
+``UnimolPolicy`` architecture, see :doc:`cb_setup`.
 
 Training Pipeline
 -----------------
@@ -246,27 +253,32 @@ Training Pipeline
 System Configuration
 ~~~~~~~~~~~~~~~~~~~~
 
-The ``system`` section specifies environment-level parameters that affect how molecular
-structures are processed during training:
+Each entry in the top-level ``systems:`` list carries its own ``solvent_state``, since a
+single training run can combine systems in different environments:
 
 .. code-block:: yaml
 
-   system:
-     solvent_state: solv  # Environment type
+   systems:
+     - name: 14benz_solv
+       input_dir: examples/14benz
+       out_dir: examples/14benz/generated_combos
+       solvent_state: solv   # Environment type
 
 **Solvent State**:
 
-Specifies the simulation environment to determine which atoms are included as context 
-during AEV computation for DeepSet embeddings:
+Specifies the simulation environment to determine which atoms are included as environment
+context when computing each substituent's Uni-Mol embedding:
 
-* ``solv`` or ``solvent``: Includes core structure and nearby substituents from other sites (within 5.1 Å)
-* ``gas`` or ``vacuum``: Includes core structure and nearby substituents (without solvent effects)
-* ``protein``: Includes core structure, nearby substituents, AND nearby protein atoms (within 5.1 Å)
+* ``solv`` or ``solvent``: Water molecules within the environment cutoff (8.0 Å) of the core scaffold
+* ``gas`` or ``vacuum``: No environment atoms — core + substituent(+ reference subs from other sites) only
+* ``protein``: Protein atoms (and typically crystallographic waters) within the environment cutoff
 
-The environment type determines what molecular context the DeepSet encoder "sees" when 
-computing atomic environment vectors. For protein systems, including nearby protein atoms 
-in the AEV computation naturally encodes protein-specific interactions into the learned 
-embeddings. See :doc:`deepset_pretraining` for technical details on context-aware AEV computation.
+The environment type determines what molecular context Uni-Mol "sees" when computing the
+embedding. For protein systems, including nearby protein atoms naturally encodes
+protein-specific interactions into the learned embedding. See :doc:`unimol_representation`
+for technical details on environment context, the environment-consensus filtering used to
+keep this signal consistent across substituents at a site, and the periodic-boundary
+handling used for solvated/crystal systems.
 
 The solvent state is also preserved in ``graph_info.json`` for metadata tracking.
 
@@ -414,13 +426,14 @@ Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0
 
 **Policy Gradient Training**:
 
-The policy is optimized using **REINFORCE** with per-edge per-dimension reward signals.
-The ``SitePoolMLPPolicy`` samples bias coefficients from independent Gaussian distributions
-(one per bias type per edge), runs the MSLD simulation, and then updates weights by
-maximising the log-probability of actions that produced positive rewards. Each
-``BiasHeadMLP`` receives gradient only from the reward dimension that corresponds to
-its bias type, providing clean per-type credit assignment without a value network or
-Q-critic.
+The policy is optimized using **REINFORCE** with per-edge per-dimension reward signals
+(or, with ``bandit.algorithm: neurallinear_ts`` in the config, by folding rewards directly
+into each head's Bayesian posterior instead — see :doc:`cb_setup`). ``UnimolPolicy`` samples
+bias coefficients from independent Gaussian distributions (one per bias type per edge), runs
+the MSLD simulation, and then updates weights by maximising the log-probability of actions
+that produced positive rewards. Each ``BiasHeadMLP`` receives gradient only from the reward
+dimension that corresponds to its bias type, providing clean per-type credit assignment
+without a value network or Q-critic.
 
 For architectural details on the policy network and per-dimension reward signals, see :doc:`cb_setup`.
 
@@ -504,24 +517,24 @@ Enable curriculum learning in your workflow YAML:
      stages:
        # Stage 1: Pairs at single sites
        - name: pairs_single_site_easy
-         min_subs: 2
-         max_subs: 2
+         min_subs_per_site: 2
+         max_subs_per_site: 2
          min_sites: 1
          max_sites: 1
          epochs: 50
          
        # Stage 2: Triplets at single sites
        - name: triplets_single_site
-         min_subs: 3
-         max_subs: 3
+         min_subs_per_site: 3
+         max_subs_per_site: 3
          min_sites: 1
          max_sites: 1
          epochs: 50
          
        # Stage 3: Cross-site combinations
        - name: pairs_two_sites
-         min_subs: 4  # 2 per site
-         max_subs: 4
+         min_subs_per_site: 4  # 2 per site
+         max_subs_per_site: 4
          min_sites: 2
          max_sites: 2
          epochs: 50
@@ -537,8 +550,15 @@ Each stage specifies:
 
 **Combination Filters**:
 
-* ``min_subs``, ``max_subs``: Total substituents in combination
+* ``min_subs_per_site``, ``max_subs_per_site``: Bounds on substituents at any single site in
+  the combination (checked against the min/max across that combination's per-site counts,
+  not the combo's total substituent count)
 * ``min_sites``, ``max_sites``: Number of sites represented
+* ``combo_whitelist``: Optional explicit list of combo names to restrict this stage to,
+  bypassing the size filters above
+* ``min_transitions_for_stage`` / ``transition_filter_lookback``: On stage advancement
+  (not the first stage), additionally require a combo's most recent runs to have hit this
+  many transitions per site before it's eligible for the new stage
 
 **Training Duration**:
 
@@ -557,13 +577,15 @@ Combination Selection
 
 For each stage, the workflow:
 
-1. Filters all training combinations by stage criteria (min/max subs/sites)
-2. If filtered count exceeds ``max_train_combos_per_stage``, randomly selects subset
-3. Uses reproducible random selection (seeded by ``split.seed + stage_index``)
+1. Filters all training combinations by stage criteria (min/max subs-per-site/sites)
+2. If filtered count exceeds ``max_train_combos_per_stage``, randomly selects a subset each
+   epoch (stratified across systems by default — see ``curriculum.stratified_sampling`` /
+   ``curriculum.min_combos_per_system``)
+3. Uses reproducible random selection (seeded by the top-level ``seed`` plus the epoch index)
 
 **Important**: Random selection is uniform across all matching combinations.
-If a stage allows both pairs (2 subs) and triplets (3 subs) via ``min_subs: 2,
-max_subs: 3``, the 100 selected combinations will be a random mix with no
+If a stage allows both pairs (2 subs) and triplets (3 subs) via ``min_subs_per_site: 2,
+max_subs_per_site: 3``, the 100 selected combinations will be a random mix with no
 preference for either size.
 
 **Reproducibility**: Same seed produces same combination selection across runs.
@@ -656,8 +678,8 @@ Advanced users can override reward parameters per stage:
 
    stages:
      - name: pairs_single_site_easy
-       min_subs: 2
-       max_subs: 2
+       min_subs_per_site: 2
+       max_subs_per_site: 2
        min_sites: 1
        max_sites: 1
        epochs: 50
@@ -690,31 +712,38 @@ Enable checkpointing in your workflow YAML:
 Training-Level Checkpoints
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**Location**: ``{base_dir}/checkpoint_epoch_XXX.pt``
+**Location**: ``{base_dir}/checkpoint_{epoch:03d}.pt`` (e.g. ``checkpoint_005.pt``)
 
 Saved every ``checkpoint_freq`` epochs, containing:
 
 * ``epoch``: Completed epoch number
-* ``encoder_state``: Full RGCN encoder state dict
-* ``policy_state``: Full edge policy state dict  
-* ``optimizer_state``: Optimizer state (momentum, learning rates, etc.)
-* ``stats``: Training statistics (loss, average reward)
+* ``policy_state_dict``: Full ``UnimolPolicy`` state dict
+* ``rl_optimizer_state_dict``: Optimizer state (momentum, learning rates, etc.)
+* ``current_stage_idx``: Curriculum stage index, for resuming mid-curriculum
+* ``stats``: Training statistics for that epoch (loss, average reward)
+
+A separate ``bandit_state.json`` in ``base_dir`` tracks per-combo failure counts and
+(in NeuralLinear + TS mode) uncertainty bookkeeping across epochs; it is loaded/saved
+alongside checkpoints but is not itself a model checkpoint. When training finishes, a final
+``{base_dir}/final_model.pt`` is written with the last policy/optimizer state plus the full
+per-epoch ``all_stats`` history.
 
 Automatic Resume
 ~~~~~~~~~~~~~~~~
 
 When training restarts, the workflow:
 
-1. Scans for ``checkpoint_epoch_*.pt`` files
+1. Scans for ``checkpoint_*.pt`` files in ``base_dir``
 2. Loads the latest checkpoint (highest epoch number)
-3. Restores model and optimizer state
-4. Continues from the next epoch
+3. Restores policy and optimizer state, and the curriculum stage (if any)
+4. Continues from the next epoch — falling back to the ``pretrain.model_path`` checkpoint
+   (partial load, ``strict=False``) if the latest checkpoint fails to load
 
-For each combination in each epoch:
-
-1. Checks for ``epoch_results.pt`` in the combination's directory
-2. If found: loads cached reward/actions/logp, skips simulation
-3. If not found: runs simulation, computes reward, saves checkpoint
+For each combination in each epoch, the Uni-Mol embeddings and graph tensors computed
+before submitting the simulation are persisted to a small ``graph_data.pt`` in that epoch's
+run directory, so the later REINFORCE update (after the SLURM wait) reloads them instead of
+recomputing embeddings — without holding every epoch's combos resident in memory for the
+full SLURM wait.
 
 Archiving Combinations
 -----------------------
@@ -766,12 +795,12 @@ This provides:
      enabled: true
      stages:
        - name: pairs_single_site_easy
-         min_subs: 2
-         max_subs: 2
+         min_subs_per_site: 2
+         max_subs_per_site: 2
          epochs: 50
        - name: pairs_single_site_full
-         min_subs: 2
-         max_subs: 2
+         min_subs_per_site: 2
+         max_subs_per_site: 2
          epochs: 50
    
    archive:
@@ -847,113 +876,115 @@ Complete Workflow Example
 Full Pipeline Script
 ~~~~~~~~~~~~~~~~~~~~
 
-The main training workflow is implemented in ``examples/run_workflow_deepset.py``:
+The main online-training workflow is implemented in ``examples/run_workflow.py``:
 
 .. code-block:: bash
 
-   cd examples
-   python run_workflow_deepset.py workflow_14benz.yaml
+   cd mllf   # repository root
+   python examples/run_workflow.py examples/workflow_14benz.yaml
 
 This executes:
 
-1. Combination generation (if ``create_combos`` specified)
-2. Train/val/test split based on ``split`` configuration
-3. Model initialization (RGCN encoder + edge policy)
-4. Checkpoint detection and resume (if checkpoints exist)
-5. Training loop with SLURM job submission
-6. Checkpoint saving at ``checkpoint_freq`` intervals
-7. Archiving combinations (if ``archive.enabled`` is true)
+1. Combination manifest generation for every system in ``systems:`` (parallelized across
+   systems; large combo pools are handled separately from small ones to avoid OOM)
+2. Curriculum stage setup and held-out validation split (if ``validation_fraction > 0`` and
+   enough combos are available)
+3. Policy initialization (``UnimolPolicy``, optionally with Bayesian heads)
+4. Checkpoint detection and resume, or warm start from ``pretrain.model_path``
+5. Training loop: per epoch, sample/filter combos, compute Uni-Mol embeddings, sample
+   actions, submit SLURM simulations, compute per-edge rewards, and update the policy
+6. Checkpoint saving at ``checkpoint_freq`` intervals, plus a final ``final_model.pt``
 
 .. _Complete Configuration Example:
 
 Configuration File
 ~~~~~~~~~~~~~~~~~~
 
-A complete workflow configuration (``workflow_14benz.yaml``) includes:
+A minimal single-system workflow configuration (``examples/workflow_14benz.yaml``, trimmed
+here — see the file itself for full inline documentation):
 
 .. code-block:: yaml
 
-   # System environment
-   system:
-     solvent_state: solv
-   
-   # Generate combinations
-   create_combos:
-     input_dir: /path/to/14benz
-     out_dir: /path/to/generated_combos
-     include_patterns: [msld_flat.py]
-   
-   # Data splitting
-   split:
-     train_frac: 0.9
-     val_frac: 0.1
-     seed: 42
-   
-   # Pretraining (optional but recommended)
-   pretrain:
-     model_path: models/pretrained_policy.pt
-   
-   # Curriculum learning
+   seed: 42
+
+   # One system is still a list -- see "Configuration Format" above
+   systems:
+     - name: 14benz_solv
+       input_dir: examples/14benz
+       out_dir: examples/14benz/generated_combos
+       solvent_state: solv
+       include_patterns: [msld_flat.py]
+       max_subs_per_site: 3
+
+   # Warm start from a behavior-cloned checkpoint (optional -- see :doc:`cb_pretraining`).
+   # Omitted here; UnimolPolicy trains from a random initialization by default.
+   # pretrain:
+   #   model_path: models/<your_pretrain_run>/best_policy.pt
+
+   # Curriculum: restrict to the easiest stage so this example runs quickly
    curriculum:
      enabled: true
-     max_train_combos_per_stage: 100
+     max_train_combos_per_stage: 20
      stages:
        - name: pairs_single_site
-         min_subs: 2
-         max_subs: 2
-         epochs: 50
-       - name: triplets_single_site
-         min_subs: 3
-         max_subs: 3
-         epochs: 50
+         min_sites: 1
+         max_sites: 1
+         min_subs_per_site: 2
+         max_subs_per_site: 2
+         epochs: 5
      progression:
        type: epoch
-   
-   # Model architecture
+
+   validation_fraction: 0.0   # too few combos for a held-out split in this tiny example
+
+   # Policy architecture (UnimolPolicy -- see :doc:`cb_setup`)
    training:
-     encoder:
-       hidden_dims: [64, 64]
-       out_dim: 32
      policy:
+       unimol_dim: 512
        mlp_hidden: 64
-     value_network:
-       hidden_dims: [64, 32]
-       lr: 0.001
      optimizer:
        lr: 0.0001
-   
-   # Simulation settings
+     bias_clip: 1000.0
+
+   output:
+     base_dir: examples/14benz/training_output
+     save_checkpoints: true
+     checkpoint_freq: 1
+
    run_sims: true
-   max_concurrent_jobs: 60
+   wait_for_jobs: true
+   max_concurrent_jobs: 10
    timeout: 1200
-   
-   # Reward function
+
+   slurm:
+     partition: gpu
+     gres: gpu:1
+     time: '01:00:00'
+     module: charmm/charmm/c51a1
+
    reward:
      w_P: 0.5
      w_T: 0.75
      w_U: 0.3
      gamma: 4.0
-     lambda_entropy: 0.5
-   
-   # Checkpointing
-   output:
-     base_dir: /path/to/training_output
-     save_checkpoints: true
-     checkpoint_freq: 5
-   
-   # Per-stage archiving
-   archive:
-     enabled: true
-     per_stage: true
-     archive_dir: /path/to/archives
+     entropy_bonus: 8.0
+     P_baseline: 500.0
+     T_baseline: 50.0
+     min_transitions_per_site: 10
+     no_transition_weight: 0.15
 
+For a large-scale, multi-system production config (30+ systems, curriculum stages through
+cross-site combinations, per-system overrides, NeuralLinear + Thompson Sampling) see the
+``bandit:``, ``curriculum.stratified_sampling``, and per-system override options referenced
+throughout this page — ``examples/workflow_14benz.yaml`` intentionally keeps most of these
+at their defaults.
 
 See Also
 ~~~~~~~~
 
 * :doc:`file_handling` - File format documentation and parsers
 * :doc:`cb_setup` - CB infrastructure and policy architecture
-* :doc:`deepset_pretraining` - DeepSet pretraining for node embeddings
+* :doc:`unimol_representation` - Uni-Mol embeddings for node features
 * :doc:`cb_pretraining` - Behavior cloning from expert coefficients
 * :doc:`examples` - Example workflows and usage patterns
 * :doc:`api` - API reference for workflow modules

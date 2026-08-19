@@ -16,18 +16,18 @@ For detailed documentation on file formats and usage examples, see :doc:`file_ha
    mllf.file_handling.read_output
    mllf.file_handling.generate_combinations
 
-DeepSet Modules
----------------
+Uni-Mol Representation
+-----------------------
 
-For detailed documentation on DeepSet pretraining, see :doc:`deepset_pretraining`.
+For detailed documentation on Uni-Mol embeddings and environment context, see
+:doc:`unimol_representation`.
 
 .. autosummary::
    :toctree: api
 
-   mllf.cb.deepset_autoencoder
-   mllf.cb.deepset_pretraining_dataset
-   mllf.cb.train_deepset_autoencoder
-   mllf.cb.aev_processor
+   mllf.cb.unimol_representation
+   mllf.cb.environment_consensus
+   mllf.cb.atom_vocab
 
 Graph and CB Modules
 --------------------
@@ -38,10 +38,21 @@ For detailed documentation on CB architecture, see :doc:`cb_setup`.
    :toctree: api
 
    mllf.cb.graph
-   mllf.cb.policy
-   mllf.cb.value_net
-   mllf.cb.rgcn
    mllf.cb.graph_utils
+   mllf.cb.policy
+   mllf.cb.bayesian_head
+   mllf.cb.train_improved
+
+Pretraining (Behavior Cloning)
+-------------------------------
+
+For detailed documentation on behavior-cloning pretraining, see :doc:`cb_pretraining`.
+
+.. autosummary::
+   :toctree: api
+
+   mllf.cb.pretrain_policy
+   mllf.cli.collect_pretraining_data
 
 Workflow Utilities
 ------------------
@@ -52,3 +63,5 @@ For detailed documentation on the workflow system, see :doc:`workflow`.
    :toctree: api
 
    mllf.cli.workflow
+   mllf.cli.sim
+   mllf.cb.workflow_utils
