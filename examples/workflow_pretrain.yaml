@@ -49,13 +49,19 @@ unimol:
     #   solv: ['solvent.pdb']
     # If null, standard fallback chain used (minimized.pdb → protein.pdb → solvent.pdb)
   
-  cache_embeddings: false
-    # If true, save computed Uni-Mol embeddings to disk for fast reloading
-    # Useful if running multiple pretraining epochs to avoid recomputation
-    # Cache stored in: pretraining_dir/embeddings_cache/
-  
-  cache_dir: null
-    # Path to embedding cache directory (default: <pretraining_dir>/embeddings_cache/)
+  cache_embeddings: true
+    # If true, save computed Uni-Mol embeddings to disk for fast reloading.
+    # Does NOT speed up epochs within a single run (those already reuse an
+    # in-memory per-system cache) -- what this buys is skipping the ~6h+
+    # embedding pre-build phase entirely on a RESUBMITTED/rerun job (e.g.
+    # after hitting a SLURM time limit), since it's persisted to cache_dir.
+
+  cache_dir: /home/pbowling/mllf/pretraining/embeddings_cache
+    # Path to embedding cache directory. Explicit absolute path (rather than
+    # the <pretraining_dir>/embeddings_cache/ default) since this config is
+    # invoked with many separate --pretraining-dir args (one per system/combo)
+    # -- a single shared cache dir here means every system's embeddings land
+    # in one place instead of scattered across thousands of per-combo dirs.
   
   use_environment_consensus: true
     # If true, build consensus environment atoms for each site using the core scaffold

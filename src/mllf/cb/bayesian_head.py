@@ -177,7 +177,9 @@ class BayesianLinearHead(nn.Module):
         """Set the observation noise variance (typically from pretraining residuals)."""
         self.noise_var.fill_(max(float(sigma2), 1e-6))
 
-    def seed_mean(self, weight: torch.Tensor, bias: float = 0.0) -> None:
+    def seed_mean(self, weight: torch.Tensor, bias: float = 0.0,
+                  prior_precision: Optional[float] = None,
+                  precision_floor: float = 1e-6) -> None:
         """Warm-start the posterior mean from a pretrained ``nn.Linear(feat_dim, 1)``.
 
         Sets ``mu`` to ``[weight, bias]`` directly and back-fills ``Lambda_mu``
@@ -191,10 +193,39 @@ class BayesianLinearHead(nn.Module):
             weight: ``[feat_dim]`` weight vector (e.g. the deterministic head's
                 readout weight row for this bias type).
             bias: Scalar bias/intercept term (e.g. the readout bias entry).
+            prior_precision: If given, **rescales the prior/posterior
+                covariance** to this value *before* seeding (equivalent to
+                calling :meth:`reset` with a different ``prior_precision``,
+                then seeding). This matters a great deal: a fixed
+                ``prior_precision`` (e.g. the constructor default of 1.0)
+                gives every sampled weight component unit variance —
+                Thompson-sampling noise with std 1.0 per dimension — which
+                completely swamps a well-fitted ``weight`` whose components
+                are typically much smaller than 1 (e.g. a BC-trained
+                deterministic readout's weights are commonly O(0.01-0.1)).
+                Left uncalibrated, ``sample_weights()`` draws are dominated by
+                noise rather than the seeded mean, regardless of fit quality
+                — this is exactly what caused wildly-scaled, near-random
+                online-training actions from an otherwise well-trained
+                checkpoint. Pass e.g. ``prior_precision / mean(weight**2)``
+                (see ``pretrain_policy.initialize_bayesian_heads_from_pretrained``)
+                to scale the prior to this head's own fitted weight
+                magnitude instead of an arbitrary absolute constant.
+            precision_floor: Minimum value accepted for ``prior_precision``
+                — floors it away from ~0 (which would make ``Lambda_inv``
+                blow up and sampling numerically unstable).
         """
         weight = weight.to(self.mu.dtype).reshape(-1)
         assert weight.numel() == self.feat_dim, (
             f"seed_mean: expected weight of length {self.feat_dim}, got {weight.numel()}")
+
+        if prior_precision is not None:
+            prior_precision = max(float(prior_precision), precision_floor)
+            eye = torch.eye(self._D, device=self.Lambda.device, dtype=self.Lambda.dtype)
+            self.Lambda = prior_precision * eye
+            self.Lambda_inv = (1.0 / prior_precision) * eye
+            self._prior_precision = prior_precision  # keeps reset() consistent with this seed
+
         mu0 = torch.cat([weight, torch.tensor([float(bias)], dtype=self.mu.dtype,
                                                 device=self.mu.device)])
         self.mu = mu0

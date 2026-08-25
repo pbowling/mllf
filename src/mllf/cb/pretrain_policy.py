@@ -533,6 +533,8 @@ def _compute_unimol_embeddings_and_edges(
                     custom_search_paths=sub_custom_paths,
                     skip_minimized=(structure_type == 'unrelaxed'),
                     consensus_atoms=consensus_atoms,  # Filter by consensus if provided
+                    cache_dir=cache_dir,
+                    save_cache=(cache_dir is not None),
                 )
                 # Concatenate for storage: UnimolPolicy._forward_edges() will split [ligand, full]
                 emb = np.concatenate([emb_ligand, emb_full])  # [1024]
@@ -546,7 +548,7 @@ def _compute_unimol_embeddings_and_edges(
                     atom_limit=256,
                     custom_search_paths=sub_custom_paths,
                     cache_dir=cache_dir,
-                    save_cache=False,  # Save caching is optional; set by caller
+                    save_cache=(cache_dir is not None),
                     skip_minimized=(structure_type == 'unrelaxed'),
                     consensus_atoms=consensus_atoms,  # Filter by consensus if provided
                 )
@@ -2445,6 +2447,95 @@ def pretrain(
 
 # ── NeuralLinear + Thompson Sampling: Bayesian head warm-start ──────────────
 
+def _compute_physical_residual_variance(
+    policy_det, graph_cache: List, device, max_runs: int = 200,
+) -> tuple:
+    """Physical-unit ``(target - mean)`` residuals per bias type, from BC data.
+
+    Shared low-level pass used by both ``estimate_reward_noise_variance``
+    (observation noise) and ``initialize_bayesian_heads_from_pretrained``
+    (exploration-precision calibration) — both need "how much do real bias
+    coefficients actually scatter around the deterministic model's
+    prediction, per bias type", just for different purposes.
+
+    Returns:
+        (residuals, n_used) — residuals is a list of 4 lists of floats (one
+        per bias type, in physical bias-coefficient units), n_used is how
+        many cached runs actually contributed.
+    """
+    policy_det.eval()
+    residuals = [[] for _ in range(4)]
+    n_used = 0
+    with torch.no_grad():
+        for cached in graph_cache:
+            if cached is None:
+                continue
+            if n_used >= max_runs:
+                break
+            unimol_emb, edge_idx, targets_list = cached
+            if not targets_list:
+                continue
+            try:
+                unimol_emb = unimol_emb.to(device)
+                edge_idx = edge_idx.to(device)
+                targets = torch.tensor(targets_list, dtype=torch.float32, device=device)  # [E, 4]
+                mean, _ = policy_det._forward_edges(unimol_emb, edge_idx, edge_type=None)
+                if mean.shape != targets.shape:
+                    continue
+                resid = (targets - mean).detach().cpu().numpy()
+                for d in range(4):
+                    residuals[d].extend(resid[:, d].tolist())
+                n_used += 1
+            except Exception:
+                continue
+    return residuals, n_used
+
+
+def _compute_typical_z_norm_sq(
+    policy_det, graph_cache: List, device, max_runs: int = 200,
+) -> List[float]:
+    """Estimate ``E[||z||^2]`` per bias type from real BC-pretraining edge features.
+
+    ``z`` is each trunk's feature vector (see ``UnimolPolicy.forward_features``)
+    — the input the Bayesian head's linear regression actually sees. Needed to
+    correctly calibrate ``BayesianLinearHead``'s prior precision: a precision
+    calibrated only from the deterministic weights' own magnitude (as an
+    earlier version of this code did) implicitly assumes ``||z|| ~ 1``, which
+    is not remotely true for a real trunk on real Uni-Mol embeddings (``||z||``
+    of 5-10+ is typical) — so the resulting Thompson-sampling noise can still
+    swamp the signal even when the weight-based calibration alone looks tight.
+    See ``initialize_bayesian_heads_from_pretrained``.
+
+    Returns:
+        List of 4 floats: ``[linear, quadratic, skew, end]`` mean ``||z||^2``.
+    """
+    policy_det.eval()
+    sums = [0.0] * 4
+    counts = [0] * 4
+    with torch.no_grad():
+        n_used = 0
+        for cached in graph_cache:
+            if cached is None:
+                continue
+            if n_used >= max_runs:
+                break
+            unimol_emb, edge_idx, targets_list = cached
+            if not targets_list:
+                continue
+            try:
+                unimol_emb = unimol_emb.to(device)
+                edge_idx = edge_idx.to(device)
+                edge_input = policy_det._build_edge_input(unimol_emb, edge_idx)
+                for d in range(4):
+                    z = policy_det.edge_mlp.mlps[d].forward_features(edge_input)
+                    sums[d] += float(z.pow(2).sum(dim=-1).sum())
+                    counts[d] += z.shape[0]
+                n_used += 1
+            except Exception:
+                continue
+    return [sums[d] / max(counts[d], 1) for d in range(4)]
+
+
 def estimate_reward_noise_variance(
     policy_det,
     graph_cache: List,
@@ -2474,56 +2565,90 @@ def estimate_reward_noise_variance(
     Returns:
         List of 4 floats: ``[linear, quadratic, skew, end]`` noise variances.
     """
-    policy_det.eval()
-    residuals = [[] for _ in range(4)]
-    n_used = 0
-    with torch.no_grad():
-        for cached in graph_cache:
-            if cached is None:
-                continue
-            if n_used >= max_runs:
-                break
-            unimol_emb, edge_idx, targets_list = cached
-            if not targets_list:
-                continue
-            try:
-                unimol_emb = unimol_emb.to(device)
-                edge_idx = edge_idx.to(device)
-                targets = torch.tensor(targets_list, dtype=torch.float32, device=device)  # [E, 4]
-                mean, _ = policy_det._forward_edges(unimol_emb, edge_idx, edge_type=None)
-                if mean.shape != targets.shape:
-                    continue
-                resid = (targets - mean).detach().cpu().numpy()
-                for d in range(4):
-                    residuals[d].extend(resid[:, d].tolist())
-                n_used += 1
-            except Exception:
-                continue
+    residuals, n_used = _compute_physical_residual_variance(policy_det, graph_cache, device, max_runs)
+
+    # Residuals above are in *physical* bias-coefficient units (both `mean`
+    # and `targets` are), but BayesianLinearHead.noise_var is consumed in the
+    # posterior's native *pre-activation* space (see UnimolPolicy
+    # ._preact_to_action / ._action_to_preact — the posterior is seeded from,
+    # and regresses toward, the deterministic readout's pre-softsign+scale
+    # output). Convert via the local-linear approximation d(scale*softsign(x))/dx
+    # = scale/(1+|x|)^2 -> near x=0 this is ~scale, so Var(physical) ~
+    # scale^2 * Var(pre-activation). Exact at the origin, an underestimate of
+    # the true pre-activation noise near saturation -- adequate for a warm-
+    # start prior hyperparameter, not a claim of statistical precision.
+    scale_factors = policy_det.scale_factors.detach().cpu().numpy()
 
     noise_vars = []
     for d in range(4):
         if len(residuals[d]) >= 5:
-            noise_vars.append(max(float(np.var(residuals[d])), floor))
+            noise_var_physical = max(float(np.var(residuals[d])), floor)
         else:
-            noise_vars.append(1.0)  # too little data — fall back to a neutral hyperparameter
+            noise_var_physical = 1.0  # too little data — fall back to a neutral hyperparameter
+        noise_vars.append(noise_var_physical / float(scale_factors[d]) ** 2)
     dim_names = ['linear', 'quadratic', 'skew', 'end']
-    print(f"  Estimated reward noise variance (sigma^2) from {n_used} sampled runs: "
-          + ', '.join(f'{n}={v:.4f}' for n, v in zip(dim_names, noise_vars)))
+    print(f"  Estimated reward noise variance (sigma^2, pre-activation space) "
+          f"from {n_used} sampled runs: "
+          + ', '.join(f'{n}={v:.6f}' for n, v in zip(dim_names, noise_vars)))
     return noise_vars
 
 
-def initialize_bayesian_heads_from_pretrained(policy_det, bayesian_prior_precision: float = 1.0):
+def initialize_bayesian_heads_from_pretrained(
+    policy_det, bayesian_prior_precision: float = 1.0,
+    graph_cache: Optional[List] = None, device=None,
+    exploration_fraction: float = 0.3,
+):
     """Build a ``use_bayesian_heads=True`` sibling of a trained deterministic policy.
 
     Copies each bias type's trunk (feature extractor) weights 1:1 — the trunk
     architecture is identical between the two modes — and warm-starts each
     ``BayesianLinearHead``'s posterior *mean* at the deterministic head's
-    trained readout weight/bias, leaving posterior *uncertainty* at the
-    (uninformed) prior so it is genuinely narrowed by real online observations.
+    trained readout weight/bias, leaving posterior *uncertainty* at a
+    calibrated prior (see below) so it is genuinely narrowed by real online
+    observations.
 
     Args:
         policy_det: Trained deterministic UnimolPolicy (use_bayesian_heads=False).
-        bayesian_prior_precision: Prior precision for each BayesianLinearHead.
+        bayesian_prior_precision: Fallback precision multiplier, used only
+            when ``graph_cache`` is not provided (see below).
+        graph_cache: Per-run cache of ``(unimol_emb, edge_index, targets_list)``
+            or ``None`` entries, as built during the main BC loop (see
+            ``pretrain_with_runs``). Strongly recommended: when given, prior
+            precision is calibrated from real data (see "Calibration" below)
+            instead of the weaker weight-magnitude-only heuristic.
+        device: torch device for the calibration forward passes (defaults to
+            ``policy_det``'s own device). Only used when ``graph_cache`` is given.
+        exploration_fraction: Only used with ``graph_cache``. Target
+            Thompson-sampling exploration variance, in **physical**
+            bias-coefficient units, as a fraction of the real physical-space
+            residual variance already estimated for that dimension (see
+            ``estimate_reward_noise_variance``) — i.e. "let sampling wiggle
+            the action by roughly this fraction of how much real bias
+            coefficients for this type actually vary." 0.3 gives visible but
+            not overwhelming exploration; raise to explore more aggressively,
+            lower to hew closer to the deterministic prediction initially.
+
+    Calibration:
+        Without ``graph_cache``, precision is set from ``weight`` magnitude
+        alone (``bayesian_prior_precision / mean(weight**2)``), implicitly
+        assuming trunk features ``z`` have norm ~1. Real Uni-Mol-derived
+        trunk features don't (``||z||`` of 5-10+ is typical), and scale
+        factors vary hugely across bias types (quadratic's is 520, end's is
+        30) — so even a "tight-looking" weight-only calibration can leave
+        Thompson-sampling noise, in *physical* units near the origin
+        (``scale_factor * raw_noise``), swamping the signal for
+        high-scale_factor dimensions. This was caught against a real
+        checkpoint: sampled actions differed from the (correct) deterministic
+        mean by up to ~9x, including sign flips, despite an apparently
+        well-calibrated weight-based precision.
+
+        With ``graph_cache``, precision is instead set so the *physical-unit*
+        exploration variance directly targets a fraction of the *physical*
+        residual variance real BC data actually shows for that dimension —
+        using the real trunk's ``E[||z||^2]`` (``_compute_typical_z_norm_sq``)
+        and the real physical-space residual variance
+        (``_compute_physical_residual_variance``, shared with
+        ``estimate_reward_noise_variance``) instead of a scale-blind guess.
 
     Returns:
         A new UnimolPolicy with use_bayesian_heads=True, same architecture/
@@ -2539,6 +2664,23 @@ def initialize_bayesian_heads_from_pretrained(policy_det, bayesian_prior_precisi
         bayesian_prior_precision=bayesian_prior_precision,
     ).to(next(policy_det.parameters()).device)
 
+    typical_z_norm_sq = None
+    residual_vars_physical = None
+    if graph_cache is not None:
+        device = device or next(policy_det.parameters()).device
+        typical_z_norm_sq = _compute_typical_z_norm_sq(policy_det, graph_cache, device)
+        residuals, _ = _compute_physical_residual_variance(policy_det, graph_cache, device)
+        residual_vars_physical = [
+            max(float(np.var(residuals[d])), 1e-6) if len(residuals[d]) >= 5 else None
+            for d in range(4)
+        ]
+        print(f"  Data-driven prior-precision calibration: E[||z||^2]="
+              + ', '.join(f'{v:.2f}' for v in typical_z_norm_sq)
+              + ", physical residual var="
+              + ', '.join(f'{v:.4f}' if v is not None else 'n/a' for v in residual_vars_physical))
+
+    scale_factors = policy_det.scale_factors.detach().cpu().numpy()
+
     for d in range(policy_det.mlp_out_dim):
         det_mlp = policy_det.edge_mlp.mlps[d]
         bayes_mlp = policy_bayes.edge_mlp.mlps[d]
@@ -2548,7 +2690,22 @@ def initialize_bayesian_heads_from_pretrained(policy_det, bayesian_prior_precisi
         # posterior instead).
         weight = det_mlp.readout.weight.data[0]  # [64]
         bias = float(det_mlp.readout.bias.data[0])
-        bayes_mlp.bayesian_head.seed_mean(weight, bias)
+
+        if typical_z_norm_sq is not None and residual_vars_physical[d] is not None:
+            # Data-driven: target physical-unit exploration variance as a
+            # fraction of real physical residual variance, then convert to
+            # the raw pre-activation precision that produces it given this
+            # head's actual typical ||z||^2 (see docstring "Calibration").
+            target_physical_var = exploration_fraction * residual_vars_physical[d]
+            target_preact_var = target_physical_var / (float(scale_factors[d]) ** 2)
+            adaptive_precision = typical_z_norm_sq[d] / max(target_preact_var, 1e-8)
+        else:
+            # Fallback: weight-magnitude-only heuristic (see docstring).
+            combined = torch.cat([weight, torch.tensor([bias], dtype=weight.dtype, device=weight.device)])
+            typical_scale_sq = float(combined.pow(2).mean().clamp(min=1e-6))
+            adaptive_precision = bayesian_prior_precision / typical_scale_sq
+
+        bayes_mlp.bayesian_head.seed_mean(weight, bias, prior_precision=adaptive_precision)
 
     return policy_bayes
 
@@ -2826,6 +2983,20 @@ def pretrain_with_runs(
     env_cutoff = unimol_cfg.get('environment_cutoff', 8.0)  # Distance cutoff for environment filtering
     use_environment_difference = unimol_cfg.get('use_environment_difference', True)  # Use (env+lig)-(lig) representation
     tracking_file = initialize_representation_tracker(output_dir)
+
+    # Persistent Uni-Mol embedding cache (unimol.cache_embeddings / unimol.cache_dir
+    # in the config). This is on-disk and survives across separate sbatch
+    # submissions — unlike system_graph_cache below (in-memory, per-system,
+    # scoped to this one process), it's what lets a resubmitted/rerun job skip
+    # recomputing embeddings for systems it already computed last time.
+    embed_cache_dir: Optional[Path] = None
+    if unimol_cfg.get('cache_embeddings', False):
+        embed_cache_dir = unimol_cfg.get('cache_dir')
+        embed_cache_dir = Path(embed_cache_dir) if embed_cache_dir else Path(output_dir) / 'embeddings_cache'
+        embed_cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Uni-Mol embedding cache: ENABLED ({embed_cache_dir})")
+    else:
+        print(f"  Uni-Mol embedding cache: disabled (set unimol.cache_embeddings: true to enable)")
     
     # Initialize consensus_dict - will be populated if consensus building is enabled
     consensus_dict = None
@@ -2996,6 +3167,7 @@ def pretrain_with_runs(
                     use_environment_difference=use_environment_difference,
                     run_idx=0,
                     consensus_dict=consensus_dict,
+                    cache_dir=embed_cache_dir,
                 )
                 
                 # Cache the system graph (shared across all runs)
@@ -3094,6 +3266,7 @@ def pretrain_with_runs(
                     use_environment_difference=use_environment_difference,
                     run_idx=run_idx,
                     consensus_dict=consensus_dict,
+                    cache_dir=embed_cache_dir,
                 )
                 
                 # Track representation choice
@@ -3356,7 +3529,8 @@ def pretrain_with_runs(
 
             def _save_bayesian_sibling(det_policy, out_path, extra_ckpt_fields):
                 bayes_policy = initialize_bayesian_heads_from_pretrained(
-                    det_policy, bayesian_prior_precision=bayesian_prior_precision)
+                    det_policy, bayesian_prior_precision=bayesian_prior_precision,
+                    graph_cache=graph_cache, device=device)
                 for d, sigma2 in enumerate(noise_vars):
                     bayes_policy.edge_mlp.mlps[d].bayesian_head.set_noise_var(sigma2)
                 ckpt = {'policy_state': bayes_policy.state_dict(), 'noise_var': noise_vars}

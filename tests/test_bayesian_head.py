@@ -146,6 +146,38 @@ class TestBayesianLinearHeadUtilities:
         head._refresh_posterior()
         assert torch.allclose(head.mu, expected_mu, atol=1e-5)
 
+    def test_seed_mean_with_prior_precision_rescales_covariance(self):
+        """seed_mean(..., prior_precision=X) must rescale Lambda/Lambda_inv
+        BEFORE seeding, and Lambda_mu must reflect the new Lambda (not the
+        constructor-time default) -- otherwise mu drifts on the next
+        _refresh_posterior() instead of surviving exactly."""
+        feat_dim = 4
+        head = BayesianLinearHead(feat_dim=feat_dim, prior_precision=1.0)
+        weight = torch.tensor([0.01, -0.02, 0.005, 0.0])
+        bias = 0.001
+
+        head.seed_mean(weight, bias, prior_precision=500.0)
+
+        expected_lambda = 500.0 * torch.eye(feat_dim + 1)
+        assert torch.allclose(head.Lambda, expected_lambda)
+        assert torch.allclose(head.Lambda_inv, (1.0 / 500.0) * torch.eye(feat_dim + 1))
+
+        expected_mu = torch.cat([weight, torch.tensor([bias])])
+        assert torch.allclose(head.mu, expected_mu)
+        head._refresh_posterior()
+        assert torch.allclose(head.mu, expected_mu, atol=1e-5), (
+            "mu must survive _refresh_posterior() exactly under the NEW Lambda"
+        )
+
+    def test_seed_mean_prior_precision_none_keeps_constructor_default(self):
+        """Omitting prior_precision must leave the constructor's Lambda alone
+        (backward compatible with the original seed_mean behavior)."""
+        feat_dim = 3
+        head = BayesianLinearHead(feat_dim=feat_dim, prior_precision=7.0)
+        original_lambda = head.Lambda.clone()
+        head.seed_mean(torch.tensor([1.0, 2.0, 3.0]), 0.5)
+        assert torch.allclose(head.Lambda, original_lambda)
+
     def test_set_noise_var_floors_at_positive(self):
         head = BayesianLinearHead(feat_dim=2)
         head.set_noise_var(-5.0)

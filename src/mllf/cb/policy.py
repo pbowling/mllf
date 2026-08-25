@@ -109,21 +109,34 @@ class EdgeValueMLP(nn.Module):
         ])
 
     def forward_features(self, x: torch.Tensor,
-                          edge_type: torch.Tensor) -> torch.Tensor:
-        """Route each edge to its bias type's trunk and return its features.
+                          edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return per-bias-type trunk features, routed or not.
 
         Args:
             x: ``[E, in_dim]`` edge input features.
-            edge_type: ``[E]`` integer relation-type index; required (unlike
-                ``forward``'s legacy no-routing path — a NeuralLinear head's
-                features are only meaningful for its own bias type).
+            edge_type: ``[E]`` integer relation-type index. When provided,
+                each edge is routed to ``mlps[edge_type // 2]`` (matches
+                ``forward``'s routed path — used by the pretraining
+                fully-connected 4x-edges-per-pair graph structure). When
+                ``None`` (the online-training graph structure: one edge per
+                pair, every bias type independently meaningful for every
+                edge — matches ``forward``'s legacy no-routing path), every
+                edge gets a feature vector from **each** of the ``D`` trunks.
 
         Returns:
-            ``[E, 64]``: ``z = phi(x)`` from the routed trunk for each edge.
+            Routed (``edge_type`` given): ``[E, 64]``, one trunk's output per
+            edge. Unrouted (``edge_type=None``): ``[E, D, 64]``, all ``D``
+            trunks' outputs for every edge (index the bias-type dim to get a
+            per-head ``[E, 64]`` slice, e.g. ``z[:, d, :]``).
         """
         D = self.num_bias_types
-        bias_type = edge_type // 2  # [E], values 0..D-1
         feat_dim = self.mlps[0].feat_dim
+        if edge_type is None:
+            # Legacy/online-training path: every edge is independently
+            # meaningful to every bias type's trunk (no routing to discard).
+            return torch.stack([mlp.forward_features(x) for mlp in self.mlps], dim=1)  # [E, D, feat]
+
+        bias_type = edge_type // 2  # [E], values 0..D-1
         out = torch.zeros(x.size(0), feat_dim, dtype=x.dtype, device=x.device)
         for i, mlp in enumerate(self.mlps):
             mask = (bias_type == i)
@@ -503,52 +516,115 @@ class UnimolPolicy(nn.Module):
 
     def forward_features(self, unimol_embeddings: torch.Tensor,
                          edge_index: torch.LongTensor,
-                         edge_type: torch.Tensor) -> torch.Tensor:
-        """Return per-edge trunk features ``z = phi(x)``, routed by bias type.
+                         edge_type: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return per-edge trunk features ``z = phi(x)``, routed or not.
 
         Args:
             unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
             edge_index: [2, E] directed edge index.
-            edge_type: [E] integer relation index (required — features are only
-                meaningful for an edge's own routed bias type).
+            edge_type: [E] integer relation index. When given, routes each
+                edge to its own bias type's trunk (the pretraining
+                fully-connected 4x-edges-per-pair graph structure). When
+                ``None`` (the online-training graph structure — one edge per
+                pair, every bias type independently meaningful for every
+                edge — this is what ``build_graph_and_data`` in
+                ``training/workflow.py`` always produces), every edge gets
+                features from **every** bias type's trunk.
 
         Returns:
-            [E, 64] feature tensor, one row per edge from its routed trunk.
+            Routed: ``[E, 64]``. Unrouted (``edge_type=None``): ``[E, D, 64]``.
         """
         edge_input = self._build_edge_input(unimol_embeddings, edge_index)
         return self.edge_mlp.forward_features(edge_input, edge_type)
 
+    def _preact_to_action(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        """Map a bias head's raw (pre-activation) output into physical bias-
+        coefficient units for dimension ``dim``: ``scale_factors[dim] *
+        softsign(x)``.
+
+        This is the exact transform ``_forward_edges`` applies to every
+        deterministic head's raw output, and it's why ``BayesianLinearHead``
+        is seeded from the deterministic readout's raw (pre-transform)
+        weights (see ``pretrain_policy.initialize_bayesian_heads_from_pretrained``)
+        — the posterior lives in the *same* pre-activation space, so its
+        output needs the same transform applied before it's a valid action.
+        Skipping this (as an earlier version of this code did) produces raw,
+        effectively-unbounded linear-regression outputs used directly as bias
+        coefficients — silently wrong-scale actions that pin combos into
+        degenerate, low-transition states.
+        """
+        return F.softsign(x) * self.scale_factors[dim]
+
+    def _action_to_preact(self, y: torch.Tensor, dim: int, eps: float = 1e-3) -> torch.Tensor:
+        """Inverse of ``_preact_to_action``: map an observed physical bias
+        coefficient back into the pre-activation space the posterior actually
+        models, so ``update_bayesian_posteriors`` regresses toward the same
+        quantity ``sample_weights()``/``mu`` predict.
+
+        ``softsign(x) = x / (1 + |x|)`` inverts to ``x = s / (1 - |s|)`` for
+        ``s = y / scale`` (clamped away from ``±1`` for numerical stability —
+        an observed action at or beyond the scale bound would otherwise
+        invert to ``±inf``).
+        """
+        s = (y / self.scale_factors[dim]).clamp(-1.0 + eps, 1.0 - eps)
+        return s / (1.0 - s.abs())
+
     def predict_uncertainty(self, unimol_embeddings: torch.Tensor,
                             edge_index: torch.LongTensor,
-                            edge_type: torch.Tensor) -> tuple:
-        """Posterior predictive mean/variance for every edge's routed bias head.
+                            edge_type: Optional[torch.Tensor] = None) -> tuple:
+        """Posterior predictive mean/variance for every edge's bias head(s).
 
         Used for uncertainty-driven combo selection: average/max predictive
         variance over a combo's edges ranks how much this combo would teach the
         model if simulated next.
 
         Returns:
-            mean: [E] posterior predictive mean (routed head's ``z @ mu``).
-            var: [E] posterior predictive variance (``z^T Lambda_inv z + noise_var``).
+            ``mean`` is in **physical bias-coefficient units**
+            (``scale_factors[d] * softsign(raw_mean)``, matching what
+            ``_forward_edges``/the analysis script report — see
+            ``_preact_to_action``). ``var`` stays in the posterior's native
+            pre-activation space (variance doesn't transform simply through a
+            nonlinearity); it's only ever used for *relative* combo ranking
+            in ``select_combos_by_uncertainty``, where that's sufficient
+            (softsign is monotonic, so relative ordering by pre-activation
+            uncertainty tracks relative physical-space uncertainty).
+
+            Routed (``edge_type`` given): ``mean [E]``, ``var [E]`` — the
+            edge's own routed head's posterior predictive mean/variance.
+            Unrouted (``edge_type=None``): ``mean [E, D]``, ``var [E, D]`` —
+            every head's prediction for every edge (matches ``_forward_edges``'s
+            legacy-path shape).
         """
         z = self.forward_features(unimol_embeddings, edge_index, edge_type)
+        D = self.mlp_out_dim
+
+        if edge_type is None:
+            E = z.size(0)
+            mean = torch.zeros(E, D, device=z.device, dtype=z.dtype)
+            var = torch.zeros(E, D, device=z.device, dtype=z.dtype)
+            for d in range(D):
+                head = self.edge_mlp.mlps[d].bayesian_head
+                mean_raw, var[:, d] = head.predict(z[:, d, :])
+                mean[:, d] = self._preact_to_action(mean_raw, d)
+            return mean, var
+
         bias_type = edge_type // 2
         E = z.size(0)
         mean = torch.zeros(E, device=z.device, dtype=z.dtype)
         var = torch.zeros(E, device=z.device, dtype=z.dtype)
-        for d in range(self.mlp_out_dim):
+        for d in range(D):
             mask = bias_type == d
             if not mask.any():
                 continue
             head = self.edge_mlp.mlps[d].bayesian_head
             m_d, v_d = head.predict(z[mask])
-            mean[mask] = m_d
+            mean[mask] = self._preact_to_action(m_d, d)
             var[mask] = v_d
         return mean, var
 
     def get_actions_thompson(self, unimol_embeddings: torch.Tensor,
                              edge_index: torch.LongTensor,
-                             edge_type: torch.Tensor,
+                             edge_type: Optional[torch.Tensor] = None,
                              deterministic: bool = False) -> tuple:
         """Sample actions via Thompson sampling from each bias head's posterior.
 
@@ -559,48 +635,68 @@ class UnimolPolicy(nn.Module):
         Args:
             unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
             edge_index: [2, E] directed edge index.
-            edge_type: [E] integer relation index (required).
+            edge_type: [E] integer relation index. See ``forward_features``
+                for the routed vs. unrouted (``None``, the online-training
+                default) distinction.
             deterministic: If True, use the posterior mean ``mu`` instead of a
                 sample (no exploration — for eval/replay).
 
         Returns:
-            actions: [E, mlp_out_dim] bias coefficients (only the routed column
-                per edge is meaningful; other columns are 0 — same convention
-                as ``get_actions``'s routed path).
-            mean: [E] posterior predictive mean for each edge's routed head.
-            var: [E] posterior predictive variance for each edge's routed head.
+            actions: [E, mlp_out_dim] bias coefficients, in the same physical
+                units as REINFORCE's ``get_actions``/``_forward_edges``
+                (``scale_factors[d] * softsign(raw_sample)`` — see
+                ``_preact_to_action``; the posterior itself lives in raw
+                pre-activation space, seeded from the deterministic readout's
+                pre-transform weights, so this transform is required to turn
+                a sample into a valid action). Routed: only the routed column
+                per edge is meaningful, others are 0 (same convention as
+                ``get_actions``'s routed path). Unrouted: every column is a
+                real prediction for every edge.
+            mean, var: predictive mean/variance, same routed-vs-unrouted shape
+                and mean/var unit convention as ``predict_uncertainty``.
         """
         z = self.forward_features(unimol_embeddings, edge_index, edge_type)
-        bias_type = edge_type // 2
         D = self.mlp_out_dim
         E = z.size(0)
         actions = torch.zeros(E, D, device=z.device, dtype=z.dtype)
-        mean = torch.zeros(E, device=z.device, dtype=z.dtype)
-        var = torch.zeros(E, device=z.device, dtype=z.dtype)
-        for d in range(D):
-            mask = bias_type == d
-            if not mask.any():
-                continue
-            head = self.edge_mlp.mlps[d].bayesian_head
-            z_d = z[mask]
-            w = head.mu if deterministic else head.sample_weights()
-            actions[mask, d] = head.act(z_d, w)
-            m_d, v_d = head.predict(z_d)
-            mean[mask] = m_d
-            var[mask] = v_d
 
-        # Safety clip, matching the REINFORCE path's margin around scale_factors
-        # (write_variables_from_actions/bias_clip assume bounded values).
-        clip_limits = (self.scale_factors * 1.05).unsqueeze(0)
-        actions = torch.clamp(actions, -clip_limits, clip_limits)
+        if edge_type is None:
+            mean = torch.zeros(E, D, device=z.device, dtype=z.dtype)
+            var = torch.zeros(E, D, device=z.device, dtype=z.dtype)
+            for d in range(D):
+                head = self.edge_mlp.mlps[d].bayesian_head
+                z_d = z[:, d, :]
+                w = head.mu if deterministic else head.sample_weights()
+                actions[:, d] = self._preact_to_action(head.act(z_d, w), d)
+                mean_raw, var[:, d] = head.predict(z_d)
+                mean[:, d] = self._preact_to_action(mean_raw, d)
+        else:
+            bias_type = edge_type // 2
+            mean = torch.zeros(E, device=z.device, dtype=z.dtype)
+            var = torch.zeros(E, device=z.device, dtype=z.dtype)
+            for d in range(D):
+                mask = bias_type == d
+                if not mask.any():
+                    continue
+                head = self.edge_mlp.mlps[d].bayesian_head
+                z_d = z[mask]
+                w = head.mu if deterministic else head.sample_weights()
+                actions[mask, d] = self._preact_to_action(head.act(z_d, w), d)
+                m_d, v_d = head.predict(z_d)
+                mean[mask] = self._preact_to_action(m_d, d)
+                var[mask] = v_d
+
+        # No extra clamp needed: softsign(x) is strictly within (-1, 1) for
+        # any finite x, so _preact_to_action already guarantees actions lie
+        # strictly within (-scale_factors[d], scale_factors[d]).
         return actions, mean, var
 
     def update_bayesian_posteriors(self, unimol_embeddings: torch.Tensor,
                                    edge_index: torch.LongTensor,
-                                   edge_type: torch.Tensor,
+                                   edge_type: Optional[torch.Tensor],
                                    targets: torch.Tensor,
                                    weights: Optional[torch.Tensor] = None) -> None:
-        """Fold observed ``(z, target)`` pairs into each routed head's posterior.
+        """Fold observed ``(z, target)`` pairs into each bias head's posterior.
 
         No gradient, no optimizer — this is the closed-form replacement for
         ``policy_loss.backward(); optimizer.step()``.
@@ -608,28 +704,60 @@ class UnimolPolicy(nn.Module):
         Args:
             unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
             edge_index: [2, E] directed edge index.
-            edge_type: [E] integer relation index (required).
+            edge_type: [E] integer relation index. See ``forward_features``
+                for the routed vs. unrouted (``None``, the online-training
+                default) distinction. Unrouted: every edge updates every head
+                (using that head's own target column) — no masking, since
+                every column is independently meaningful for every edge.
             targets: [E] or [E, mlp_out_dim] regression targets — the observed
-                action (bias coefficient) each edge actually submitted. Only the
-                column matching each edge's routed bias type is used.
-            weights: Optional [E] per-edge confidence weight for the update
-                (e.g. reward-derived AWR weight combined with the existing
-                DDG-transition confidence weight). Defaults to all-ones.
+                action (bias coefficient, in physical units) each edge
+                actually submitted. Internally inverse-transformed
+                (``_action_to_preact``) into the posterior's native
+                pre-activation space before regressing — the posterior was
+                seeded from the deterministic readout's pre-transform
+                weights (see
+                ``pretrain_policy.initialize_bayesian_heads_from_pretrained``)
+                and ``get_actions_thompson`` samples in that same space, so
+                the update must too, or the posterior mean drifts away from
+                what's actually being sampled/acted on.
+            weights: Optional per-edge confidence weight for the update (e.g.
+                reward-derived AWR weight combined with the existing
+                DDG-transition confidence weight). Either [E] (same weight
+                reused for every head — the only sensible shape when
+                ``edge_type`` routes each edge to one head anyway) or
+                [E, mlp_out_dim] (a genuinely per-head weight per edge — e.g.
+                each bias type has its own AWR weight since
+                ``compute_pair_reward`` gives each dimension its own reward).
+                Defaults to all-ones.
         """
         z = self.forward_features(unimol_embeddings, edge_index, edge_type)
-        bias_type = edge_type // 2
         D = self.mlp_out_dim
         if targets.dim() == 1:
             targets = targets.unsqueeze(-1).expand(-1, D)
+
+        def _weights_for_dim(d: int) -> Optional[torch.Tensor]:
+            if weights is None:
+                return None
+            return weights if weights.dim() == 1 else weights[:, d]
+
+        if edge_type is None:
+            for d in range(D):
+                head = self.edge_mlp.mlps[d].bayesian_head
+                r_d_raw = self._action_to_preact(targets[:, d], d)
+                head.update(z[:, d, :], r_d_raw, weights=_weights_for_dim(d))
+            return
+
+        bias_type = edge_type // 2
         for d in range(D):
             mask = bias_type == d
             if not mask.any():
                 continue
             head = self.edge_mlp.mlps[d].bayesian_head
             z_d = z[mask]
-            r_d = targets[mask, d]
-            w_d = weights[mask] if weights is not None else None
-            head.update(z_d, r_d, weights=w_d)
+            r_d_raw = self._action_to_preact(targets[mask, d], d)
+            w_all = _weights_for_dim(d)
+            w_d = w_all[mask] if w_all is not None else None
+            head.update(z_d, r_d_raw, weights=w_d)
 
     def get_actions(self, unimol_embeddings: torch.Tensor,
                     edge_index: torch.LongTensor,
