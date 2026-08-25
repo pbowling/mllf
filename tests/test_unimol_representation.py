@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from mllf.cb.unimol_representation import (
     _generate_embedding_cache_key,
+    _system_label_from_prep_dir,
     save_embedding,
     load_embedding,
 )
@@ -140,7 +141,13 @@ class TestEmbeddingSaving:
             )
             
             assert save_path.exists(), "Embedding file should be created"
-            assert save_path.parent.parent.name == 'embeddings', "Should be in embeddings subdirectory"
+            # Layout: embeddings/{system_label}/{sub_name}/{cache_key}.npy —
+            # system_label groups entries by system (derived from prep_dir) so
+            # different systems sharing a substituent name (e.g. site1_sub3)
+            # don't land in one shared directory.
+            assert save_path.parent.parent.parent.name == 'embeddings', "Should be in embeddings subdirectory"
+            assert save_path.parent.parent.name == 'to', "Should be nested under a system-label directory"
+            assert save_path.parent.name == 'sub', "Should be nested under the substituent-name directory"
     
     def test_save_embedding_creates_metadata(self):
         """Verify save_embedding creates metadata JSON file."""
@@ -249,6 +256,71 @@ class TestEmbeddingSaving:
             assert save_path == save_path2, "Should return same path"
             loaded = np.load(save_path)
             assert np.allclose(loaded, embedding2), "Embedding should be overwritten with overwrite=True"
+
+
+class TestSystemLabelScoping:
+    """Test that the embedding cache is organized (and looked up) per system,
+    not just per substituent name -- see _system_label_from_prep_dir."""
+
+    def test_flat_layout_label(self):
+        assert _system_label_from_prep_dir('/x/pretraining/14benz_solv/prep') == '14benz_solv'
+
+    def test_nested_combo_layout_label(self):
+        label = _system_label_from_prep_dir(
+            '/x/pretraining/12fuzed_vac/comb_1744603_site1_subs_18_19_28_32/prep'
+        )
+        assert label == '12fuzed_vac__comb_1744603_site1_subs_18_19_28_32'
+
+    def test_two_systems_sharing_a_sub_name_do_not_collide(self):
+        """Two different systems that both have e.g. site1_sub3 must land in
+        separate cache subdirectories, not one shared bucket."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            emb_a = np.random.randn(512).astype(np.float32)
+            emb_b = np.random.randn(512).astype(np.float32)
+
+            path_a = save_embedding(
+                embedding=emb_a, cache_dir=cache_dir,
+                sub_pdb='/x/pretraining/sysA/comb_0001/prep/site1_sub3_frag.pdb',
+                core_pdb='/x/pretraining/sysA/comb_0001/prep/core.pdb',
+                prep_dir='/x/pretraining/sysA/comb_0001/prep',
+            )
+            path_b = save_embedding(
+                embedding=emb_b, cache_dir=cache_dir,
+                sub_pdb='/x/pretraining/sysB/comb_0007/prep/site1_sub3_frag.pdb',
+                core_pdb='/x/pretraining/sysB/comb_0007/prep/core.pdb',
+                prep_dir='/x/pretraining/sysB/comb_0007/prep',
+            )
+
+            assert path_a.parent != path_b.parent, "Different systems must not share a directory"
+            assert np.allclose(np.load(path_a), emb_a)
+            assert np.allclose(np.load(path_b), emb_b)
+
+    def test_load_falls_back_to_legacy_flat_layout(self):
+        """Entries written before system-scoping was added (flat
+        embeddings/{sub_name}/ layout, no system_label) must still be found."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            embedding = np.random.randn(512).astype(np.float32)
+
+            legacy_dir = cache_dir / 'embeddings' / 'site9_sub9'
+            legacy_dir.mkdir(parents=True)
+            key = _generate_embedding_cache_key(
+                '/x/pretraining/sysC/prep/site9_sub9_frag.pdb',
+                '/x/pretraining/sysC/prep/core.pdb',
+                '/x/pretraining/sysC/prep', 5.0, False, None, None, None,
+            )
+            np.save(legacy_dir / f'{key}.npy', embedding)
+
+            loaded = load_embedding(
+                cache_dir,
+                sub_pdb='/x/pretraining/sysC/prep/site9_sub9_frag.pdb',
+                core_pdb='/x/pretraining/sysC/prep/core.pdb',
+                prep_dir='/x/pretraining/sysC/prep',
+                verbose=False,
+            )
+            assert loaded is not None, "Should fall back to the legacy flat layout"
+            assert np.allclose(loaded, embedding)
 
 
 class TestEmbeddingLoading:

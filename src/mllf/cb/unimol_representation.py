@@ -505,6 +505,37 @@ def _filter_environment_by_consensus(
     return None
 
 
+def _system_label_from_prep_dir(prep_dir: str) -> str:
+    """Derive a short, human-readable, filesystem-safe system label from a prep dir.
+
+    Used purely to organize the on-disk embedding cache by system (see
+    ``save_embedding``/``load_embedding``) so that e.g. ``site1_sub3`` from
+    thousands of different systems don't all land in one shared directory,
+    indistinguishable except by opening each entry's metadata JSON.
+
+    Mirrors the "system/combo" display-name convention already used for
+    logging elsewhere in the pretraining pipeline: for a nested combo layout
+    (``.../<system>/comb_XXXX/prep``) this returns ``<system>__comb_XXXX``;
+    for a flat layout (``.../<system>/prep``) it returns ``<system>``.
+
+    Args:
+        prep_dir: Path to a system's prep directory (the directory containing
+            core.pdb / site*_sub*_frag.pdb / environment PDBs).
+
+    Returns:
+        Filesystem-safe label, e.g. ``12benz_solvent__comb_0001_site1_subs_1_2``.
+    """
+    prep_path = Path(prep_dir)
+    parent = prep_path.parent
+    if parent.name.startswith('comb_'):
+        label = f"{parent.parent.name}__{parent.name}"
+    else:
+        label = parent.name
+    # Defensive sanitization: these are already directory *names*, not full
+    # paths, but keep the cache robust to any unexpected separators.
+    return label.replace('/', '_') or 'unknown_system'
+
+
 def _generate_embedding_cache_key(
     sub_pdb: str,
     core_pdb: str,
@@ -512,16 +543,22 @@ def _generate_embedding_cache_key(
     env_cutoff: float,
     include_other_sites: bool,
     custom_search_paths: Optional[List[str]] = None,
+    consensus_atoms: Optional[set] = None,
+    variant: Optional[str] = None,
 ) -> str:
     """Generate a unique cache key for an embedding based on input parameters.
-    
+
     Creates a deterministic hash from the system configuration, allowing embeddings
     to be cached and reused across runs. The hash includes:
     - Paths to core and substituent PDBs
     - Prep directory path
     - Environment cutoff and search configuration
     - Whether reference subs from other sites are included
-    
+    - Consensus environment atoms (if consensus filtering is in use)
+    - A representation "variant" tag (e.g. 'ligand' vs 'full' for dual
+      embeddings), so two different representations for the same substituent
+      never collide on the same cache entry
+
     Args:
         sub_pdb: Path to substituent fragment PDB
         core_pdb: Path to core scaffold PDB
@@ -529,7 +566,17 @@ def _generate_embedding_cache_key(
         env_cutoff: Environment distance cutoff in Angstroms
         include_other_sites: Whether reference subs from other sites are included
         custom_search_paths: Optional custom PDB search paths for environment
-        
+        consensus_atoms: Optional set of (resnum, chain, atomname)-style tuples
+            used for consensus environment filtering. Must be included in the
+            key — the same sub/core/prep_dir/env_cutoff combination produces a
+            *different* embedding depending on which consensus atoms are kept,
+            so omitting this would let one system's cached embedding be
+            silently served for a different system's consensus filter.
+        variant: Optional tag distinguishing multiple cached representations
+            for the same underlying (sub, core, prep_dir) — e.g. dual
+            embeddings cache a 'ligand'-only and a 'full' (ligand+environment)
+            representation for the same substituent under distinct keys.
+
     Returns:
         str: Unique hash key for this embedding configuration
     """
@@ -541,12 +588,14 @@ def _generate_embedding_cache_key(
         'env_cutoff': float(env_cutoff),
         'include_other_sites': bool(include_other_sites),
         'custom_search_paths': sorted(custom_search_paths) if custom_search_paths else None,
+        'consensus_atoms': sorted(list(a) for a in consensus_atoms) if consensus_atoms else None,
+        'variant': variant,
     }
-    
+
     # Create deterministic JSON string and hash it
     key_str = json.dumps(key_components, sort_keys=True)
     cache_key = hashlib.sha256(key_str.encode()).hexdigest()[:16]
-    
+
     return cache_key
 
 
@@ -559,21 +608,32 @@ def save_embedding(
     env_cutoff: float = 5.0,
     include_other_sites: bool = False,
     custom_search_paths: Optional[List[str]] = None,
+    consensus_atoms: Optional[set] = None,
+    variant: Optional[str] = None,
     overwrite: bool = False,
 ) -> Path:
     """Save a computed Uni-Mol embedding to disk with metadata.
-    
+
     Embeddings are stored in a structured directory with metadata JSON files
     tracking the configuration used to compute them. This allows efficient
     reloading during subsequent pretraining or analysis runs.
-    
+
     Directory structure:
         cache_dir/
             embeddings/
-                {sub_name}/
-                    {cache_key}.npy          # embedding array
-                    {cache_key}_metadata.json  # configuration metadata
-    
+                {system_label}/
+                    {sub_name}/
+                        {cache_key}.npy          # embedding array
+                        {cache_key}_metadata.json  # configuration metadata
+
+    ``system_label`` (see ``_system_label_from_prep_dir``) keeps each system's
+    substituents in their own directory — without it, every system that
+    happens to have a "site1_sub3" (i.e. most of them) would dump their
+    embeddings into one shared ``embeddings/site1_sub3/`` directory,
+    identifiable only by opening each entry's metadata JSON, and that
+    directory could grow to tens of thousands of files across a large
+    pretraining corpus.
+
     Args:
         embedding: [512] numpy array of Uni-Mol embedding
         cache_dir: Base cache directory (will create embeddings/ subdirectory)
@@ -583,38 +643,45 @@ def save_embedding(
         env_cutoff: Environment cutoff used for computation
         include_other_sites: Whether ref subs from other sites were included
         custom_search_paths: Custom search paths used for environment
+        consensus_atoms: Consensus environment atoms used, if any (see
+            ``_generate_embedding_cache_key`` — must match what was used to
+            actually compute ``embedding``, or the cache entry is invalid).
+        variant: Optional tag distinguishing this from other cached
+            representations of the same substituent (e.g. 'ligand' vs 'full').
         overwrite: If True, overwrite existing cache (default: False)
-        
+
     Returns:
         Path: Path where embedding was saved
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Generate cache key
     cache_key = _generate_embedding_cache_key(
-        sub_pdb, core_pdb, prep_dir, env_cutoff, include_other_sites, custom_search_paths
+        sub_pdb, core_pdb, prep_dir, env_cutoff, include_other_sites,
+        custom_search_paths, consensus_atoms, variant,
     )
-    
+
     # Extract substituent name from path
     sub_name = Path(sub_pdb).stem.replace('_frag', '')
-    
-    # Create subdirectory for this substituent
-    sub_cache_dir = cache_dir / 'embeddings' / sub_name
+    system_label = _system_label_from_prep_dir(prep_dir)
+
+    # Create subdirectory for this system's substituent
+    sub_cache_dir = cache_dir / 'embeddings' / system_label / sub_name
     sub_cache_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Paths for embedding and metadata
     embedding_path = sub_cache_dir / f'{cache_key}.npy'
     metadata_path = sub_cache_dir / f'{cache_key}_metadata.json'
-    
+
     # Check if already exists
     if embedding_path.exists() and not overwrite:
         warnings.warn(f"Embedding cache already exists at {embedding_path}, skipping (use overwrite=True to replace)")
         return embedding_path
-    
+
     # Save embedding
     np.save(embedding_path, embedding)
-    
+
     # Save metadata
     metadata = {
         'sub_pdb': str(Path(sub_pdb).resolve()),
@@ -623,16 +690,18 @@ def save_embedding(
         'env_cutoff': float(env_cutoff),
         'include_other_sites': bool(include_other_sites),
         'custom_search_paths': sorted(custom_search_paths) if custom_search_paths else None,
+        'consensus_atoms': sorted(list(a) for a in consensus_atoms) if consensus_atoms else None,
+        'variant': variant,
         'embedding_shape': list(embedding.shape),
         'embedding_dtype': str(embedding.dtype),
         'cache_key': cache_key,
     }
-    
+
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
-    
+
     print(f"      [CACHE] Saved embedding to {embedding_path}")
-    
+
     return embedding_path
 
 
@@ -644,13 +713,15 @@ def load_embedding(
     env_cutoff: float = 5.0,
     include_other_sites: bool = False,
     custom_search_paths: Optional[List[str]] = None,
+    consensus_atoms: Optional[set] = None,
+    variant: Optional[str] = None,
     verbose: bool = True,
 ) -> Optional[np.ndarray]:
     """Load a cached Uni-Mol embedding from disk if available.
-    
+
     Checks if a matching embedding exists in the cache directory based on
     the input configuration. Returns the embedding if found, None otherwise.
-    
+
     Args:
         cache_dir: Base cache directory to check
         sub_pdb: Path to substituent PDB
@@ -659,36 +730,48 @@ def load_embedding(
         env_cutoff: Environment cutoff parameter
         include_other_sites: Whether ref subs from other sites are included
         custom_search_paths: Custom search paths for environment
+        consensus_atoms: Consensus environment atoms in use, if any — must
+            match what was passed to ``save_embedding`` for a hit (see
+            ``_generate_embedding_cache_key``).
+        variant: Optional tag distinguishing this from other cached
+            representations of the same substituent (e.g. 'ligand' vs 'full').
         verbose: If True, print cache hit/miss messages (default: True)
-        
+
     Returns:
         [512] numpy array if found, None otherwise
     """
     cache_dir = Path(cache_dir)
-    
+
     if not cache_dir.exists():
         return None
-    
+
     # Generate cache key to look up
     cache_key = _generate_embedding_cache_key(
-        sub_pdb, core_pdb, prep_dir, env_cutoff, include_other_sites, custom_search_paths
+        sub_pdb, core_pdb, prep_dir, env_cutoff, include_other_sites,
+        custom_search_paths, consensus_atoms, variant,
     )
-    
+
     # Extract substituent name
     sub_name = Path(sub_pdb).stem.replace('_frag', '')
-    
-    # Build paths
-    embedding_path = cache_dir / 'embeddings' / sub_name / f'{cache_key}.npy'
-    
+    system_label = _system_label_from_prep_dir(prep_dir)
+
+    # Current (system-scoped) layout first; fall back to the flat
+    # embeddings/{sub_name}/ layout used before system-scoping was added, so
+    # entries written under the old layout are still found rather than
+    # silently recomputed.
+    embedding_path = cache_dir / 'embeddings' / system_label / sub_name / f'{cache_key}.npy'
+    if not embedding_path.exists():
+        embedding_path = cache_dir / 'embeddings' / sub_name / f'{cache_key}.npy'
+
     if embedding_path.exists():
         embedding = np.load(embedding_path)
         if verbose:
             print(f"      [CACHE] Loaded embedding from {embedding_path}")
         return embedding
-    
+
     if verbose:
         print(f"      [CACHE] No cached embedding found for {sub_name}")
-    
+
     return None
 
 
@@ -1716,6 +1799,7 @@ def get_substituent_unimol_with_environment(
     save_cache: bool = False,
     skip_minimized: bool = False,
     consensus_atoms: Optional[set] = None,
+    variant: Optional[str] = None,
 ) -> np.ndarray:
     """Compute Uni-Mol 512D representation for substituent with full environment context.
     
@@ -1785,10 +1869,14 @@ def get_substituent_unimol_with_environment(
             Has no effect for vacuum systems (which skip all environment loading).
         consensus_atoms: Optional set of (resnum, chain, atomname) tuples for consensus filtering.
             If provided, environment is further filtered to only include these atoms.
-        
+        variant: Optional tag distinguishing this cached representation from
+            other representations of the same substituent (e.g. dual-embedding
+            mode caches this function's output under variant='full', separate
+            from the ligand-only half). Only affects cache key/lookup.
+
     Returns:
         [512] numpy array of Uni-Mol molecular embedding
-        
+
     Raises:
         FileNotFoundError: If core_pdb not found
         Exception: If Uni-Mol computation fails (caught and re-raised with context)
@@ -1797,7 +1885,7 @@ def get_substituent_unimol_with_environment(
     prep_dir = Path(prep_dir)
     if not core_pdb_path.exists():
         raise FileNotFoundError(f"Core PDB not found: {core_pdb}")
-    
+
     # Try to load from cache first if cache_dir provided
     sub_name = Path(sub_pdb).name
     if cache_dir is not None:
@@ -1809,6 +1897,8 @@ def get_substituent_unimol_with_environment(
             env_cutoff=env_cutoff,
             include_other_sites=include_other_sites,
             custom_search_paths=custom_search_paths,
+            consensus_atoms=consensus_atoms,
+            variant=variant,
             verbose=True,
         )
         if cached_embedding is not None:
@@ -1913,8 +2003,10 @@ def get_substituent_unimol_with_environment(
                 env_cutoff=env_cutoff,
                 include_other_sites=include_other_sites,
                 custom_search_paths=custom_search_paths,
+                consensus_atoms=consensus_atoms,
+                variant=variant,
             )
-        
+
         return embedding
     except Exception as e:
         raise Exception(
@@ -1935,6 +2027,8 @@ def get_substituent_dual_embeddings(
     custom_search_paths: Optional[List[str]] = None,
     skip_minimized: bool = False,
     consensus_atoms: Optional[set] = None,
+    cache_dir: Optional[Path] = None,
+    save_cache: bool = False,
 ) -> tuple:
     """Compute two Uni-Mol embeddings: ligand-only and ligand+environment.
     
@@ -1972,7 +2066,12 @@ def get_substituent_dual_embeddings(
         consensus_atoms: Optional set of (resnum, chain, atomname) tuples for consensus filtering.
             If provided, environment in ligand+environment embedding is filtered to only include
             these atoms, preventing noise in the mean embedding.
-        
+        cache_dir: Optional directory to cache both embeddings. If provided, each
+            half (ligand-only, full) is cached/loaded independently under its
+            own variant tag, so a cache hit on one doesn't require the other.
+        save_cache: If True and cache_dir provided, save newly computed
+            embeddings to cache (default: False).
+
     Returns:
         (embedding_ligand_only [512], embedding_with_env [512])
     """
@@ -1980,23 +2079,57 @@ def get_substituent_dual_embeddings(
     prep_dir = Path(prep_dir)
     if not core_pdb_path.exists():
         raise FileNotFoundError(f"Core PDB not found: {core_pdb}")
-    
-    # Construct ligand-only (no environment)
-    ligand_only_dict = construct_full_ligand(
-        sub_pdb=sub_pdb,
-        core_pdb=core_pdb,
-        sub_rtf_data=sub_rtf_data,
-        core_rtf_data=core_rtf_data,
-        ref_sub_info=None,  # No ref_subs
-        protein_pdb=None,    # No environment
-        solvent_coords=None,
-        solvent_elements=None,
-    )
-    
-    # Compute ligand-only embedding
-    embedding_ligand_only = get_unimol_representation(ligand_only_dict, use_cuda=use_cuda)
-    
-    # Compute ligand+environment embedding (full version with environment)
+
+    # Ligand-only half: try cache first (env_cutoff/include_other_sites/
+    # custom_search_paths/consensus_atoms don't actually affect this half's
+    # value, but including them in the key is harmless and keeps a single
+    # key-generation convention shared with the 'full' half below).
+    embedding_ligand_only = None
+    if cache_dir is not None:
+        embedding_ligand_only = load_embedding(
+            cache_dir=cache_dir,
+            sub_pdb=sub_pdb,
+            core_pdb=core_pdb,
+            prep_dir=str(prep_dir),
+            env_cutoff=env_cutoff,
+            include_other_sites=include_other_sites,
+            custom_search_paths=custom_search_paths,
+            consensus_atoms=consensus_atoms,
+            variant='ligand',
+            verbose=True,
+        )
+
+    if embedding_ligand_only is None:
+        # Construct ligand-only (no environment)
+        ligand_only_dict = construct_full_ligand(
+            sub_pdb=sub_pdb,
+            core_pdb=core_pdb,
+            sub_rtf_data=sub_rtf_data,
+            core_rtf_data=core_rtf_data,
+            ref_sub_info=None,  # No ref_subs
+            protein_pdb=None,    # No environment
+            solvent_coords=None,
+            solvent_elements=None,
+        )
+        embedding_ligand_only = get_unimol_representation(ligand_only_dict, use_cuda=use_cuda)
+
+        if save_cache and cache_dir is not None:
+            save_embedding(
+                embedding=embedding_ligand_only,
+                cache_dir=cache_dir,
+                sub_pdb=sub_pdb,
+                core_pdb=core_pdb,
+                prep_dir=str(prep_dir),
+                env_cutoff=env_cutoff,
+                include_other_sites=include_other_sites,
+                custom_search_paths=custom_search_paths,
+                consensus_atoms=consensus_atoms,
+                variant='ligand',
+            )
+
+    # Ligand+environment half: get_substituent_unimol_with_environment handles
+    # its own cache check/save internally (variant='full' keeps it distinct
+    # from the ligand-only entry above).
     embedding_with_env = get_substituent_unimol_with_environment(
         sub_pdb=sub_pdb,
         core_pdb=core_pdb,
@@ -2010,6 +2143,9 @@ def get_substituent_dual_embeddings(
         custom_search_paths=custom_search_paths,
         skip_minimized=skip_minimized,
         consensus_atoms=consensus_atoms,  # Pass consensus if provided
+        cache_dir=cache_dir,
+        save_cache=save_cache,
+        variant='full',
     )
-    
+
     return embedding_ligand_only, embedding_with_env
