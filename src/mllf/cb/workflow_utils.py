@@ -8,6 +8,7 @@ This module contains reusable functions for:
 Note: For manifest loading, use mllf.cli.workflow.load_manifest()
 """
 import math
+import random
 from pathlib import Path
 from typing import List, Dict, Optional
 import json
@@ -364,6 +365,79 @@ def compute_pair_reward(
     return rewards
 
 
+def compute_pair_success_stats(
+    edge_index: torch.Tensor,
+    ddg_pairs: dict,
+    populations: list,
+    total_transitions: int = 0,
+    min_transitions: int = 3,
+    balance_threshold: float = 0.1,
+    block_offset: int = 2,
+) -> Dict[str, int]:
+    """Per-pair (per-edge, undirected) success breakdown for reporting.
+
+    Purely diagnostic — not used anywhere in reward/gradient computation.
+    Gives a pair-level view of sampling quality, since the combo-level
+    reward/``Avg Reward`` can look fine while individual pairs within a
+    multi-site combo are poorly resolved.
+
+    CHARMM's output only exposes per-pair *existence* of a valid DDG
+    (``SINGLE DDG`` — requires bidirectional lambda-space crossings for that
+    specific pair) plus a per-*site* (not per-pair) total transition count;
+    there is no true per-pair transition count to threshold directly. So
+    "crossed" combines the most granular signal available for a single pair
+    (its own DDG being finite) with the combo's total transition count
+    meeting ``min_transitions`` as a sanity floor.
+
+    A pair is graded on two independent criteria:
+      - ``crossed``:  per-pair DDG is finite AND total_transitions >= min_transitions.
+      - ``balanced``: population split isn't heavily pinned to one substituent
+                      (``minority_frac >= balance_threshold``).
+
+    Args:
+        edge_index: [2, E] node-index tensor (directed; each undirected pair
+            counted once via the ``src < dst`` row).
+        ddg_pairs: dict from simulation_results 'ddg_pairs': {"blk_i_blk_j": float|None}.
+        populations: list of raw highest-lambda population counts per block.
+        total_transitions: combo-level total lambda-space crossings (sum of
+            per-site transition counts).
+        min_transitions: threshold for the "crossed" criterion (default 3).
+        balance_threshold: minimum minority-substituent occupancy fraction
+            for the "balanced" criterion (default 0.1).
+        block_offset: integer offset from node index to block ID (default 2).
+
+    Returns:
+        Dict with integer counts: ``total`` (undirected pairs), ``crossed``,
+        ``balanced``, ``both`` (crossed AND balanced).
+    """
+    counts = {'total': 0, 'crossed': 0, 'balanced': 0, 'both': 0}
+    for k in range(edge_index.size(1)):
+        src = int(edge_index[0, k].item())
+        dst = int(edge_index[1, k].item())
+        if src >= dst:
+            continue  # count each undirected pair once
+        lo, hi = src + block_offset, dst + block_offset
+        entry = ddg_pairs.get(f"{lo}_{hi}")
+        pair_has_ddg = entry is not None and not (
+            isinstance(entry, float) and (math.isinf(entry) or math.isnan(entry))
+        )
+        crossed = pair_has_ddg and total_transitions >= min_transitions
+
+        pop_i = populations[src] if src < len(populations) else 0
+        pop_j = populations[dst] if dst < len(populations) else 0
+        minority_frac = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)
+        balanced = minority_frac >= balance_threshold
+
+        counts['total'] += 1
+        if crossed:
+            counts['crossed'] += 1
+        if balanced:
+            counts['balanced'] += 1
+        if crossed and balanced:
+            counts['both'] += 1
+    return counts
+
+
 def load_bandit_state(path: Path) -> Dict[str, Dict]:
     """Load the per-combo NeuralLinear+TS bookkeeping state (retries/deferrals).
 
@@ -428,6 +502,8 @@ def select_combos_by_uncertainty(
     bandit_state: Dict[str, Dict],
     device: str,
     build_graph_fn,
+    ensure_dir_fn=None,
+    min_per_system: int = 0,
 ) -> List[str]:
     """Rank candidate combos by predictive uncertainty and return the top ``n_select``.
 
@@ -436,7 +512,10 @@ def select_combos_by_uncertainty(
     expected to have already applied the simulator-tractability gate (the
     existing curriculum/transition filters) to *candidates* — this function only
     ranks within whatever pool it's given, plus the deferred-backfill fallback
-    below.
+    below. Callers should also cap the size of *candidates* themselves (scoring
+    a combo costs the same as training on it — a full Uni-Mol embedding build —
+    so ranking an entire multi-hundred-thousand-combo curriculum pool every
+    epoch is not tractable).
 
     Args:
         candidates: Combo path strings to rank (already curriculum/transition
@@ -452,13 +531,30 @@ def select_combos_by_uncertainty(
             (data, extras)`` — injected rather than imported directly to avoid a
             circular import with ``training/workflow.py`` (typically
             ``build_graph_and_data``).
+        ensure_dir_fn: Optional callable ``(combo_path: Path, sys_cfg, config,
+            verbose: bool) -> Path`` (typically ``ensure_combo_dir_exists``
+            pre-bound to a metadata lookup for *candidates*). Combo
+            directories are created lazily, so most of a large curriculum pool
+            has never been materialized on disk — omitting this means nearly
+            every such candidate fails ``build_graph_fn`` with a caught
+            ``FileNotFoundError`` and is silently excluded from ranking
+            (this was the cause of an epoch selecting far fewer than
+            ``n_select`` combos after a restart).
+        min_per_system: If > 0, guarantee each system contributes at least
+            this many of its own highest-uncertainty combos before the
+            remaining slots are filled by global uncertainty rank. Pure
+            global top-K otherwise silently starves out systems whose
+            combos happen to score lower variance (e.g. small manifests, or
+            feature directions the trunk already represents well) in favor
+            of whichever systems dominate the candidate pool by count —
+            observed in practice as "exploration" converging onto a handful
+            of systems while others are never selected.
 
     Returns:
-        List of up to ``n_select`` combo path strings, highest predictive
-        variance first. If fewer than ``n_select`` non-deferred candidates are
-        eligible, backfills from the deferred pool (oldest-first by failure
-        count) and logs how many were backfilled rather than silently
-        truncating the epoch's combo pool.
+        List of up to ``n_select`` combo path strings. If fewer than
+        ``n_select`` non-deferred candidates are eligible, backfills from the
+        deferred pool (oldest-first by failure count) and logs how many were
+        backfilled rather than silently truncating the epoch's combo pool.
     """
     eligible = [c for c in candidates if not bandit_state.get(c, {}).get('deferred', False)]
     deferred = [c for c in candidates if bandit_state.get(c, {}).get('deferred', False)]
@@ -469,20 +565,47 @@ def select_combos_by_uncertainty(
         for combo_dir in eligible:
             sys_cfg = combo_system_map.get(combo_dir, {})
             try:
-                data, _ = build_graph_fn(combo_dir, sys_cfg, config, device)
+                combo_path = Path(combo_dir)
+                if ensure_dir_fn is not None:
+                    resolved_path = ensure_dir_fn(combo_path, sys_cfg, config, False)
+                    if str(resolved_path) != combo_dir and sys_cfg:
+                        combo_system_map[str(resolved_path)] = sys_cfg
+                    combo_path = resolved_path
+                data, _ = build_graph_fn(str(combo_path), sys_cfg, config, device)
                 _, var = policy.predict_uncertainty(data.x, data.edge_index, data.edge_type)
                 score = float(var.mean().item())
             except Exception:
                 n_skipped += 1
                 continue
-            scored.append((score, combo_dir))
+            scored.append((score, str(combo_path)))
 
     if n_skipped:
         print(f"  select_combos_by_uncertainty: {n_skipped}/{len(eligible)} candidates "
               f"could not be scored (graph build failed) — excluded from ranking")
 
     scored.sort(key=lambda t: t[0], reverse=True)
-    selected = [c for _, c in scored[:n_select]]
+
+    if min_per_system > 0:
+        by_system: Dict[str, List[str]] = {}
+        for _, combo_dir in scored:
+            sys_name = combo_system_map.get(combo_dir, {}).get('name', 'unknown')
+            by_system.setdefault(sys_name, []).append(combo_dir)
+        selected: List[str] = []
+        selected_set = set()
+        for combo_list in by_system.values():
+            for combo_dir in combo_list[:min_per_system]:
+                if combo_dir not in selected_set:
+                    selected.append(combo_dir)
+                    selected_set.add(combo_dir)
+        for _, combo_dir in scored:
+            if len(selected) >= n_select:
+                break
+            if combo_dir not in selected_set:
+                selected.append(combo_dir)
+                selected_set.add(combo_dir)
+        selected = selected[:n_select]
+    else:
+        selected = [c for _, c in scored[:n_select]]
 
     if len(selected) < n_select and deferred:
         n_backfill = min(n_select - len(selected), len(deferred))

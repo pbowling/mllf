@@ -48,15 +48,16 @@ Usage (with unrelaxed structures):
 import argparse
 import collections
 import csv
+import json
 import math
 import random
 import re
+import sys
 import threading
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
-import json
 import yaml
 
 import torch
@@ -2064,6 +2065,7 @@ def pretrain_epoch(
     baseline_mean: Optional[torch.Tensor] = None,
     baseline_std: Optional[torch.Tensor] = None,
     success_floor: Optional[float] = None,
+    system_emphasis: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Run one behavior cloning AWR epoch for UnimolPolicy with optional pairwise weighting.
     
@@ -2097,6 +2099,10 @@ def pretrain_epoch(
         success_floor: Optional floor to clamp the per-pair advantage from below (mirrors
                         ``reward.success_advantage_floor`` in online training), so a single
                         badly-scored pair can't dominate the run's loss.
+        system_emphasis: Optional {system_name_substring: weight} dict to up-weight
+                        specific (typically under-represented) systems' runs, matched
+                        case-insensitively against each run's 'system_label'. See
+                        ``pretrain_with_runs`` for how this combines with reward_weighted.
     
     Returns:
         Dict with 'loss', 'num_runs', 'num_updates' keys
@@ -2122,6 +2128,29 @@ def pretrain_epoch(
             norm_weights = None
     else:
         norm_weights = None
+
+    # Per-system emphasis: up-weight runs from named (typically under-
+    # represented) systems so they drive proportionally more gradient and get
+    # fit more accurately, independent of reward_weighted. Matched by
+    # case-insensitive substring against each run's 'system_label' (set in
+    # main() from the --pretraining-dir basename). Combined multiplicatively
+    # with the reward-based weight above, then renormalised to mean=1.0 so
+    # the effective learning rate stays comparable to an unweighted epoch.
+    if system_emphasis:
+        base_w = norm_weights if norm_weights is not None else [1.0] * len(runs)
+        emphasis_w = []
+        for run in runs:
+            label = run.get('system_label', '').lower()
+            w = 1.0
+            for pattern, weight in system_emphasis.items():
+                if pattern.lower() in label:
+                    w = weight
+                    break
+            emphasis_w.append(w)
+        combined = [b * e for b, e in zip(base_w, emphasis_w)]
+        total_c = sum(combined)
+        if total_c > 1e-10:
+            norm_weights = [c * len(runs) / total_c for c in combined]
 
     epoch_loss = 0.0
     num_updates = 0
@@ -2734,6 +2763,8 @@ def pretrain_with_runs(
     use_per_pair_awr: bool = True,
     bayesian_heads: bool = False,
     bayesian_prior_precision: float = 1.0,
+    exploration_fraction: float = 0.3,
+    system_emphasis: Optional[Dict[str, float]] = None,
 ):
     """Run policy pretraining with provided runs.
     
@@ -2781,6 +2812,22 @@ def pretrain_with_runs(
                         or the original deterministic checkpoints at all.
         bayesian_prior_precision: Prior precision for each BayesianLinearHead
                         when bayesian_heads=True. Unused otherwise.
+        exploration_fraction: Target Thompson-sampling exploration variance
+                        (physical bias-coefficient units) as a fraction of
+                        the real physical residual variance for that
+                        dimension — see
+                        ``initialize_bayesian_heads_from_pretrained``. Only
+                        used when bayesian_heads=True. Raise (e.g. 0.5-1.0)
+                        for visibly more exploration in online NeuralLinear+TS
+                        training; lower to hew closer to the deterministic
+                        prediction.
+        system_emphasis: Optional {system_name_substring: weight} dict, matched
+                        case-insensitively against each run's originating
+                        --pretraining-dir basename, to up-weight specific
+                        (typically under-represented) systems' contribution to
+                        the BC loss so they get fit more accurately. See
+                        ``pretrain_epoch`` for how this combines with
+                        reward_weighted.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3472,6 +3519,7 @@ def pretrain_with_runs(
             baseline_mean=baseline_mean,
             baseline_std=baseline_std,
             success_floor=success_floor,
+            system_emphasis=system_emphasis,
         )
 
         print(f"  AWR Loss: {stats['loss']:.4f}")
@@ -3530,7 +3578,8 @@ def pretrain_with_runs(
             def _save_bayesian_sibling(det_policy, out_path, extra_ckpt_fields):
                 bayes_policy = initialize_bayesian_heads_from_pretrained(
                     det_policy, bayesian_prior_precision=bayesian_prior_precision,
-                    graph_cache=graph_cache, device=device)
+                    graph_cache=graph_cache, device=device,
+                    exploration_fraction=exploration_fraction)
                 for d, sigma2 in enumerate(noise_vars):
                     bayes_policy.edge_mlp.mlps[d].bayesian_head.set_noise_var(sigma2)
                 ckpt = {'policy_state': bayes_policy.state_dict(), 'noise_var': noise_vars}
@@ -3606,8 +3655,14 @@ def main():
         "--pretraining-dir",
         type=str,
         action='append',
-        required=True,
-        help="Directory containing collected pretraining data (can specify multiple times)",
+        default=None,
+        help="Directory containing collected pretraining data (can specify multiple times). Mutually exclusive with --manifest-file.",
+    )
+    parser.add_argument(
+        "--manifest-file",
+        type=str,
+        default=None,
+        help="Path to a JSON manifest file containing a list of pretraining directories. One directory path per line, or a JSON object with 'directories' key. Use this instead of --pretraining-dir when you have too many directories (avoids 'Argument list too long' error).",
     )
     parser.add_argument(
         "--output-dir",
@@ -3749,22 +3804,104 @@ def main():
              "when --bayesian-heads is set. Higher = stronger shrinkage "
              "toward zero and lower initial posterior variance. Default: 1.0.",
     )
+    parser.add_argument(
+        "--exploration-fraction",
+        type=float,
+        default=0.3,
+        help="Target Thompson-sampling exploration variance (physical bias-"
+             "coefficient units) as a fraction of the real physical residual "
+             "variance for each dimension, when --bayesian-heads is set. "
+             "Raise (e.g. 0.5-1.0) for more exploration in online "
+             "NeuralLinear+TS training. Default: 0.3.",
+    )
+    parser.add_argument(
+        "--emphasize-systems",
+        type=str,
+        action='append',
+        default=None,
+        metavar="NAME:WEIGHT",
+        help="Up-weight a system's runs in the BC loss so it gets fit more "
+             "accurately despite having few samples, e.g. "
+             "--emphasize-systems luis_tyk2_solvent:5.0. Matched by "
+             "case-insensitive substring against the --pretraining-dir "
+             "basename. Repeat the flag to emphasize multiple systems.",
+    )
     args = parser.parse_args()
     
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
+    # Determine which directories to load from: manifest file or command-line args
+    pretraining_dirs = []
+    if args.manifest_file:
+        if args.pretraining_dir:
+            print("Error: Cannot specify both --manifest-file and --pretraining-dir")
+            sys.exit(1)
+        print(f"\nLoading pretraining directories from manifest: {args.manifest_file}")
+        try:
+            with open(args.manifest_file, 'r') as f:
+                content = f.read().strip()
+            
+            # Try to parse as JSON first
+            try:
+                manifest_data = json.loads(content)
+                if isinstance(manifest_data, dict) and 'directories' in manifest_data:
+                    pretraining_dirs = manifest_data['directories']
+                elif isinstance(manifest_data, list):
+                    pretraining_dirs = manifest_data
+                else:
+                    print(f"Error: Manifest file must contain a 'directories' key or be a JSON array")
+                    sys.exit(1)
+            except json.JSONDecodeError:
+                # Fall back to line-separated format
+                pretraining_dirs = [line.strip() for line in content.split('\n') if line.strip()]
+            
+            print(f"  Found {len(pretraining_dirs)} directories in manifest")
+        except FileNotFoundError:
+            print(f"Error: Manifest file not found: {args.manifest_file}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error reading manifest file: {e}")
+            sys.exit(1)
+    elif args.pretraining_dir:
+        pretraining_dirs = args.pretraining_dir
+    else:
+        print("Error: Must specify either --pretraining-dir or --manifest-file")
+        sys.exit(1)
+    
     # Combine runs from all pretraining directories
     all_runs = []
-    for pretrain_dir_str in args.pretraining_dir:
+    for pretrain_dir_str in pretraining_dirs:
         pretrain_dir = Path(pretrain_dir_str)
         print(f"\nLoading from {pretrain_dir}...")
         runs = load_pretraining_runs(pretrain_dir)
         print(f"  Loaded {len(runs)} runs")
+        # Tag each run with its originating system (basename of the
+        # --pretraining-dir passed in, unwrapping one level for comb_* dirs)
+        # so --emphasize-systems can match against it.
+        system_label = pretrain_dir.name
+        if system_label.startswith('comb_'):
+            system_label = pretrain_dir.parent.name
+        for run in runs:
+            run['system_label'] = system_label
         all_runs.extend(runs)
     
     print(f"\nTotal runs from all directories: {len(all_runs)}")
+
+    system_emphasis = {}
+    if args.emphasize_systems:
+        for entry in args.emphasize_systems:
+            name, sep, weight_str = entry.rpartition(':')
+            if not sep:
+                print(f"  Warning: --emphasize-systems entry '{entry}' missing ':WEIGHT' — skipping")
+                continue
+            try:
+                system_emphasis[name] = float(weight_str)
+            except ValueError:
+                print(f"  Warning: --emphasize-systems entry '{entry}' has non-numeric weight — skipping")
+        if system_emphasis:
+            print(f"System emphasis weights: {system_emphasis}")
     
     # Run pretraining with combined runs
     pretrain_with_runs(
@@ -3788,6 +3925,8 @@ def main():
         use_per_pair_awr=not args.no_per_pair_awr,  # Default to True (per-pair enabled)
         bayesian_heads=args.bayesian_heads,
         bayesian_prior_precision=args.bayesian_prior_precision,
+        exploration_fraction=args.exploration_fraction,
+        system_emphasis=system_emphasis or None,
     )
 
 

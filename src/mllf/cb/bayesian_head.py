@@ -94,13 +94,23 @@ class BayesianLinearHead(nn.Module):
         var = torch.einsum('nd,de,ne->n', z, self.Lambda_inv, z) + self.noise_var
         return mean, var
 
-    def sample_weights(self) -> torch.Tensor:
+    def sample_weights(self, exploration_scale: float = 1.0) -> torch.Tensor:
         """Draw one weight sample from the current posterior (Thompson sampling).
 
+        Args:
+            exploration_scale: Multiplies the sampled deviation from ``mu``
+                (``w = mu + exploration_scale * L @ eps``). 1.0 reproduces
+                standard Thompson sampling from the calibrated posterior;
+                raise (e.g. 2-4) to force wider exploration around the
+                posterior mean without changing the posterior itself — useful
+                when the posterior has already narrowed (from pretraining
+                calibration or accumulated online observations) more than
+                desired for continued exploration.
+
         Returns:
-            ``[feat_dim + 1]`` sample ``w ~ N(mu, Lambda_inv)`` (last entry is
-            the intercept; combine with :meth:`_augment`-ed features, or use
-            ``w[:-1] @ z + w[-1]`` directly).
+            ``[feat_dim + 1]`` sample ``w ~ N(mu, exploration_scale^2 * Lambda_inv)``
+            (last entry is the intercept; combine with :meth:`_augment`-ed
+            features, or use ``w[:-1] @ z + w[-1]`` directly).
         """
         D = self._D
         cov = self.Lambda_inv + self.jitter * torch.eye(D, device=self.Lambda_inv.device,
@@ -114,7 +124,7 @@ class BayesianLinearHead(nn.Module):
                 D, device=cov.device, dtype=cov.dtype)
             L = torch.linalg.cholesky(cov)
         eps = torch.randn(D, device=self.mu.device, dtype=self.mu.dtype)
-        return self.mu + L @ eps
+        return self.mu + exploration_scale * (L @ eps)
 
     def act(self, z: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Apply a (possibly sampled) weight vector to un-augmented features.

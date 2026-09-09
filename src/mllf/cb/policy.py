@@ -625,7 +625,8 @@ class UnimolPolicy(nn.Module):
     def get_actions_thompson(self, unimol_embeddings: torch.Tensor,
                              edge_index: torch.LongTensor,
                              edge_type: Optional[torch.Tensor] = None,
-                             deterministic: bool = False) -> tuple:
+                             deterministic: bool = False,
+                             exploration_scale: float = 1.0) -> tuple:
         """Sample actions via Thompson sampling from each bias head's posterior.
 
         One weight vector is sampled per bias type per call (i.e. one Thompson
@@ -640,6 +641,12 @@ class UnimolPolicy(nn.Module):
                 default) distinction.
             deterministic: If True, use the posterior mean ``mu`` instead of a
                 sample (no exploration — for eval/replay).
+            exploration_scale: Passed to ``BayesianLinearHead.sample_weights``
+                (see its docstring) — a runtime multiplier on Thompson-sample
+                spread around the posterior mean, independent of the
+                posterior's own (pretraining-calibrated or online-narrowed)
+                covariance. 1.0 = standard Thompson sampling. Unused when
+                ``deterministic=True``.
 
         Returns:
             actions: [E, mlp_out_dim] bias coefficients, in the same physical
@@ -666,7 +673,7 @@ class UnimolPolicy(nn.Module):
             for d in range(D):
                 head = self.edge_mlp.mlps[d].bayesian_head
                 z_d = z[:, d, :]
-                w = head.mu if deterministic else head.sample_weights()
+                w = head.mu if deterministic else head.sample_weights(exploration_scale)
                 actions[:, d] = self._preact_to_action(head.act(z_d, w), d)
                 mean_raw, var[:, d] = head.predict(z_d)
                 mean[:, d] = self._preact_to_action(mean_raw, d)
@@ -680,7 +687,7 @@ class UnimolPolicy(nn.Module):
                     continue
                 head = self.edge_mlp.mlps[d].bayesian_head
                 z_d = z[mask]
-                w = head.mu if deterministic else head.sample_weights()
+                w = head.mu if deterministic else head.sample_weights(exploration_scale)
                 actions[mask, d] = self._preact_to_action(head.act(z_d, w), d)
                 m_d, v_d = head.predict(z_d)
                 mean[mask] = self._preact_to_action(m_d, d)
