@@ -15,6 +15,8 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import re
+import yaml
 import torch
 
 from mllf.cli.collect_pretraining_data import (
@@ -22,6 +24,8 @@ from mllf.cli.collect_pretraining_data import (
     parse_bias_from_py,
     parse_bias_from_inp,
     detect_solvent_state,
+    fix_inp_nonlinear_signs,
+    backfill_barrier_pairs,
 )
 from mllf.cb.pretrain_policy import filter_best_runs_per_system
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
@@ -236,6 +240,29 @@ class TestParseBiasFromInp:
         assert len(c) == n * n
         assert all(len(row) == n * n for row in c)
 
+    def test_nonlinear_signs_match_matrix_convention(self, tmp_path):
+        """Flat cs/xs/ss values are -matrix (ALF convention); lams is b unchanged.
+
+        Mirrors an ALF variablesflat.py that stores both forms:
+        c[0][1] = +19.53 with cs1s1s1s2 = -19.53, x[0][1] = -0.49 with
+        xs1s1s1s2 = +0.49, x[1][0] = +1.60 with xs1s2s1s1 = -1.60,
+        s[0][1] = +1.11 with ss1s1s1s2 = -1.11, b[1] = lams1s2 = -7.94.
+        """
+        f = tmp_path / 'variables.inp'
+        f.write_text('\n'.join([
+            'set lams1s1 = 0.00', 'set lams1s2 = -7.94',
+            'set cs1s1s1s2 = -19.53',
+            'set xs1s1s1s2 = 0.49', 'set xs1s2s1s1 = -1.60',
+            'set ss1s1s1s2 = -1.11', 'set ss1s2s1s1 = 0.25',
+        ]) + '\n')
+        r = parse_bias_from_inp(f)
+        assert r['b'] == pytest.approx([0.0, -7.94])
+        assert r['c'][0][1] == pytest.approx(19.53)
+        assert r['x'][0][1] == pytest.approx(-0.49)
+        assert r['x'][1][0] == pytest.approx(1.60)
+        assert r['s'][0][1] == pytest.approx(1.11)
+        assert r['s'][1][0] == pytest.approx(-0.25)
+
     def test_parses_real_example_inp(self):
         """Parses the checked-in tests/fixtures/variables85.inp."""
         example = Path(__file__).parent / 'samples' / 'variables85.inp'
@@ -244,6 +271,109 @@ class TestParseBiasFromInp:
         result = parse_bias_from_inp(example)
         assert 'b' in result
         assert len(result['b']) > 0
+
+
+class TestFixInpNonlinearSigns:
+    """fix_inp_nonlinear_signs: repair runs collected from .inp before the sign fix."""
+
+    @staticmethod
+    def _make_run(root, name, source_files, c01, x01, x10, s01, b1=-3.0):
+        source = root / 'sources' / name
+        source.mkdir(parents=True)
+        for fn in source_files:
+            (source / fn).write_text('set lams1s1 = 0.00\n')
+        run = root / 'pretraining' / name
+        run.mkdir(parents=True)
+        (run / 'metadata.json').write_text(json.dumps({'source_run_dir': str(source)}))
+        bias = {'b': [0.0, b1], 'c': [[0.0, c01], [0.0, 0.0]],
+                'x': [[0.0, x01], [x10, 0.0]], 's': [[0.0, s01], [0.0, 0.0]]}
+        (run / 'variables.py').write_text(
+            '"""Auto-generated variables file for pretraining data."""\nimport yaml\n\n'
+            f'bias_string = """\n{yaml.dump(bias, sort_keys=False).strip()}\n"""\n\n'
+            'bias = yaml.safe_load(bias_string)\n')
+        return run
+
+    @staticmethod
+    def _bias(run):
+        text = (run / 'variables.py').read_text()
+        return yaml.safe_load(re.search(r'bias_string\s*=\s*"""(.*?)"""', text, re.S).group(1))
+
+    def test_inp_sourced_run_is_negated_once(self, tmp_path):
+        run = self._make_run(tmp_path, 'inp_run', ['variablesflat.inp'], -19.5, 0.5, -1.6, -1.1)
+        assert fix_inp_nonlinear_signs(tmp_path / 'pretraining') == (1, 0, 0)
+        b = self._bias(run)
+        assert b['c'][0][1] == pytest.approx(19.5)
+        assert b['x'][0][1] == pytest.approx(-0.5) and b['x'][1][0] == pytest.approx(1.6)
+        assert b['s'][0][1] == pytest.approx(1.1)
+        assert b['b'] == pytest.approx([0.0, -3.0])          # linear bias untouched
+        assert b['_nonlinear_sign_convention'] == 'matrix'
+        # rerunning does not flip it back
+        assert fix_inp_nonlinear_signs(tmp_path / 'pretraining') == (0, 1, 0)
+        assert self._bias(run)['c'][0][1] == pytest.approx(19.5)
+
+    def test_py_sourced_run_untouched(self, tmp_path):
+        run = self._make_run(tmp_path, 'py_run', ['variablesflat.py', 'variables3.inp'], 19.5, -0.5, 1.6, 1.1)
+        before = (run / 'variables.py').read_text()
+        assert fix_inp_nonlinear_signs(tmp_path / 'pretraining') == (0, 1, 0)
+        assert (run / 'variables.py').read_text() == before
+
+    def test_missing_source_reported_not_changed(self, tmp_path):
+        run = self._make_run(tmp_path, 'gone', [], 19.5, -0.5, 1.6, 1.1)
+        before = (run / 'variables.py').read_text()
+        assert fix_inp_nonlinear_signs(tmp_path / 'pretraining') == (0, 0, 1)
+        assert (run / 'variables.py').read_text() == before
+
+    def test_dry_run_writes_nothing(self, tmp_path):
+        run = self._make_run(tmp_path, 'inp_run', ['variables5.inp'], -19.5, 0.5, -1.6, -1.1)
+        before = (run / 'variables.py').read_text()
+        assert fix_inp_nonlinear_signs(tmp_path / 'pretraining', dry_run=True) == (1, 0, 0)
+        assert (run / 'variables.py').read_text() == before
+
+    def test_new_inp_collections_are_marked(self, tmp_path):
+        f = tmp_path / 'variables.inp'
+        f.write_text('set lams1s1 = 0.00\nset lams1s2 = -1.00\nset cs1s1s1s2 = -5.00\n')
+        assert parse_bias_from_inp(f)['_nonlinear_sign_convention'] == 'matrix'
+
+
+class TestBackfillLambdaProfile:
+    """backfill_barrier_pairs: add barrier/skew/end to existing simulation_results.json."""
+
+    @staticmethod
+    def _output_text():
+        rows = ([[1.0, 0.0]] * 400 + [[0.97, 0.03]] * 40 + [[0.7, 0.3]] * 20 + [[0.5, 0.5]] * 30
+                + [[0.3, 0.7]] * 20 + [[0.03, 0.97]] * 40 + [[0.0, 1.0]] * 400)
+        lines = [" LAMBDA.......TIME(ps).. .BLOCKS   2   THRU BLOCK    3"]
+        lines += [f"LAMBDA>  {0.02 * (i + 1):10.4f}  {a:.4f}  {b:.4f}" for i, (a, b) in enumerate(rows)]
+        lines += ["Temperature is:  298.150 K", "Site:     1", "SINGLE DDG>  2  3   0.0  0.0  -1.0  -1.0"]
+        return "\n".join(lines)
+
+    def _make(self, root):
+        with_out = root / 'sys' / 'comb_0001' / 'run_001'
+        no_out = root / 'sys' / 'comb_0001' / 'run_002'
+        for r in (with_out, no_out):
+            r.mkdir(parents=True)
+            (r / 'simulation_results.json').write_text(json.dumps({'ddg_pairs': {'2_3': -1.0}}))
+        (with_out / 'output.out').write_text(self._output_text())
+        return with_out, no_out
+
+    @pytest.mark.parametrize('workers', [1, 2])
+    def test_fills_fields_and_skips_missing_output(self, tmp_path, workers):
+        with_out, no_out = self._make(tmp_path)
+        assert backfill_barrier_pairs(tmp_path, workers=workers) == (1, 1)
+        sr = json.loads((with_out / 'simulation_results.json').read_text())
+        assert set(sr) >= {'barrier_pairs', 'skew_pairs', 'end_pairs'}
+        assert sr['barrier_pairs']['2_3'] is not None
+        assert sr['skew_pairs']['2_3'] == pytest.approx(0.0, abs=1e-9)   # symmetric profile
+        assert sr['end_pairs']['2_3'] == pytest.approx(0.0, abs=1e-9)
+        assert 'barrier_pairs' not in json.loads((no_out / 'simulation_results.json').read_text())
+        # second pass skips the run that already has the fields
+        assert backfill_barrier_pairs(tmp_path, workers=workers) == (0, 2)
+
+    def test_dry_run_writes_nothing(self, tmp_path):
+        with_out, _ = self._make(tmp_path)
+        before = (with_out / 'simulation_results.json').read_text()
+        assert backfill_barrier_pairs(tmp_path, dry_run=True)[0] == 1
+        assert (with_out / 'simulation_results.json').read_text() == before
 
 
 # ---------------------------------------------------------------------------

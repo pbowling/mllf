@@ -24,8 +24,14 @@ from mllf.file_handling.read_output import (
     parse_transitions_and_rates,
     terminated_normally,
     parse_single_ddg,
+    parse_pair_profile,
+    resolve_output_file,
 )
-from mllf.file_handling.read_bias_coeff import read_bias_coeff
+from mllf.file_handling.read_bias_coeff import (
+    FLAT_TO_MATRIX_NONLINEAR,
+    NONLINEAR_SIGN_KEY,
+    read_bias_coeff,
+)
 
 
 def find_run_directories(base_path: Path) -> List[Path]:
@@ -131,6 +137,14 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
     
     We need to convert these to matrix format for compatibility with the
     graph building code that expects c, x, s matrices.
+
+    Sign convention: the flat ``cs*``/``xs*``/``ss*`` values are what CHARMM
+    receives (``ldbv ... @coeff``), which is the NEGATIVE of the c/x/s matrix
+    convention used by ALF's variables*.py / variablesflat.py and by every
+    other pretraining ``variables.py`` (ALF writes both forms side by side,
+    e.g. matrix ``c[0][1] = +19.53`` with ``cs1s1s1s2 = -19.53``). The
+    nonlinear entries are therefore negated here; ``lams*`` (b) is stored
+    unchanged in both conventions.
     
     Args:
         variables_file: Path to variables*.inp file
@@ -203,7 +217,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             i = site_sub_to_idx.get((site1, sub1))
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
-                c_matrix[i][j] = float(value)
+                c_matrix[i][j] = FLAT_TO_MATRIX_NONLINEAR * float(value)
     
     # Fill x matrix from xs entries (skew coefficients)
     for key, value in old_data.get("xs", {}).items():
@@ -213,7 +227,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             i = site_sub_to_idx.get((site1, sub1))
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
-                x_matrix[i][j] = float(value)
+                x_matrix[i][j] = FLAT_TO_MATRIX_NONLINEAR * float(value)
                 # Note: x is typically asymmetric
     
     # Fill s matrix from ss entries (end-state coefficients)
@@ -225,7 +239,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             i = site_sub_to_idx.get((site1, sub1))
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
-                s_matrix[i][j] = float(value)
+                s_matrix[i][j] = FLAT_TO_MATRIX_NONLINEAR * float(value)
     
     return {
         "b": b_vector,
@@ -234,6 +248,9 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
         "s": s_matrix,
         # Topology metadata: not a bias coefficient, stripped before writing variables.py
         "_nsubs_per_site": [len(site_sub_counts[s]) for s in sorted(site_sub_counts.keys())],
+        # Marks c/x/s as already converted to the matrix convention, so
+        # fix_inp_nonlinear_signs() never flips this run again.
+        NONLINEAR_SIGN_KEY: "matrix",
     }
 
 
@@ -290,6 +307,9 @@ def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
     
     # Parse per-pair DDG data (NaN = no transitions between that pair)
     ddg_raw = parse_single_ddg(content)
+    # Per-pair barrier / skew / end signals from the lambda trajectory
+    # (quadratic, skew and end pair rewards)
+    profile = parse_pair_profile(content, pairs=list(ddg_raw.keys()))
 
     # Convert to JSON-serializable format (handles tuple/float keys)
     return {
@@ -298,7 +318,186 @@ def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
         'rates': convert_to_json_serializable(rates),
         'terminated_normally': terminated,
         'ddg_pairs': {f"{lo}_{hi}": val for (lo, hi), val in ddg_raw.items()},
+        **_profile_fields(profile),
     }
+
+
+PROFILE_FIELDS = (('barrier_pairs', 'barrier'), ('skew_pairs', 'skew'), ('end_pairs', 'end'),
+                  ('transition_pairs', 'transitions'))
+
+
+def _profile_fields(profile: Dict[Tuple[int, int], Dict[str, Optional[float]]]) -> Dict[str, Dict]:
+    """simulation_results.json fields: 'barrier_pairs', 'skew_pairs', 'end_pairs' and
+    'transition_pairs' (per-pair transitions at the λ ≥ 0.99 cutoff)."""
+    return {field: {f"{lo}_{hi}": vals[key] for (lo, hi), vals in profile.items()}
+            for field, key in PROFILE_FIELDS}
+
+
+def _backfill_profile_one(sim_path: Path, dry_run: bool, overwrite: bool) -> Tuple[str, str]:
+    """Backfill one run's λ-profile fields. Returns (status, message)."""
+    run_dir = sim_path.parent
+    try:
+        with open(sim_path) as f:
+            sim_results = json.load(f)
+    except (OSError, ValueError) as exc:
+        return 'error', f"unreadable {sim_path}: {exc}"
+    if all(field in sim_results for field, _ in PROFILE_FIELDS) and not overwrite:
+        return 'present', ''
+    output_file = resolve_output_file(run_dir)
+    if output_file is None:
+        return 'no_output', str(run_dir)
+    try:
+        content = output_file.read_text()
+        pairs = [tuple(int(v) for v in k.split('_')) for k in sim_results.get('ddg_pairs', {})] or None
+        fields = _profile_fields(parse_pair_profile(content, pairs=pairs))
+    except Exception as exc:
+        return 'error', f"could not parse lambda profile for {run_dir}: {exc}"
+    n_ok = sum(1 for v in fields['barrier_pairs'].values() if v is not None)
+    if not dry_run:
+        sim_results.update(fields)
+        with open(sim_path, 'w') as f:
+            json.dump(sim_results, f, indent=2)
+    return 'updated', f"{run_dir}: {n_ok}/{len(fields['barrier_pairs'])} pairs with a barrier"
+
+
+def _backfill_profile_task(args) -> Tuple[str, str]:
+    return _backfill_profile_one(*args)
+
+
+def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
+                           overwrite: bool = False, workers: int = 1) -> Tuple[int, int]:
+    """Add per-pair lambda-profile signals to existing simulation_results.json files.
+
+    Mirrors ``backfill_ddg_pairs``. Writes 'barrier_pairs', 'skew_pairs' and
+    'end_pairs' (``parse_pair_profile``) -- the quadratic, skew and end pair
+    reward signals; runs without them fall back to the legacy signals -- and
+    'transition_pairs' (per-pair transitions at the λ ≥ 0.99 cutoff). Reads
+    the run directory's own ``output.out`` when present, else the source run
+    named by metadata.json's ``source_run_dir`` (nothing is copied). Stores the
+    raw signals, not rewards, so reward targets/widths can change without a
+    new backfill.
+
+    Args:
+        pretraining_root: Root directory containing pretraining subdirectories.
+        dry_run: If True, report what would be done without modifying files.
+        overwrite: Recompute runs that already have all three fields.
+        workers: Parallel processes (each run writes only its own file).
+
+    Returns:
+        (n_updated, n_skipped) counts.
+    """
+    sim_results_files = sorted(pretraining_root.rglob('simulation_results.json'))
+    total = len(sim_results_files)
+    print(f"Found {total} simulation_results.json files under {pretraining_root}"
+          + (f" ({workers} workers)" if workers > 1 else ""), flush=True)
+
+    tasks = [(p, dry_run, overwrite) for p in sim_results_files]
+    counts = {'updated': 0, 'present': 0, 'no_output': 0, 'error': 0}
+    shown = {'updated': 0, 'no_output': 0, 'error': 0}
+    limits = {'updated': 10 if dry_run else 0, 'no_output': 10, 'error': 20}
+
+    def _consume(results):
+        for n, (status, msg) in enumerate(results, 1):
+            counts[status] += 1
+            if status in shown and shown[status] < limits[status]:
+                shown[status] += 1
+                prefix = {'updated': 'Would update', 'no_output': 'No output file for',
+                          'error': 'Warning:'}[status]
+                print(f"  {prefix} {msg}", flush=True)
+            if n % 1000 == 0:
+                print(f"  ... {n}/{total} runs checked", flush=True)
+
+    if workers > 1:
+        from multiprocessing import Pool
+        with Pool(workers) as pool:
+            _consume(pool.imap_unordered(_backfill_profile_task, tasks, chunksize=16))
+    else:
+        _consume(_backfill_profile_one(*t) for t in tasks)
+
+    n_skipped = counts['present'] + counts['no_output'] + counts['error']
+    verb = "would update" if dry_run else "updated"
+    print(f"\nLambda-profile backfill summary: {counts['updated']} {verb}, {counts['present']} already had "
+          f"the fields, {counts['no_output']} without an output file, {counts['error']} errors", flush=True)
+    return counts['updated'], n_skipped
+
+
+def _source_variables_format(run_dir: Path) -> Optional[str]:
+    """'py' or 'inp' for the variables file the collector would have read from
+    this run's source (``metadata.json`` → ``source_run_dir``), else None."""
+    metadata_path = run_dir / 'metadata.json'
+    if not metadata_path.exists():
+        return None
+    try:
+        source = json.loads(metadata_path.read_text()).get('source_run_dir')
+    except (OSError, ValueError):
+        return None
+    if not source or not Path(source).is_dir():
+        return None
+    source = Path(source)
+    # Same precedence as collect_run_data(): .py first, then .inp
+    if any(source.glob('variables*.py')):
+        return 'py'
+    if any(source.glob('variables*.inp')):
+        return 'inp'
+    return None
+
+
+def fix_inp_nonlinear_signs(pretraining_root: Path, dry_run: bool = False) -> Tuple[int, int, int]:
+    """Correct c/x/s signs in runs collected from variables*.inp before the fix.
+
+    ``parse_bias_from_inp`` used to copy the flat cs/xs/ss values straight into
+    the matrices, but those values are the negative of the matrix convention
+    that every ``.py``-derived run uses (see its docstring). Affected runs are
+    identified by their source: if ``source_run_dir`` has no variables*.py but
+    does have variables*.inp, the stored c/x/s are negated back and the file is
+    marked with ``_nonlinear_sign_convention: matrix``. Marked runs and
+    ``.py``-sourced runs are left untouched, so rerunning is safe. b is never
+    changed.
+
+    Returns:
+        (n_fixed, n_already_ok, n_unresolved) -- unresolved means the source
+        directory or its variables file could not be found.
+    """
+    n_fixed = n_ok = n_unresolved = 0
+    unresolved_examples: List[str] = []
+    var_files = sorted(pretraining_root.rglob('variables.py'))
+    print(f"Found {len(var_files)} variables.py files under {pretraining_root}")
+    for var_path in var_files:
+        run_dir = var_path.parent
+        text = var_path.read_text()
+        m = re.search(r'bias_string\s*=\s*"""(.*?)"""', text, re.DOTALL)
+        if not m:
+            continue
+        bias = yaml.safe_load(m.group(1))
+        if not isinstance(bias, dict) or bias.get(NONLINEAR_SIGN_KEY) == "matrix":
+            n_ok += 1
+            continue
+        fmt = _source_variables_format(run_dir)
+        if fmt == 'py':
+            n_ok += 1
+            continue
+        if fmt is None:
+            n_unresolved += 1
+            if len(unresolved_examples) < 5:
+                unresolved_examples.append(str(run_dir))
+            continue
+        for key in ('c', 'x', 's'):
+            if key in bias:
+                bias[key] = [[(-float(v) if float(v) != 0.0 else 0.0) for v in row] for row in bias[key]]
+        bias[NONLINEAR_SIGN_KEY] = "matrix"
+        if dry_run:
+            if n_fixed < 5:
+                print(f"  Would fix {run_dir}")
+        else:
+            bias_yaml = yaml.dump(bias, default_flow_style=False, sort_keys=False)
+            var_path.write_text(text[:m.start(1)] + "\n" + bias_yaml.strip() + "\n" + text[m.end(1):])
+        n_fixed += 1
+    verb = "would fix" if dry_run else "fixed"
+    print(f"\n.inp sign fix: {n_fixed} {verb}, {n_ok} already correct (.py source or marked), "
+          f"{n_unresolved} unresolved (no source dir/variables file)")
+    for ex in unresolved_examples:
+        print(f"  unresolved e.g. {ex}")
+    return n_fixed, n_ok, n_unresolved
 
 
 def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[int, int]:
@@ -908,9 +1107,65 @@ Examples:
         ),
     )
 
+    parser.add_argument(
+        '--backfill-barrier',
+        metavar='PRETRAINING_ROOT',
+        type=Path,
+        default=None,
+        help=(
+            'Backfill per-pair lambda-profile signals (barrier / skew / end: the '
+            'quadratic, skew and end pair rewards) into existing simulation_results.json '
+            "files under PRETRAINING_ROOT. Reads each run's output.out (or its "
+            'metadata.json source_run_dir). Pass --dry-run to preview without writing.'
+        ),
+    )
+
+    parser.add_argument(
+        '--fix-inp-signs',
+        metavar='PRETRAINING_ROOT',
+        type=Path,
+        default=None,
+        help=(
+            'Correct c/x/s signs in variables.py files collected from variables*.inp '
+            'sources before parse_bias_from_inp negated them (identified via '
+            "metadata.json source_run_dir). Safe to rerun. Pass --dry-run to preview."
+        ),
+    )
+
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        help='With --backfill-barrier: recompute runs that already have the λ-profile fields',
+    )
+
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=1,
+        metavar='N',
+        help='With --backfill-barrier: parallel worker processes (default 1)',
+    )
+
     args = parser.parse_args()
 
-    # --- Backfill mode: mutually exclusive with normal collection mode ---
+    # --- Maintenance modes: mutually exclusive with normal collection mode ---
+    if args.fix_inp_signs is not None:
+        root = args.fix_inp_signs.resolve()
+        if not root.exists():
+            print(f"Error: root does not exist: {root}")
+            return 1
+        fix_inp_nonlinear_signs(root, dry_run=args.dry_run)
+        return 0
+
+    if args.backfill_barrier is not None:
+        root = args.backfill_barrier.resolve()
+        if not root.exists():
+            print(f"Error: Backfill root does not exist: {root}")
+            return 1
+        backfill_barrier_pairs(root, dry_run=args.dry_run, overwrite=args.overwrite,
+                               workers=max(1, args.workers))
+        return 0
+
     if args.backfill_ddg is not None:
         root = args.backfill_ddg.resolve()
         if not root.exists():
@@ -921,9 +1176,9 @@ Examples:
 
     # Normal collection mode — base_path and --output-dir are required
     if args.base_path is None:
-        parser.error("base_path is required unless --backfill-ddg is specified")
+        parser.error("base_path is required unless a --backfill-*/--fix-inp-signs mode is specified")
     if args.output_dir is None:
-        parser.error("--output-dir is required unless --backfill-ddg is specified")
+        parser.error("--output-dir is required unless a --backfill-*/--fix-inp-signs mode is specified")
 
     base_path = args.base_path.resolve()
     if not base_path.exists():

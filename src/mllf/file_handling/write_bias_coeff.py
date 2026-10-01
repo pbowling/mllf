@@ -3,6 +3,10 @@
 This module provides helpers to write a simple `.inp` or `.py` file with lines of the
 form `set <param> = <value>` so the existing parser can read it back.
 
+Sign convention: flat ``cs*``/``xs*``/``ss*`` values (what CHARMM receives via
+``ldbv ... @coeff``) are the negatives of the c/x/s matrix / graph coefficients;
+``lams*`` equals b. Every conversion here goes through
+``read_bias_coeff.FLAT_TO_MATRIX_NONLINEAR``.
 """
 from __future__ import annotations
 
@@ -10,7 +14,12 @@ from typing import Union, Sequence, Optional
 import os
 import re
 
-from .read_bias_coeff import parse_old  # kept for tests/debug
+from .read_bias_coeff import (  # parse_old kept for tests/debug
+    FLAT_TO_MATRIX_LINEAR,
+    FLAT_TO_MATRIX_NONLINEAR,
+    NONLINEAR_SIGN_KEY,
+    parse_old,
+)
 
 
 def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequence[int]] = None,
@@ -18,6 +27,11 @@ def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequenc
     """Write a `.inp` file from a Graph instance.
 
     This writes single-sub (lams) and two-sub (cs) entries.
+
+    The graph's edge coefficients are in the matrix convention (what the policy
+    predicts). The flat ``cs``/``xs``/``ss`` values written here are what CHARMM
+    receives, so they are the NEGATIVE of the quadratic/skew/end coefficients;
+    ``lams`` keeps the linear value's sign (see FLAT_TO_MATRIX_NONLINEAR).
 
     Arguments:
         graph: instance with `num_nodes` and `edges` mapping (EdgeCoeffs dataclass)
@@ -44,6 +58,12 @@ def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequenc
         a, b = (i, j) if i < j else (j, i)
         e = graph.get_edge(a, b)
         return float(getattr(e, key, 0.0))
+
+    def flat_value(i: int, j: int, key: str) -> float:
+        """Edge coefficient converted to the flat CHARMM sign for cs/xs/ss."""
+        v = FLAT_TO_MATRIX_NONLINEAR * edge_coeff_key(i, j, key)
+        return v if v != 0.0 else 0.0   # avoid writing '-0.00000000'
+
 
     lines = []
 
@@ -88,7 +108,7 @@ def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequenc
             incident_vals.append(edge_coeff_key(i, j, "linear"))
         site_val = float(sum(incident_vals) / len(incident_vals)) if incident_vals else 0.0
         for s in range(1, sub_counts[i] + 1):
-            lines.append(f"set lams{i+1}s{s} = {site_val:12.8f}\n")
+            lines.append(f"set lams{i+1}s{s} = {FLAT_TO_MATRIX_LINEAR * site_val:12.8f}\n")
 
     # Pair biases: for each ordered pair of (site,sub) x (site2,sub2) excluding identical
     # site+sub, write cs/ss/xs using mapped edge coefficient components.
@@ -98,9 +118,9 @@ def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequenc
                 # all combinations for different sites
                 for sa in range(1, sub_counts[i] + 1):
                     for sb in range(1, sub_counts[j] + 1):
-                        cs_val = edge_coeff_key(i, j, mapping.get("cs", "quadratic"))
-                        ss_val = edge_coeff_key(i, j, mapping.get("ss", "end"))
-                        xs_val = edge_coeff_key(i, j, mapping.get("xs", "skew"))
+                        cs_val = flat_value(i, j, mapping.get("cs", "quadratic"))
+                        ss_val = flat_value(i, j, mapping.get("ss", "end"))
+                        xs_val = flat_value(i, j, mapping.get("xs", "skew"))
                         lines.append(f"set cs{i+1}s{sa}s{j+1}s{sb} = {cs_val:12.8f}\n")
                         # ss/xs forward
                         lines.append(f"set ss{i+1}s{sa}s{j+1}s{sb} = {ss_val:12.8f}\n")
@@ -112,9 +132,9 @@ def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequenc
                 # same site: only sa < sb (strict upper triangle)
                 for sa in range(1, sub_counts[i] + 1):
                     for sb in range(sa + 1, sub_counts[j] + 1):
-                        cs_val = edge_coeff_key(i, j, mapping.get("cs", "quadratic"))
-                        ss_val = edge_coeff_key(i, j, mapping.get("ss", "end"))
-                        xs_val = edge_coeff_key(i, j, mapping.get("xs", "skew"))
+                        cs_val = flat_value(i, j, mapping.get("cs", "quadratic"))
+                        ss_val = flat_value(i, j, mapping.get("ss", "end"))
+                        xs_val = flat_value(i, j, mapping.get("xs", "skew"))
                         lines.append(f"set cs{i+1}s{sa}s{j+1}s{sb} = {cs_val:12.8f}\n")
                         # ss/xs forward
                         lines.append(f"set ss{i+1}s{sa}s{j+1}s{sb} = {ss_val:12.8f}\n")
@@ -169,6 +189,12 @@ def write_variables_py_from_inp(inp_path: str, out_path: str):
     existing `parse_old` helper and writes out a small Python file containing
     scalar lines of the form `param: value` (one per line). A minimal
     `bias_string` is included to be compatible with existing templates.
+
+    Signs follow ALF's variablesflat.py layout: the ``b``/``c``/``x``/``s``
+    matrices are in the matrix convention (c/x/s = NEGATED flat cs/xs/ss, b =
+    lams), while the scalar ``lams``/``cs``/``xs``/``ss`` entries are copied as
+    written (flat CHARMM convention). The file is marked with
+    ``_nonlinear_sign_convention: matrix``.
     """
     if not os.path.exists(inp_path):
         raise FileNotFoundError(inp_path)
@@ -230,10 +256,11 @@ def write_variables_py_from_inp(inp_path: str, out_path: str):
     # build b vector (flattened lams in global order)
     b_vec = [0.0] * total_subs
     for (s, sub), g in global_index.items():
-        b_vec[g - 1] = float(lams_map.get(s, {}).get(sub, 0.0))
+        b_vec[g - 1] = FLAT_TO_MATRIX_LINEAR * float(lams_map.get(s, {}).get(sub, 0.0))
 
     # helper to initialize NxN matrix and fill from group dict by parsing keys
-    def build_matrix_from_group(group_dict):
+    def build_matrix_from_group(group_dict, sign):
+        """NxN matrix from flat cs/xs/ss entries, converted to the matrix convention."""
         mat = [[0.0 for _ in range(total_subs)] for _ in range(total_subs)]
         for k, v in group_dict.items():
             nums = re.findall(r"(\d+)", k)
@@ -242,18 +269,18 @@ def write_variables_py_from_inp(inp_path: str, out_path: str):
                 i = global_index.get((s1, a))
                 j = global_index.get((s2, b))
                 if i is not None and j is not None:
-                    mat[i - 1][j - 1] = float(v)
+                    mat[i - 1][j - 1] = (sign * float(v)) or 0.0
             elif len(nums) >= 2:
                 # fallback: treat as site/sub -> value mapping (diagonal)
                 s1 = int(nums[0]); a = int(nums[1])
                 i = global_index.get((s1, a))
                 if i is not None:
-                    mat[i - 1][i - 1] = float(v)
+                    mat[i - 1][i - 1] = (sign * float(v)) or 0.0
         return mat
 
-    c_mat = build_matrix_from_group(data.get('cs', {}))
-    x_mat = build_matrix_from_group(data.get('xs', {}))
-    s_mat = build_matrix_from_group(data.get('ss', {}))
+    c_mat = build_matrix_from_group(data.get('cs', {}), FLAT_TO_MATRIX_NONLINEAR)
+    x_mat = build_matrix_from_group(data.get('xs', {}), FLAT_TO_MATRIX_NONLINEAR)
+    s_mat = build_matrix_from_group(data.get('ss', {}), FLAT_TO_MATRIX_NONLINEAR)
 
     # Compose bias_string block with b (single row) and full NxN matrices for c/x/s
     bias_lines = ["bias_string=\"\"\"\n"]
@@ -280,9 +307,11 @@ def write_variables_py_from_inp(inp_path: str, out_path: str):
     bias_lines.extend(_mat_to_lines(x_mat))
     bias_lines.append("s:\n")
     bias_lines.extend(_mat_to_lines(s_mat))
+    bias_lines.append(f"{NONLINEAR_SIGN_KEY}: matrix\n")
 
 
-    # include textual scalar entries inside the bias_string (single copy)
+    # include textual scalar entries inside the bias_string (single copy),
+    # as written -- flat CHARMM convention, like ALF's variablesflat.py
     for group in ('lams', 'cs', 'xs', 'ss'):
         grp = data.get(group, {})
         if grp:
