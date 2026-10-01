@@ -424,6 +424,28 @@ class UnimolPolicy(nn.Module):
             torch.tensor([305.0, 520.0, 85.0, 30.0]),
             persistent=False,
         )
+
+        # Per-head log_std bounds, scaled relative to each head's own
+        # scale_factor rather than one absolute bound shared across all 4
+        # heads. The old shared bound (std clamped into [2e-9, 7.39] for
+        # every head) gave "end" (scale=30) a ceiling of ~25% of its range
+        # but "linear" (scale=305) only ~2.4% -- heads with a larger
+        # coefficient range had far less proportional room to explore even
+        # before considering collapse. Bounding std as a fraction of each
+        # head's own scale keeps the *proportional* exploration ceiling
+        # comparable across heads.
+        min_std_frac = 0.002
+        max_std_frac = 0.25
+        self.register_buffer(
+            'log_std_min',
+            torch.log(self.scale_factors * min_std_frac),
+            persistent=False,
+        )
+        self.register_buffer(
+            'log_std_max',
+            torch.log(self.scale_factors * max_std_frac),
+            persistent=False,
+        )
     
     def _build_edge_input(self, unimol_embeddings: torch.Tensor,
                           edge_index: torch.LongTensor) -> torch.Tensor:
@@ -486,7 +508,8 @@ class UnimolPolicy(nn.Module):
 
         Returns:
             mean: [E, mlp_out_dim] softsign-scaled bias coefficient means.
-            log_std: [E, mlp_out_dim] clamped log standard deviations.
+            log_std: [E, mlp_out_dim] log standard deviations, soft-bounded
+                per-head into (log_std_min, log_std_max).
         """
         edge_input = self._build_edge_input(unimol_embeddings, edge_index)
 
@@ -497,13 +520,25 @@ class UnimolPolicy(nn.Module):
         
         D = self.mlp_out_dim
         mean = out[:, :D]
-        log_std = out[:, D:2*D]
-        
+        log_std_raw = out[:, D:2*D]
+
         # Scale mean outputs using softsign (avoids saturation zone of tanh)
         mean = F.softsign(mean) * self.scale_factors.unsqueeze(0)
-        
-        # Clamp log_std: exp(-20) ≈ 2e-9, exp(2.0) ≈ 7.4
-        log_std = torch.clamp(log_std, min=-20.0, max=2.0)
+
+        # Soft, per-head-scaled bound instead of a hard clamp. A hard
+        # torch.clamp has exactly zero gradient outside its range, so once
+        # log_std_raw drifts past the boundary (e.g. during pretraining,
+        # for a head trained against a low-information reward proxy) no
+        # amount of further training can ever recover it -- observed in
+        # practice as the skew/end heads permanently pinned at std ~= 0
+        # from the very first checkpoint of an online REINFORCE run.
+        # sigmoid keeps a (shrinking but nonzero) gradient path open at
+        # every input value instead of a hard dead zone, and
+        # log_std_min/log_std_max are scaled per-head from scale_factors
+        # (see __init__) so all 4 heads get a comparable proportional
+        # exploration ceiling instead of one shared absolute std range.
+        log_std = self.log_std_min.unsqueeze(0) + \
+            (self.log_std_max - self.log_std_min).unsqueeze(0) * torch.sigmoid(log_std_raw)
 
         return mean, log_std
 
@@ -1054,3 +1089,75 @@ class UnimolPolicy(nn.Module):
 #                 rel_mask[bias_type == d, d] = True
 #             logp = logp * rel_mask.float()
 #         return logp, log_std
+
+
+class ContextBaseline(nn.Module):
+    """Learned, context-dependent REINFORCE baseline (per bias type, per system).
+
+    Replaces a single scalar-per-bias-type EMA baseline (see
+    ``training/workflow.py``'s ``ema_baseline`` / ``global_baseline``) with a
+    small regression head that predicts "typical reward for a context like
+    this" from the same per-head trunk features ``z`` the policy already
+    computes, concatenated with a learned embedding of *which system* this
+    edge belongs to.
+
+    Why this matters: a single pooled EMA baseline is blind to system
+    identity, so the same raw reward gets judged identically whether it came
+    from an intrinsically easy system or an intrinsically hard one -- an
+    action that's actually an improvement on a hard system can look "bad"
+    relative to the pooled average, and a mediocre action on an easy system
+    can look "good". Conditioning the baseline on system identity (and,
+    as training accumulates revisits, implicitly on the finer-grained
+    substituent-pair identity already encoded in ``z``) fixes the sign/
+    magnitude of that judgement without touching the reward function itself.
+
+    One independent small head per bias type, mirroring ``BiasHeadMLP``'s own
+    per-type independence -- each head sees only its own bias type's trunk
+    output, not the other three's.
+
+    Deliberately NOT sharing gradients with the policy's own trunk: callers
+    must pass an already-``.detach()``ed ``z`` (see ``UnimolPolicy.
+    forward_features``). This keeps the baseline's "predict typical reward"
+    objective from pulling on the same features the policy heads rely on for
+    "discriminate good actions from bad ones" -- a different, and for a
+    small per-epoch batch, easily conflicting objective.
+    """
+
+    def __init__(self, trunk_dim: int = 64, num_bias_types: int = 4,
+                 num_systems: int = 1, system_embed_dim: int = 8,
+                 hidden: int = 32):
+        super().__init__()
+        self.num_bias_types = int(num_bias_types)
+        self.system_embed = nn.Embedding(int(num_systems), int(system_embed_dim))
+        in_dim = trunk_dim + system_embed_dim
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_dim, hidden), nn.ReLU(),
+                nn.Linear(hidden, 1),
+            )
+            for _ in range(self.num_bias_types)
+        ])
+
+    def forward(self, z: torch.Tensor, system_ids: torch.Tensor) -> torch.Tensor:
+        """Predict typical reward per edge per bias type.
+
+        Args:
+            z: ``[E, D, trunk_dim]`` per-head trunk features (``D`` =
+                ``num_bias_types``) -- e.g. from ``UnimolPolicy.
+                forward_features(..., edge_type=None)``. Callers are
+                responsible for detaching this before passing it in if the
+                policy's own trunk should not receive gradient from the
+                baseline's loss (see class docstring).
+            system_ids: ``[E]`` long tensor, the same system index repeated
+                for every edge that came from one combo (all edges in a
+                combo share one system).
+
+        Returns:
+            ``[E, D]`` predicted "typical reward" per edge per bias type.
+        """
+        sys_emb = self.system_embed(system_ids)  # [E, embed_dim]
+        out = []
+        for d in range(self.num_bias_types):
+            inp = torch.cat([z[:, d, :], sys_emb], dim=-1)
+            out.append(self.heads[d](inp).squeeze(-1))
+        return torch.stack(out, dim=-1)  # [E, D]
