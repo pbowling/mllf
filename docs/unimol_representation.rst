@@ -12,12 +12,10 @@ substituent, ``mllf.cb.unimol_representation`` assembles a complete 3D ligand sy
 frozen, pretrained Uni-Mol model to obtain a 512-dimensional embedding. These embeddings
 are the node features consumed by ``UnimolPolicy`` (see :doc:`cb_setup`).
 
-This replaces an earlier, project-specific ``AtomBondGNN``/DeepSet pipeline that trained
-a dual-stream GINEConv autoencoder from scratch on AEV features. There is no longer a
-separate "pretrain the encoder" step: Uni-Mol is used off-the-shelf and never fine-tuned,
-so representation quality comes from the foundation model rather than from an in-repo
-training run. The behavior-cloning stage described in :doc:`cb_pretraining` trains only
-the downstream ``BiasHeadMLP`` weights on top of these fixed embeddings.
+Uni-Mol is used off-the-shelf and never fine-tuned, so representation quality comes from
+the foundation model rather than from any in-repo training run — there is no separate
+"pretrain the encoder" step. The behavior-cloning stage described in :doc:`cb_pretraining`
+trains only the downstream ``BiasHeadMLP`` weights on top of these fixed embeddings.
 
 Ligand Construction
 --------------------

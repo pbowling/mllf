@@ -19,14 +19,22 @@ Running the Workflow
 Basic Usage
 ~~~~~~~~~~~
 
-Online (REINFORCE) training is driven by a YAML configuration file and
-``examples/run_workflow.py`` — a tracked copy of the multi-system UniMol CB training driver:
+Online (REINFORCE) training is driven by a YAML configuration file. The driver itself is
+``mllf.cli.train_workflow`` — an importable library entry point, not a repo-local script —
+so it can be installed and reused outside this repository:
 
 .. code-block:: bash
 
    cd mllf   # repository root
-   python examples/run_workflow.py examples/workflow_14benz.yaml
-   python examples/run_workflow.py my_config.yaml  # Use a custom config
+   python -m mllf.cli.train_workflow examples/workflow_14benz.yaml
+   python -m mllf.cli.train_workflow my_config.yaml  # Use a custom config
+
+``training/workflow.py`` is a thin wrapper around the same entry point (kept so existing
+invocations and SLURM scripts that reference that path keep working):
+
+.. code-block:: bash
+
+   python training/workflow.py training/workflow_instructions.yaml
 
 See :doc:`examples` for a full walkthrough of the 1,4-benzene (14benz) example. Combination
 generation and manifest splitting can also be driven directly from
@@ -52,7 +60,8 @@ one shared policy across any number of systems simultaneously:
 * **bandit**: Optional NeuralLinear + Thompson Sampling configuration (see :doc:`cb_setup`)
 * **reward**: Reward function weights and thresholds
 * **output**: Checkpointing and output organization
-* **slurm**: Cluster submission settings (partition, gres, time, module)
+* **slurm**: Cluster submission settings (partition, gres, time, module) — see
+  :ref:`Launching Simulations` for which of these are optional
 * **archive**: Automatic compression of completed runs
 
 See the :ref:`Complete Configuration Example` for a full annotated YAML file.
@@ -282,12 +291,6 @@ handling used for solvated/crystal systems.
 
 The solvent state is also preserved in ``graph_info.json`` for metadata tracking.
 
-**Auto-Detection** (legacy):
-
-Previously, the system attempted to auto-detect solvent state from directory names
-(e.g., ``14benz_solv`` → ``solv``). This is now deprecated in favor of explicit 
-configuration for clarity and reliability.
-
 Reward Function
 ~~~~~~~~~~~~~~~
 
@@ -310,13 +313,8 @@ through multiple components:
 
 where :math:`coverage\_factor = \left(\frac{N_{\text{visited}}}{N_{\text{subs}}}\right)^2` is a smooth
 quadratic multiplier that scales all positive reward components by coverage. At 100% coverage it is 1.0;
-at 50% it is 0.25; at 0% it is 0.0. This replaces the earlier hard completeness gate
-(which clipped all positive reward to −0.01 when any substituent was unvisited) with a
-smooth gradient signal that rewards partial progress.
-
-This eliminates :math:`R_U` (the explicit uniformity term) and the adaptive
-coverage penalty :math:`P_{\text{cov}}` — both are now subsumed by
-:math:`coverage\_factor`.
+at 50% it is 0.25; at 0% it is 0.0 — a smooth gradient signal that rewards partial progress
+and subsumes any separate uniformity term or coverage penalty.
 
 **Population Balance Reward** :math:`R_P`:
 
@@ -337,8 +335,7 @@ where:
 
 The confidence factor scales population rewards based on data reliability, reducing
 false rewards from low-transition runs with unreliable population distributions.
-Within-visited uniformity is now captured entirely by :math:`R_{\text{entropy}}`
-(see below) rather than by the balance factor :math:`e^{-CV}` which has been removed.
+Within-visited uniformity is captured by :math:`R_{\text{entropy}}` (see below).
 
 **Transition Reward** :math:`R_T`:
 
@@ -415,37 +412,54 @@ Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0
    reward:
      w_P: 0.5                                # Population weight
      w_T: 0.75                               # Transition weight
-     w_U: 0.3                                # Accepted for API compatibility; coverage handled by coverage_factor
+     w_U: 0.3                                # accepted but unused; coverage handled by coverage_factor
      gamma: 4.0                              # Base penalty coefficient
      P_baseline: 500.0                       # Population normalization
      T_baseline: 50.0                        # Transition normalization
      min_transitions_per_site: 10            # Tier 3 threshold
-     min_coverage_ratio: 0.5                 # Accepted for API compatibility; coverage handled by coverage_factor
+     min_coverage_ratio: 0.5                 # accepted but unused; coverage handled by coverage_factor
      entropy_bonus: 8.0                      # Entropy bonus coefficient
      concentration_penalty_threshold: 0.8    # Single-substituent dominance threshold
+     barrier_target: 1.2                     # Optional: quadratic pair reward peaks at this midpoint barrier (kcal/mol)
+     barrier_width: 1.29                     # Optional: Gaussian width of that reward (kcal/mol)
+     skew_width: 0.78                        # Optional: width of the skew pair reward (skew asymmetry, target 0)
+     end_width: 0.58                         # Optional: width of the end pair reward (end asymmetry, target 0)
 
 **Policy Gradient Training**:
 
-The policy is optimized using **REINFORCE** with per-edge per-dimension reward signals
-(or, with ``bandit.algorithm: neurallinear_ts`` in the config, by folding rewards directly
-into each head's Bayesian posterior instead — see :doc:`cb_setup`). ``UnimolPolicy`` samples
-bias coefficients from independent Gaussian distributions (one per bias type per edge), runs
-the MSLD simulation, and then updates weights by maximising the log-probability of actions
-that produced positive rewards. Each ``BiasHeadMLP`` receives gradient only from the reward
-dimension that corresponds to its bias type, providing clean per-type credit assignment
-without a value network or Q-critic.
-
-For architectural details on the policy network and per-dimension reward signals, see :doc:`cb_setup`.
+The policy is optimized with **REINFORCE** (or, with ``bandit.algorithm: neurallinear_ts``
+in the config, by folding rewards into each head's Bayesian posterior instead). See
+:doc:`cb_setup` for the policy network, the per-edge per-dimension reward, and the optimizer
+step.
 
 Simulation Execution
 --------------------
 
+.. _Launching Simulations:
+
 Launching Simulations
 ~~~~~~~~~~~~~~~~~~~~~
 
-Simulations are launched via subprocess, running CHARMM with bias coefficients 
-written to ``variables.py`` from the policy's sampled actions. The simulator 
+Simulations are launched via subprocess, running CHARMM with bias coefficients
+written to ``variables.py`` from the policy's sampled actions. The simulator
 outputs transition counts and population distributions for reward computation.
+
+Online training (``mllf.cli.train_workflow`` / ``mllf.cli.slurm.submit_epoch_simulation``)
+submits one SLURM job per combo per epoch. Every cluster-specific detail comes from the
+config's ``slurm:`` block, and nothing about it is hardcoded to any particular cluster's
+resource names:
+
+* ``partition``: passed as ``#SBATCH -p``. Omit it to let your cluster's/account's default
+  partition apply.
+* ``gres``: passed as ``#SBATCH --gres``. Omit it for a CPU-only cluster — no GPU is
+  requested.
+* ``time``: passed as ``#SBATCH --time``. Defaults to ``01:00:00`` if the whole ``slurm:``
+  block is omitted; override this if a simulation needs more (or less) wall time.
+* ``module``: passed to ``module load``. Omit it if your cluster doesn't use an
+  environment-modules system, or if the simulator is already on ``PATH``.
+
+An empty (or absent) ``slurm:`` block still produces a valid, runnable script — it just
+omits the directives you didn't set.
 
 Output Parsing
 ~~~~~~~~~~~~~~
@@ -656,7 +670,6 @@ Training Flow Example
    --- Epoch 1/150 - Stage 1/3: pairs_single_site_easy (epoch 1/50) ---
    Epoch 1 Stats:
      Loss: 12.3456
-     Value Loss: 45.6789
      Avg Reward: -28.5432
    
    [... epochs 2-50 ...]
@@ -876,19 +889,22 @@ Complete Workflow Example
 Full Pipeline Script
 ~~~~~~~~~~~~~~~~~~~~
 
-The main online-training workflow is implemented in ``examples/run_workflow.py``:
+The main online-training workflow is implemented in ``mllf.cli.train_workflow``
+(``run_training``), invoked either as a module or via the ``training/workflow.py`` wrapper:
 
 .. code-block:: bash
 
    cd mllf   # repository root
-   python examples/run_workflow.py examples/workflow_14benz.yaml
+   python -m mllf.cli.train_workflow examples/workflow_14benz.yaml
 
 This executes:
 
 1. Combination manifest generation for every system in ``systems:`` (parallelized across
    systems; large combo pools are handled separately from small ones to avoid OOM)
 2. Curriculum stage setup and held-out validation split (if ``validation_fraction > 0`` and
-   enough combos are available)
+   enough combos are available). To reuse another run's held-out set exactly, set
+   ``validation_combos_file`` to its ``validation_combos.json``. The seeded split picks
+   by index, so it changes whenever the combo pool changes.
 3. Policy initialization (``UnimolPolicy``, optionally with Bayesian heads)
 4. Checkpoint detection and resume, or warm start from ``pretrain.model_path``
 5. Training loop: per epoch, sample/filter combos, compute Uni-Mol embeddings, sample
@@ -956,6 +972,8 @@ here — see the file itself for full inline documentation):
    max_concurrent_jobs: 10
    timeout: 1200
 
+   # All four keys are optional (see below); only `time` has a generic
+   # default (01:00:00) if the block is omitted entirely.
    slurm:
      partition: gpu
      gres: gpu:1

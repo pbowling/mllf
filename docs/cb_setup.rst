@@ -24,9 +24,7 @@ graph encoder**:
    the node embeddings are combined into a 1024D edge input and passed to four completely
    independent ``BiasHeadMLP`` networks (one per MSLD bias type: linear, quadratic, skew,
    end), each producing a ``(mean, log_std)`` pair. There is no shared trunk across bias
-   types and no intermediate graph convolution — this eliminates the RGCN encoder and
-   AtomBondGNN/DeepSet pretraining stage used by earlier versions of this framework (see
-   :doc:`unimol_representation` for that history).
+   types, no graph encoder, and no intermediate graph convolution.
 
 .. _Architecture Diagram:
 
@@ -77,10 +75,10 @@ graph encoder**:
    ║      all 4 dims = -1.0                                                  ║
    ║  Visited pair:                                                           ║
    ║    dim 0 (linear):    minority_frac = min(p_i,p_j)/(p_i+p_j) ∈ [0,0.5] ║
-   ║    dim 1 (quadratic): (pair_visited + trans_quality) / 2   ∈ [0.5,1.0] ║
-   ║    dim 2 (skew):      combined population/quality proxy                ║
-   ║    dim 3 (end):       fraction-physical-ligand proxy (or combined       ║
-   ║                       fallback if not available)                        ║
+   ║    dim 1 (quadratic): barrier_quality(midpoint barrier)    ∈ [0.5,1.0] ║
+   ║    dim 2 (skew):      gaussian_quality(skew asymmetry, 0)  ∈ [0.5,1.0] ║
+   ║    dim 3 (end):       gaussian_quality(end asymmetry, 0)   ∈ [0.5,1.0] ║
+   ║                       (legacy proxies when no λ trajectory)             ║
    ║                                                                          ║
    ║  policy_loss = -∑_e R[e, :] · logp_e[:]     each head trained only on   ║
    ║                                              its own reward dimension    ║
@@ -114,13 +112,15 @@ graph construction passes ``edge_type=None`` and lets every ``BiasHeadMLP`` proc
 edge — there is no per-relation-type edge subset to route).
 
 .. note::
-   An older, sparser graph construction still exists in the codebase
-   (``mllf.cb.graph_utils.build_pyg_graph_from_mllf_graph``) that expands each undirected
-   pair into up to eight *relation-typed* directed edges (``linear_fwd``/``bwd``,
-   ``quadratic_fwd``/``bwd``, etc.) and routes each edge to a single ``BiasHeadMLP`` via
-   ``edge_type // 2``. This is used by the legacy, encoder-agnostic ``EdgePolicy`` class
-   (paired with ``mllf.cli.workflow.build_data_and_targets_from_combo``) for callers that
-   supply their own node encoder. Current examples do not use this path.
+   An alternative, sparser graph construction is also available
+   (``mllf.cb.graph_utils.build_pyg_graph_from_mllf_graph``, with manually engineered atom
+   type/charge features from ``mllf.cb.atom_vocab`` and no Uni-Mol embeddings): it expands
+   each undirected pair into up to eight *relation-typed* directed edges
+   (``linear_fwd``/``bwd``, ``quadratic_fwd``/``bwd``, etc.) and routes each edge to a
+   single ``BiasHeadMLP`` via ``edge_type // 2``. It pairs with the encoder-agnostic
+   ``EdgePolicy`` class (and ``mllf.cli.workflow.build_data_and_targets_from_combo``) for
+   callers that supply their own node encoder or lack PDB coordinates. The examples and
+   production training use the Uni-Mol path above, not this one.
 
 **Bias Types**:
 
@@ -162,15 +162,8 @@ For each combination directory, graph construction:
 ``protein``, or ``gas``/``vacuum``) controls what — if anything — is included as
 environment atoms during embedding computation (protein atoms, solvent atoms, or none).
 See :doc:`unimol_representation` for the full fallback chain and periodic-boundary
-handling. This eliminates the need for explicit environment flags as node features — the
-environmental information is implicitly encoded in the embeddings themselves.
-
-**Legacy RTF-Only Construction**: graphs can also be built directly from RTF topology
-fragments without Uni-Mol embeddings, using manually engineered features (atom type/element
-counts, charge) via ``build_pyg_graph_from_mllf_graph`` and ``mllf.cb.atom_vocab``. This
-path is what feeds the legacy ``EdgePolicy``/relation-typed-edge pipeline described above,
-and remains available for systems where PDB coordinates are unavailable, but Uni-Mol-based
-``UnimolPolicy`` is what production training uses.
+handling. Because the environment is baked into the embedding, no explicit environment
+flags are needed as node features.
 
 Policy Network Architecture
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -207,10 +200,11 @@ networks, one per MSLD bias type. Each head owns its entire feature-extraction s
        — or —
        BayesianLinearHead(64 → 1)       → (posterior mean, 0.5·log(var))     [NeuralLinear mode]
 
-``EdgeValueMLP`` holds all four heads. When ``edge_type`` is supplied (the legacy
-relation-typed path), each edge is routed to exactly one head via ``edge_type // 2``; when
-``edge_type`` is ``None`` (the current fully-connected pairwise scheme), every head
-processes every edge and the results are stacked into one ``[E, 4]`` mean/log-std tensor —
+``EdgeValueMLP`` holds all four heads. When ``edge_type`` is supplied (the relation-typed
+path noted under `Graph Representation`_), each edge is routed to exactly one head via
+``edge_type // 2``; when ``edge_type`` is ``None`` (the fully-connected pairwise scheme the
+examples use), every head processes every edge and the results are stacked into one
+``[E, 4]`` mean/log-std tensor —
 credit assignment per bias type then comes entirely from ``compute_pair_reward``'s
 per-dimension reward (see `Training and Optimization`_), not from edge masking.
 
@@ -255,6 +249,58 @@ curriculum sampling. A deterministic pretrained policy can be converted to a Bay
 sibling via ``pretrain_policy.py --bayesian-heads`` (see :doc:`cb_pretraining`), which
 warm-starts each posterior mean from the trained deterministic readout.
 
+**Hindsight targets** (``bandit.update_target: hindsight``, :mod:`mllf.cb.hindsight`): by
+default (``awr``) the posterior regresses toward the action each run sampled, weighted by
+``exp(r/β)``. A scalar reward says whether a run's biases were good, but not which way
+they were off or by how much. Because the samples sit around the current mean, the
+update also barely moves the posterior. With ``hindsight``, each run is relabelled with
+the biases it *measured* it should have used, and the linear and quadratic heads regress
+toward those:
+
+* linear, directed edge :math:`(i \to j)`:
+  :math:`\Delta b^* = \Delta b - kT \ln(p_j / p_i)`. When one substituent is unsampled,
+  this is a capped step toward it.
+* quadratic: :math:`c^* = c + (B - B_0)/|s_c|`, from the pair's midpoint barrier
+  :math:`B`, where :math:`s_c` is the barrier's response to c from the pretraining
+  bias-sensitivity analysis.
+
+Iterative flattening methods also correct biases from each simulation. Those
+corrections apply only to the system being simulated, so every new system starts from
+scratch. This implementation differs in three ways:
+
+* **Transfer.** The corrected targets train a shared model conditioned on the
+  substituents' Uni-Mol embeddings, not the biases of one system. What is learned on
+  one pair improves the first guess for pairs and systems that have never been
+  simulated.
+* **Calibrated weighting.** Each target enters the Bayesian posterior with its own
+  measurement variance: the number of crossings for b, barrier scatter for c, and a term
+  that grows with the size of the linearized step. Well-measured runs count for more
+  than noisy ones, with no fixed per-coefficient regularization.
+* **Active selection.** The posterior's epistemic uncertainty chooses which pairs to
+  simulate next, so simulations go where the model knows least.
+
+Each step is still capped (``hindsight_linear_step_cap``,
+``hindsight_quadratic_step_cap``), because the linearized responses hold only near
+sensible biases. Skew and end keep the AWR target.
+
+With ``bandit.pair_offsets: true``, each training pair's last ``offset_history`` targets
+are stored in ``bandit_state.json`` under its original site/sub numbers. Its next
+proposal combines them with the model prediction, which acts as a Bayesian prior of sd
+``offset_prior_sd``: a pair the model already predicts well moves little, and one it
+predicts poorly is corrected from its own data without distorting the shared model. The
+shared model carries what generalizes; the offsets hold what is specific to a pair.
+Validation passes never apply offsets, so they measure the shared model alone.
+
+**Uncertainty-driven selection with plain REINFORCE**: ``bandit.selection: uncertainty``
+also works without ``neurallinear_ts`` — ``select_combos_by_uncertainty`` accepts a
+``score_fn`` and defaults to ``action_std_score`` for any other ``bandit.algorithm``, which
+ranks candidate combos by the policy's own mean action std (``exp(log_std)``) instead of a
+Bayesian posterior variance. This needs no extra model state, but it is *not* epistemic
+uncertainty — ``log_std`` is a learned exploration parameter, so it measures how much the
+policy is currently exploring a combo rather than how much it would learn from it. Default
+remains ``random`` (stratified/uniform combo sampling) for REINFORCE; both strategies have
+merit and the choice is left to the config.
+
 Training and Optimization
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -280,17 +326,58 @@ For visited pairs:
 
 * **dim 0 (linear)**: ``minority_frac`` = :math:`\min(p_i, p_j)/(p_i + p_j)` ∈ [0, 0.5] —
   rewards population balance
-* **dim 1 (quadratic)**: ``(pair_visited + trans_quality) / 2`` ∈ [0.5, 1.0], where
-  ``trans_quality = min(total_transitions, T_baseline) / T_baseline`` — rewards barrier
-  removal via per-pair DDG existence plus a combo-level transition-count quality signal
-* **dim 2 (skew)**: the mean of the (normalized) population-balance and quadratic-quality
-  signals above — a combined proxy, since no simulation observable yet isolates barrier
-  asymmetry specifically
-* **dim 3 (end)**: ``min(1.0, fraction_physical × total_pairs)`` — the combo-level
-  "fraction physical ligand" diagnostic (fraction of the trajectory in a fully-resolved,
-  single-substituent-per-site state) scaled by the combo's substituent-pair count so combos
-  of different sizes are graded comparably; falls back to the dim-2 ``combined`` proxy when
-  the diagnostic wasn't parsed (e.g. older cached results)
+* **dim 1 (quadratic)**: ``barrier_quality(barrier)`` =
+  :math:`0.5 + 0.5\exp[-\tfrac{1}{2}((B - B_0)/\sigma)^2]` ∈ [0.5, 1.0], where
+  :math:`B` is the pair's biased midpoint free-energy barrier from the λ trajectory,
+
+  .. math::
+
+     B = G(\lambda \approx 0.5) - \tfrac{1}{2}\left[G(\lambda \approx 0) + G(\lambda \approx 1)\right],
+     \qquad G = -kT \ln P(\lambda)
+
+  (``parse_pair_barriers`` in ``mllf.file_handling.read_output``; for 3+ substituents,
+  frames on the pair's edge of the simplex). The quadratic term contributes
+  :math:`-c\,\lambda_i\lambda_j`, which is zero at both endpoints and :math:`-c/4` at the
+  midpoint, so :math:`B` moves by :math:`-c/4` per unit :math:`c`, while the linear bias
+  cancels between the midpoint and the mean of the endpoints. The signal is therefore
+  per-pair and specific to the quadratic coefficient, and two-sided: an over-flattened
+  barrier (run stuck at intermediate λ) and a too-high barrier (few crossings) both score
+  lower. :math:`B_0` / :math:`\sigma` are ``reward.barrier_target`` /
+  ``reward.barrier_width`` (defaults ``BARRIER_TARGET`` / ``BARRIER_WIDTH`` in
+  ``workflow_utils``, set from ``pretraining/1_analysis_scripts/analyze_bias_sensitivity.py``).
+  When no barrier is available (outputs without a λ trajectory, or cached results /
+  ``simulation_results.json`` files without ``barrier_pairs``), falls back to the legacy
+  ``(pair_visited + trans_quality) / 2`` with
+  ``trans_quality = min(total_transitions, T_baseline) / T_baseline``
+* **dim 2 (skew)** and **dim 3 (end)**: ``gaussian_quality(v, 0, σ)`` ∈ [0.5, 1.0], where
+  :math:`v` is an *asymmetry of the biased* λ profile along the pair's edge — what remains
+  after the biases have (or have not) cancelled the physical surface's asymmetry. The
+  physical surface is not symmetric; that is why the skew and end coefficients exist. The
+  target 0 means they have cancelled it, so the simulation samples a profile that is
+  symmetric in that respect (runs whose sampled profile kept less asymmetry succeed more
+  often, across 26 systems). Both come from ``parse_pair_profile``, with
+  :math:`r = \lambda_{hi}/(\lambda_{lo}+\lambda_{hi})` and :math:`G = -kT\ln` (density):
+
+  - **end** = :math:`K_{hi} - K_{lo}`, each endpoint's sharpness
+    :math:`K = G(\text{near-end shoulder}) - G(\text{endpoint core})` ([0.95, 0.99) vs
+    ≥ 0.99, and [0.01, 0.05) vs < 0.01). The end term :math:`s_{ij}` peaks within a few
+    percent of an endpoint and vanishes at it, so :math:`K_{hi}` moves ≈ −0.44 per unit
+    ``s[lo][hi]`` and :math:`K_{lo}` ≈ −0.46 per unit ``s[hi][lo]`` (``x`` leaks ≈ 0.09;
+    b, c ≈ 0).
+  - **skew** = :math:`[G(r{\approx}0.7) - G(r{\approx}0.3)] - 0.4\,\text{tilt} - 0.687\,\text{end}`.
+    The skew term ``x[lo][hi]`` is a broad hump peaking near :math:`r \approx 0.7`
+    (``x[hi][lo]`` near 0.3), so the flank difference tracks ``x[lo][hi] − x[hi][lo]``
+    (≈ ∓0.19 per unit); subtracting the linear tilt removes b, and 0.687·end removes the end
+    terms' reach into the flanks (residual ≈ 0.01 per unit ``s``).
+
+  Widths ``reward.skew_width`` / ``reward.end_width`` (defaults ``SKEW_WIDTH`` = 0.78 and
+  ``END_WIDTH`` = 0.58 kcal/mol) put the reward at 0.75 where P(success) halves in a pooled
+  fit. Both directed edges of a pair get the same value (the reward uses the magnitude).
+  Fallbacks when no λ-profile signal is available: skew → the mean of the normalized
+  population-balance signal and the legacy transition-based quality signal (``combined``);
+  end → ``min(1.0, fraction_physical × total_pairs)``, else ``combined``. (The fraction
+  physical ligand is mostly set by the barrier, i.e. by c, which is why the end asymmetry
+  replaced it.)
 
 Edges whose pair had no observed λ-space transition at all (as opposed to a *finite* DDG)
 can additionally be down-weighted via ``build_edge_weights`` /

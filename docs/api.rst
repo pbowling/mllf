@@ -65,3 +65,10 @@ For detailed documentation on the workflow system, see :doc:`workflow`.
    mllf.cli.workflow
    mllf.cli.sim
    mllf.cb.workflow_utils
+   mllf.cli.train_workflow
+   mllf.cb.reinforce_trainer
+   mllf.cb.graph_build
+   mllf.cb.hindsight
+   mllf.cb.curriculum
+   mllf.cli.slurm
+   mllf.file_handling.manifests
