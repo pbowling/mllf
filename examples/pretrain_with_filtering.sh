@@ -46,6 +46,11 @@
 # To tune AWR temperature (higher → more uniform, lower → sharper emphasis; default 1.0):
 #   sbatch --export=ALL,AWR_TEMPERATURE=0.5 pretrain_with_filtering.sh
 #
+# To up-weight specific under-represented systems so the BC loss fits them more
+# accurately (space-separated NAME:WEIGHT entries, matched by substring against
+# each --pretraining-dir basename):
+#   sbatch --export=ALL,EMPHASIZE_SYSTEMS="luis_tyk2_solvent:5.0 luis_thrombin_solvent:5.0" pretrain_with_filtering.sh
+#
 # To also produce a NeuralLinear + Thompson Sampling checkpoint (best_policy_bayesian.pt /
 # final_policy_bayesian.pt) alongside the normal deterministic one, for use with
 # training/workflow_instructions_neurallinear_ts.yaml (bandit.algorithm: neurallinear_ts):
@@ -55,6 +60,14 @@
 #
 # To disable stratified sampling and fall back to reward threshold filtering:
 #   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=0 pretrain_with_filtering.sh
+#
+# Data hygiene (default on; DATA_HYGIENE=false to disable): each pair's target
+# for each bias type counts only when the run measured what sets it (linear:
+# both substituents sampled with a finite pair DDG; quadratic: midpoint
+# barrier; skew/end: the lambda profile's skew/end asymmetry), and runs without
+# usable populations contribute nothing. Runs that never sampled a pair add no
+# weight for it, so run-level filters are unnecessary. To train on all runs:
+#   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=none pretrain_with_filtering.sh
 #
 # Default excluded datasets (EXCLUDE_DATASETS):
 #   14benz_pair_combos  - combo structure handled separately; exclude from normal scan
@@ -120,6 +133,9 @@ USE_PER_PAIR_AWR="${USE_PER_PAIR_AWR:-true}"
 AWR_TEMPERATURE="${AWR_TEMPERATURE:-1.0}"
 BAYESIAN_HEADS="${BAYESIAN_HEADS:-false}"
 BAYESIAN_PRIOR_PRECISION="${BAYESIAN_PRIOR_PRECISION:-1.0}"
+EMPHASIZE_SYSTEMS="${EMPHASIZE_SYSTEMS:-}"
+DATA_HYGIENE="${DATA_HYGIENE:-true}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 
 echo "Configuration:"
 echo "  Config file: $CONFIG_FILE"
@@ -127,7 +143,8 @@ echo "  Output dir: $OUTPUT_DIR"
 echo "  Epochs: $EPOCHS"
 echo "  Learning rate: $LEARNING_RATE"
 echo "  Outlier threshold: ${OUTLIER_THRESHOLD}σ"
-echo "  Reward threshold: >= $REWARD_THRESHOLD"
+echo "  Reward threshold: $([ "$REWARD_THRESHOLD" = "none" ] && echo "none" || echo ">= $REWARD_THRESHOLD")"
+echo "  Data hygiene: $([ "$DATA_HYGIENE" = "false" ] && echo "disabled" || echo "ENABLED")"
 echo "  Filtering enabled: $([ "$NO_FILTER" = "false" ] && echo "yes" || echo "no")"
 echo "  Use best only: $([ "$USE_BEST_ONLY" = "true" ] && echo "yes" || echo "no")"
 if [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
@@ -144,6 +161,9 @@ echo "  Early stopping patience: $PATIENCE epochs"
 echo "  Per-pair AWR: $([ "$USE_PER_PAIR_AWR" = "true" ] && echo "ENABLED" || echo "disabled")"
 echo "  AWR temperature: $AWR_TEMPERATURE"
 echo "  NeuralLinear+TS Bayesian-head checkpoint: $([ "$BAYESIAN_HEADS" = "true" ] && echo "ENABLED (prior_precision=$BAYESIAN_PRIOR_PRECISION)" || echo "disabled")"
+if [ -n "$EMPHASIZE_SYSTEMS" ]; then
+    echo "  System emphasis: $EMPHASIZE_SYSTEMS"
+fi
 
 # Find pretraining directory
 PRETRAIN_DIR=""
@@ -171,7 +191,7 @@ echo ""
 # (at any depth) and add each. If a system has no combos, add the system directory itself.
 total_systems=0
 total_runs_available=0
-pretrain_dirs=""
+manifest_dirs=()
 
 for dataset_dir in "$PRETRAIN_DIR"/*/; do
     if [ ! -d "$dataset_dir" ]; then
@@ -183,7 +203,8 @@ for dataset_dir in "$PRETRAIN_DIR"/*/; do
     # Skip special output directories
     if [ "$dataset_name" = "deepset_pretraining_output" ] \
     || [ "$dataset_name" = "atombondgnn_training_output" ] \
-    || [ "$dataset_name" = "1_analysis_scripts" ]; then
+    || [ "$dataset_name" = "1_analysis_scripts" ] \
+    || [ "$dataset_name" = "embeddings_cache" ]; then
         continue
     fi
 
@@ -218,7 +239,7 @@ for dataset_dir in "$PRETRAIN_DIR"/*/; do
                 total_systems=$((total_systems + 1))
                 total_runs_available=$((total_runs_available + run_count))
                 echo "      $comb_name: $run_count runs"
-                pretrain_dirs="$pretrain_dirs --pretraining-dir $comb_dir"
+                manifest_dirs+=("$comb_dir")
             fi
         done <<< "$comb_dirs"
         
@@ -229,7 +250,7 @@ for dataset_dir in "$PRETRAIN_DIR"/*/; do
             total_systems=$((total_systems + 1))
             total_runs_available=$((total_runs_available + direct_run_dirs))
             echo "      [direct runs]: $direct_run_dirs runs"
-            pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
+            manifest_dirs+=("$dataset_dir")
         fi
     else
         # This system has no combo directories, check for direct runs
@@ -238,7 +259,7 @@ for dataset_dir in "$PRETRAIN_DIR"/*/; do
             total_systems=$((total_systems + 1))
             total_runs_available=$((total_runs_available + run_count))
             echo "  - $dataset_name: $run_count runs"
-            pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
+            manifest_dirs+=("$dataset_dir")
         fi
     fi
 done
@@ -247,11 +268,35 @@ echo ""
 echo "Total: $total_systems systems, $total_runs_available runs available"
 echo ""
 
-if [ -z "$pretrain_dirs" ]; then
+if [ ${#manifest_dirs[@]} -eq 0 ]; then
     echo "Error: No pretraining directories found"
     exit 1
 fi
 
+# Create manifest file to avoid "Argument list too long" error
+MANIFEST_FILE="$OUTPUT_DIR/pretraining_manifest.json"
+mkdir -p "$OUTPUT_DIR"
+
+# Write directories to temp file (avoids passing huge array to Python)
+TMPFILE=$(mktemp)
+for dir in "${manifest_dirs[@]}"; do
+    echo "$dir" >> "$TMPFILE"
+done
+
+# Convert temp file to JSON manifest using Python
+python3 << PYTHONEOF
+import json
+with open('$TMPFILE') as f:
+    dirs = [line.strip() for line in f if line.strip()]
+with open('$MANIFEST_FILE', 'w') as f:
+    json.dump({'directories': dirs}, f, indent=2)
+print(f'Manifest file created: $MANIFEST_FILE')
+print(f'Directories in manifest: {len(dirs)}')
+PYTHONEOF
+
+rm "$TMPFILE"
+
+echo ""
 echo "========================================="
 echo "Starting Pretraining"
 echo "========================================="
@@ -259,7 +304,7 @@ echo ""
 
 # Build command with optional flags
 CMD="python -u -m mllf.cb.pretrain_policy \
-    $pretrain_dirs \
+    --manifest-file $MANIFEST_FILE \
     --output-dir $OUTPUT_DIR \
     --config $CONFIG_FILE \
     --epochs $EPOCHS \
@@ -281,7 +326,7 @@ if [ -n "$MIN_TRANSITIONS" ] && [ "$MIN_TRANSITIONS" != "0" ]; then
 elif [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
     CMD="$CMD --stratified-negative-fraction $STRATIFIED_FRACTION"
     echo "Stratified negative sampling: ENABLED (max ${STRATIFIED_FRACTION}, quadratic ramp)"
-elif [ -n "$REWARD_THRESHOLD" ]; then
+elif [ -n "$REWARD_THRESHOLD" ] && [ "$REWARD_THRESHOLD" != "none" ]; then
     CMD="$CMD --min-reward-threshold $REWARD_THRESHOLD"
     echo "Reward filtering: ENABLED (>= $REWARD_THRESHOLD)"
 else
@@ -306,6 +351,22 @@ if [ "$REWARD_WEIGHTED" = "true" ]; then
     echo "Reward-weighted loss: ENABLED"
 fi
 
+# Resume an interrupted run (same settings and OUTPUT_DIR) from its
+# checkpoint_epoch_NNN.pt, e.g. after hitting the wall time:
+#   sbatch --export=ALL,RESUME_CHECKPOINT=models/<run>/checkpoint_epoch_047.pt pretrain_wUnimol.sh
+if [ -n "$RESUME_CHECKPOINT" ]; then
+    CMD="$CMD --resume-checkpoint $RESUME_CHECKPOINT"
+    echo "Resuming from: $RESUME_CHECKPOINT"
+fi
+
+# Data hygiene (per-pair, per-bias-type measured-target mask)
+if [ "$DATA_HYGIENE" = "false" ]; then
+    CMD="$CMD --no-data-hygiene"
+    echo "Data hygiene: DISABLED (every target of every run counts)"
+else
+    echo "Data hygiene: ENABLED (targets count only where the run measured them)"
+fi
+
 # Add per-pair AWR control
 if [ "$USE_PER_PAIR_AWR" = "false" ]; then
     CMD="$CMD --no-per-pair-awr"
@@ -323,6 +384,14 @@ fi
 if [ "$BAYESIAN_HEADS" = "true" ]; then
     CMD="$CMD --bayesian-heads --bayesian-prior-precision $BAYESIAN_PRIOR_PRECISION"
     echo "NeuralLinear+TS: ENABLED (will also save best_policy_bayesian.pt / final_policy_bayesian.pt)"
+fi
+
+# Add per-system emphasis weighting (one --emphasize-systems flag per entry)
+if [ -n "$EMPHASIZE_SYSTEMS" ]; then
+    for entry in $EMPHASIZE_SYSTEMS; do
+        CMD="$CMD --emphasize-systems $entry"
+    done
+    echo "System emphasis: ENABLED ($EMPHASIZE_SYSTEMS)"
 fi
 
 echo ""

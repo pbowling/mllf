@@ -33,8 +33,10 @@ Pretraining is invoked via ``mllf.cb.pretrain_policy``'s CLI:
 one training set. Key flags (all optional, sensible defaults shown):
 
 * ``--use-best-only`` — keep only the highest-reward run per system (default: use all valid runs)
+* ``--no-data-hygiene`` — disable the per-pair, per-bias-type measured-target mask (see
+  "Data Hygiene" below; on by default)
 * ``--no-per-pair-awr`` — disable per-pair AWR weighting and fall back to one scalar weight
-  per run (see "Per-Pair AWR Weighting" above; per-pair is the default)
+  per run (see "Per-Pair AWR Weighting" below; per-pair is the default)
 * ``--awr-temperature`` (default 0.5) — AWR temperature :math:`\beta`
 * ``--min-transitions N`` / ``--min-reward-threshold`` / ``--stratified-negative-fraction`` —
   quality filters, see "Quality Filtering" below (mutually exclusive; ``--min-transitions``
@@ -61,10 +63,6 @@ function weights used to compute the per-run/per-pair AWR weights described abov
 Behavior Cloning Training
 --------------------------
 
-The policy network learns to predict expert bias coefficients through supervised learning
-on the filtered dataset. This process mimics how expert systems (ALF or converged CB) assign
-coefficients to different molecular transition types.
-
 .. _Training Objective:
 
 **Training Objective**:
@@ -90,7 +88,7 @@ where:
 - :math:`\mathcal{G}` is the set of runs sharing the same graph structure (gradient-accumulated
   before a single optimizer step)
 - :math:`R_r` is the pre-computed BC reward for run :math:`r` (stored in ``run["_bc_reward"]``)
-- :math:`\beta` is the AWR temperature (default: 1.0)
+- :math:`\beta` is the AWR temperature (``--awr-temperature``, default: 0.5)
 - :math:`\mathcal{A}_r = \{(i,j,k) : |a_{ij}^{(k)}| > \epsilon\}` is the set of active
   (non-zero) target entries for run :math:`r`
 - :math:`k \in \{\text{linear, quadratic, skew, end}\}` are bias types
@@ -129,6 +127,40 @@ flat run-level weight. This keeps the pretraining signal consistent with what on
 REINFORCE later optimizes against. The AWR temperature :math:`\beta` (``--awr-temperature``,
 default 0.5) still controls how sharply confidence is weighted.
 
+**Data Hygiene** (default; ``--no-data-hygiene`` to disable):
+
+A run's bias coefficients are evidence for a coefficient only when the simulation sampled
+the part of λ space that coefficient shapes. A trapped or diverging run leaves the other
+coefficients wherever the optimizer that produced it stopped. For example, flattening runs
+that never reached their endpoints drove end biases to 10–18, far outside converged
+values. Cloning those teaches the model coefficients that prevent sampling.
+
+``compute_pairwise_measured_mask`` therefore keeps each edge's target, per bias type, only
+when the run measured what sets it:
+
+* **linear**: both substituents sampled and a finite pair ΔΔG (the rule above);
+* **quadratic**: the pair's midpoint barrier was measured;
+* **skew / end**: the pair's skew / end asymmetry of the λ profile was measured (these
+  need frames at both endpoint cores).
+
+The profile signals come from ``simulation_results.json`` (see
+``read_output.parse_pair_profile``). Runs collected without them keep only their
+linear targets, and runs without usable populations contribute nothing, where legacy
+mode gives every edge full weight. The Bayesian heads' noise and prior calibration use the
+same mask.
+
+Hygiene also changes how runs are normalized. In legacy mode each run's loss is a weighted
+mean over its targets (divided by the sum of weights), so every run counts equally and the
+weights only rank targets within a run, which is why run-level filters were needed. Under
+hygiene each run's weighted sum is divided by its number of active targets, so a run whose
+targets are unmeasured or poorly resolved contributes proportionally less. With hygiene
+on, the quality filters below are optional: runs that never sampled a pair add no weight
+for it. ``examples/pretrain_wUnimol.sh`` runs this way (``STRATIFIED_FRACTION=0``,
+``REWARD_THRESHOLD=none``).
+
+Per-run weights from ``--reward-weighted`` and ``--emphasize-systems`` multiply each run's
+loss in both modes.
+
 **Graph Caching**:
 
 Before training begins, all pretraining graphs are built once and stored in an in-memory
@@ -160,13 +192,10 @@ The pretraining process produces several artifacts:
 
 **Using Pretrained Models**:
 
-The pretrained policy provides a strong initialization for reinforcement learning on new
-systems. Rather than starting with random weights, the CB agent begins with a policy that
-already understands basic patterns in bias coefficient assignment.
-
-Transfer learning is most effective when pretraining systems share structural or chemical
-similarity with the target system. However, even diverse pretraining data improves learning
-efficiency by teaching general principles of bias coefficient assignment.
+Point an online workflow at ``best_policy.pt`` via its ``pretrain.model_path`` (see
+:doc:`workflow`). Transfer is most effective when pretraining systems share structural or
+chemical similarity with the target system, but even diverse pretraining data improves
+learning efficiency by teaching general principles of bias coefficient assignment.
 
 Expert Coefficient Collection
 ------------------------------
@@ -236,7 +265,7 @@ the ``pretraining/`` directory structure:
 
 **Automatic Discovery**:
 
-The ``pretrain_with_filtering.sh`` script scans all subdirectories and collects:
+``mllf.cli.collect_pretraining_data`` scans all subdirectories and collects:
 
 1. **System identification**: Detects all systems in ``pretraining/``
 2. **Run enumeration**: Finds all run directories per system

@@ -764,8 +764,57 @@ def compute_pairwise_confidence_weights(
         # Population balance weight: min / max (symmetric around 0.5 for equal pops)
         balance = min(pop_i, pop_j) / max(pop_i, pop_j)
         weights.append(float(balance))
-    
+
     return weights
+
+
+# Signal that has to have been measured for each bias type's target to count
+# (order matches the policy's [linear, quadratic, skew, end] outputs; None =
+# the linear rule in compute_pairwise_confidence_weights).
+MEASURED_SIGNAL = (None, 'barrier_pairs', 'skew_pairs', 'end_pairs')
+
+
+def compute_pairwise_measured_mask(
+    sim_results: Dict,
+    pairs: List[tuple],
+    linear_weights: Optional[List[float]],
+) -> List[List[float]]:
+    """Per-edge, per-bias-type mask: 1 where the run measured what sets that target.
+
+    A run's biases are only evidence for a coefficient when the simulation
+    actually sampled the part of lambda space that coefficient shapes; a
+    trapped or diverging run leaves the others wherever the optimizer that
+    produced them happened to stop (e.g. end biases of 10-18 in flattening
+    runs that never reached their endpoints). So each target counts only if:
+
+    * linear: both substituents were sampled and the pair's DDG is finite
+      (``linear_weights`` > 0, from ``compute_pairwise_confidence_weights``);
+    * quadratic: the pair's midpoint barrier was measured;
+    * skew / end: the pair's skew / end asymmetry was measured (these need
+      frames at both endpoint cores; see read_output.parse_pair_profile).
+
+    Runs without the profile fields (collected before they were parsed) get 0
+    for quadratic/skew/end: there is no evidence those targets were sampled.
+
+    Returns:
+        [E][4] list of 0.0 / 1.0.
+    """
+    def _finite(v) -> bool:
+        try:
+            return v is not None and math.isfinite(float(v))
+        except (TypeError, ValueError):
+            return False
+
+    mask = []
+    for k, (i, j) in enumerate(pairs):
+        lo, hi = min(i, j) + 2, max(i, j) + 2
+        row = [1.0 if (linear_weights is not None and linear_weights[k] > 0) else 0.0]
+        for field in MEASURED_SIGNAL[1:]:
+            values = sim_results.get(field) or {}
+            v = values.get(f"{lo}_{hi}", values.get(f"{hi}_{lo}"))
+            row.append(1.0 if _finite(v) else 0.0)
+        mask.append(row)
+    return mask
 
 
 def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None,
@@ -2045,6 +2094,39 @@ def sample_runs_stratified_negative(
     return result
 
 
+def _awr_run_loss(w, logp_per, combined_mask, active_mask, w_sum, data_hygiene):
+    """One run's AWR behaviour-cloning loss.
+
+    Legacy: a weighted mean over the run's kept targets (divided by the sum of
+    weights), so every run counts equally and the weights only rank targets
+    within a run -- which is why run-level filters were needed. Data hygiene:
+    divided by the run's number of active targets instead, so a run whose
+    targets are unmeasured (weight 0) or poorly resolved (low AWR/balance
+    weight) contributes proportionally less, and no run filter is needed.
+    """
+    total = -(w * logp_per)[combined_mask].sum()
+    if data_hygiene:
+        return total / active_mask.sum().clamp(min=1)
+    return total / w_sum
+
+
+def _edge_confidence(pairwise_weights_cache, run_idx, logp_per, device, data_hygiene):
+    """Per-edge (or per-edge, per-bias-type) confidence for one run's BC loss.
+
+    Returns a tensor broadcastable to ``logp_per`` ([E, 1] or [E, D]), or None
+    when the run should be skipped: under data hygiene a run with no pairwise
+    weights (no usable populations) has no measured targets, where the legacy
+    behaviour gives every edge full weight.
+    """
+    weights = pairwise_weights_cache[run_idx] if pairwise_weights_cache is not None else None
+    if weights is None:
+        if data_hygiene:
+            return None
+        return torch.ones((logp_per.size(0), 1), dtype=torch.float32, device=device)
+    conf = torch.tensor(weights, dtype=torch.float32, device=device)
+    return conf.unsqueeze(-1) if conf.dim() == 1 else conf
+
+
 def pretrain_epoch(
     policy: nn.Module,
     optimizer: optim.Optimizer,
@@ -2066,6 +2148,7 @@ def pretrain_epoch(
     baseline_std: Optional[torch.Tensor] = None,
     success_floor: Optional[float] = None,
     system_emphasis: Optional[Dict[str, float]] = None,
+    data_hygiene: bool = False,
 ) -> Dict[str, float]:
     """Run one behavior cloning AWR epoch for UnimolPolicy with optional pairwise weighting.
     
@@ -2082,7 +2165,11 @@ def pretrain_epoch(
         groups: Optional run grouping for grouped updates
         reward_weighted: Whether to use AWR weighting
         awr_temperature: Temperature for AWR reweighting
-        pairwise_weights_cache: Optional per-run pairwise edge weights (confidence in [0,1])
+        pairwise_weights_cache: Optional per-run pairwise edge weights (confidence in [0,1]),
+                        either [E] or, under data hygiene, [E][4] per bias type
+        data_hygiene: If True, runs with no pairwise weights are skipped instead of
+                        getting full weight on every edge (see
+                        ``compute_pairwise_measured_mask``).
         unimol_config: Optional dict with 'environment_cutoff' and 'use_environment_difference'
         pair_reward_cache: Optional per-run [E, 4] per-edge, per-dimension reward tensor
                         (from compute_pair_reward(), same reward used by online REINFORCE
@@ -2191,12 +2278,10 @@ def pretrain_epoch(
                 logp_per = torch.distributions.Normal(mean, std).log_prob(targets)  # [E, D]
 
                 # Per-edge confidence weight (population balance + DDG validity).
-                if pairwise_weights_cache is not None and pairwise_weights_cache[run_idx] is not None:
-                    edge_conf = torch.tensor(
-                        pairwise_weights_cache[run_idx], dtype=torch.float32, device=device
-                    ).unsqueeze(-1)  # [E, 1]
-                else:
-                    edge_conf = torch.ones((logp_per.size(0), 1), dtype=torch.float32, device=device)
+                edge_conf = _edge_confidence(pairwise_weights_cache, run_idx, logp_per, device,
+                                             data_hygiene)
+                if edge_conf is None:
+                    continue
 
                 r_pair = pair_reward_cache[run_idx] if per_pair_awr_enabled else None
                 if r_pair is not None and r_pair.shape[0] == logp_per.shape[0]:
@@ -2222,7 +2307,8 @@ def pretrain_epoch(
                 combined_mask = active_mask & (edge_conf > 1e-8)
                 w_sum = w[combined_mask].sum() if combined_mask.any() else torch.tensor(0.0, device=device)
                 if combined_mask.any() and w_sum > 1e-8:
-                    run_loss = -(w * logp_per)[combined_mask].sum() / w_sum / n_valid
+                    run_loss = rw * _awr_run_loss(w, logp_per, combined_mask, active_mask,
+                                                  w_sum, data_hygiene) / n_valid
                 else:
                     continue
                 
@@ -2293,12 +2379,9 @@ def pretrain_epoch(
         logp_per = torch.distributions.Normal(mean, std).log_prob(targets)
 
         # Per-edge confidence weight (population balance + DDG validity).
-        if pairwise_weights_cache is not None and pairwise_weights_cache[run_idx] is not None:
-            edge_conf = torch.tensor(
-                pairwise_weights_cache[run_idx], dtype=torch.float32, device=device
-            ).unsqueeze(-1)  # [E, 1]
-        else:
-            edge_conf = torch.ones((logp_per.size(0), 1), dtype=torch.float32, device=device)
+        edge_conf = _edge_confidence(pairwise_weights_cache, run_idx, logp_per, device, data_hygiene)
+        if edge_conf is None:
+            continue
 
         r_pair = pair_reward_cache[run_idx] if per_pair_awr_enabled else None
         if r_pair is not None and r_pair.shape[0] == logp_per.shape[0]:
@@ -2314,7 +2397,7 @@ def pretrain_epoch(
         combined_mask = active_mask & (edge_conf > 1e-8)
         w_sum = w[combined_mask].sum() if combined_mask.any() else torch.tensor(0.0, device=device)
         if combined_mask.any() and w_sum > 1e-8:
-            loss = -(w * logp_per)[combined_mask].sum() / w_sum
+            loss = rw * _awr_run_loss(w, logp_per, combined_mask, active_mask, w_sum, data_hygiene)
         else:
             continue
         
@@ -2411,8 +2494,13 @@ def _compute_run_pair_reward(
     Uses the SAME ``compute_pair_reward()`` that online REINFORCE training
     uses (``training/workflow.py`` / ``mllf.cb.workflow_utils``), so BC/AWR
     pretraining and online training score individual substituent pairs on
-    identical criteria: per-pair population balance (linear), per-pair DDG
-    existence + transition quality (quadratic), the FRACTION PHYSICAL LIGAND
+    identical criteria: per-pair population balance (linear), per-pair
+    midpoint barrier from the lambda trajectory (quadratic; falls back to DDG
+    existence + transition quality when ``barrier_pairs`` is absent from
+    ``simulation_results.json`` -- see ``--backfill-barrier`` in
+    collect_pretraining_data), the pair's skew and end asymmetries of that
+    profile (skew / end; ``skew_pairs`` / ``end_pairs``, same backfill), else
+    the FRACTION PHYSICAL LIGAND
     proxy scaled by pair count (skew), and the population/quality combined
     proxy (end). Without this, every pair within an otherwise-successful run
     would share one whole-run scalar reward, even though some pairs are
@@ -2436,12 +2524,20 @@ def _compute_run_pair_reward(
         total_transitions = _extract_total_transitions(sim_results.get("transitions", {}))
         t_baseline = reward_config.get("T_baseline", 50.0)
         fraction_physical = sim_results.get("fraction_physical")
-        from mllf.cb.workflow_utils import compute_pair_reward
+        from mllf.cb.workflow_utils import (BARRIER_TARGET, BARRIER_WIDTH, END_WIDTH, SKEW_WIDTH,
+                                            compute_pair_reward)
         return compute_pair_reward(
             edge_index.detach().cpu(), ddg_pairs, populations,
             total_transitions=total_transitions,
             t_baseline=t_baseline,
             fraction_physical=fraction_physical,
+            barrier_pairs=sim_results.get("barrier_pairs"),
+            barrier_target=reward_config.get("barrier_target", BARRIER_TARGET),
+            barrier_width=reward_config.get("barrier_width", BARRIER_WIDTH),
+            skew_pairs=sim_results.get("skew_pairs"),
+            end_pairs=sim_results.get("end_pairs"),
+            skew_width=reward_config.get("skew_width", SKEW_WIDTH),
+            end_width=reward_config.get("end_width", END_WIDTH),
         )
     except Exception:
         return None
@@ -2478,6 +2574,7 @@ def pretrain(
 
 def _compute_physical_residual_variance(
     policy_det, graph_cache: List, device, max_runs: int = 200,
+    weights_cache: Optional[List] = None,
 ) -> tuple:
     """Physical-unit ``(target - mean)`` residuals per bias type, from BC data.
 
@@ -2486,6 +2583,10 @@ def _compute_physical_residual_variance(
     (exploration-precision calibration) — both need "how much do real bias
     coefficients actually scatter around the deterministic model's
     prediction, per bias type", just for different purposes.
+
+    ``weights_cache`` (the data-hygiene [E][4] pairwise weights, indexed like
+    ``graph_cache``) restricts residuals to measured targets and skips runs
+    without an entry; without it every target counts.
 
     Returns:
         (residuals, n_used) — residuals is a list of 4 lists of floats (one
@@ -2496,7 +2597,7 @@ def _compute_physical_residual_variance(
     residuals = [[] for _ in range(4)]
     n_used = 0
     with torch.no_grad():
-        for cached in graph_cache:
+        for run_idx, cached in enumerate(graph_cache):
             if cached is None:
                 continue
             if n_used >= max_runs:
@@ -2504,6 +2605,12 @@ def _compute_physical_residual_variance(
             unimol_emb, edge_idx, targets_list = cached
             if not targets_list:
                 continue
+            keep = None
+            if weights_cache is not None:
+                w = weights_cache[run_idx] if run_idx < len(weights_cache) else None
+                if w is None or not w or not isinstance(w[0], (list, tuple)):
+                    continue
+                keep = np.array(w) > 0
             try:
                 unimol_emb = unimol_emb.to(device)
                 edge_idx = edge_idx.to(device)
@@ -2512,8 +2619,11 @@ def _compute_physical_residual_variance(
                 if mean.shape != targets.shape:
                     continue
                 resid = (targets - mean).detach().cpu().numpy()
+                if keep is not None and keep.shape != resid.shape:
+                    continue
                 for d in range(4):
-                    residuals[d].extend(resid[:, d].tolist())
+                    col = resid[:, d] if keep is None else resid[keep[:, d], d]
+                    residuals[d].extend(col.tolist())
                 n_used += 1
             except Exception:
                 continue
@@ -2571,6 +2681,7 @@ def estimate_reward_noise_variance(
     device,
     max_runs: int = 200,
     floor: float = 0.05,
+    weights_cache: Optional[List] = None,
 ) -> List[float]:
     """Estimate per-bias-type observation noise variance from BC residuals.
 
@@ -2586,6 +2697,8 @@ def estimate_reward_noise_variance(
         graph_cache: Per-run cache of ``(unimol_emb, edge_index, targets_list)``
             or ``None``, as built during the main BC loop (see ``pretrain_with_runs``).
         device: torch device.
+        weights_cache: Optional data-hygiene [E][4] pairwise weights (indexed
+            like ``graph_cache``); when given, only measured targets count.
         max_runs: Cap on how many cached runs to sample — residual-variance
             estimation doesn't need the full dataset; keeps this fast.
         floor: Minimum returned variance, so a small/lucky sample can't make the
@@ -2594,7 +2707,8 @@ def estimate_reward_noise_variance(
     Returns:
         List of 4 floats: ``[linear, quadratic, skew, end]`` noise variances.
     """
-    residuals, n_used = _compute_physical_residual_variance(policy_det, graph_cache, device, max_runs)
+    residuals, n_used = _compute_physical_residual_variance(
+        policy_det, graph_cache, device, max_runs, weights_cache=weights_cache)
 
     # Residuals above are in *physical* bias-coefficient units (both `mean`
     # and `targets` are), but BayesianLinearHead.noise_var is consumed in the
@@ -2626,6 +2740,7 @@ def initialize_bayesian_heads_from_pretrained(
     policy_det, bayesian_prior_precision: float = 1.0,
     graph_cache: Optional[List] = None, device=None,
     exploration_fraction: float = 0.3,
+    weights_cache: Optional[List] = None,
 ):
     """Build a ``use_bayesian_heads=True`` sibling of a trained deterministic policy.
 
@@ -2647,6 +2762,9 @@ def initialize_bayesian_heads_from_pretrained(
             instead of the weaker weight-magnitude-only heuristic.
         device: torch device for the calibration forward passes (defaults to
             ``policy_det``'s own device). Only used when ``graph_cache`` is given.
+        weights_cache: Optional data-hygiene [E][4] pairwise weights (indexed
+            like ``graph_cache``); when given, calibration uses only measured
+            targets.
         exploration_fraction: Only used with ``graph_cache``. Target
             Thompson-sampling exploration variance, in **physical**
             bias-coefficient units, as a fraction of the real physical-space
@@ -2698,7 +2816,8 @@ def initialize_bayesian_heads_from_pretrained(
     if graph_cache is not None:
         device = device or next(policy_det.parameters()).device
         typical_z_norm_sq = _compute_typical_z_norm_sq(policy_det, graph_cache, device)
-        residuals, _ = _compute_physical_residual_variance(policy_det, graph_cache, device)
+        residuals, _ = _compute_physical_residual_variance(
+            policy_det, graph_cache, device, weights_cache=weights_cache)
         residual_vars_physical = [
             max(float(np.var(residuals[d])), 1e-6) if len(residuals[d]) >= 5 else None
             for d in range(4)
@@ -2765,6 +2884,9 @@ def pretrain_with_runs(
     bayesian_prior_precision: float = 1.0,
     exploration_fraction: float = 0.3,
     system_emphasis: Optional[Dict[str, float]] = None,
+    data_hygiene: bool = True,
+    init_checkpoint: Optional[Path] = None,
+    resume_checkpoint: Optional[Path] = None,
 ):
     """Run policy pretraining with provided runs.
     
@@ -2828,6 +2950,24 @@ def pretrain_with_runs(
                         the BC loss so they get fit more accurately. See
                         ``pretrain_epoch`` for how this combines with
                         reward_weighted.
+        data_hygiene: If True (default), each edge's target for each bias
+                        type counts only when the run measured what sets it
+                        (``compute_pairwise_measured_mask``), and runs with no
+                        usable populations contribute nothing instead of
+                        full weight. Makes run-level filters (reward,
+                        transition, stratified sampling) unnecessary: runs
+                        that never sampled a pair add no weight for it.
+        init_checkpoint: Optional checkpoint (``policy_state``) to start from.
+                        With ``epochs=0`` and ``bayesian_heads`` this only builds
+                        the Bayesian-head sibling of that policy
+                        (``final_policy_bayesian.pt``), e.g. when a long run was
+                        stopped before its post-pass.
+        resume_checkpoint: Optional ``checkpoint_epoch_NNN.pt`` from an
+                        interrupted run with the same data and settings, written
+                        to the same ``output_dir``. Restores the policy,
+                        optimizer and LR-scheduler state, continues at the next
+                        epoch, and restores early stopping from that directory's
+                        ``best_policy.pt`` (best loss, and epochs since it).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2951,6 +3091,11 @@ def pretrain_with_runs(
         mlp_out_dim=len(sample_extras['relation_names']) // 2,
         use_dual_embeddings=use_environment_difference,
     ).to(device)
+    if init_checkpoint is not None:
+        _init = torch.load(init_checkpoint, map_location=device, weights_only=False)
+        policy.load_state_dict(_init['policy_state'])
+        print(f"\nInitialized policy from {init_checkpoint} "
+              f"(epoch {_init.get('epoch')}, loss {_init.get('loss')})")
     
     print(f"\nModel architecture:")
     if use_environment_difference:
@@ -2983,6 +3128,20 @@ def pretrain_with_runs(
     reward_config = config.get('reward', {})
     best_loss = float('inf')
     epochs_without_improvement = 0
+    start_epoch = 0
+    if resume_checkpoint is not None:
+        _res = torch.load(resume_checkpoint, map_location=device, weights_only=False)
+        policy.load_state_dict(_res['policy_state'])
+        active_opt.load_state_dict(_res['optimizer_state'])
+        active_sched.load_state_dict(_res['scheduler_state'])
+        start_epoch = int(_res['epoch'])
+        _best_path = output_dir / "best_policy.pt"
+        if _best_path.exists():
+            _best = torch.load(_best_path, map_location='cpu', weights_only=False)
+            best_loss = float(_best['loss'])
+            epochs_without_improvement = start_epoch - int(_best['epoch'])
+        print(f"\nResuming from {resume_checkpoint}: epoch {start_epoch} done; "
+              f"best loss {best_loss:.4f}, {epochs_without_improvement} epoch(s) without improvement")
 
     # ------------------------------------------------------------------
     # Suppress per-occurrence warnings during training and collect them
@@ -3359,7 +3518,10 @@ def pretrain_with_runs(
     
     pairwise_weights_cache = [None] * len(runs)
     n_weights_ok = 0
-    
+    # Data hygiene bookkeeping: per bias type, edges whose target counts.
+    _kept = np.zeros(4)
+    _edges_total = 0
+
     for run_idx, run in enumerate(runs):
         try:
             run_dir = Path(run["run_dir"])
@@ -3381,20 +3543,33 @@ def pretrain_with_runs(
                 weights = compute_pairwise_confidence_weights(
                     run["sim_results"], nsubs_per_site, pairs
                 )
+                if weights is not None and data_hygiene:
+                    # [E][4]: the pair's balance weight, zeroed per bias type
+                    # where the run didn't measure what sets that target.
+                    mask = compute_pairwise_measured_mask(run["sim_results"], pairs, weights)
+                    weights = [[w * m for m in row] for w, row in zip(weights, mask)]
+                    _kept += (np.array(weights) > 0).sum(axis=0)
+                    _edges_total += len(weights)
                 if weights is not None:
                     pairwise_weights_cache[run_idx] = weights
                     n_weights_ok += 1
-        
+
         except Exception as e:
             # If pairwise weighting fails, just skip for this run (graceful degradation)
             pass
-        
+
         if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
             print(f"  {run_idx + 1}/{len(runs)} runs ({n_weights_ok} with pairwise weights)...")
-    
+
     print(f"\nPairwise confidence weights ready: {n_weights_ok} runs with weights")
     if n_weights_ok > 0:
         print(f"  Pairwise AWR weighting: ENABLED")
+    if data_hygiene:
+        _frac = _kept / max(_edges_total, 1)
+        print(f"  Data hygiene: targets kept only where measured (of {_edges_total} edges): "
+              f"linear {_frac[0]:.1%}, quadratic {_frac[1]:.1%}, skew {_frac[2]:.1%}, "
+              f"end {_frac[3]:.1%}; {len(runs) - n_weights_ok} runs without usable "
+              f"populations contribute nothing")
     
     # Build per-pair reward cache if requested (enables per-edge, per-dimension AWR in pretrain_epoch)
     pair_reward_cache = [None] * len(runs)
@@ -3500,7 +3675,7 @@ def pretrain_with_runs(
         print("Reward-weighted loss: ENABLED")
     print(f"{'='*60}\n")
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         print(f"Epoch {epoch+1}/{epochs}")
 
         stats = pretrain_epoch(
@@ -3520,6 +3695,7 @@ def pretrain_with_runs(
             baseline_std=baseline_std,
             success_floor=success_floor,
             system_emphasis=system_emphasis,
+            data_hygiene=data_hygiene,
         )
 
         print(f"  AWR Loss: {stats['loss']:.4f}")
@@ -3573,13 +3749,16 @@ def pretrain_with_runs(
         print("NeuralLinear + TS: building Bayesian-head sibling checkpoint(s)")
         print(f"{'='*60}")
         try:
-            noise_vars = estimate_reward_noise_variance(policy, graph_cache, device)
+            _hygiene_weights = pairwise_weights_cache if data_hygiene else None
+            noise_vars = estimate_reward_noise_variance(
+                policy, graph_cache, device, weights_cache=_hygiene_weights)
 
             def _save_bayesian_sibling(det_policy, out_path, extra_ckpt_fields):
                 bayes_policy = initialize_bayesian_heads_from_pretrained(
                     det_policy, bayesian_prior_precision=bayesian_prior_precision,
                     graph_cache=graph_cache, device=device,
-                    exploration_fraction=exploration_fraction)
+                    exploration_fraction=exploration_fraction,
+                    weights_cache=_hygiene_weights)
                 for d, sigma2 in enumerate(noise_vars):
                     bayes_policy.edge_mlp.mlps[d].bayesian_head.set_noise_var(sigma2)
                 ckpt = {'policy_state': bayes_policy.state_dict(), 'noise_var': noise_vars}
@@ -3774,6 +3953,39 @@ def main():
              "Default: 0.5.",
     )
     parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Start from this checkpoint's policy_state. With --epochs 0 --bayesian-heads, "
+             "only builds its Bayesian-head sibling (final_policy_bayesian.pt).",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Continue an interrupted run from its checkpoint_epoch_NNN.pt (same data, "
+             "settings and --output-dir): restores model, optimizer, LR schedule and "
+             "early-stopping state, then runs the remaining epochs and the post-passes.",
+    )
+    parser.add_argument(
+        "--max-runs",
+        type=int,
+        default=None,
+        help="Use a random sample (seed 0) of at most this many runs, e.g. for a quick "
+             "Bayesian post-pass with --init-checkpoint --epochs 0.",
+    )
+    parser.add_argument(
+        "--no-data-hygiene",
+        action="store_true",
+        default=False,
+        help="Disable data hygiene (enabled by default). With hygiene, each edge's "
+             "target for each bias type counts only when the run measured what sets it "
+             "(linear: both substituents sampled and a finite pair DDG; quadratic: "
+             "midpoint barrier; skew/end: skew/end asymmetry of the lambda profile), "
+             "and runs without usable populations contribute nothing. Makes run-level "
+             "filters (reward, transitions, stratified sampling) unnecessary.",
+    )
+    parser.add_argument(
         "--no-per-pair-awr",
         action="store_true",
         default=False,
@@ -3888,6 +4100,9 @@ def main():
         all_runs.extend(runs)
     
     print(f"\nTotal runs from all directories: {len(all_runs)}")
+    if args.max_runs is not None and len(all_runs) > args.max_runs:
+        all_runs = random.Random(0).sample(all_runs, args.max_runs)
+        print(f"Sampled {len(all_runs)} runs (--max-runs, seed 0)")
 
     system_emphasis = {}
     if args.emphasize_systems:
@@ -3927,6 +4142,9 @@ def main():
         bayesian_prior_precision=args.bayesian_prior_precision,
         exploration_fraction=args.exploration_fraction,
         system_emphasis=system_emphasis or None,
+        data_hygiene=not args.no_data_hygiene,
+        init_checkpoint=args.init_checkpoint,
+        resume_checkpoint=args.resume_checkpoint,
     )
 
 
