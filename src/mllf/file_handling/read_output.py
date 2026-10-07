@@ -381,12 +381,18 @@ PROFILE_MIN_END_FRAMES = 5          # each endpoint core needs this many frames 
 # the end terms' reach into the flanks (pooled within-pair fit on 26 systems: with this
 # value the skew signal moves -0.19/+0.19 per unit x_lo->hi / x_hi->lo and ~0.01 per unit s).
 SKEW_END_CORRECTION = 0.687
+# Endpoint occupancy (see parse_pair_profile 'endpoints'): r < END_CORE / r >= 1 - END_CORE
+# is the endpoint itself (the physical state for a two-substituent site), and
+# [END_CORE, NEAR_END_WIDTH) / [1 - NEAR_END_WIDTH, 1 - END_CORE) is just short of it.
+END_CORE = 0.01
+NEAR_END_WIDTH = 0.20
 
 
 def _pair_counts(frames, ci: int, cj: int) -> Dict[str, int]:
     """Bin one pair's on-edge frames along r = lambda_j / (lambda_i + lambda_j)."""
     mid_lo, mid_hi = BARRIER_MID_WINDOW
-    n = {"edge": 0, "end0": 0, "end1": 0, "mid": 0, **{k: 0 for k in PROFILE_BINS}}
+    n = {"edge": 0, "end0": 0, "end1": 0, "mid": 0,
+         "at_lo": 0, "near_lo": 0, "near_hi": 0, "at_hi": 0, **{k: 0 for k in PROFILE_BINS}}
     for f in frames:
         s = f[ci] + f[cj]
         if s < BARRIER_MIN_PAIR_SUM:
@@ -399,6 +405,14 @@ def _pair_counts(frames, ci: int, cj: int) -> Dict[str, int]:
             n["end1"] += 1
         elif mid_lo <= r < mid_hi:
             n["mid"] += 1
+        if r < END_CORE:
+            n["at_lo"] += 1
+        elif r < NEAR_END_WIDTH:
+            n["near_lo"] += 1
+        elif r >= 1.0 - END_CORE:
+            n["at_hi"] += 1
+        elif r >= 1.0 - NEAR_END_WIDTH:
+            n["near_hi"] += 1
         for k, (lo, hi) in PROFILE_BINS.items():
             if lo <= r < hi or (hi == 1.0 and r >= lo):
                 n[k] += 1
@@ -490,6 +504,13 @@ def parse_pair_profile(
       removed via the end signal. Measured: -0.19 / +0.19 per unit
       x[lo][hi] / x[hi][lo], ~0.01 per unit s, ~0 for b and c.
 
+    * ``endpoints`` = on-edge frame counts {'edge', 'at_lo', 'near_lo', 'near_hi',
+      'at_hi'}: at an endpoint (r < 0.01 / r >= 0.99, the physical state for a
+      two-substituent site) or just short of it ([0.01, 0.2) / [0.8, 0.99)).
+      Many frames near an endpoint that is never reached means the end term at
+      that endpoint holds lambda off it (s[hi][lo] at the lo end, s[lo][hi] at
+      the hi end); available even when the barrier/skew/end are not.
+
     Signs of ``skew`` and ``end`` follow the (lo, hi) block orientation; rewards
     use their magnitude.
 
@@ -501,8 +522,10 @@ def parse_pair_profile(
             line, else 298.15.
 
     Returns:
-        Dict (lo, hi) -> {'barrier', 'skew', 'end', 'transitions'}; the first three
-        are floats or None, ``transitions`` an int.
+        Dict (lo, hi) -> {'barrier', 'skew', 'end', 'transitions', 'endpoints'};
+        the first three are floats or None, ``transitions`` an int,
+        ``endpoints`` a dict of ints (None if the pair's blocks are not in the
+        trajectory).
         ``barrier`` is None when the pair has fewer than BARRIER_MIN_FRAMES
         frames on its edge or an endpoint (r < 0.1 / r >= 0.9) was never
         visited; ``skew``/``end`` are None when either endpoint core
@@ -532,11 +555,13 @@ def parse_pair_profile(
         lo, hi = (blk_a, blk_b) if blk_a < blk_b else (blk_b, blk_a)
         ci, cj = lo - first_block, hi - first_block
         out: Dict[str, Optional[float]] = {"barrier": None, "skew": None, "end": None,
-                                           "transitions": transitions.get((lo, hi), 0)}
+                                           "transitions": transitions.get((lo, hi), 0),
+                                           "endpoints": None}
         result[(lo, hi)] = out
         if ci < 0 or cj >= n_cols:
             continue
         n = _pair_counts(frames, ci, cj)
+        out["endpoints"] = {k: n[k] for k in ("edge", "at_lo", "near_lo", "near_hi", "at_hi")}
         if n["edge"] < BARRIER_MIN_FRAMES:
             continue
         if n["end0"] > 0 and n["end1"] > 0:

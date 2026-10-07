@@ -150,6 +150,10 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
                        kcal/mol (see ``parse_pair_profile``)
           'transition_pairs': same keys → transitions between that pair's two
                        substituents at the λ ≥ 0.99 cutoff (int)
+          'endpoint_pairs': same keys → the pair's on-edge frame counts at and
+                       just short of each endpoint ({'edge', 'at_lo',
+                       'near_lo', 'near_hi', 'at_hi'}, or None); see
+                       ``parse_pair_profile``
     """
     from mllf.file_handling.read_output import (
         parse_single_population,
@@ -160,7 +164,8 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
     )
 
     raw_metrics = {'populations': [], 'transitions': [], 'ddg_pairs': {}, 'fraction_physical': None,
-                   'barrier_pairs': {}, 'skew_pairs': {}, 'end_pairs': {}, 'transition_pairs': {}}
+                   'barrier_pairs': {}, 'skew_pairs': {}, 'end_pairs': {}, 'transition_pairs': {},
+                   'endpoint_pairs': {}}
 
     try:
         with open(output_file, 'r') as f:
@@ -176,7 +181,7 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         try:
             profile = parse_pair_profile(output_text, pairs=list(ddg_data.keys()))
             for field, key in (('barrier_pairs', 'barrier'), ('skew_pairs', 'skew'), ('end_pairs', 'end'),
-                               ('transition_pairs', 'transitions')):
+                               ('transition_pairs', 'transitions'), ('endpoint_pairs', 'endpoints')):
                 raw_metrics[field] = {f"{lo}_{hi}": vals[key] for (lo, hi), vals in profile.items()}
         except Exception:
             pass

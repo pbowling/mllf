@@ -790,6 +790,8 @@ def train_epoch(
             'barrier_pairs': raw_metrics.get('barrier_pairs', {}),
             'skew_pairs': raw_metrics.get('skew_pairs', {}),
             'end_pairs': raw_metrics.get('end_pairs', {}),
+            'transition_pairs': raw_metrics.get('transition_pairs', {}),
+            'endpoint_pairs': raw_metrics.get('endpoint_pairs', {}),
             'run_id': run_id,
         }, jepoch_dir / 'epoch_results.pt')
 
@@ -893,6 +895,8 @@ def train_epoch(
                     'barrier_pairs': _rec_metrics.get('barrier_pairs', {}),
                     'skew_pairs': _rec_metrics.get('skew_pairs', {}),
                     'end_pairs': _rec_metrics.get('end_pairs', {}),
+                    'transition_pairs': _rec_metrics.get('transition_pairs', {}),
+                    'endpoint_pairs': _rec_metrics.get('endpoint_pairs', {}),
                     'run_id': run_id,
                 }, epoch_results_file)
                 if verbose:

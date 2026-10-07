@@ -232,6 +232,22 @@ def test_parse_pair_profile_skew_end_none_without_endpoint_cores():
     assert prof["barrier"] is not None
 
 
+def test_parse_pair_profile_endpoint_occupancy():
+    from mllf.file_handling.read_output import parse_pair_profile
+    ep = parse_pair_profile(_lambda_output(_profile_rows(_SYMMETRIC)))[(2, 3)]["endpoints"]
+    # r=0.0 -> at_lo, 0.03 -> near_lo, 0.97 -> near_hi, 1.0 -> at_hi; 0.3/0.5/0.7 in neither
+    assert ep == {"edge": 950, "at_lo": 400, "near_lo": 40, "near_hi": 40, "at_hi": 400}
+
+
+def test_parse_pair_profile_endpoint_held_off_signature():
+    # lambda crowds up to the lo end (r ~ 0.1) but never reaches it, hi end untouched:
+    # the mup1 failure. Occupancy is reported although no barrier/skew/end is defined.
+    from mllf.file_handling.read_output import parse_pair_profile
+    prof = parse_pair_profile(_lambda_output(_profile_rows({0.1: 800, 0.3: 200})))[(2, 3)]
+    assert prof["endpoints"] == {"edge": 1000, "at_lo": 0, "near_lo": 800, "near_hi": 0, "at_hi": 0}
+    assert prof["barrier"] is None and prof["end"] is None
+
+
 def test_parse_pair_barriers_matches_profile():
     from mllf.file_handling.read_output import parse_pair_profile
     text = _lambda_output(_profile_rows(_SYMMETRIC))
