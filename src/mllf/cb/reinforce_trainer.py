@@ -901,10 +901,13 @@ def train_epoch(
             except Exception as _rec_e:
                 warnings.warn(f"Recovery from output.out failed for {combo_path.name}: {_rec_e}")
 
-        # Check cache
+        # Check cache: only this run's own results (resuming a crashed run);
+        # another run's results for the same (combo, epoch) are re-simulated.
         if epoch_results_file.exists():
             try:
                 cached = torch.load(epoch_results_file, weights_only=False)
+                if cached.get('run_id') != run_id:
+                    raise LookupError(f"results belong to run {cached.get('run_id')!r}")
                 reward_config = config.get('reward', {})
                 cached_reward_config = cached.get('reward_config', {})
                 reward_changed = any(
@@ -941,6 +944,9 @@ def train_epoch(
                 if verbose:
                     print(f"  Using cached reward: {reward:.4f}")
                 return ('cached', combo_idx, reward, combo_path, epoch_dir)
+            except LookupError as e:
+                if verbose:
+                    print(f"  Not reusing {epoch_results_file}: {e}")
             except Exception as e:
                 warnings.warn(f"Failed to load cached results for {combo_path.name}: {e}")
 

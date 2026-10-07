@@ -271,8 +271,17 @@ def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
     build_combo_dir_lookup for the current epoch.  When provided it avoids
     re-reading combo_metadata.json; when absent the function falls back to a
     full JSON scan (correct but slow for large systems).
+
+    The manifest lives in input_dir and is shared by every run of the system,
+    so its paths point at whichever out_dir first built it. The combo dir is
+    always this run's ``out_dir / name``: an existing dir elsewhere belongs to
+    another run, and using it would read that run's results as cached.
     """
-    if combo_path.exists():
+    if system_config.get('out_dir'):
+        local = Path(system_config['out_dir']) / combo_path.name
+        if local.exists():
+            return local
+    elif combo_path.exists():
         return combo_path
 
     combo_info = (_lookup or {}).get(str(combo_path))

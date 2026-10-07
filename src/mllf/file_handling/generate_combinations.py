@@ -435,10 +435,28 @@ def augment_core_with_excluded_sub1(
         if line.startswith('ATOM'):
             sub1_pdb_atoms.append(line)
     
-    # Augment core.rtf
+    # Idempotent: a combo directory reused by a later epoch keeps its already
+    # augmented core files (they are only copied when missing), so skip a file
+    # that already holds this substituent's atoms. Augmenting twice duplicates
+    # atom names and CHARMM stops while reading core.rtf.
+    def _rtf_atom_names(lines):
+        return {l.split()[1].upper() for l in lines
+                if l.strip().startswith('ATOM') and len(l.split()) > 1}
+
+    def _pdb_atom_names(lines):
+        return {l[12:16].strip().upper() for l in lines if l.startswith(('ATOM', 'HETATM'))}
+
     core_rtf_content = core_rtf_path.read_text()
     core_rtf_lines = core_rtf_content.split('\n')
-    
+    sub1_names = _rtf_atom_names(sub1_atoms)
+    rtf_done = bool(sub1_names) and sub1_names <= _rtf_atom_names(core_rtf_lines)
+    pdb_done = bool(sub1_pdb_atoms) and (
+        _pdb_atom_names(sub1_pdb_atoms) <= _pdb_atom_names(core_pdb_path.read_text().split('\n')))
+    if rtf_done and pdb_done:
+        return
+
+    # Augment core.rtf
+
     # Process the RTF file line by line
     final_rtf_lines = []
     header_done = False
@@ -490,7 +508,10 @@ def augment_core_with_excluded_sub1(
             for bond_line in sub1_bonds:
                 final_rtf_lines.append(bond_line)
     
-    core_rtf_path.write_text('\n'.join(final_rtf_lines))
+    if not rtf_done:
+        core_rtf_path.write_text('\n'.join(final_rtf_lines))
+    if pdb_done:
+        return
     
     # Augment core.pdb
     core_pdb_content = core_pdb_path.read_text()

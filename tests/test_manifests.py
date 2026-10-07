@@ -196,6 +196,27 @@ def test_ensure_combo_dir_exists_creates_lazily_from_lookup(tmp_path):
     assert (combo_path / 'mapping.json').exists()
 
 
+def test_ensure_combo_dir_exists_ignores_another_runs_dir(tmp_path):
+    # The shared manifest points at the out_dir of the run that built it; a
+    # later run with its own out_dir must not reuse that run's combo dir (and
+    # with it that run's results as "cached").
+    input_dir = _make_site_sub_fixture(tmp_path / 'sys_g', {1: 3})
+    old_out, new_out = tmp_path / 'run1_out', tmp_path / 'run2_out'
+    combo_info = list_possible_combinations(input_dir, old_out, max_subs_per_site=10)[0]
+    old_path = Path(combo_info['path'])
+    lookup = {combo_info['path']: combo_info}
+    old_cfg = {'name': 'sys_g', 'input_dir': str(input_dir), 'out_dir': str(old_out)}
+    assert ensure_combo_dir_exists(old_path, old_cfg, {}, _lookup=lookup) == old_path
+    (old_path / 'run_000').mkdir()
+
+    new_cfg = {**old_cfg, 'out_dir': str(new_out)}
+    created = ensure_combo_dir_exists(old_path, new_cfg, {}, _lookup=lookup)
+    assert created == new_out / old_path.name
+    assert (created / 'mapping.json').exists()
+    assert not (created / 'run_000').exists()
+    assert ensure_combo_dir_exists(old_path, new_cfg, {}, _lookup=lookup) == created
+
+
 def test_ensure_combo_dir_exists_raises_when_info_not_found(tmp_path):
     input_dir = tmp_path / 'sys_g'
     input_dir.mkdir()
