@@ -31,13 +31,30 @@ import torch.nn.functional as F
 from mllf.cb.graph_build import build_graph_and_data
 from mllf.cb.graph_utils import build_directed_pairs
 from mllf.cb.hindsight import (
+    BARRIER_TRAP_WIDTH,
+    BIAS_DIMS,
     DEFAULT_TEMPERATURE,
+    EXPLORE_FACTOR_MAX,
+    PERSISTENT_FAILURES,
+    OFFSET_DIMS,
+    QUADRATIC_STEP_MAX,
     apply_pair_offsets,
+    barrier_trapped_c_targets,
     combo_node_labels,
+    grow_directional_b_steps,
+    held_off_counts,
     hindsight_targets,
     preact_weights,
     read_applied_biases,
+    record_pair_outcomes,
     record_pair_targets,
+    update_exploration,
+)
+from mllf.cb.hindsight_regression import (
+    build_replay_set,
+    online_item,
+    regression_config,
+    regression_step,
 )
 from mllf.cb.policy import ContextBaseline, UnimolPolicy
 from mllf.cb.pretrain_policy import compute_pairwise_confidence_weights
@@ -60,6 +77,9 @@ from mllf.cli.slurm import submit_epoch_simulation
 from mllf.cli.workflow import write_variables_from_actions
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
 
+
+# Replay sets for the hindsight regression, keyed by cache path (built once per process).
+_REPLAY_CACHE: Dict[str, list] = {}
 
 # Thread-safety lock for policy inference (policy forward passes are not thread-safe on CPU)
 _policy_inference_lock = threading.Lock()
@@ -461,15 +481,20 @@ def train_epoch(
     # 1.0 reproduces the posterior's own calibrated/narrowed spread exactly.
     _exploration_scale = config.get('bandit', {}).get('exploration_scale', 1.0)
     # NeuralLinear+TS update target: 'awr' regresses toward the sampled action
-    # weighted by exp(r/beta); 'hindsight' regresses the linear and quadratic
-    # heads toward the biases each run measured it should have used (see
-    # mllf.cb.hindsight), and by default keeps per-pair offsets for what the
-    # shared model can't fit. Offsets need bandit_state, so validation passes
-    # (bandit_state=None) always see the shared model alone.
+    # weighted by exp(r/beta); 'hindsight' regresses the heads in
+    # bandit.hindsight_dims (default all four) toward the biases each run
+    # measured it should have used (see mllf.cb.hindsight), and by default
+    # keeps per-pair offsets for what the shared model can't fit. With
+    # bandit.offset_sampling, proposals sample each pair's offset and pairs
+    # that fail without a measurable direction widen their own exploration.
+    # Offsets need bandit_state, so validation passes (bandit_state=None)
+    # always see the shared model alone.
     _bandit_cfg = config.get('bandit', {})
     _use_hindsight = _bandit_cfg.get('update_target', 'awr') == 'hindsight'
     _use_offsets = (_use_hindsight and bandit_state is not None
                     and bool(_bandit_cfg.get('pair_offsets', True)))
+    _hs_dims = [d for d in _bandit_cfg.get('hindsight_dims', list(BIAS_DIMS)) if d in OFFSET_DIMS]
+    _offset_sampling = _use_offsets and bool(_bandit_cfg.get('offset_sampling', False))
 
     def _with_pair_offsets(actions, data, combo_path, sys_cfg):
         """Shift a Thompson-sampled proposal by the pair's offsets, if any."""
@@ -482,7 +507,10 @@ def train_epoch(
         shifted, _n = apply_pair_offsets(
             actions, mean.detach(), bandit_state, sys_cfg.get('name', 'unknown'),
             combo_node_labels(combo_path), data.edge_index,
-            prior_sd=_bandit_cfg.get('offset_prior_sd'))
+            prior_sd=_bandit_cfg.get('offset_prior_sd'),
+            sample=_offset_sampling and not deterministic_actions,
+            base_sd=_bandit_cfg.get('offset_base_sd'),
+            dims=_hs_dims)
         return shifted
     # Tags every epoch_results.pt written this call with which training run
     # (checkpoint dir) produced it -- out_dir/combo trees are shared across
@@ -1140,12 +1168,44 @@ def train_epoch(
         _r_relevant_all = []
         _hs_barrier_target = float(reward_config.get('barrier_target', BARRIER_TARGET))
         _hs_temperature = float(bandit_cfg.get('temperature', DEFAULT_TEMPERATURE))
-        _hs_linear_cap = float(bandit_cfg.get('hindsight_linear_step_cap', 3.0))
-        _hs_quadratic_cap = float(bandit_cfg.get('hindsight_quadratic_step_cap', 12.0))
-        _hs_weight_scale = float(bandit_cfg.get('hindsight_weight_scale', 1.0))
-        _hs_steps = ([], [])      # |target - applied| per head, for the summary
+        _hs_caps = dict(
+            linear_step_cap=float(bandit_cfg.get('hindsight_linear_step_cap', 3.0)),
+            quadratic_step_cap=float(bandit_cfg.get('hindsight_quadratic_step_cap', 12.0)),
+            skew_step_cap=float(bandit_cfg.get('hindsight_skew_step_cap', 3.0)),
+            end_step_cap=float(bandit_cfg.get('hindsight_end_step_cap', 1.5)),
+            end_reference=float(bandit_cfg.get('end_reference_s', 1.5)),
+        )
+        # Shared-model update strength: one number, or per head
+        # ({linear: .., quadratic: .., skew: .., end: ..}, missing heads 1.0).
+        _hs_ws_cfg = bandit_cfg.get('hindsight_weight_scale', 1.0)
+        _hs_weight_scale = ({d: float(_hs_ws_cfg.get(d, 1.0)) for d in _hs_dims}
+                            if isinstance(_hs_ws_cfg, dict)
+                            else {d: float(_hs_ws_cfg) for d in _hs_dims})
+        _hs_b_base = float(bandit_cfg.get('hindsight_linear_step_cap', 3.0))
+        _hs_b_max = float(bandit_cfg.get('linear_step_max', _hs_b_base))
+        _hs_n_grown = 0
+        _hs_n_bracketed = 0
+        _hs_n_c_trapped = 0
+        _hs_c_trap = dict(
+            base_step=_hs_caps['quadratic_step_cap'],
+            max_step=float(bandit_cfg.get('quadratic_step_max', QUADRATIC_STEP_MAX)),
+            trap_width=float(bandit_cfg.get('barrier_trap_width', BARRIER_TRAP_WIDTH)),
+        )
+        # bandit.shared_update: 'posterior' (closed-form last-layer update,
+        # default) or 'regression' (gradient steps on the full network toward
+        # the hindsight targets with pretraining replay; see
+        # mllf.cb.hindsight_regression). Per-pair offsets are the same either way.
+        _shared_regression = (_use_hindsight
+                              and bandit_cfg.get('shared_update', 'posterior') == 'regression')
+        _reg_items = []
+        _hs_factor_max = float(bandit_cfg.get('explore_factor_max', EXPLORE_FACTOR_MAX))
+        _hs_persistent = int(bandit_cfg.get('explore_after_failures', PERSISTENT_FAILURES))
+        _hs_cols = [OFFSET_DIMS[d] for d in _hs_dims]
+        _hs_steps = {d: [] for d in _hs_dims}   # |target - proposed| per head, for the summary
         _hs_n_edges = 0
         _hs_n_offsets = 0
+        _hs_n_held_off = 0
+        _hs_widened = _hs_narrowed = 0
         for (combo_path_u, epoch_dir_u, reward_u) in deferred_updates:
             try:
                 (vdata_u, saved_data, saved_actions, r_pair,
@@ -1189,45 +1249,80 @@ def train_epoch(
                 update_targets = saved_actions
 
                 if _use_hindsight and vdata_u.edge_type is None:
-                    # Linear/quadratic heads: regress toward the biases this
+                    # Heads in hindsight_dims regress toward the biases this
                     # run measured it should have used, each weighted by its
                     # own measurement noise (no reward weighting -- a trapped
                     # or over-flattened run is as informative as a good one).
-                    # Skew/end keep the AWR target above.
+                    # Other heads keep the AWR target above.
                     _applied = read_applied_biases(epoch_dir_u)
                     if _applied is not None:
-                        hs_t, hs_v = hindsight_targets(
+                        hs_t, hs_v, hs_dir = hindsight_targets(
                             vdata_u.edge_index, _applied, saved_data,
                             barrier_target=_hs_barrier_target,
-                            temperature=_hs_temperature,
-                            linear_step_cap=_hs_linear_cap,
-                            quadratic_step_cap=_hs_quadratic_cap,
+                            temperature=_hs_temperature, return_directional=True, **_hs_caps,
                         )
-                        hs_t = hs_t.to(saved_actions.dtype).to(device)
+                        _labels = combo_node_labels(combo_path_u) if _use_offsets else None
+                        _sys_name = combo_system_map.get(str(combo_path_u), {}).get('name', 'unknown')
+                        if update_policy and _labels:
+                            # Per-pair offsets get grown directional b and
+                            # (barrier-trapped) c steps; the shared model
+                            # below keeps the base steps.
+                            hs_t_pair, hs_v_pair = hs_t.clone(), hs_v.clone()
+                            hs_dir_pair = hs_dir.clone()
+                            if 'linear' in _hs_dims and _hs_b_max >= _hs_b_base:
+                                _g, _br = grow_directional_b_steps(
+                                    bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                    hs_t_pair, hs_dir, _applied,
+                                    base_step=_hs_b_base, max_step=_hs_b_max, var=hs_v_pair)
+                                _hs_n_grown += _g
+                                _hs_n_bracketed += _br
+                            if 'quadratic' in _hs_dims:
+                                _hs_n_c_trapped += barrier_trapped_c_targets(
+                                    bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                    hs_t_pair, hs_v_pair, hs_dir_pair, _applied, **_hs_c_trap)
+                            _hs_n_offsets += record_pair_targets(
+                                bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                hs_t_pair, hs_v_pair, history=int(bandit_cfg.get('offset_history', 5)),
+                                dims=_hs_dims, directional=hs_dir_pair,
+                            )
+                            record_pair_outcomes(bandit_state, _sys_name, _labels,
+                                                 vdata_u.edge_index, saved_data)
+                            if _offset_sampling:
+                                _wd, _nr = update_exploration(
+                                    bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                    hs_v, saved_data, factor_max=_hs_factor_max, dims=_hs_dims,
+                                    persistent_failures=_hs_persistent)
+                                _hs_widened += _wd
+                                _hs_narrowed += _nr
+                        if _labels and 'quadratic' in _hs_dims:
+                            barrier_trapped_c_targets(
+                                bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                hs_t, hs_v, hs_dir.clone(), _applied,
+                                **{**_hs_c_trap, 'grow': False})
+                        hs_t_dev = hs_t.to(saved_actions.dtype).to(device)
                         finite = torch.isfinite(hs_v).to(device)
                         update_targets = saved_actions.clone()
-                        update_targets[:, :2] = torch.where(finite, hs_t, saved_actions[:, :2])
                         combined_weight = combined_weight.expand_as(saved_actions).clone()
-                        combined_weight[:, :2] = preact_weights(
-                            policy, hs_t.cpu(), hs_v, dims=(0, 1), scale=_hs_weight_scale,
-                        ).to(device)
-                        _applied_t = saved_actions[:, :2].detach().cpu().double()
-                        _step = (hs_t.cpu().double() - _applied_t)
-                        for _col in range(2):
+                        _w = preact_weights(policy, hs_t[:, _hs_cols], hs_v[:, _hs_cols],
+                                            dims=_hs_cols).to(device)
+                        _w = _w * torch.tensor([_hs_weight_scale[_d] for _d in _hs_dims],
+                                               dtype=_w.dtype, device=_w.device)
+                        _step = hs_t - saved_actions.detach().cpu().double()
+                        for _n, (_d, _col) in enumerate(zip(_hs_dims, _hs_cols)):
+                            update_targets[:, _col] = torch.where(
+                                finite[:, _col], hs_t_dev[:, _col], saved_actions[:, _col])
+                            combined_weight[:, _col] = _w[:, _n]
                             _m = torch.isfinite(hs_v[:, _col])
-                            _hs_steps[_col].extend(_step[_m, _col].abs().tolist())
+                            _hs_steps[_d].extend(_step[_m, _col].abs().tolist())
                         _hs_n_edges += int(vdata_u.edge_index.size(1))
-                        if update_policy and _use_offsets:
-                            _labels = combo_node_labels(combo_path_u)
-                            if _labels:
-                                _hs_n_offsets += record_pair_targets(
-                                    bandit_state,
-                                    combo_system_map.get(str(combo_path_u), {}).get('name', 'unknown'),
-                                    _labels, vdata_u.edge_index, hs_t.cpu(), hs_v,
-                                    history=int(bandit_cfg.get('offset_history', 5)),
-                                )
+                        _hs_n_held_off += held_off_counts(vdata_u.edge_index, saved_data)
 
-                if update_policy:
+                if update_policy and _shared_regression:
+                    if vdata_u.edge_type is None and _applied is not None:
+                        _it = online_item(vdata_u.x, vdata_u.edge_index, hs_t, hs_v)
+                        if _it is not None:
+                            _reg_items.append(_it)
+                elif update_policy:
                     policy.update_bayesian_posteriors(
                         vdata_u.x, vdata_u.edge_index, vdata_u.edge_type,
                         update_targets, weights=combined_weight,
@@ -1254,12 +1349,45 @@ def train_epoch(
             )
             print(_stats_msg)
             _detail_lines.append(_stats_msg)
+        if update_policy and _shared_regression:
+            _reg_cfg = regression_config(bandit_cfg)
+            _ck = Path(config.get('output', {}).get('base_dir', 'checkpoints'))
+            _buf_path = _ck / 'regression_online_buffer.pt'
+            _buf = torch.load(_buf_path, weights_only=False) if _buf_path.exists() else []
+            _buf.append(_reg_items)
+            _buf = _buf[-int(_reg_cfg['online_history']):]
+            _ck.mkdir(parents=True, exist_ok=True)
+            torch.save(_buf, _buf_path)
+            if _reg_cfg.get('replay_cache') is None:
+                _reg_cfg['replay_cache'] = str(_ck / 'regression_replay.pt')
+            _replay = _REPLAY_CACHE.get(_reg_cfg['replay_cache'])
+            if _replay is None and float(_reg_cfg['replay_weight']) > 0:
+                _replay = build_replay_set(_reg_cfg, seed=0)
+                _REPLAY_CACHE[_reg_cfg['replay_cache']] = _replay
+            _online_all = [it for ep in _buf for it in ep]
+            _rs = regression_step(policy, _online_all, _replay or [], _reg_cfg, device=device,
+                                  seed=epoch)
+            _reg_msg = (f"  Hindsight regression (full network): {_rs.get('steps', 0)} steps on "
+                        f"{len(_online_all)} online graphs ({len(_buf)} epoch(s)) + "
+                        f"{len(_replay or [])} replay; loss online "
+                        f"{_rs.get('online_before', float('nan')):.3f} -> "
+                        f"{_rs.get('online_after', float('nan')):.3f}, replay "
+                        f"{_rs.get('replay_before', float('nan')):.3f} -> "
+                        f"{_rs.get('replay_after', float('nan')):.3f}")
+            print(_reg_msg)
+            _detail_lines.append(_reg_msg)
         if _hs_n_edges:
             def _med(v):
                 return f"{float(np.median(v)):.2f} (n={len(v)})" if v else "n/a"
             _hs_msg = (
-                f"  Hindsight targets: median |step| linear {_med(_hs_steps[0])} kcal/mol, "
-                f"quadratic {_med(_hs_steps[1])}; pair-offset observations recorded: {_hs_n_offsets}"
+                "  Hindsight targets: median |step| "
+                + ', '.join(f"{d} {_med(v)}" for d, v in _hs_steps.items())
+                + f"; held-off endpoints {_hs_n_held_off}; grown b steps {_hs_n_grown}"
+                + f"; bracketed b {_hs_n_bracketed}"
+                + f"; barrier-trapped c {_hs_n_c_trapped}"
+                + f"; pair-offset observations {_hs_n_offsets}"
+                + (f"; exploration widened {_hs_widened}, narrowed {_hs_narrowed}"
+                   if _offset_sampling else "")
             )
             print(_hs_msg)
             _detail_lines.append(_hs_msg)

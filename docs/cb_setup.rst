@@ -254,42 +254,126 @@ default (``awr``) the posterior regresses toward the action each run sampled, we
 ``exp(r/β)``. A scalar reward says whether a run's biases were good, but not which way
 they were off or by how much. Because the samples sit around the current mean, the
 update also barely moves the posterior. With ``hindsight``, each run is relabelled with
-the biases it *measured* it should have used, and the linear and quadratic heads regress
-toward those:
+the biases it *measured* it should have used, and the heads in ``hindsight_dims``
+(default: all four) regress toward those. Each signal comes from the run's own λ
+trajectory (``read_output.parse_pair_profile``), and each response is from the
+pretraining bias-sensitivity analysis:
 
 * linear, directed edge :math:`(i \to j)`:
   :math:`\Delta b^* = \Delta b - kT \ln(p_j / p_i)`. When one substituent is unsampled,
   this is a capped step toward it.
 * quadratic: :math:`c^* = c + (B - B_0)/|s_c|`, from the pair's midpoint barrier
-  :math:`B`, where :math:`s_c` is the barrier's response to c from the pretraining
-  bias-sensitivity analysis.
+  :math:`B`, where :math:`s_c` is the barrier's response to c.
+* skew: the step that removes the pair's skew asymmetry, split between
+  :math:`x_{lo,hi}` and :math:`x_{hi,lo}`.
+* end: the step that removes the pair's end asymmetry, split between
+  :math:`s_{lo,hi}` and :math:`s_{hi,lo}`. When the trajectory crowds up to an endpoint
+  but does not hold it (many frames just short of it, almost none at it), the end term
+  there is holding λ off. That s (:math:`s_{hi,lo}` at the lo end, :math:`s_{lo,hi}` at
+  the hi end) then moves part of the way toward a typical converged value
+  (``end_reference_s``), so even a large error shrinks within a few runs. This signal
+  exists exactly when the others do not: the pair never reached an endpoint.
 
 Iterative flattening methods also correct biases from each simulation. Those
 corrections apply only to the system being simulated, so every new system starts from
-scratch. This implementation differs in three ways:
+scratch. This implementation differs in four ways:
 
 * **Transfer.** The corrected targets train a shared model conditioned on the
   substituents' Uni-Mol embeddings, not the biases of one system. What is learned on
   one pair improves the first guess for pairs and systems that have never been
   simulated.
 * **Calibrated weighting.** Each target enters the Bayesian posterior with its own
-  measurement variance: the number of crossings for b, barrier scatter for c, and a term
-  that grows with the size of the linearized step. Well-measured runs count for more
-  than noisy ones, with no fixed per-coefficient regularization.
-* **Active selection.** The posterior's epistemic uncertainty chooses which pairs to
-  simulate next, so simulations go where the model knows least.
+  measurement variance (crossings for b, the scatter of the barrier, skew or end signal,
+  and a term that grows with the size of the linearized step). Well-measured runs count
+  for more than noisy ones, with no fixed per-coefficient regularization.
+  ``hindsight_weight_scale`` sets how strongly the shared model follows the training
+  pairs relative to the per-pair offsets below.
+* **Pair-level Bayesian offsets and exploration.** Each pair's own measurements are
+  combined with the model's prediction as a prior, and proposals *sample* from that
+  per-pair posterior (below), so exploration is targeted where it is needed.
+* **Active selection.** The shared posterior's epistemic uncertainty and each pair's
+  own state choose which pairs to simulate next.
 
 Each step is still capped (``hindsight_linear_step_cap``,
-``hindsight_quadratic_step_cap``), because the linearized responses hold only near
-sensible biases. Skew and end keep the AWR target.
+``hindsight_quadratic_step_cap``, ``hindsight_skew_step_cap``,
+``hindsight_end_step_cap``), because the linearized responses hold only near sensible
+biases.
+A pair that keeps stepping b toward an unsampled substituent in the same direction is far
+from its working b. Its per-pair steps then double with each consecutive step, up to
+``linear_step_max``, and reset once both substituents are sampled. The shared model keeps
+the base step.
+
+``hindsight_weight_scale`` can be given per head (``{linear: …, quadratic: …, skew: …,
+end: …}``). A head whose shared update would shift predictions for every pair, including
+ones it never trained on, can be damped strongly while the per-pair offsets still correct
+that coefficient pair by pair.
 
 With ``bandit.pair_offsets: true``, each training pair's last ``offset_history`` targets
-are stored in ``bandit_state.json`` under its original site/sub numbers. Its next
-proposal combines them with the model prediction, which acts as a Bayesian prior of sd
+are stored in ``bandit_state.json`` under its original site/sub numbers, per coefficient
+(per direction for x and s, which are independent parameters). Its next proposal combines
+them with the model prediction, which acts as a Bayesian prior of sd
 ``offset_prior_sd``: a pair the model already predicts well moves little, and one it
 predicts poorly is corrected from its own data without distorting the shared model. The
 shared model carries what generalizes; the offsets hold what is specific to a pair.
 Validation passes never apply offsets, so they measure the shared model alone.
+
+With ``bandit.offset_sampling: true``, proposals draw each pair's offset rather than
+using its mean:
+
+* A coefficient the pair has not measured is explored with sd
+  ``offset_base_sd × factor`` on top of the shared model's Thompson sample.
+* A coefficient it has measured is proposed at the model mean plus a draw from the
+  pair's own offset posterior. Exploration then narrows as the pair's data accumulate,
+  instead of following the shared model's noise.
+* When a run fails without giving a direction for *any* of the pair's coefficients
+  (a failure no signal explains), the pair's factors double, up to
+  ``explore_factor_max``, so the next proposals search further. A success halves them.
+  A single failure that does give a direction leaves the factors alone: the targets
+  address it.
+* A pair that fails ``bandit.explore_after_failures`` runs in a row (default 3) is not
+  being fixed by its targets, so all of its factors double, measured coefficients
+  included. A measured coefficient's spread stays capped by its offset posterior sd.
+  Because b gets a target whenever either substituent is sampled, almost every failure
+  gives a direction, so this is the usual way a stuck pair widens its search.
+
+This is how the method copes with a new system whose failure mode was not anticipated:
+diagnosable failures are corrected directly, and undiagnosable ones widen the search
+until something measurable happens.
+
+With ``bandit.selection_attention_weight`` > 0, uncertainty-driven selection ranks
+candidates by the percentile of their shared posterior variance plus this weight × the
+pair's own state (+1 if its last run failed, up to +1 for widened exploration), so pairs
+that are stuck or still converging keep being revisited until they succeed.
+
+**Full-network hindsight regression** (``bandit.shared_update: regression``,
+:mod:`mllf.cb.hindsight_regression`): the default ``posterior`` update moves only each
+head's last linear layer, in closed form. With ``regression``, the epoch's hindsight
+targets instead train the whole policy, every head's trunk and output weights, by
+gradient descent:
+
+* the loss pulls each prediction toward its hindsight target, weighted by that target's
+  own variance (the regression counterpart of the posterior update);
+* pretraining runs are replayed in the same loss (``regression.replay_weight``), with the
+  data-hygiene weights, so fitting new pairs doesn't overwrite what the model knows. Each
+  source's error is measured in its own unit (its starting residual), so the noisier
+  pretraining targets don't swamp the online signal;
+* online targets from the last ``regression.online_history`` epochs are kept, so each
+  step sees more than one epoch's pairs;
+* afterwards each Bayesian head is re-seeded with the trained output weights and its
+  calibrated prior precision, so Thompson sampling and uncertainty-driven selection keep
+  working on the new features. The precision is not updated from online runs, so the
+  posterior variance that selection ranks by reflects distance from the pretraining
+  data; the attention term (``selection_attention_weight``) is what brings back pairs
+  that are failing online. ``min_observations_before_confident`` does not apply in this
+  mode, since no posterior observations are added;
+* with ``regression.validation_gate``, a validation pass that scores worse than the last
+  accepted one by more than ``gate_margin`` restores that accepted model (per-pair
+  offsets are kept).
+
+Unlike REINFORCE, which only learns whether a sampled action scored above or below
+average, each run here supplies a direction and size for every coefficient it measured.
+REINFORCE and the closed-form posterior update are unchanged and selectable as before.
+The replay set can be prebuilt with ``training/build_regression_replay.sh``.
 
 **Uncertainty-driven selection with plain REINFORCE**: ``bandit.selection: uncertainty``
 also works without ``neurallinear_ts`` — ``select_combos_by_uncertainty`` accepts a

@@ -17,6 +17,7 @@ entry point, and :doc:`workflow` for the full configuration reference.
 from pathlib import Path
 from typing import Dict, List
 import collections
+import copy
 import concurrent.futures
 import json
 import re
@@ -34,6 +35,7 @@ from mllf.cb.curriculum import (
     sample_combos_stratified,
 )
 from mllf.cb.graph_build import build_graph_and_data
+from mllf.cb.hindsight import combo_node_labels, pair_attention
 from mllf.cb.policy import ContextBaseline, UnimolPolicy
 from mllf.cb.reinforce_trainer import append_summary, format_pair_success, train_epoch
 from mllf.cb.workflow_utils import (
@@ -594,6 +596,11 @@ def run_training(config_path: str) -> None:
         except Exception as _vf_err:
             print(f"  Warning: could not restore validation combo set: {_vf_err}")
 
+    _gate_state, _gate_score = None, None   # validation gate (see below)
+    _gate_key = None                        # held-out set the gate's scores refer to
+    # Best validated model (shared_update: regression with the gate): saved as
+    # best_model.pt, and what the run ends on if the last validation is worse.
+    _best_state, _best_score, _best_epoch, _last_val_score = None, None, None, None
     for epoch in range(start_epoch, num_epochs):
         if curriculum_enabled:
             stages = curriculum_config.get('stages', [])
@@ -692,7 +699,14 @@ def run_training(config_path: str) -> None:
         _uncertainty_score_fn = (
             bayesian_variance_score if algorithm == 'neurallinear_ts' else action_std_score
         )
-        if use_uncertainty_selection and algorithm == 'neurallinear_ts':
+        # shared_update: regression re-seeds each head's mean but never adds
+        # posterior observations, so n_obs stays at the pretrained value (0)
+        # and this gate would hold selection at random for the whole run. The
+        # pretraining-calibrated precision it keeps is the posterior that
+        # selection scores against, so skip the gate there.
+        _shared_regression = (bandit_cfg.get('update_target', 'awr') == 'hindsight'
+                              and bandit_cfg.get('shared_update', 'posterior') == 'regression')
+        if use_uncertainty_selection and algorithm == 'neurallinear_ts' and not _shared_regression:
             _min_obs = bandit_cfg.get('min_observations_before_confident', 3)
             _n_obs_per_head = [mlp.bayesian_head.n_obs.item() for mlp in policy.edge_mlp.mlps]
             if min(_n_obs_per_head) < _min_obs:
@@ -736,6 +750,12 @@ def run_training(config_path: str) -> None:
                     combo_path, sys_cfg, cfg, verbose=verbose,
                     _lookup=_uncertainty_dir_lookup)
 
+            # Pairs' own online state (last run failed, exploration widened)
+            # adds to the ranking so stuck pairs keep being revisited.
+            def _pair_attention_fn(combo_dir, data):
+                return pair_attention(
+                    bandit_state, combo_system_map.get(combo_dir, {}).get('name', 'unknown'),
+                    combo_node_labels(combo_dir), data.edge_index)
             epoch_combos = select_combos_by_uncertainty(
                 _uncertainty_candidates, policy, combo_system_map, config,
                 n_select=_max_epoch_combos, bandit_state=bandit_state,
@@ -743,6 +763,8 @@ def run_training(config_path: str) -> None:
                 ensure_dir_fn=_ensure_dir_for_scoring,
                 min_per_system=_min_per_system,
                 score_fn=_uncertainty_score_fn,
+                attention_fn=_pair_attention_fn,
+                attention_weight=float(bandit_cfg.get('selection_attention_weight', 0.0)),
             )
             _score_label = 'posterior variance' if algorithm == 'neurallinear_ts' else 'action std'
             print(f"  Epoch combo sample (uncertainty-driven, {_score_label}): "
@@ -879,6 +901,43 @@ def run_training(config_path: str) -> None:
             stats['val_n_combos'] = len(_epoch_val)
             stats['val_pair_success'] = val_stats.get('pair_success', {})
 
+            # Validation gate (bandit.shared_update: regression): the full
+            # network moves each epoch, so keep it only while held-out pairs
+            # hold up. A pass that scores worse than the last accepted one by
+            # more than the margin restores that accepted model; per-pair
+            # offsets (bandit_state) are left as they are.
+            _reg_gate = (bandit_cfg.get('shared_update', 'posterior') == 'regression'
+                         and (bandit_cfg.get('regression') or {}).get('validation_gate', True))
+            if _reg_gate:
+                _val_key = frozenset(_epoch_val)
+                if _gate_key is not None and _val_key != _gate_key:
+                    # e.g. a new stage adds a system: scores aren't comparable
+                    print("  [VALIDATION GATE] held-out set changed (new stage): gate and best "
+                          "model reset")
+                    _gate_state = _gate_score = None
+                    _best_state = _best_score = _best_epoch = None
+                _gate_key = _val_key
+                _score = int(val_stats.get('pair_success', {}).get('both', 0))
+                _margin = int((bandit_cfg.get('regression') or {}).get('gate_margin', 2))
+                if _gate_score is not None and _score < _gate_score - _margin:
+                    policy.load_state_dict(_gate_state)
+                    _gate_msg = (f"  [VALIDATION GATE] held-out success {_score} < accepted "
+                                 f"{_gate_score} - {_margin}: restored the last accepted model")
+                else:
+                    _gate_state = copy.deepcopy(policy.state_dict())
+                    _gate_score = _score if _gate_score is None else max(_gate_score, _score)
+                    _gate_msg = (f"  [VALIDATION GATE] held-out success {_score}: model accepted "
+                                 f"(reference {_gate_score})")
+                _last_val_score = _score
+                if _best_score is None or _score > _best_score:
+                    _best_state = copy.deepcopy(policy.state_dict())
+                    _best_score, _best_epoch = _score, epoch
+                    torch.save({'policy_state_dict': _best_state, 'epoch': epoch,
+                                'val_success': _score}, checkpoint_dir / 'best_model.pt')
+                    _gate_msg += f"; new best (epoch {epoch}) saved to best_model.pt"
+                print(_gate_msg)
+                _val_detail_lines.append(_gate_msg)
+
         try:
             _summary_lines = [f"\nEpoch {epoch} Summary:"]
             print(_summary_lines[-1])
@@ -940,7 +999,10 @@ def run_training(config_path: str) -> None:
             traceback.print_exc()
             sys.stdout.flush()
 
-        if not stats.get('bc_mode') and stats.get('update_policy', True):
+        # rl_optimizer only steps in REINFORCE and BC; NL+TS updates in closed
+        # form or, with regression, with its own optimizer at regression.lr.
+        if (not stats.get('bc_mode') and stats.get('update_policy', True)
+                and algorithm != 'neurallinear_ts'):
             prev_lrs = [pg['lr'] for pg in rl_optimizer.param_groups]
             rl_scheduler.step(n_success_ep)
             new_lrs = [pg['lr'] for pg in rl_optimizer.param_groups]
@@ -974,9 +1036,18 @@ def run_training(config_path: str) -> None:
 
     print("\n=== Training Complete ===")
 
+    # End on the best validated model when the last validation scored lower.
+    _final_from = 'last epoch'
+    if _best_state is not None and _last_val_score is not None and _last_val_score < _best_score:
+        policy.load_state_dict(_best_state)
+        _final_from = f'best validated model (epoch {_best_epoch}, held-out success {_best_score})'
+        print(f"Restored the best validated model: epoch {_best_epoch}, held-out success "
+              f"{_best_score} (last validation {_last_val_score})")
+
     # Save final model
     final_path = checkpoint_dir / 'final_model.pt'
     torch.save({
+        'final_from': _final_from,
         'policy_state_dict': policy.state_dict(),
         'rl_optimizer_state_dict': rl_optimizer.state_dict(),
         'all_stats': all_stats,

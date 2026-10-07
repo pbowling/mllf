@@ -658,6 +658,8 @@ def select_combos_by_uncertainty(
     ensure_dir_fn=None,
     min_per_system: int = 0,
     score_fn: Optional[Callable] = None,
+    attention_fn: Optional[Callable] = None,
+    attention_weight: float = 0.0,
 ) -> List[str]:
     """Rank candidate combos by a per-combo score and return the top ``n_select``.
 
@@ -711,6 +713,13 @@ def select_combos_by_uncertainty(
             ``bayesian_variance_score`` (the original NeuralLinear + TS
             behavior). Pass ``action_std_score`` to use this function with a
             plain REINFORCE policy instead.
+        attention_fn: Optional callable ``(combo_path_str, data) -> float``
+            scoring the combo's pairs from their own online state (e.g.
+            ``hindsight.pair_attention``: last run failed, exploration
+            widened). With ``attention_weight`` > 0 the ranking score becomes
+            the percentile rank of ``score_fn`` (0-1, since its scale is
+            arbitrary) plus ``attention_weight`` x attention, so pairs that
+            are stuck or still converging keep being revisited.
 
     Returns:
         List of up to ``n_select`` combo path strings. If fewer than
@@ -738,10 +747,18 @@ def select_combos_by_uncertainty(
                     combo_path = resolved_path
                 data, _ = build_graph_fn(str(combo_path), sys_cfg, config, device)
                 score = score_fn(policy, data, device)
+                attention = (attention_fn(str(combo_path), data)
+                             if attention_fn is not None and attention_weight > 0 else 0.0)
             except Exception:
                 n_skipped += 1
                 continue
-            scored.append((score, str(combo_path)))
+            scored.append((score, str(combo_path), attention))
+
+    if attention_fn is not None and attention_weight > 0 and scored:
+        order = sorted(range(len(scored)), key=lambda n: scored[n][0])
+        pct = {n: (rank + 1) / len(scored) for rank, n in enumerate(order)}
+        scored = [(pct[n] + attention_weight * a, c, a) for n, (_, c, a) in enumerate(scored)]
+    scored = [(s, c) for s, c, _ in scored]
 
     if n_skipped:
         print(f"  select_combos_by_uncertainty: {n_skipped}/{len(eligible)} candidates "

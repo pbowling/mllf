@@ -100,7 +100,8 @@ def test_hindsight_targets_edge_directions(tmp_path):
     assert t[1, 0].item() == pytest.approx(-db)      # 1 -> 0: antisymmetric
     assert t[0, 1].item() == pytest.approx(t[1, 1].item())  # c symmetric
     assert t[0, 1].item() > 20.0
-    assert torch.isfinite(v).all()
+    assert torch.isfinite(v[:, :2]).all()
+    assert torch.isinf(v[:, 2:]).all()   # no skew/end measured
 
 
 def test_hindsight_targets_fall_back_to_site_transitions(tmp_path):
@@ -124,8 +125,8 @@ def test_offsets_follow_original_sub_order(tmp_path):
     _write_mapping(a, [4, 8])
     _write_mapping(b, [8, 4])
     state = {}
-    targets = torch.tensor([[2.0, 30.0], [-2.0, 30.0]], dtype=torch.float64)
-    var = torch.full((2, 2), 0.01, dtype=torch.float64)
+    targets = torch.tensor([[2.0, 30.0, 0, 0], [-2.0, 30.0, 0, 0]], dtype=torch.float64)
+    var = torch.tensor([[0.01, 0.01, math.inf, math.inf]] * 2, dtype=torch.float64)
     record_pair_targets(state, 'sys', combo_node_labels(a), EDGES, targets, var)
     assert list(state[OFFSET_KEY]) == ['sys|s1|4|8']
 
@@ -152,8 +153,8 @@ def test_offset_history_is_bounded():
     state = {}
     labels = [(1, 1), (1, 2)]
     for k in range(8):
-        t = torch.tensor([[float(k), 20.0], [-float(k), 20.0]], dtype=torch.float64)
-        record_pair_targets(state, 'sys', labels, EDGES, t, torch.ones(2, 2, dtype=torch.float64),
+        t = torch.tensor([[float(k), 20.0, 0, 0], [-float(k), 20.0, 0, 0]], dtype=torch.float64)
+        record_pair_targets(state, 'sys', labels, EDGES, t, torch.ones(2, 4, dtype=torch.float64),
                             history=5)
     obs = state[OFFSET_KEY]['sys|s1|1|2']['linear']
     assert [o[0] for o in obs] == [3.0, 4.0, 5.0, 6.0, 7.0]
