@@ -182,3 +182,18 @@ def test_sample_combos_stratified_reduces_min_per_system_if_infeasible():
     # min_per_system rather than raise or exceed n_total.
     sampled = sample_combos_stratified(pools, n_total=6, min_per_system=10, seed=1)
     assert len(sampled) <= 6
+
+
+def test_stage_systems_filter_keeps_listed_systems():
+    from mllf.cb.curriculum import apply_stage_combo_filter
+    combos = ['/s/solv/comb_0001_site1_subs_1_2', '/s/prot/comb_0001_site1_subs_1_2',
+              '/s/prot/comb_0002_site1_subs_1_3']
+    cmap = {combos[0]: {'name': 'p38_solv'}, combos[1]: {'name': 'p38_prot'},
+            combos[2]: {'name': 'p38_prot'}}
+    stage = {'min_sites': 1, 'max_sites': 1, 'min_subs_per_site': 2, 'max_subs_per_site': 2}
+    only_solv = apply_stage_combo_filter(combos, {**stage, 'systems': ['p38_solv']}, {}, 0, 0,
+                                         apply_transition_filter=False, combo_system_map=cmap)
+    both = apply_stage_combo_filter(combos, {**stage, 'systems': ['p38_solv', 'p38_prot']}, {}, 0, 0,
+                                    apply_transition_filter=False, combo_system_map=cmap)
+    assert only_solv == [combos[0]]
+    assert sorted(both) == sorted(combos)

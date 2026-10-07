@@ -95,8 +95,21 @@ def filter_combos_by_transitions(combos: List, min_transitions: int,
 
 
 def apply_stage_combo_filter(train_combos, stage, curriculum_config, stage_idx, seed,
-                               apply_transition_filter: bool = True):
-    """Apply curriculum + optional transition filter for a given stage config."""
+                               apply_transition_filter: bool = True,
+                               combo_system_map: Optional[Dict[str, Dict]] = None):
+    """Apply curriculum + optional transition filter for a given stage config.
+
+    A stage may list ``systems: [name, ...]`` to train on only those systems
+    (e.g. a solvent leg first, then add the protein leg in a later stage);
+    needs ``combo_system_map`` (combo path -> system config).
+    """
+    if stage.get('systems'):
+        if combo_system_map is None:
+            raise ValueError("stage 'systems' needs combo_system_map")
+        keep = set(stage['systems'])
+        train_combos = [c for c in train_combos
+                        if combo_system_map.get(c, {}).get('name') in keep]
+        print(f"  Stage systems: {sorted(keep)} ({len(train_combos)} combos)")
     combos = filter_combos_by_curriculum(
         train_combos,
         min_sites=stage['min_sites'],

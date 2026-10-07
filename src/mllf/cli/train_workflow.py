@@ -463,6 +463,7 @@ def run_training(config_path: str) -> None:
             train_combos, current_stage, curriculum_config,
             stage_idx=current_stage_idx, seed=seed,
             apply_transition_filter=(resumed and current_stage_idx > 0),
+            combo_system_map=combo_system_map,
         )
         if resumed:
             _resume_lr = current_stage.get('policy_lr')
@@ -490,7 +491,33 @@ def run_training(config_path: str) -> None:
     # training settings on the same pairs). The seeded draw below picks by
     # index, so it changes whenever the combo pool does.
     _fixed_val_file = config.get('validation_combos_file')
-    if start_epoch == 0 and num_epochs > 0 and _fixed_val_file:
+    _val_per_system = config.get('validation_per_system')
+    if start_epoch == 0 and num_epochs > 0 and _val_per_system and not _fixed_val_file:
+        # A fixed number of held-out pairs per system, drawn from every system
+        # in the run (all curriculum stages, so a system that only joins in a
+        # later stage is held out from the start), with the first stage's
+        # site/substituent limits.
+        _stage0 = dict((curriculum_config.get('stages') or [{}])[0]) if curriculum_enabled else {}
+        _stage0.pop('systems', None)
+        _pool = (apply_stage_combo_filter(train_combos, _stage0, curriculum_config, stage_idx=0,
+                                          seed=seed, apply_transition_filter=False)
+                 if _stage0 else list(train_combos))
+        _by_sys: Dict[str, List[str]] = {}
+        for c in _pool:
+            _by_sys.setdefault(combo_system_map.get(c, {}).get('name'), []).append(c)
+        for _name in sorted(_by_sys, key=str):
+            _cands = sorted(_by_sys[_name])
+            _k = min(int(_val_per_system), max(len(_cands) - 1, 0))
+            if _k > 0:
+                _idx = np.random.RandomState(seed=42).choice(len(_cands), size=_k, replace=False)
+                validation_combos.extend(_cands[i] for i in sorted(_idx))
+        _val_set = set(validation_combos)
+        active_train_combos = [c for c in active_train_combos if c not in _val_set]
+        with open(validation_combos_path, 'w') as _vf:
+            json.dump(validation_combos, _vf)
+        print(f"Held-out validation set: {_val_per_system} per system, {len(validation_combos)} combos "
+              f"over {len(_by_sys)} system(s) (excluded from training pool)")
+    elif start_epoch == 0 and num_epochs > 0 and _fixed_val_file:
         with open(_fixed_val_file, 'r') as _vf:
             _fixed = json.load(_vf)
         _pool = set(active_train_combos)
@@ -498,12 +525,31 @@ def run_training(config_path: str) -> None:
         if len(validation_combos) < len(_fixed):
             print(f"  Warning: {len(_fixed) - len(validation_combos)} of {len(_fixed)} combos in "
                   f"{_fixed_val_file} are not in this run's pool; validating on the rest")
+        n_from_file = len(validation_combos)
+        # Systems the file doesn't cover get their own seeded held-out draw
+        # (validation_per_new_system combos each), so a run that adds systems
+        # keeps the file's set for comparison and still validates the new ones.
+        _covered = {combo_system_map.get(c, {}).get('name') for c in validation_combos}
+        _n_new = int(config.get('validation_per_new_system', 6))
+        _by_sys: Dict[str, List[str]] = {}
+        for c in active_train_combos:
+            _name = combo_system_map.get(c, {}).get('name')
+            if _name not in _covered and c not in set(validation_combos):
+                _by_sys.setdefault(_name, []).append(c)
+        for _name in sorted(_by_sys, key=str):
+            _cands = sorted(_by_sys[_name])
+            _k = min(_n_new, max(len(_cands) - 1, 0))
+            if _k > 0:
+                _idx = np.random.RandomState(seed=42).choice(len(_cands), size=_k, replace=False)
+                validation_combos.extend(_cands[i] for i in sorted(_idx))
         _val_set = set(validation_combos)
         active_train_combos = [c for c in active_train_combos if c not in _val_set]
         with open(validation_combos_path, 'w') as _vf:
             json.dump(validation_combos, _vf)
-        print(f"Held-out validation set from {_fixed_val_file}: {len(validation_combos)} combos "
-              f"(excluded from training pool)")
+        print(f"Held-out validation set from {_fixed_val_file}: {n_from_file} combos"
+              + (f" + {len(validation_combos) - n_from_file} drawn for {len(_by_sys)} system(s) "
+                 f"not in it" if len(validation_combos) > n_from_file else "")
+              + " (excluded from training pool)")
     elif start_epoch == 0 and num_epochs > 0 and len(active_train_combos) > 20:
         val_fraction = config.get('validation_fraction', 0.1)
         # Cap validation size based on max_train_combos_per_stage (curriculum training budget)
@@ -575,6 +621,7 @@ def run_training(config_path: str) -> None:
                         train_combos, current_stage, curriculum_config,
                         stage_idx=current_stage_idx, seed=seed,
                         apply_transition_filter=True,
+                        combo_system_map=combo_system_map,
                     )
                     # Keep the held-out set out of every stage's pool.
                     _val_set = set(validation_combos)
@@ -782,11 +829,21 @@ def run_training(config_path: str) -> None:
         # Buffered (not written immediately) for the same reason as
         # train_epoch's detail_lines -- see the epoch-summary-first write below.
         _val_detail_lines: List[str] = []
-        if validation_combos and epoch % config.get('eval_freq', 1) == 0:
-            print(f"\n  [VALIDATION] Evaluating on {len(validation_combos)} held-out combos (deterministic)...")
+        # Validate every eval_freq epochs and always after the last epoch, so the
+        # run's end point is measured (and the best model can be chosen).
+        # Validate only the systems the current stage trains on (a stage with
+        # `systems:` leaves the others for later).
+        _stage_systems = (set(current_stage['systems'])
+                          if curriculum_enabled and current_stage.get('systems') else None)
+        _epoch_val = ([c for c in validation_combos
+                       if combo_system_map.get(c, {}).get('name') in _stage_systems]
+                      if _stage_systems else validation_combos)
+        if _epoch_val and (epoch % config.get('eval_freq', 1) == 0
+                           or epoch == num_epochs - 1):
+            print(f"\n  [VALIDATION] Evaluating on {len(_epoch_val)} held-out combos (deterministic)...")
             val_stats = train_epoch(
                 policy, rl_optimizer,
-                validation_combos, combo_system_map,
+                _epoch_val, combo_system_map,
                 epoch, epoch_config, device,
                 update_policy=False,  # No gradient updates on validation
                 bc_mode=False,
@@ -819,7 +876,7 @@ def run_training(config_path: str) -> None:
             stats['val_reward'] = val_reward
             stats['val_reward_std'] = val_std
             stats['val_loss'] = val_loss
-            stats['val_n_combos'] = len(validation_combos)
+            stats['val_n_combos'] = len(_epoch_val)
             stats['val_pair_success'] = val_stats.get('pair_success', {})
 
         try:
@@ -833,7 +890,7 @@ def run_training(config_path: str) -> None:
             if 'val_reward' in stats and not np.isnan(stats['val_reward']):
                 _summary_lines.append(
                     f"  Val Reward: {stats['val_reward']:.4f}±{stats.get('val_reward_std', 0.0):.4f} "
-                    f"({len(validation_combos)} combos)"
+                    f"({stats.get('val_n_combos', len(validation_combos))} combos)"
                 )
                 print(_summary_lines[-1])
             n_success_ep = stats.get('n_success', 0)
