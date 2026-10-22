@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 import json
 
+from mllf.cb.cost_ledger import simulated_ns
+from mllf.file_handling.generate_combinations import is_combo_dir_name
 from mllf.file_handling.read_rtf import parse_rtf_dir
 from mllf.file_handling.read_output import (
     parse_single_population,
@@ -50,8 +52,7 @@ def find_run_directories(base_path: Path) -> List[Path]:
     run_dirs = []
     
     # Check if this is a generated combo structure (has comb_* directories)
-    combo_dirs = list(base_path.glob("comb_*"))
-    combo_dirs = [d for d in combo_dirs if d.is_dir()]
+    combo_dirs = [d for d in base_path.iterdir() if d.is_dir() and is_combo_dir_name(d.name)]
     
     def _has_run_data(p: Path) -> bool:
         """Return True if the directory contains the minimum files for a completed run."""
@@ -291,7 +292,8 @@ def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
         run_dir: Path to run directory (used to check for _failed)
         
     Returns:
-        Dict with 'populations', 'transitions', 'rates', and 'terminated_normally'
+        Dict with 'populations', 'transitions', 'rates', 'terminated_normally',
+        the per-pair fields and 'simulated_ns' (run length, None if unknown)
     """
     content = output_file.read_text()
     
@@ -319,6 +321,7 @@ def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
         'terminated_normally': terminated,
         'ddg_pairs': {f"{lo}_{hi}": val for (lo, hi), val in ddg_raw.items()},
         **_profile_fields(profile),
+        'simulated_ns': simulated_ns(output_file),
     }
 
 
@@ -341,17 +344,27 @@ def _backfill_profile_one(sim_path: Path, dry_run: bool, overwrite: bool) -> Tup
             sim_results = json.load(f)
     except (OSError, ValueError) as exc:
         return 'error', f"unreadable {sim_path}: {exc}"
-    if all(field in sim_results for field, _ in PROFILE_FIELDS) and not overwrite:
+    has_profile = all(field in sim_results for field, _ in PROFILE_FIELDS)
+    if has_profile and 'simulated_ns' in sim_results and not overwrite:
         return 'present', ''
     output_file = resolve_output_file(run_dir)
     if output_file is None:
         return 'no_output', str(run_dir)
+    if has_profile and not overwrite:
+        # Only the run length is missing (collected before it was recorded).
+        ns = simulated_ns(output_file)
+        if not dry_run:
+            sim_results['simulated_ns'] = ns
+            with open(sim_path, 'w') as f:
+                json.dump(sim_results, f, indent=2)
+        return 'updated', f"{run_dir}: simulated_ns = {ns}"
     try:
         content = output_file.read_text()
         pairs = [tuple(int(v) for v in k.split('_')) for k in sim_results.get('ddg_pairs', {})] or None
         fields = _profile_fields(parse_pair_profile(content, pairs=pairs))
     except Exception as exc:
         return 'error', f"could not parse lambda profile for {run_dir}: {exc}"
+    fields['simulated_ns'] = simulated_ns(output_file)
     n_ok = sum(1 for v in fields['barrier_pairs'].values() if v is not None)
     if not dry_run:
         sim_results.update(fields)
@@ -373,7 +386,10 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
     reward signals; runs without them fall back to the legacy signals -- and
     'transition_pairs' (per-pair transitions at the λ ≥ 0.99 cutoff). Reads
     the run directory's own ``output.out`` when present, else the source run
-    named by metadata.json's ``source_run_dir`` (nothing is copied). Stores the
+    named by metadata.json's ``source_run_dir`` (nothing is copied). Also writes
+    'simulated_ns' (the run's length; pretraining judges short runs by the
+    online short-run success test), alone for runs that already have the
+    profile fields. Stores the
     raw signals, not rewards, so reward targets/widths can change without a
     new backfill.
 
@@ -629,103 +645,212 @@ def extract_graph_info(source_prep: Path, solvent_state: str = "unknown") -> Dic
     return graph_info
 
 
+_ECHO_PREFIX_RE = re.compile(r'^\s*[A-Z]*>\s*')
+_DEFINE_RE = re.compile(r'^define\s+(site\d+_sub\d+)\b', re.IGNORECASE)
+_SELE_ATOM_RE = re.compile(r'\batom\s+\S+\s+\S+\s+(\S+)', re.IGNORECASE)
+_CALL_RE = re.compile(r'^call\s+(\d+)\s+sele\s+(site\d+_sub\d+)\b', re.IGNORECASE)
+_RTF_ATOM_RE = re.compile(r'^ATOM\s+(\S+)', re.IGNORECASE)
+_READ_RTF_RE = re.compile(r'read\s+rtf\s+append.*?/?(site(\d+)_sub(\d+))_pres\.rtf', re.IGNORECASE)
+_PRES_FILE_RE = re.compile(r'^(site\d+_sub\d+)_pres\.rtf$')
+
+
+def _sequential_subs(nsubs_per_site: List[int]) -> Dict[str, List[str]]:
+    return {
+        f'site{s}': [f'site{s}_sub{i}' for i in range(1, n + 1)]
+        for s, n in enumerate(nsubs_per_site, start=1)
+    }
+
+
+def _split_by_site(ordered: List[str], nsubs_per_site: List[int]) -> Dict[str, List[str]]:
+    """Distribute an ordered list of master subs to MSLD sites by cumulative count."""
+    result, offset = {}, 0
+    for s, n in enumerate(nsubs_per_site, start=1):
+        result[f'site{s}'] = ordered[offset:offset + n]
+        offset += n
+    return result
+
+
+def _master_sub_atoms(prep_dir: Path) -> Dict[str, set]:
+    """Atom names of each master substituent: {'site1_sub3': {'C040', ...}}."""
+    atoms = {}
+    for p in prep_dir.glob('site*_sub*_pres.rtf'):
+        m = _PRES_FILE_RE.match(p.name)
+        if not m:
+            continue
+        names = set()
+        for line in p.read_text(errors='ignore').splitlines():
+            am = _RTF_ATOM_RE.match(line.strip())
+            if am:
+                names.add(am.group(1).upper())
+        atoms[m.group(1)] = names
+    return atoms
+
+
+def _block_selections(lines) -> List[set]:
+    """Atom-name sets of the MSLD substituent blocks, in block order.
+
+    Reads ``define siteS_subJ`` selections and the ``call N sele siteS_subJ``
+    lines of the BLOCK setup from a CHARMM script or from its echo in a
+    CHARMM output (``CHARMM>`` / ``BLOCK>`` prefixes stripped). Block N carries
+    bias position N - 1, so the calls, not the ``read rtf`` or ``patch``
+    order, define the bias numbering; the selection labels are local names.
+    Returns [] if either part is missing.
+    """
+    defines: Dict[str, set] = {}
+    calls: Dict[int, str] = {}
+    current = None
+    for raw in lines:
+        line = _ECHO_PREFIX_RE.sub('', raw).strip()
+        if not line or line.startswith('!'):
+            continue
+        dm = _DEFINE_RE.match(line)
+        if dm:
+            current = dm.group(1).lower()
+            defines.setdefault(current, set())
+            continue
+        if current is not None:
+            am = _SELE_ATOM_RE.search(line)
+            if am:
+                defines[current].add(am.group(1).upper())
+            if re.search(r'\bend\b', line, re.IGNORECASE) and not line.endswith('-'):
+                current = None
+            continue
+        cm = _CALL_RE.match(line)
+        if cm:
+            calls.setdefault(int(cm.group(1)), cm.group(2).lower())
+    if not calls or not defines:
+        return []
+    return [defines.get(label, set()) for _, label in sorted(calls.items())]
+
+
+def _map_selections_to_masters(selections: List[set],
+                               master_atoms: Dict[str, set]) -> Optional[List[str]]:
+    """Master sub for each block selection: the one defining most of its atoms.
+
+    Atoms not in any substituent RTF (lone pairs added by lpsites) are ignored.
+    None unless every selection maps to a single master covering at least half
+    of its atoms, each master used once.
+    """
+    known = set().union(*master_atoms.values()) if master_atoms else set()
+    out = []
+    for sel in selections:
+        sel = sel & known
+        if not sel:
+            return None
+        scored = sorted(((len(sel & names), master) for master, names in master_atoms.items()),
+                        reverse=True)
+        best, master = scored[0]
+        if best * 2 < len(sel) or (len(scored) > 1 and scored[1][0] == best):
+            return None
+        out.append(master)
+    return out if len(set(out)) == len(out) else None
+
+
+def parse_active_subs_from_output(
+    output_file: Path,
+    prep_dir: Path,
+    nsubs_per_site: List[int],
+) -> Optional[Dict[str, List[str]]]:
+    """Active substituents in bias order, from what the run actually executed.
+
+    The CHARMM output echoes the substituent ``define`` selections and the
+    BLOCK ``call`` lines; each selection is matched to the master
+    ``siteS_subJ_pres.rtf`` in ``prep_dir`` that defines its atoms. This does
+    not depend on which (or how many) .inp files sit in prep/. Returns None
+    when the output lacks the echo or the blocks don't match nsubs_per_site.
+    """
+    if not nsubs_per_site or not output_file or not Path(output_file).exists():
+        return None
+    try:
+        with open(output_file, errors='ignore') as fh:
+            selections = _block_selections(fh)
+    except OSError:
+        return None
+    if len(selections) != sum(nsubs_per_site):
+        return None
+    ordered = _map_selections_to_masters(selections, _master_sub_atoms(prep_dir))
+    return _split_by_site(ordered, nsubs_per_site) if ordered else None
+
+
 def parse_active_subs_from_inp(
     prep_dir: Path,
     nsubs_per_site: List[int],
 ) -> Dict[str, List[str]]:
-    """Parse the ordered list of active substituents from the CHARMM .inp file.
+    """Parse the ordered list of active substituents from the CHARMM .inp files.
 
-    The order in which RTF files are ``read rtf append``-ed in the main .inp file
-    defines the sequential bias-variable numbering (lams1s1=position 1, etc.).
-    For systems whose .inp lists the FULL master prep (more subs than
-    nsubs_per_site indicates), falls back to sequential numbering (sub1, sub2, …).
+    Fallback for runs whose output does not echo the BLOCK setup (see
+    ``parse_active_subs_from_output``, which is preferred). Every candidate
+    .inp in prep/ is considered, in name order, so the result does not depend
+    on directory listing order (a prep can hold several, e.g. p38's benz.inp
+    listing all subs next to the p38.inp that ran):
+
+    1. ``define``/``call`` selections mapped to master RTFs by atom names
+       (the bias numbering itself), when a file's blocks match nsubs_per_site;
+    2. ``read rtf append`` order, from a file whose per-site counts match
+       nsubs_per_site exactly;
+    3. the first sum(nsubs_per_site) reads distributed by cumulative count,
+       only from a file with exactly that many reads (systems whose one MSLD
+       site spans several file-naming site prefixes, e.g. JNK1);
+    4. sequential numbering (sub1, sub2, ...).
+
+    Within a tier, candidates giving different answers are reported, and the
+    first in name order is used.
 
     Args:
-        prep_dir:       Prep directory to search for a CHARMM .inp file.
+        prep_dir:       Prep directory to search for CHARMM .inp files.
         nsubs_per_site: Number of active subs per site, from the bias variables.
 
     Returns:
         Dict mapping 'site1', 'site2', … to an ordered list of master sub names,
         e.g. {'site1': ['site1_sub3', 'site1_sub1', …], 'site2': ['site2_sub15', …]}
     """
-    # Candidate .inp files: top-level only, exclude known non-MSLD files
     exclude = {'lpsites.inp', 'variablesflat.inp'}
-    inp_candidates = [
+    inp_candidates = sorted(
         p for p in prep_dir.glob('*.inp')
         if p.name not in exclude and 'traj' not in p.name
-    ]
-
-    def _sequential(npsite: List[int]) -> Dict[str, List[str]]:
-        return {
-            f'site{s}': [f'site{s}_sub{i}' for i in range(1, n + 1)]
-            for s, n in enumerate(npsite, start=1)
-        }
-
-    if not inp_candidates or not nsubs_per_site:
-        return _sequential(nsubs_per_site)
-
-    # Parse the RTF read order from the first valid .inp file.
-    # Only consider uncommented lines (CHARMM comment prefix: ! or !!).
-    pattern = re.compile(
-        r'read\s+rtf\s+append.*?/?(site(\d+)_sub(\d+))_pres\.rtf',
-        re.IGNORECASE,
     )
-    comment_re = re.compile(r'^\s*!')
-    by_site: Dict[int, List[str]] = {}
-    all_active_ordered: List[str] = []
+    if not inp_candidates or not nsubs_per_site:
+        return _sequential_subs(nsubs_per_site)
+
+    master_atoms = _master_sub_atoms(prep_dir)
+    total = sum(nsubs_per_site)
+    tiers: List[List[Tuple[str, Dict[str, List[str]]]]] = [[], [], []]
     for inp_file in inp_candidates:
         try:
-            for line in inp_file.read_text().splitlines():
-                if comment_re.match(line):
-                    continue  # skip CHARMM comment lines
-                m = pattern.search(line)
-                if m:
-                    master_sub = m.group(1)   # e.g. 'site1_sub3'
-                    site_num = int(m.group(2))
-                    by_site.setdefault(site_num, []).append(master_sub)
-                    all_active_ordered.append(master_sub)
-            if by_site:
-                break   # found RTF reads in this file; stop
+            lines = inp_file.read_text(errors='ignore').splitlines()
         except Exception:
             continue
+        selections = _block_selections(lines)
+        if len(selections) == total:
+            ordered = _map_selections_to_masters(selections, master_atoms)
+            if ordered:
+                tiers[0].append((inp_file.name, _split_by_site(ordered, nsubs_per_site)))
+        reads: List[Tuple[int, str]] = []
+        for line in lines:
+            if line.lstrip().startswith('!'):
+                continue
+            m = _READ_RTF_RE.search(line)
+            if m:
+                reads.append((int(m.group(2)), m.group(1)))
+        by_site: Dict[int, List[str]] = {}
+        for site_num, master in reads:
+            by_site.setdefault(site_num, []).append(master)
+        if all(len(by_site.get(s, [])) == n for s, n in enumerate(nsubs_per_site, start=1)) \
+                and len(reads) == total:
+            tiers[1].append((inp_file.name, {f'site{s}': by_site[s]
+                                             for s in range(1, len(nsubs_per_site) + 1)}))
+        elif len(reads) == total:
+            tiers[2].append((inp_file.name, _split_by_site([m for _, m in reads], nsubs_per_site)))
 
-    if not by_site:
-        return _sequential(nsubs_per_site)
-
-    # First attempt: per-site grouping.  Works when the CHARMM file-naming
-    # site prefix matches the MSLD site index (e.g. BACE, MCL1, PTP1B, P38).
-    result: Dict[str, List[str]] = {}
-    per_site_ok = True
-    for s_idx, n_active in enumerate(nsubs_per_site):
-        s_num = s_idx + 1
-        inp_subs = by_site.get(s_num, [])
-        if len(inp_subs) == n_active:
-            # Exact match: .inp lists exactly the right subs in the right order.
-            result[f'site{s_num}'] = inp_subs
-        else:
-            per_site_ok = False
-            break
-    if per_site_ok:
-        return result
-
-    # Second attempt: global sequential.  Handles systems where the active subs
-    # for one MSLD site span multiple CHARMM file-naming site prefixes (e.g. JNK1
-    # uses site2_sub* files for its single MSLD site's sequential positions 2-6).
-    # Take the first sum(nsubs_per_site) active reads in file order and
-    # distribute them to MSLD sites by cumulative count.
-    total_expected = sum(nsubs_per_site)
-    if len(all_active_ordered) >= total_expected:
-        result = {}
-        offset = 0
-        for s_idx, n_active in enumerate(nsubs_per_site):
-            s_num = s_idx + 1
-            result[f'site{s_num}'] = all_active_ordered[offset:offset + n_active]
-            offset += n_active
-        return result
-
-    # Final fallback: sequential sub names (sub1, sub2, …) per site.
-    # Used when the .inp over-lists subs with no usable ordering signal.
-    return _sequential(nsubs_per_site)
+    for tier in tiers:
+        if not tier:
+            continue
+        distinct = {json.dumps(r, sort_keys=True) for _, r in tier}
+        if len(distinct) > 1:
+            print(f"  Warning: {prep_dir}: .inp files disagree on the active substituents "
+                  f"({', '.join(n for n, _ in tier)}); using {tier[0][0]}")
+        return tier[0][1]
+    return _sequential_subs(nsubs_per_site)
 
 
 def _parse_nsubs_from_mapping(mapping_path: Path) -> Optional[List[int]]:
@@ -845,11 +970,10 @@ def collect_run_data(
     
     graph_info = extract_graph_info(prep_path, solvent_state)
 
-    # Build the active-substituent mapping from the CHARMM .inp file.
-    # The read-RTF order in the .inp defines the sequential bias numbering
-    # (lams1s1 = position 1, lams1s2 = position 2, …).
-    # For master preps that list ALL subs, parse_active_subs_from_inp falls back
-    # to sequential numbering (site1_sub1, site1_sub2, …).
+    # Build the active-substituent mapping: which master sub carries each
+    # sequential bias position (lams1s1 = position 1, lams1s2 = position 2, …).
+    # The BLOCK calls define it (parse_active_subs_from_output); the prep .inp
+    # files are the fallback, and sequential numbering (site1_sub1, …) the last.
     # nsubs_per_site_override takes priority (e.g. combo runs where prep/ is full-system).
     #
     # Auto-detect from mapping.json for generated-combo runs: alf_info.py in the
@@ -865,7 +989,10 @@ def collect_run_data(
         bias_data['_nsubs_per_site'] = nsubs_per_site_override
     else:
         nsubs_per_site = bias_data.get('_nsubs_per_site') or []
-    active_subs_ordered = parse_active_subs_from_inp(prep_path, nsubs_per_site)
+    # What the run executed (its output's BLOCK setup) first; the prep .inp
+    # files only when the output doesn't echo it.
+    active_subs_ordered = (parse_active_subs_from_output(output_file, prep_path, nsubs_per_site)
+                           or parse_active_subs_from_inp(prep_path, nsubs_per_site))
 
     # Re-key graph_info['sites']:
     #   sequential key 'site1_sub1' ← master sub at position 0 (e.g. site1_sub3)
@@ -895,18 +1022,35 @@ def collect_run_data(
             for s, n in enumerate(nsubs_per_site, start=1)
         }
 
-    graph_info['sites'] = {}
-    for site_label, ordered_masters in active_subs_ordered.items():
-        for seq_idx, master_sub in enumerate(ordered_masters):
-            seq_key = f"{site_label}_sub{seq_idx + 1}"
-            entry = dict(all_rtf_sites.get(master_sub, {}))
-            entry['sub'] = seq_idx + 1  # Sequential sub number (for correct graph node ordering)
-            graph_info['sites'][seq_key] = entry
-
-    graph_info['active_subs_ordered'] = active_subs_ordered
-    graph_info['nsubs_per_site'] = nsubs_per_site
+    graph_info = rekey_graph_info(graph_info, active_subs_ordered, nsubs_per_site)
 
     return bias_data, output_results, graph_info
+
+
+def rekey_graph_info(graph_info: Dict[str, Any], active_subs_ordered: Dict[str, List[str]],
+                     nsubs_per_site: List[int]) -> Dict[str, Any]:
+    """Key graph_info['sites'] by bias position (in place; returned).
+
+    ``graph_info['sites']`` holds every master sub in prep/ (from
+    ``extract_graph_info``). Each active one becomes 'site{S}_sub{k}' for MSLD
+    site S and bias position k, with 'site' = S and 'sub' = k (graph node
+    order) and 'master' = the master sub ('site2_sub21'), whose RTF supplied
+    the atom data and whose fragment PDB is the substituent's structure. A
+    master's own site prefix can differ from its MSLD site (JNK1).
+    """
+    all_rtf_sites = graph_info['sites']
+    graph_info['sites'] = {}
+    for site_label, ordered_masters in active_subs_ordered.items():
+        site_num = int(site_label.replace('site', ''))
+        for seq_idx, master_sub in enumerate(ordered_masters):
+            entry = dict(all_rtf_sites.get(master_sub, {}))
+            entry['site'] = site_num
+            entry['sub'] = seq_idx + 1
+            entry['master'] = master_sub
+            graph_info['sites'][f"{site_label}_sub{seq_idx + 1}"] = entry
+    graph_info['active_subs_ordered'] = active_subs_ordered
+    graph_info['nsubs_per_site'] = nsubs_per_site
+    return graph_info
 
 
 def create_pretraining_entry(
@@ -1023,6 +1167,82 @@ bias = yaml.safe_load(bias_string)
     return entry_dir
 
 
+def _relabel_one(entry_dir: Path, dry_run: bool) -> Tuple[str, str]:
+    """Re-derive one collected run's active substituents; rewrite graph_info.json
+    if they (or the node site/master fields) differ. Returns (status, message)."""
+    try:
+        meta = json.loads((entry_dir / 'metadata.json').read_text())
+        gi_path = entry_dir / 'graph_info.json'
+        old = json.loads(gi_path.read_text())
+        src = Path(meta.get('source_run_dir', ''))
+        prep = src / 'prep' if (src / 'prep').is_dir() else src.parent / 'prep'
+        if not prep.is_dir():
+            return 'no_source', str(entry_dir)
+        out = src / 'output' if (src / 'output').exists() else src / 'output.out'
+        nsubs = old.get('nsubs_per_site') or meta.get('nsubs_per_site') or []
+        new_subs = (parse_active_subs_from_output(out, prep, nsubs)
+                    or parse_active_subs_from_inp(prep, nsubs))
+        new = rekey_graph_info(extract_graph_info(prep, old.get('solvent_state', 'unknown')),
+                               new_subs, nsubs)
+        if not all(e.get('atom_types') for e in new['sites'].values()):
+            return 'error', f"{entry_dir}: unresolved substituents {new_subs}"
+        if {k: (v.get('site'), v.get('sub'), v.get('master')) for k, v in new['sites'].items()} == \
+                {k: (v.get('site'), v.get('sub'), v.get('master')) for k, v in old.get('sites', {}).items()}:
+            return 'same', str(entry_dir)
+        changed = old.get('active_subs_ordered') != new_subs
+        if not dry_run:
+            backup = entry_dir / 'graph_info.orig.json'
+            if not backup.exists():
+                backup.write_text(gi_path.read_text())
+            gi_path.write_text(json.dumps(new, indent=2))
+        return ('relabeled' if changed else 'annotated'), \
+            f"{entry_dir}: {old.get('active_subs_ordered')} -> {new_subs}"
+    except Exception as e:
+        return 'error', f"{entry_dir}: {e}"
+
+
+def _relabel_task(args):
+    return _relabel_one(*args)
+
+
+def relabel_active_subs(root: Path, datasets: Optional[List[str]] = None,
+                        dry_run: bool = False, workers: int = 1) -> Dict[str, int]:
+    """Rewrite graph_info.json of collected runs with the substituents each run
+    actually executed (``parse_active_subs_from_output``, .inp fallback).
+
+    For data collected before that parser: the first .inp found in prep/ set
+    the labels, so a prep holding several (p38's benz.inp next to p38.inp) or
+    defining its blocks out of read order (BACE, thrombin, JNK1) mislabeled
+    the substituents. 'relabeled' = substituents changed; 'annotated' = only
+    the node site/master fields added. The original is kept once as
+    graph_info.orig.json. ``datasets``: dataset directory names to limit to.
+    """
+    entries = sorted(p.parent for p in root.glob('*/*/graph_info.json')
+                     if not datasets or p.parent.parent.name in datasets)
+    print(f"Relabeling active substituents in {len(entries)} runs under {root}"
+          + (" (dry run)" if dry_run else ""), flush=True)
+    counts = {k: 0 for k in ('relabeled', 'annotated', 'same', 'no_source', 'error')}
+    by_dataset: Dict[str, str] = {}
+    tasks = [(e, dry_run) for e in entries]
+    if workers > 1:
+        from multiprocessing import Pool
+        with Pool(workers) as pool:
+            results = list(pool.imap(_relabel_task, tasks, chunksize=8))
+    else:
+        results = [_relabel_one(*t) for t in tasks]
+    for (entry_dir, _), (status, msg) in zip(tasks, results):
+        counts[status] += 1
+        if status == 'relabeled':
+            by_dataset.setdefault(entry_dir.parent.name, msg.split(': ', 1)[1])
+        elif status == 'error':
+            print(f"  Warning: {msg}", flush=True)
+    for ds, change in sorted(by_dataset.items()):
+        print(f"  {ds}: {change}", flush=True)
+    verb = 'would be' if dry_run else 'were'
+    print(f"\nRelabel summary ({verb}): " + ', '.join(f"{v} {k}" for k, v in counts.items()), flush=True)
+    return counts
+
+
 def main():
     """Main entry point for collecting pretraining data."""
     parser = argparse.ArgumentParser(
@@ -1114,9 +1334,10 @@ Examples:
         default=None,
         help=(
             'Backfill per-pair lambda-profile signals (barrier / skew / end: the '
-            'quadratic, skew and end pair rewards) into existing simulation_results.json '
-            "files under PRETRAINING_ROOT. Reads each run's output.out (or its "
-            'metadata.json source_run_dir). Pass --dry-run to preview without writing.'
+            'quadratic, skew and end pair rewards) and the run length (simulated_ns) '
+            'into existing simulation_results.json files under PRETRAINING_ROOT. '
+            "Reads each run's output.out (or its metadata.json source_run_dir). "
+            'Pass --dry-run to preview without writing.'
         ),
     )
 
@@ -1130,6 +1351,26 @@ Examples:
             'sources before parse_bias_from_inp negated them (identified via '
             "metadata.json source_run_dir). Safe to rerun. Pass --dry-run to preview."
         ),
+    )
+
+    parser.add_argument(
+        '--relabel-subs',
+        metavar='PRETRAINING_ROOT',
+        type=Path,
+        default=None,
+        help=(
+            'Rewrite graph_info.json of collected runs under PRETRAINING_ROOT with the '
+            'substituents each run actually executed (its output\'s BLOCK setup, read via '
+            'metadata.json source_run_dir); keeps graph_info.orig.json. Limit with '
+            '--datasets. Pass --dry-run to preview.'
+        ),
+    )
+
+    parser.add_argument(
+        '--datasets',
+        nargs='+',
+        default=None,
+        help='With --relabel-subs: dataset directory names to process (default: all)',
     )
 
     parser.add_argument(
@@ -1149,6 +1390,15 @@ Examples:
     args = parser.parse_args()
 
     # --- Maintenance modes: mutually exclusive with normal collection mode ---
+    if args.relabel_subs is not None:
+        root = args.relabel_subs.resolve()
+        if not root.exists():
+            print(f"Error: root does not exist: {root}")
+            return 1
+        counts = relabel_active_subs(root, datasets=args.datasets, dry_run=args.dry_run,
+                                     workers=max(1, args.workers))
+        return 1 if counts['error'] else 0
+
     if args.fix_inp_signs is not None:
         root = args.fix_inp_signs.resolve()
         if not root.exists():
@@ -1176,9 +1426,9 @@ Examples:
 
     # Normal collection mode — base_path and --output-dir are required
     if args.base_path is None:
-        parser.error("base_path is required unless a --backfill-*/--fix-inp-signs mode is specified")
+        parser.error("base_path is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode is specified")
     if args.output_dir is None:
-        parser.error("--output-dir is required unless a --backfill-*/--fix-inp-signs mode is specified")
+        parser.error("--output-dir is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode is specified")
 
     base_path = args.base_path.resolve()
     if not base_path.exists():
@@ -1212,7 +1462,7 @@ Examples:
             combo_name = args.name_pattern.format(run_num)
         else:
             # For generated combo structure, include parent combo name
-            if run_dir.parent != base_path and run_dir.parent.name.startswith('comb_'):
+            if run_dir.parent != base_path and is_combo_dir_name(run_dir.parent.name):
                 combo_name = f"{run_dir.parent.name}_{run_dir.name}"
             else:
                 combo_name = run_dir.name
