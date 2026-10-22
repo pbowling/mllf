@@ -1,45 +1,23 @@
 Installation
 ============
 
-Recommended steps to get the project running locally.
+Install the package in editable mode, with the documentation requirements, into a fresh
+environment:
 
-Virtualenv (recommended)
-------------------------
+.. code-block:: bash
 
-1. Create and activate a virtualenv:
+   conda create -n mllf python=3.10      # or: python -m venv .venv && source .venv/bin/activate
+   conda activate mllf
+   pip install -e .
+   pip install -r docs/requirements.txt
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
+Simulations need CHARMM with pyCHARMM on the cluster; the workflow loads it through the
+``slurm.module`` setting (:doc:`workflow`).
 
-2. Install the package and development requirements:
+Run the tests with:
 
-```bash
-pip install -e .
-pip install -r docs/requirements.txt
-```
+.. code-block:: bash
 
-Conda (alternative)
---------------------
+   python -m pytest tests/ -v
 
-```bash
-conda create -n mllf python=3.10
-conda activate mllf
-pip install -e .
-pip install -r docs/requirements.txt
-```
-
-Running tests
--------------
-
-Run the unit tests with pytest:
-
-```bash
-python -m pytest tests/ -v
-```
-
-Building the docs locally
--------------------------
-
-See `docs/README.md` for details on building the documentation locally.
+To build the documentation locally, see ``docs/README.md``.

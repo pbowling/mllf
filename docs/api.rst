@@ -69,6 +69,11 @@ For detailed documentation on the workflow system, see :doc:`workflow`.
    mllf.cb.reinforce_trainer
    mllf.cb.graph_build
    mllf.cb.hindsight
+   mllf.cb.hindsight_regression
    mllf.cb.curriculum
+   mllf.cb.system_stages
+   mllf.cb.export_biases
+   mllf.cb.cost_ledger
    mllf.cli.slurm
    mllf.file_handling.manifests
+   mllf.file_handling.combo_sets

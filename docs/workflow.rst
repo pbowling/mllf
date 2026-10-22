@@ -4,14 +4,22 @@ Workflow System
 Overview
 --------
 
-The workflow system automates the complete pipeline for multisite λ-dynamics
-simulations with contextual bandit training:
+The online workflow takes a set of systems from fragment files to production biases. The
+shared model proposes biases, and every simulation corrects both the model and the pair it
+sampled (see :doc:`index` for the motivation and :doc:`cb_setup` for the model). The
+pipeline has five parts:
 
-1. **Combination Generation**: Create all valid site/substituent combinations
-2. **Splitting**: Divide combinations into training/validation/test sets
-3. **Training**: Train CB policy on graph structures
-4. **Simulation**: Run MD simulations with optimized bias coefficients
-5. **Compression**: Archive simulation outputs for storage
+1. **Combination generation**: enumerate the site/substituent combinations of each
+   system (:ref:`Combination Generation`).
+2. **Held-out split**: set aside pairs the training never runs, so validation measures
+   the shared model alone (:ref:`Held-Out Validation`).
+3. **Staged online training**: each system moves on its own from pairs of substituents
+   to the substituent groups used in production (:ref:`Staged Online Training`).
+4. **Production biases**: fixed biases, per group, for each finished system
+   (:ref:`Production Biases`).
+5. **Cost accounting**: simulated nanoseconds per system and stage, measured the same
+   way for the online run and for the iterative-flattening runs it is compared against
+   (:ref:`Simulation Cost`).
 
 Running the Workflow
 --------------------
@@ -19,52 +27,49 @@ Running the Workflow
 Basic Usage
 ~~~~~~~~~~~
 
-Online (REINFORCE) training is driven by a YAML configuration file. The driver itself is
-``mllf.cli.train_workflow`` — an importable library entry point, not a repo-local script —
-so it can be installed and reused outside this repository:
+Online training is driven by a YAML configuration file. The driver is
+``mllf.cli.train_workflow``, an importable entry point rather than a repo-local script,
+so it can be installed and used outside this repository:
 
 .. code-block:: bash
 
    cd mllf   # repository root
    python -m mllf.cli.train_workflow examples/workflow_14benz.yaml
-   python -m mllf.cli.train_workflow my_config.yaml  # Use a custom config
+   python -m mllf.cli.train_workflow my_config.yaml
 
-``training/workflow.py`` is a thin wrapper around the same entry point (kept so existing
-invocations and SLURM scripts that reference that path keep working):
-
-.. code-block:: bash
-
-   python training/workflow.py training/workflow_instructions.yaml
-
-See :doc:`examples` for a full walkthrough of the 1,4-benzene (14benz) example. Combination
-generation and manifest splitting can also be driven directly from
-``mllf.file_handling.generate_combinations`` / ``mllf.cli.workflow`` for scripting outside
-the full training loop; the low-level ``mllf.cli.workflow.run_from_config`` entry point
-handles a lighter-weight subset (combo generation, split, a single-combo sanity check,
-optional simulation batch, archiving) without the policy training loop.
+``examples/run_workflow.py`` runs the same driver. See :doc:`examples` for a walkthrough of
+the 1,4-benzene (14benz) example. Combination generation and manifest splitting can also be
+run on their own from ``mllf.file_handling.generate_combinations`` and
+``mllf.cli.workflow``. The lighter ``mllf.cli.workflow.run_from_config`` entry point covers
+combination generation, the split, a single-combo sanity check, an optional simulation
+batch and archiving, without the training loop.
 
 Configuration Format
 ~~~~~~~~~~~~~~~~~~~~
 
-A workflow config is a YAML file specifying which operations to run and their parameters.
-Unlike a single ``create_combos:`` block, the top-level key is a **list of systems** —
-``systems:`` — even when training on just one system, since the driver is designed to train
-one shared policy across any number of systems simultaneously:
+The top-level key of a workflow config is a **list of systems** (``systems:``), even for a
+single system, because the driver trains one shared model across all of them:
 
-* **systems**: List of systems to train on, each with its own ``name``, ``input_dir``,
-  ``out_dir``, ``solvent_state``, and optional per-system overrides (e.g.
-  ``max_subs_per_site``, ``protein_pdbs``, ``solvent_pdb``)
-* **pretrain**: Optional warm-start from a behavior-cloned checkpoint (see :doc:`cb_pretraining`)
-* **curriculum**: Progressive training stages (see :ref:`Curriculum Learning`)
-* **training**: Policy architecture and optimizer hyperparameters
-* **bandit**: Optional NeuralLinear + Thompson Sampling configuration (see :doc:`cb_setup`)
-* **reward**: Reward function weights and thresholds
-* **output**: Checkpointing and output organization
-* **slurm**: Cluster submission settings (partition, gres, time, module) — see
-  :ref:`Launching Simulations` for which of these are optional
-* **archive**: Automatic compression of completed runs
+* **systems**: one entry per system, each with its own ``name``, ``input_dir``,
+  ``out_dir`` and ``solvent_state``, plus optional per-system settings
+  (``max_subs_per_site``, ``protein_pdbs``, ``solvent_pdb``, ``combo_sets``,
+  ``export_combo_set``)
+* **mode**: ``train`` (default) or ``deploy`` (:ref:`Testing on New Systems`)
+* **pretrain**: warm start from a behavior-cloned checkpoint (see :doc:`cb_pretraining`)
+* **curriculum**: the stages each system passes through (:ref:`Staged Online Training`)
+* **validation_per_system** / **eval_schedule**: the held-out set and when it is run
+* **alf_root**: where the iterative-flattening datasets live, for ALF-derived combo sets
+  and the cost comparison
+* **training**: policy architecture and optimizer settings
+* **bandit**: NeuralLinear + Thompson sampling, hindsight targets and per-pair offsets
+  (see :doc:`cb_setup`)
+* **reward**: reward weights and thresholds (:ref:`Reward Function`)
+* **output**: checkpoint directory and frequency
+* **slurm**: cluster submission settings (:ref:`Launching Simulations`)
 
-See the :ref:`Complete Configuration Example` for a full annotated YAML file.
+Working configs are listed in :ref:`Example Configurations`.
+
+.. _Combination Generation:
 
 Combination Generation
 ----------------------
@@ -72,73 +77,49 @@ Combination Generation
 Principles
 ~~~~~~~~~~
 
-Combinations are generated from site/substituent fragment files:
-
-* **Input files**: ``site{N}_sub{M}_{label}.{rtf,pdb}`` files in the input directory
-* **Sites**: Identified by the site number (N)
-* **Substituents**: Identified by the sub number (M) within each site
+A combination is the set of substituents simulated together in one MSLD run. Combinations
+are generated from the fragment files ``site{N}_sub{M}_{label}.{rtf,pdb}`` in a system's
+input directory (and its ``prep/``), where N is the site and M the substituent.
 
 .. warning::
-   **Minimum Substituents Required**: Each site must have at least 2 substituents. MSLD simulations 
-   will not run correctly with only a single substituent at a site. If any site has only 1 substituent, 
-   combination generation will fail with an error. To resolve this, either add more substituents to the site or 
-   add the site information to your core structure files (e.g., ``core.pdb`` and ``core.rtf`` if using 
-   msld-py-prep).
+   **At least two substituents per site.** MSLD does not run correctly with a single
+   substituent at a site, so generation stops with an error if any site has only one.
+   Either add substituents or move that site into the core files (``core.pdb``,
+   ``core.rtf``).
 
-The generator creates two types of combinations:
+* **Within-site combinations** use a rotating anchor: each substituent in turn is the
+  first one (the site's reference in that run), followed by subsets of the others. With
+  substituents [1, 2, 3], anchor 1 gives [1,2], [1,3], [1,2,3]; anchor 2 gives [2,1],
+  [2,3], [2,1,3]; and so on.
+* **Cross-site combinations** are the Cartesian product of the within-site selections,
+  with at least two substituents per site.
+* **Size limit.** At most ``max_subs_per_site`` substituents per site (default 10;
+  ``--max-subs``). Every substituent still appears in some combination, but the count
+  stays finite.
+* **Single-site combinations of a multi-site system** keep the molecule whole: the core
+  files are augmented with the first substituent of each site left out.
 
-1. **Within-site combinations**: Multiple substituents from a single site
-2. **Cross-site combinations**: Substituents from multiple sites simultaneously
+Each combination's files are renumbered (original substituents [2, 5] become [1, 2]), and
+the PRES tokens in the RTF files are rewritten to match so CHARMM reads the topology
+correctly. ``mapping.json`` records the original numbers.
 
-.. note::
-   **Combination Size Limit**: By default, each combination is limited to at most 10 substituents 
-   per site (``max_subs_per_site=10``). This prevents combinatorial explosion while still allowing 
-   all substituents to participate across different combinations. For example, with 50 substituents 
-   at a site, the generator will create combinations like ``[1,2,...,10]``, ``[1,2,...,9,11]``, etc., 
-   but not ``[1,2,...,11]``. This limit can be increased via the ``--max-subs`` command-line option 
-   or the ``max_subs_per_site`` parameter in the API.
+For a large site, the cross-site product is usually too large to run, and the pairs
+alone are what training needs; :ref:`Combo Sets` select explicit combinations instead.
 
 Lazy Directory Creation
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-For systems with large combination spaces (e.g., 14,211 total combinations),
-creating all directories upfront is inefficient—most will never be used in
-training. The workflow implements **lazy (on-demand) directory creation**:
-
-**Metadata Generation**: During the combination generation phase, the system:
-
-1. Lists all possible combinations without creating directories
-2. Saves metadata to ``combo_metadata.json`` with:
-   
-   - Combination name (e.g., ``comb_0001_site2_1__site2_2``)
-   - Path where directory will be created
-   - Sites and substituents included
-   - Counter for ordering
-
-3. Writes manifest files listing all possible combinations
-
-**On-Demand Creation**: Directories are created only when needed:
-
-* During training/validation splits, combinations are selected but not created
-* When a combination is accessed for training, the workflow:
-  
-  1. Checks if the directory exists
-  2. If not, loads metadata from ``combo_metadata.json``
-  3. Creates the directory with all required files
-  4. Continues with training
-
-**Benefits**:
-
-* **Disk space efficiency**: Only create ~1-2% of possible combinations (e.g., 
-  142 training + 142 validation out of 14,211 total)
-* **Faster initialization**: Split generation completes in seconds instead of hours
-* **Filesystem efficiency**: Avoid creating thousands of unused directories
-* **Scalability**: Handle massive combination spaces (100K+ combinations)
+A large system can have tens of thousands of combinations, of which training runs only a
+small fraction. Generation therefore only lists them, in ``combo_metadata.json`` (name,
+path, sites and substituents) and the manifest files. A directory is created the first
+time its combination is needed for training, validation or uncertainty scoring. The split
+then takes seconds rather than hours, and disk use scales with the combinations actually
+run.
 
 Directory Structure
 ~~~~~~~~~~~~~~~~~~~
 
-Each combination directory (created on-demand) has a standardized structure:
+Each combination directory (created on demand) has a standard layout:
 
 .. code-block:: text
 
@@ -148,7 +129,7 @@ Each combination directory (created on-demand) has a standardized structure:
    ├── train_manifest.txt                   # Training combination names
    ├── val_manifest.txt                     # Validation combination names
    ├── test_manifest.txt                    # Test combination names
-   ├── comb_0001_site2_1__site2_2/          # Created on-demand
+   ├── comb_0001_site2_1__site2_2/          # Created on demand
    │   ├── info.py                          # System configuration
    │   ├── mapping.json                     # File renumbering mapping
    │   ├── msld_flat.py                     # Simulation script (copied)
@@ -172,24 +153,16 @@ Each combination directory (created on-demand) has a standardized structure:
    │       └── ...
    └── ...
 
-**File Naming Convention**: The renaming preserves site identity:
-
-* Files maintain their site number (``site1_*``, ``site2_*``, etc.)
-* Substituents are renumbered sequentially within each site
-* Original site/sub mapping is preserved in ``mapping.json``
-
 Combination Metadata Files
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Each combination directory contains standardized metadata files:
-
-**info.py**: System configuration loaded by simulation scripts
+**info.py** holds the system configuration read by the simulation script:
 
 .. code-block:: python
 
    import numpy as np
    import os
-   
+
    info = {}
    info['name'] = 'comb_0262_site1_1__site1_2__site2_1__site2_2'
    info['nsubs'] = [2, 2]              # Substituents per site [site1, site2]
@@ -200,7 +173,7 @@ Each combination directory contains standardized metadata files:
    info['enginepath'] = os.environ.get('CHARMMEXEC', '')
    info['temp'] = 298.15               # Temperature in Kelvin
 
-**mapping.json**: File renumbering information
+**mapping.json** records each file's original and new site/sub numbers:
 
 .. code-block:: json
 
@@ -208,229 +181,398 @@ Each combination directory contains standardized metadata files:
      {
        "original": "/path/to/site1_sub2_pres.rtf",
        "new_name": "site1_sub1_pres.rtf",
-       "original_site": 1,
-       "original_sub": 2,
-       "new_site": 1,
-       "new_sub": 1
-     },
-     {
-       "original": "/path/to/site2_sub5_pres.rtf",
-       "new_name": "site2_sub1_pres.rtf",
-       "original_site": 2,
-       "original_sub": 5,
-       "new_site": 2,
-       "new_sub": 1
+       "original_site": 1, "original_sub": 2,
+       "new_site": 1, "new_sub": 1
      }
    ]
 
-This tracks how original fragment files were renumbered during combination
-creation, enabling traceability back to source files.
+Per-pair state (offsets, visits, outcomes) is stored under the *original* numbers, so a
+pair keeps its history across every combination it appears in.
 
-Manifest Files
+Manifest files list combination names, one per line (``comb_0001_site2_1__site2_2``,
+...); the full path is ``{out_dir}/{combo_name}``. Because splits are stored as names,
+they are reproducible and can be reused by later runs.
+
+Each combination becomes a graph of its substituents for the policy (:doc:`cb_setup`).
+The system's ``solvent_state`` (``solv``, ``protein``, or ``gas``/``vacuum``) sets which
+environment atoms are part of each substituent's embedding (:doc:`unimol_representation`).
+
+.. _Staged Online Training:
+
+Staged Online Training
+----------------------
+
+Why Stages
+~~~~~~~~~~
+
+A production run simulates a *group* of substituents at once, but a group run is a poor
+place to learn biases from. When it fails, the trajectory rarely shows which pair's
+biases were wrong, and every run costs the full simulation length. A *pair* run is the
+opposite: λ moves between two substituents, so the run measures that pair's linear (b)
+and quadratic (c) error directly (see the hindsight targets in :doc:`cb_setup`), and a
+short run is often enough to see it.
+
+The workflow therefore resolves pairs first and only then runs the groups built from
+them. With ``curriculum.per_system: true``, each system does this on its own schedule: a
+system the model already predicts well can finish its pairs in a few epochs, while a
+poorly predicted one keeps running pairs, and every epoch's batch mixes systems at
+different points. (The older mode, in which all systems move through the stages
+together, is described in :ref:`Global Curriculum`.)
+
+Terms
+~~~~~
+
+The following terms are used throughout this section and in the code
+(``mllf.cb.system_stages``, ``mllf.cb.hindsight``):
+
+* **Group**: a set of substituents simulated together in production, usually one of
+  the iterative-flattening groups of that system (:ref:`Combo Sets`). Its first
+  substituent at each site is the group's **reference**.
+* **Reference pair**: a group's reference paired with one of its other substituents.
+  Every substituent of a group is connected to the reference by one such pair, so these
+  pairs fix the group's b values.
+* **Good run** of a pair: both substituents were sampled, λ crossed between them at
+  least a minimum number of times, and the minority substituent held at least a minimum
+  fraction of the pair's population. Full-length runs need 10 crossings and 0.2; short
+  runs use the stage's ``explore_min_transitions`` and ``explore_min_fraction`` (defaults 2
+  and 0.2).
+* **Resolved pair**: a pair with ``advance.successes`` good runs in the current stage
+  *and* a per-pair offset whose posterior sd is at most ``advance.max_offset_sd`` for each
+  listed coefficient. Both conditions are needed: good runs show that the current biases
+  work, and the offset sd shows that the pair's correction is known, not just lucky.
+  Resolved pairs leave the stage's pool.
+* **Group test**: a group run in which, at every site, each substituent has at least
+  ``min_population_ratio / n_subs`` of the site's population and the site has at least
+  ``min_site_transitions`` transitions. A group that passes once is retired.
+
+Example
+~~~~~~~
+
+The configuration below runs one stage that holds both pairs and groups. It is taken from
+the staged configs in ``training/online_*.yaml``, with the system list shortened:
+
+.. code-block:: yaml
+
+   alf_root: /path/to/pretraining
+
+   systems:
+     - name: luis_bace_solvent
+       input_dir: training/systems/luis_bace_solvent
+       out_dir: training/simulations_online_A/luis_bace_solvent/
+       solvent_state: solv
+       include_patterns: [msld_flat.py]
+       combo_sets: {ref_pairs: alf_group_ref_pairs, group_pairs: alf_group_pairs,
+                    groups: alf_groups}
+       export_combo_set: groups
+
+   curriculum:
+     enabled: true
+     per_system: true
+     max_train_combos_per_stage: 300      # pairs + groups per epoch, all systems
+     min_combos_per_system: 12
+     combos_per_system: reference_pairs   # shares proportional to reference pairs
+     export_final_biases: true
+     stages:
+       - name: pairs_groups
+         combo_set: group_pairs           # every within-group pair
+         reference_set: ref_pairs
+         reference_pair_bonus: 1.0
+         reference_priority: strict       # reference pairs fill each share first
+         retire_after_epochs: 10
+         prioritize_unvisited: false
+         run_steps: {equil: 13000, prod: 39000}
+         confirm_full_length: false
+         explore_min_transitions: 3
+         explore_min_fraction: 0.0
+         group_set: groups
+         group_ready_fraction: 0.67
+         group_max_failures: 3
+         epochs: 20
+         advance:
+           type: groups_done
+           fraction: 1.0
+           successes: 2
+           max_offset_sd: {linear: 1.0, quadratic: 3.0}
+           min_population_ratio: 0.0      # group test: every substituent sampled
+           min_site_transitions: 0
+
+   validation_per_system: 4
+   eval_schedule: stage
+
+A system here runs short pair runs, reference pairs first, until two thirds of a group's
+reference pairs are resolved. That group then runs at full length, and the system is done
+once every group has passed.
+
+What Happens Each Epoch
+~~~~~~~~~~~~~~~~~~~~~~~
+
+For each system that has not finished, the driver:
+
+1. **Builds the pool**: the stage's combos for that system (from ``combo_set``, or the
+   manifest filtered by the stage's site and substituent limits), minus held-out pairs,
+   resolved pairs and, with ``retire_after_epochs``, retired pairs (run in that many of
+   the stage's epochs without resolving). A stage that leaves a system no combos is
+   skipped for that system.
+2. **Adds ready groups**: with ``group_set``, a group joins the pool once
+   ``group_ready_fraction`` of its reference pairs are resolved (retired ones are left
+   out of the count), and stays until it passes the group test. With
+   ``group_max_failures``, a group that fails that many runs goes back to the pair phase:
+   its pairs that include a substituent the last run never sampled are reopened (they
+   must resolve again, with a fresh retirement allowance), and the group waits until they
+   are resolved or retired.
+3. **Orders the batch**: ready groups first; with ``reference_priority: strict``, each
+   system's unresolved reference pairs next (not yet run first, then by uncertainty), up to
+   the system's share. A reference pair whose run never crossed (stuck at one end, or
+   stranded between them) also runs *reversed* from then on, with λ starting on its other
+   substituent, so the end a barrier holds λ at says something about b instead of the
+   starting state. The reversed partner (``pair07r_site1_subs_9_1`` for
+   ``pair07_site1_subs_1_9``) is the same pair, shares its offsets and takes a slot of the
+   share. Then (with short runs) pairs waiting for a
+   full-length confirming run, then pairs not yet run in this stage (up to
+   ``min_combos_per_system``, unless ``prioritize_unvisited: false``), then pairs still
+   in progress (``bandit.revisit``, :doc:`cb_setup`), and finally the rest by the shared
+   model's uncertainty plus each pair's own state. ``reference_pair_bonus`` is added to a
+   reference pair's ranking, so it is chosen ahead of other pairs of similar uncertainty.
+4. **Sets each system's share**: ``combos_per_system: reference_pairs`` makes each
+   system's share of ``max_train_combos_per_stage`` proportional to its number of
+   reference pairs, with ``min_combos_per_system`` as the floor. Without it, a system with
+   50 substituents would cover its reference pairs no faster than one with four. (The
+   epoch grows if the floors add up to more than the budget.)
+5. **Runs and learns**: each combo is simulated, its λ trajectory gives hindsight targets,
+   and the per-pair offsets and the shared model are updated (:doc:`cb_setup`).
+6. **Checks the stage**: a system leaves the stage when its ``advance`` criterion holds,
+   no sooner than ``advance.min_epochs`` (default 1), or once it has spent ``epochs`` in
+   the stage. In the second case it is recorded as *not converged*, and that label follows
+   its exported biases.
+
+Progress is kept in ``<output.base_dir>/system_stages.json``, so a resumed run continues
+each system where it stopped.
+
+Short Runs
+~~~~~~~~~~
+
+A stage's ``run_steps: {equil: 13000, prod: 39000}`` (MD steps) sets the length of its
+pair runs. It is written into each combination's copy of ``msld_flat.py`` (the ``esteps``
+and ``nsteps`` lines) before every run, so the system's template is never changed. Group
+runs are always full length.
+
+Short runs are cheaper, but they have fewer frames and crossings, so a good short run is
+weaker evidence than a good full-length one. How much weight a short run carries is the
+stage's choice:
+
+* With ``confirm_full_length: true`` (default), a short run counts only as a signal: a
+  pair whose short run is good gets one full-length *confirming* run in the next epoch,
+  and only full-length runs count toward ``successes``.
+* With ``confirm_full_length: false``, good short runs count directly. This is
+  reasonable when the stage's thresholds already ask for enough crossings, and when a
+  later group run checks the same substituents again.
+
+Stage Settings
 ~~~~~~~~~~~~~~
 
-Manifest files list combination names (one per line):
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
 
-.. code-block:: text
+   * - Key
+     - Meaning
+   * - ``epochs``
+     - Most epochs a system spends in the stage.
+   * - ``systems``
+     - Systems that enter this stage; others skip it. Omit for all systems.
+   * - ``min_sites`` / ``max_sites`` / ``min_subs_per_site`` / ``max_subs_per_site``
+     - Manifest filters, ignored when ``combo_set`` is given.
+   * - ``combo_set``
+     - Run this named combo set instead of the filtered manifest (:ref:`Combo Sets`).
+   * - ``reference_set``
+     - Combo set whose pairs are the reference pairs. Without it, every pair in the pool
+       counts as a reference pair.
+   * - ``reference_pair_bonus``
+     - Added to a reference pair's selection score (default 0).
+   * - ``reference_priority``
+     - ``strict``: unresolved reference pairs (and reopened pairs) fill each system's share
+       before other pairs, with reversed partners for pairs that got stuck. Omit to rank
+       them with the others.
+   * - ``retire_after_epochs``
+     - Retire a pair once it has run in this many of the stage's epochs without
+       resolving; it leaves the pool and no longer holds back its groups. Omit to never
+       retire.
+   * - ``group_set``
+     - Combo set of groups that join the pool once ready.
+   * - ``group_ready_fraction``
+     - Fraction of a group's reference pairs that must be resolved before the group
+       runs (default 1.0).
+   * - ``group_max_failures``
+     - Failed runs after which a group goes back to the pair phase (omit to keep running
+       it).
+   * - ``prioritize_unvisited``
+     - Put pairs not yet run in this stage ahead of selection (default true).
+   * - ``run_steps``
+     - ``{equil, prod}`` MD steps for this stage's pair runs.
+   * - ``confirm_full_length``
+     - Require a full-length confirming run before a short run counts (default true).
+   * - ``explore_min_transitions`` / ``explore_min_fraction``
+     - Good-run thresholds for short runs (defaults 2 and 0.2).
+   * - ``advance``
+     - When a system may leave the stage early (below).
 
-   comb_0001_site2_1__site2_2
-   comb_0002_site2_1__site2_3
-   comb_0003_site2_1__site2_4
-   comb_0075_site1_5__site1_1__site1_2
-   comb_0262_site1_1__site1_2__site2_1__site2_2
-   ...
+Keys that set the whole epoch's training in the global curriculum (``update_policy``,
+``reward_override``, ``policy_lr``, ``bc_mode`` ...) are ignored in per-system mode,
+because one epoch now holds systems at different stages.
 
-Manifest files enable reproducible splits and batch operations. The full paths
-are constructed by prepending the ``out_dir`` from the configuration:
-``{out_dir}/{combo_name}``.
+Advance Criteria
+~~~~~~~~~~~~~~~~
 
-Graph Construction
-------------------
+``advance.type`` selects the criterion; ``fraction`` is the share of the pairs, combos or
+groups that must meet it, and ``min_epochs`` the earliest epoch at which it is checked.
 
-During training, molecular graphs are constructed from combination directories to provide
-input for the policy network. Nodes are pretrained, frozen Uni-Mol embeddings (see
-:doc:`unimol_representation`) representing each substituent's 3D structure, chemistry, and
-environment as learned 512D (or 1024D dual) vectors; edges connect every ordered pair of
-substituents within the same λ-site.
+* ``pairs_resolved``: ``fraction`` of the system's pairs are resolved (``successes``,
+  ``max_offset_sd``). ``scope: pool`` (default) counts every pair in the stage's pool;
+  ``scope: visited`` counts only pairs run in this stage, which lets a stage end without
+  running every pair of a large site.
+* ``groups_done``: ``fraction`` of the system's groups have passed the group test
+  (``min_population_ratio``, ``min_site_transitions``). ``successes`` and
+  ``max_offset_sd`` still define resolved pairs, which decide when a group is ready.
+* ``combos_balanced``: the latest run of ``fraction`` of the stage's combos (at least
+  ``min_combos``) passes the group test. Use this for a stage of multi-substituent
+  combos without explicit groups.
+* ``epochs`` (default): the system stays for the full ``epochs``.
 
-For complete details on graph construction, node features, edge expansion, and the
-``UnimolPolicy`` architecture, see :doc:`cb_setup`.
+.. _Combo Sets:
 
-Training Pipeline
------------------
+Combo Sets
+~~~~~~~~~~
 
-System Configuration
-~~~~~~~~~~~~~~~~~~~~
-
-Each entry in the top-level ``systems:`` list carries its own ``solvent_state``, since a
-single training run can combine systems in different environments:
+The manifest of a large site holds mostly pairs, and enumerating every larger subset is
+impractical. Named **combo sets** let a stage run exactly the combinations that matter
+instead (``mllf.file_handling.combo_sets``). The built-in sets come from the
+iterative-flattening groups of each system (``<alf_root>/<system>_group*``), so the online
+run and the baseline simulate the same substituent sets and their costs can be compared
+directly:
 
 .. code-block:: yaml
 
    systems:
-     - name: 14benz_solv
-       input_dir: examples/14benz
-       out_dir: examples/14benz/generated_combos
-       solvent_state: solv   # Environment type
+     - name: luis_bace_solvent
+       ...
+       combo_sets:
+         groups: alf_groups               # one combo per group
+         group_pairs: alf_group_pairs     # every within-site pair of those groups
+         ref_pairs: alf_group_ref_pairs   # each group's reference vs its other subs
+         # explicit groups ({site: [subs]}, first sub = reference), for a system
+         # without iterative-flattening runs, and pairs built from them:
+         # mine: [{1: [3, 2], 2: [15, 6, 7]}]
+         # mine_ref_pairs: {pairs_of: mine, reference_only: true}
+       export_combo_set: groups           # production biases per group
 
-**Solvent State**:
+Some groups were prepared with the system's numbering and some with their own
+(``site1_sub1..n``), so each group's fragments are matched to the system's by content
+(source ligand, atom names, types and charges), not by file name. A site with a single
+substituent in a group is a fixed substituent, not a perturbation, and is dropped. A
+system with no ``_group*`` datasets uses its single dataset as one group.
 
-Specifies the simulation environment to determine which atoms are included as environment
-context when computing each substituent's Uni-Mol embedding:
+.. _Held-Out Validation:
 
-* ``solv`` or ``solvent``: Water molecules within the environment cutoff (8.0 Å) of the core scaffold
-* ``gas`` or ``vacuum``: No environment atoms — core + substituent(+ reference subs from other sites) only
-* ``protein``: Protein atoms (and typically crystallographic waters) within the environment cutoff
+Held-Out Validation
+~~~~~~~~~~~~~~~~~~~
 
-The environment type determines what molecular context Uni-Mol "sees" when computing the
-embedding. For protein systems, including nearby protein atoms naturally encodes
-protein-specific interactions into the learned embedding. See :doc:`unimol_representation`
-for technical details on environment context, the environment-consensus filtering used to
-keep this signal consistent across substituents at a site, and the periodic-boundary
-handling used for solvated/crystal systems.
+Validation answers one question: does the *shared model* predict biases for pairs it has
+never been trained on? To keep the answer clean, held-out pairs are never trained on, and
+validation runs never apply per-pair offsets.
 
-The solvent state is also preserved in ``graph_info.json`` for metadata tracking.
+``validation_per_system: N`` holds out ``N`` pairs per system. When the first stage runs a
+combo set, the held-out pairs are drawn from manifest pairs in none of the system's sets,
+so no stage ever runs them. (A system whose groups cover every pair has nothing to hold
+out.) ``validation_per_system: 0`` holds out nothing. To reuse another run's held-out set
+exactly, set ``validation_combos_file`` to its ``validation_combos.json``; otherwise the
+seeded draw picks by index and changes whenever the combo pool changes.
 
-Reward Function
-~~~~~~~~~~~~~~~
+With ``eval_schedule: stage``, each system's held-out pairs are run at the start, middle
+and end of each of its stages (epochs 1, ceil(n/2) and n of an n-epoch stage) and in the
+epoch it meets a stage's criterion, instead of every ``eval_freq`` epochs. Because the set
+of systems being validated then differs from pass to pass, a validation score is
+comparable only to earlier passes of the same system.
 
-**Pretraining**
+.. _Production Biases:
 
-Before training begins, the policy can be pretrained using behavior cloning
-(AWR NLL loss) to imitate successful bias coefficients from completed simulations.
-For complete details on pretraining loss, data organization, and transfer learning
-strategies, see :doc:`cb_pretraining`.
+Production Biases
+~~~~~~~~~~~~~~~~~
 
-**Training Reward**
+When a system finishes its last stage, its production biases are written to
+``<output.base_dir>/final_biases/<system>/``. They are the shared model's prediction plus
+each pair's offset posterior mean, with no Thompson or offset sampling; b is fitted per
+site from every within-site edge, weighted by each pair's linear-offset variance.
 
-During training, the policy is optimized using REINFORCE with rewards computed from simulation trajectories.
-The reward function prevents degenerate solutions (e.g., convergence to single-substituent states)
-through multiple components:
+* With ``export_combo_set``, one ``variables.py`` is written per combo of that set
+  (``final_biases/<system>/<group>/``), matching how production is run.
+* Otherwise, one export covers every substituent in the system's ``input_dir``, or the
+  subset in ``export_combo_dir``.
 
-.. math::
+Each exported group also gets ``CONFIDENCE.txt`` and ``confidence.json``. These record
+whether the group passed its group test and, for every pair in it, whether the pair was
+resolved, run but not resolved, or never run (with visits, good runs and the b/c offset
+uncertainty). A group that never passed is renamed ``<group>_unconverged``. Its biases are
+still the best available estimate, but they have not been shown to sample, so they should
+be checked before production.
 
-   R_{\text{total}} = coverage\_factor \times (R_P + R_T + R_{\text{entropy}}) + R_{\text{penalties}}
+Cross-site couplings are not predicted and are exported as 0. Exported biases are
+therefore complete for groups whose perturbed substituents share one site, but for
+multi-site groups they are only a starting point.
 
-where :math:`coverage\_factor = \left(\frac{N_{\text{visited}}}{N_{\text{subs}}}\right)^2` is a smooth
-quadratic multiplier that scales all positive reward components by coverage. At 100% coverage it is 1.0;
-at 50% it is 0.25; at 0% it is 0.0 — a smooth gradient signal that rewards partial progress
-and subsumes any separate uniformity term or coverage penalty.
+Set ``curriculum.export_final_biases: false`` to skip the export. To export or label from a
+finished run:
 
-**Population Balance Reward** :math:`R_P`:
+.. code-block:: bash
 
-Encourages equal sampling across all substituents with balanced populations:
+   python -m mllf.cb.export_biases config.yaml --model final_model.pt \
+       --bandit-state <output.base_dir>/bandit_state.json --out final_biases
+   python -m mllf.cb.export_biases config.yaml --label <output.base_dir>
 
-.. math::
+.. _Testing on New Systems:
 
-   R_P = w_P \cdot \frac{\sum_{k \in \text{visited}} p_k}{P_{\text{baseline}}} \cdot C_F
+Testing on New Systems
+~~~~~~~~~~~~~~~~~~~~~~
 
-where:
-
-* :math:`w_P` is the population weight (default: 0.5)
-* :math:`p_k` is the population count for visited substituent :math:`k`
-* :math:`P_{\text{baseline}}` is the normalization constant (default: 500.0)
-* :math:`C_F = \min(1.0, T_{\min} / (2 \times N_{\text{req}}))` is the confidence factor
-* :math:`T_{\min}` is the minimum transitions across all sites
-* :math:`N_{\text{req}}` is the minimum required transitions per site (default: 10)
-
-The confidence factor scales population rewards based on data reliability, reducing
-false rewards from low-transition runs with unreliable population distributions.
-Within-visited uniformity is captured by :math:`R_{\text{entropy}}` (see below).
-
-**Transition Reward** :math:`R_T`:
-
-Rewards frequent transitions between substituents, with bonus for high transition counts:
-
-.. math::
-
-   R_T = \begin{cases}
-   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} & \text{if all sites have } \geq \text{min_transitions_per_site} \\
-   w_T \cdot \frac{\sum_{s=1}^{N_{\text{sites}}} T_s}{T_{\text{baseline}}} \times 1.5 & \text{if avg. trans/site} > 2 \times \text{min_transitions_per_site} \\
-   0 & \text{otherwise (sites below threshold)}
-   \end{cases}
-
-where:
-
-* :math:`w_T` is the transition weight (default: 0.75)
-* :math:`T_s` is the transition count for site :math:`s`
-* :math:`T_{\text{baseline}}` is the normalization constant (default: 50.0)
-* The 1.5× bonus applies when average transitions per site exceeds 20 (2× the default minimum)
-
-**Entropy Bonus** :math:`R_{\text{entropy}}`:
-
-Rewards uniform population distributions using normalized Shannon entropy:
-
-.. math::
-
-   R_{\text{entropy}} = \alpha_{\text{entropy}} \cdot \frac{H(\mathbf{p})}{H_{\max}}
-
-where :math:`H(\mathbf{p}) = -\sum_k \frac{p_k}{P_{\text{total}}} \log \frac{p_k}{P_{\text{total}}}` 
-is Shannon entropy and :math:`H_{\max} = \log(N_{\text{subs}})` is maximum possible entropy.
-
-**Tiered Transition Penalties** :math:`R_{\text{penalties}}`:
-
-The penalty system uses three tiers based on the worst-performing site, with 
-multi-site awareness to fairly handle systems with multiple λ-sites:
-
-**Base Penalty** (determined by :math:`T_{\min}`, the minimum transitions across all sites):
-
-.. math::
-
-   P_{\text{base}} = \begin{cases}
-   40.0 & \text{if } T_{\min} = 0 \quad \text{(Tier 1: "Death Floor")} \\
-   32.0 & \text{if } T_{\min} = 1 \\
-   24.0 & \text{if } T_{\min} = 2 \\
-   2.0 + 2.0(N_{\text{req}} - T_{\min}) & \text{if } 3 \leq T_{\min} < N_{\text{req}} \quad \text{(Tier 2: "Climbing Ramp")} \\
-   0.0 & \text{if } T_{\min} \geq N_{\text{req}} \quad \text{(Tier 3: "Success Zone")}
-   \end{cases}
-
-**Multi-Site Degradation** (incremental penalty for multiple failing sites):
-
-.. math::
-
-   P_{\text{trans}} = \begin{cases}
-   P_{\text{base}} + 4.0(n_{\text{bad}} - 1) & \text{if } n_{\text{bad}} > 1 \\
-   P_{\text{base}} & \text{if } n_{\text{bad}} = 1 \\
-   0 & \text{if } n_{\text{bad}} = 0
-   \end{cases}
-
-where :math:`n_{\text{bad}} = |\{s : T_s < N_{\text{req}}\}|` counts sites below threshold.
-
-
-**Concentration Penalty** (per-site check for single-substituent dominance):
-
-.. math::
-
-   P_{\text{conc}} = \sum_{s=1}^{N_{\text{sites}}} \mathbb{1}\left[\frac{\max_k p_{s,k}}{\sum_k p_{s,k}} > 0.8\right] \cdot \gamma \cdot 5.0 \cdot \left(\frac{\max_k p_{s,k}}{\sum_k p_{s,k}} - 0.8\right)
-
-Total penalties are summed and clamped: :math:`R_{\text{penalties}} = -\min(60.0, P_{\text{trans}} + P_{\text{conc}})`
-
-**Default Hyperparameters**:
+``mode: deploy`` runs a trained model on systems it was not trained on, through the same
+per-system stages (always on in this mode):
 
 .. code-block:: yaml
 
-   reward:
-     w_P: 0.5                                # Population weight
-     w_T: 0.75                               # Transition weight
-     w_U: 0.3                                # accepted but unused; coverage handled by coverage_factor
-     gamma: 4.0                              # Base penalty coefficient
-     P_baseline: 500.0                       # Population normalization
-     T_baseline: 50.0                        # Transition normalization
-     min_transitions_per_site: 10            # Tier 3 threshold
-     min_coverage_ratio: 0.5                 # accepted but unused; coverage handled by coverage_factor
-     entropy_bonus: 8.0                      # Entropy bonus coefficient
-     concentration_penalty_threshold: 0.8    # Single-substituent dominance threshold
-     barrier_target: 1.2                     # Optional: quadratic pair reward peaks at this midpoint barrier (kcal/mol)
-     barrier_width: 1.29                     # Optional: Gaussian width of that reward (kcal/mol)
-     skew_width: 0.78                        # Optional: width of the skew pair reward (skew asymmetry, target 0)
-     end_width: 0.58                         # Optional: width of the end pair reward (end asymmetry, target 0)
+   mode: deploy
+   deploy:
+     model_path: checkpoints_run/final_model.pt
+     update_shared_model: false   # per-pair offsets still learn
+   output:
+     base_dir: deploy_test        # must not be the model's directory
 
-**Policy Gradient Training**:
+Nothing is held out for validation, because every pair of a test system is part of the
+test, and the model file is never overwritten. With ``update_shared_model: false``, the
+cost recorded for a test system is what a user of the trained model would pay: the shared
+model's first guess plus the per-pair corrections that system needed.
 
-The policy is optimized with **REINFORCE** (or, with ``bandit.algorithm: neurallinear_ts``
-in the config, by folding rewards into each head's Bayesian posterior instead). See
-:doc:`cb_setup` for the policy network, the per-edge per-dimension reward, and the optimizer
-step.
+.. _Simulation Cost:
+
+Simulation Cost
+~~~~~~~~~~~~~~~
+
+The comparison that matters is simulated time to converged biases, so both sides are
+measured in nanoseconds the same way. Each finished run's simulated time is added to
+``<output.base_dir>/cost_ledger.json`` by system, stage, and train or validation
+(``mllf.cb.cost_ledger``). The time is read from the dynamics calls in the CHARMM output
+and includes equilibration, since that is compute spent. The iterative-flattening cost for
+the same systems is read the same way from the original run outputs named in the
+pretraining datasets:
+
+.. code-block:: bash
+
+   python -m mllf.cb.cost_ledger <output.base_dir> --pretraining-root pretraining
+
+The comparison is like for like only under three conditions: both sides ran the same
+substituent groups (use the ALF-derived combo sets), validation runs are reported
+separately (they measure the model and are not needed to produce biases), and the
+online cost is that of the run that produced the exported biases. A system trained on
+earlier in a ``train`` run has also contributed to the shared model, so a cost measured
+in ``deploy`` mode is the cleaner estimate for a new system.
 
 Simulation Execution
 --------------------
@@ -440,569 +582,198 @@ Simulation Execution
 Launching Simulations
 ~~~~~~~~~~~~~~~~~~~~~
 
-Simulations are launched via subprocess, running CHARMM with bias coefficients
-written to ``variables.py`` from the policy's sampled actions. The simulator
-outputs transition counts and population distributions for reward computation.
+Each combo's biases are written to ``variables.py`` and its simulation is submitted as one
+SLURM job per combo per epoch (``mllf.cli.slurm.submit_epoch_simulation``). Every
+cluster-specific detail comes from the config's ``slurm:`` block; nothing is hardcoded:
 
-Online training (``mllf.cli.train_workflow`` / ``mllf.cli.slurm.submit_epoch_simulation``)
-submits one SLURM job per combo per epoch. Every cluster-specific detail comes from the
-config's ``slurm:`` block, and nothing about it is hardcoded to any particular cluster's
-resource names:
-
-* ``partition``: passed as ``#SBATCH -p``. Omit it to let your cluster's/account's default
-  partition apply.
-* ``gres``: passed as ``#SBATCH --gres``. Omit it for a CPU-only cluster — no GPU is
-  requested.
+* ``partition``: passed as ``#SBATCH -p``. Omit it to use the account's default partition.
+* ``gres``: passed as ``#SBATCH --gres``. Omit it on a CPU-only cluster.
 * ``time``: passed as ``#SBATCH --time``. Defaults to ``01:00:00`` if the whole ``slurm:``
-  block is omitted; override this if a simulation needs more (or less) wall time.
-* ``module``: passed to ``module load``. Omit it if your cluster doesn't use an
-  environment-modules system, or if the simulator is already on ``PATH``.
+  block is omitted.
+* ``module``: passed to ``module load``. Omit it if the simulator is already on ``PATH``.
 
-An empty (or absent) ``slurm:`` block still produces a valid, runnable script — it just
-omits the directives you didn't set.
+An empty or absent ``slurm:`` block still produces a valid script; it just omits the
+directives that were not set.
 
-Output Parsing
-~~~~~~~~~~~~~~
+When a job finishes, its output is parsed for populations, transitions, pair profiles and
+simulated time (:doc:`file_handling`).
 
-After simulation completes, the framework parses ``output.txt`` from the output 
-directory to extract:
+.. _Reward Function:
 
-* Total transitions per site :math:`T_s` for each λ-site
-* Per-substituent populations :math:`p_{s,k}` at each site
-* Coverage ratio (fraction of substituents visited)
-* Per-site concentration (maximum population fraction at each site)
+Reward Function
+---------------
 
-These metrics feed directly into the reward function components described 
-in the Reward Function section above.
+The ``reward:`` block configures a *run reward*: one number per simulation that summarizes
+how well it sampled. It is reported as the epoch's average reward, decides
+``progression: reward`` in the global curriculum, and filters or weights runs in
+pretraining (:doc:`cb_pretraining`). Online updates do not use it: they use the per-edge,
+per-coefficient reward or the hindsight targets (:doc:`cb_setup`); the ``barrier_*``,
+``skew_width``, ``end_width`` and ``no_transition_weight`` keys below belong to that
+per-edge reward.
 
-.. _Curriculum Learning:
+It is built so that a degenerate run, such as one that settles into a single
+substituent, scores below any run that samples:
 
-Curriculum Learning
--------------------
+.. math::
 
+   R = \left(\frac{N_{\text{visited}}}{N_{\text{subs}}}\right)^2 (R_P + R_T + R_{\text{entropy}}) - \min(60,\; P_{\text{trans}} + P_{\text{conc}})
 
-**Curriculum learning** progressively trains the policy on increasingly complex
-combinations, similar to how students learn from simple to complex problems.
-Instead of training on all possible combinations at once, the policy masters
-simpler tasks before advancing to harder ones.
+* :math:`R_P = w_P \, C_F \sum_{k\,\text{visited}} p_k / P_{\text{baseline}}`: population,
+  discounted by :math:`C_F = \min(1, T_{\min}/2N_{\text{req}})` because populations from
+  runs with few transitions are not yet reliable.
+* :math:`R_T = w_T \sum_s T_s / T_{\text{baseline}}` if every site reaches
+  :math:`N_{\text{req}}` = ``min_transitions_per_site`` transitions (×1.5 above twice that
+  on average), else 0.
+* :math:`R_{\text{entropy}}`: ``entropy_bonus`` × the normalized Shannon entropy of the
+  populations.
+* :math:`P_{\text{trans}}` is set by the worst site, so one failing site cannot hide
+  behind good ones: 40, 32 or 24 for :math:`T_{\min}` = 0, 1 or 2, then
+  :math:`2 + 2(N_{\text{req}} - T_{\min})` up to :math:`N_{\text{req}}`, plus 4 per
+  additional failing site.
+* :math:`P_{\text{conc}}`: for each site where one substituent holds more than 0.8 of the
+  population, :math:`5\gamma` × the excess.
 
-Why Curriculum Learning for MSLD
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. code-block:: yaml
 
-MSLD bias coefficient optimization has a natural difficulty hierarchy:
+   reward:                                   # defaults
+     w_P: 0.5
+     w_T: 0.75
+     gamma: 4.0
+     P_baseline: 500.0
+     T_baseline: 50.0
+     min_transitions_per_site: 10
+     entropy_bonus: 8.0
+     concentration_penalty_threshold: 0.8
+     # per-edge reward (cb_setup)
+     barrier_target: 1.2                     # kcal/mol
+     barrier_width: 1.29                     # kcal/mol
+     skew_width: 0.78
+     end_width: 0.58
+     no_transition_weight: 0.15
+     # accepted but unused: w_U, min_coverage_ratio
 
-**Easy**: Single-site pairs (2 substituents, 1 site)
+.. _Global Curriculum:
 
-* Simplest edge interactions to learn
-* Clear cause-and-effect relationships
-* Provides foundation for pairwise biases
+Global Curriculum
+-----------------
 
-**Medium**: Single-site triplets (3 substituents, 1 site)
+Without ``per_system``, all systems move through the curriculum stages together: every
+epoch draws from one stage, and the stage changes for everyone at once. This was the
+original mode and remains useful for REINFORCE training and for small single-system runs
+such as the 14benz example. Its weakness is that the stage length is set by the slowest
+system, so systems that are already predicted well keep spending simulations.
 
-* Introduces crowding/density effects
-* More complex interaction patterns
-* Tests generalization from pairs
-
-**Hard**: Multi-site combinations (2+ sites with multiple substituents each)
-
-* Cross-site interaction effects
-* Exponentially larger search space
-* Requires composition of learned patterns
-
-Training directly on hard combinations often fails because:
-
-* Reward signals are noisy and unclear
-* Policy has no foundation to build upon
-* Pretrained weights get overwhelmed by complex gradients
-
-Curriculum learning solves this by building skills incrementally.
-
-Configuration
-~~~~~~~~~~~~~
-
-Enable curriculum learning in your workflow YAML:
+Stages run from single-site pairs, through larger single-site combinations, to
+multi-site combinations, for the reason given in :ref:`Staged Online Training`: smaller
+combinations show their own errors more directly. For example:
 
 .. code-block:: yaml
 
    curriculum:
      enabled: true
-     max_train_combos_per_stage: 100  # Optional: limit combinations per stage
-     
+     max_train_combos_per_stage: 100
      stages:
-       # Stage 1: Pairs at single sites
-       - name: pairs_single_site_easy
-         min_subs_per_site: 2
-         max_subs_per_site: 2
-         min_sites: 1
-         max_sites: 1
-         epochs: 50
-         
-       # Stage 2: Triplets at single sites
-       - name: triplets_single_site
-         min_subs_per_site: 3
-         max_subs_per_site: 3
-         min_sites: 1
-         max_sites: 1
-         epochs: 50
-         
-       # Stage 3: Cross-site combinations
-       - name: pairs_two_sites
-         min_subs_per_site: 4  # 2 per site
-         max_subs_per_site: 4
-         min_sites: 2
-         max_sites: 2
-         epochs: 50
-     
-     # Progression criteria
+       - {name: pairs_single_site, min_sites: 1, max_sites: 1,
+          min_subs_per_site: 2, max_subs_per_site: 2, epochs: 50}
+       - {name: triplets_single_site, min_sites: 1, max_sites: 1,
+          min_subs_per_site: 3, max_subs_per_site: 3, epochs: 50}
+       - {name: pairs_two_sites, min_sites: 2, max_sites: 2,
+          min_subs_per_site: 2, max_subs_per_site: 2, epochs: 50}
      progression:
-       type: epoch  # Advance after completing stage epochs
+       type: epoch
 
-Stage Configuration
-~~~~~~~~~~~~~~~~~~~
+Each stage takes:
 
-Each stage specifies:
+* ``min_subs_per_site``, ``max_subs_per_site``: bounds on the substituents at any one
+  site of a combination (checked against the per-site counts, not the combination's
+  total)
+* ``min_sites``, ``max_sites``: number of sites represented
+* ``combo_whitelist``: an explicit list of combo names, bypassing the size filters
+* ``min_transitions_for_stage`` / ``transition_filter_lookback``: on entering a later
+  stage, keep only combos whose recent runs reached this many transitions per site
+* ``epochs``: epochs in the stage
+* ``max_train_combos``: per-stage override of ``max_train_combos_per_stage``
+* ``reward_override``: per-stage reward weights, e.g. a lower
+  ``min_transitions_per_site`` while the policy is still learning pairs
 
-**Combination Filters**:
+Each epoch draws up to ``max_train_combos_per_stage`` of the stage's combos: stratified
+across systems by default (``curriculum.stratified_sampling``,
+``curriculum.min_combos_per_system``), or by uncertainty with ``bandit.selection:
+uncertainty``. Draws are seeded by ``seed`` plus the epoch. The draw is uniform over the
+combos that pass the filter, so a stage allowing pairs and triplets draws mostly triplets,
+in proportion to how many of each exist.
 
-* ``min_subs_per_site``, ``max_subs_per_site``: Bounds on substituents at any single site in
-  the combination (checked against the min/max across that combination's per-site counts,
-  not the combo's total substituent count)
-* ``min_sites``, ``max_sites``: Number of sites represented
-* ``combo_whitelist``: Optional explicit list of combo names to restrict this stage to,
-  bypassing the size filters above
-* ``min_transitions_for_stage`` / ``transition_filter_lookback``: On stage advancement
-  (not the first stage), additionally require a combo's most recent runs to have hit this
-  many transitions per site before it's eligible for the new stage
+Progression
+~~~~~~~~~~~
 
-**Training Duration**:
-
-* ``epochs``: Number of training epochs for this stage
-
-**Optional Settings**:
-
-* ``max_train_combos``: Stage-specific limit on training combinations (overrides global setting)
-* ``reward_override``: Modify reward weights for this stage (e.g., emphasize transitions early)
-
-
-Combination Selection
-~~~~~~~~~~~~~~~~~~~~~
-
-**Filtering Process**:
-
-For each stage, the workflow:
-
-1. Filters all training combinations by stage criteria (min/max subs-per-site/sites)
-2. If filtered count exceeds ``max_train_combos_per_stage``, randomly selects a subset each
-   epoch (stratified across systems by default — see ``curriculum.stratified_sampling`` /
-   ``curriculum.min_combos_per_system``)
-3. Uses reproducible random selection (seeded by the top-level ``seed`` plus the epoch index)
-
-**Important**: Random selection is uniform across all matching combinations.
-If a stage allows both pairs (2 subs) and triplets (3 subs) via ``min_subs_per_site: 2,
-max_subs_per_site: 3``, the 100 selected combinations will be a random mix with no
-preference for either size.
-
-**Reproducibility**: Same seed produces same combination selection across runs.
-
-Progression Criteria
-~~~~~~~~~~~~~~~~~~~~
-
-Stages advance based on progression criteria:
-
-**Epoch-based** (default):
-
-.. code-block:: yaml
-
-   progression:
-     type: epoch
-
-Advances after completing the specified number of epochs for current stage.
-
-**Reward-based** (experimental):
-
-.. code-block:: yaml
-
-   progression:
-     type: reward
-     reward_threshold: 10.0  # Minimum average reward to advance
-
-Advances only if average reward over last 5 epochs exceeds threshold.
-
-**Combined**:
-
-.. code-block:: yaml
-
-   progression:
-     type: both
-     reward_threshold: 10.0
-
-Must complete all epochs AND meet reward threshold.
-
-Training Flow Example
-~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: text
-
-   === Training with Curriculum ===
-   
-   Stage 1: pairs_single_site_easy (epochs 1-50)
-   ├── Filtered: 41 combinations (2 subs, 1 site)
-   ├── Training on all 41 combinations
-   └── Epoch 50 completes → Advance to Stage 2
-   
-   Stage 2: triplets_single_site (epochs 51-100)
-   ├── Filtered: 186 combinations (3 subs, 1 site)
-   ├── Limited to 100 random combinations
-   └── Epoch 100 completes → Advance to Stage 3
-   
-   Stage 3: pairs_two_sites (epochs 101-150)
-   ├── Filtered: 1,681 combinations (4 subs, 2 sites)
-   ├── Limited to 100 random combinations
-   └── Epoch 150 completes → Training complete
-
-**Training Output**:
-
-.. code-block:: text
-
-   === Starting Stage 1/3: pairs_single_site_easy ===
-   Filtered to 41 training combinations for this stage
-   
-   --- Epoch 1/150 - Stage 1/3: pairs_single_site_easy (epoch 1/50) ---
-   Epoch 1 Stats:
-     Loss: 12.3456
-     Avg Reward: -28.5432
-   
-   [... epochs 2-50 ...]
-   
-   ============================================================
-   === Advancing to Stage 2/3: triplets_single_site ===
-   ============================================================
-   Filtered to 186 training combinations for this stage
-   Limiting to 100 random training combos (from 186 available)
-   
-   --- Epoch 51/150 - Stage 2/3: triplets_single_site (epoch 1/50) ---
-
-Stage-Specific Reward Tuning
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Advanced users can override reward parameters per stage:
-
-.. code-block:: yaml
-
-   stages:
-     - name: pairs_single_site_easy
-       min_subs_per_site: 2
-       max_subs_per_site: 2
-       min_sites: 1
-       max_sites: 1
-       epochs: 50
-       reward_override:
-         w_T: 0.9              # Emphasize transitions early
-         min_transitions_per_site: 5  # Lower threshold for easier combinations
-
-This allows fine-tuning the reward function to match stage difficulty.
-
+* ``type: epoch`` (default): advance after the stage's epochs.
+* ``type: reward``: advance only if the average reward over the last 5 epochs reaches
+  ``reward_threshold``.
+* ``type: both``: complete the epochs *and* meet the threshold.
 
 Checkpointing and Resume
--------------------------
+------------------------
 
-Long-running training jobs (e.g., 50 epochs) can be interrupted by SLURM time
-limits, system maintenance, or manual cancellation. The workflow implements
-two-level checkpointing to enable automatic resume without losing progress.
-
-Configuration
-~~~~~~~~~~~~~
-
-Enable checkpointing in your workflow YAML:
+Long runs are interrupted by SLURM time limits, maintenance or cancellation, so the driver
+saves enough state to continue from the last completed epoch.
 
 .. code-block:: yaml
 
    output:
      base_dir: /path/to/training_output
-     save_checkpoints: true    # Enable checkpoint saving
+     save_checkpoints: true
      checkpoint_freq: 5         # Save every N epochs
 
-Training-Level Checkpoints
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+``base_dir`` then holds:
 
-**Location**: ``{base_dir}/checkpoint_{epoch:03d}.pt`` (e.g. ``checkpoint_005.pt``)
+* ``checkpoint_{epoch:03d}.pt``: the policy and optimizer state, the epoch, the global
+  curriculum stage index, and that epoch's statistics
+* ``bandit_state.json``: per-combo bookkeeping and the per-pair state (offset targets,
+  visits, outcomes, exploration factors, b and c brackets). This is the state the
+  per-pair corrections depend on, so a run resumed without it starts every pair over.
+* ``system_stages.json``: each system's stage, epochs spent and progress
+  (per-system mode)
+* ``validation_combos.json``: the held-out set, so a resumed run validates on the same
+  pairs
+* ``cost_ledger.json``: simulated time per run
+* ``final_model.pt``: written at the end, with the full per-epoch statistics
 
-Saved every ``checkpoint_freq`` epochs, containing:
+On restart, the driver loads the latest ``checkpoint_*.pt`` and continues from the next
+epoch. If that checkpoint cannot be loaded, it falls back to ``pretrain.model_path``
+(partial load, ``strict=False``).
 
-* ``epoch``: Completed epoch number
-* ``policy_state_dict``: Full ``UnimolPolicy`` state dict
-* ``rl_optimizer_state_dict``: Optimizer state (momentum, learning rates, etc.)
-* ``current_stage_idx``: Curriculum stage index, for resuming mid-curriculum
-* ``stats``: Training statistics for that epoch (loss, average reward)
-
-A separate ``bandit_state.json`` in ``base_dir`` tracks per-combo failure counts and
-(in NeuralLinear + TS mode) uncertainty bookkeeping across epochs; it is loaded/saved
-alongside checkpoints but is not itself a model checkpoint. When training finishes, a final
-``{base_dir}/final_model.pt`` is written with the last policy/optimizer state plus the full
-per-epoch ``all_stats`` history.
-
-Automatic Resume
-~~~~~~~~~~~~~~~~
-
-When training restarts, the workflow:
-
-1. Scans for ``checkpoint_*.pt`` files in ``base_dir``
-2. Loads the latest checkpoint (highest epoch number)
-3. Restores policy and optimizer state, and the curriculum stage (if any)
-4. Continues from the next epoch — falling back to the ``pretrain.model_path`` checkpoint
-   (partial load, ``strict=False``) if the latest checkpoint fails to load
-
-For each combination in each epoch, the Uni-Mol embeddings and graph tensors computed
-before submitting the simulation are persisted to a small ``graph_data.pt`` in that epoch's
-run directory, so the later REINFORCE update (after the SLURM wait) reloads them instead of
-recomputing embeddings — without holding every epoch's combos resident in memory for the
-full SLURM wait.
+The Uni-Mol embeddings and graph tensors of each combo are saved to ``graph_data.pt`` in
+its run directory before the simulation is submitted. The update after the SLURM wait
+reloads them rather than recomputing the embeddings or holding every combo in memory
+during the wait.
 
 Archiving Combinations
------------------------
+----------------------
 
-Combination directories can be automatically archived to save disk space using
-two strategies: **per-stage archiving** (during curriculum training) or
-**post-training archiving** (after all training completes). Each combination
-directory is compressed into a ``.tar.gz`` file, optionally removing the original.
+The online training driver does not archive anything itself (an ``archive:`` block in
+its config is ignored), because the per-pair state and the cost ledger point back into
+the run directories. Archive a run's combination directories once its biases are exported
+and its costs summarized, with ``archive_combo_dirs(out_dir, pattern='comb_*', remove=False)``
+(``mllf.file_handling.generate_combinations``) or ``examples/14benz/archive_combos.sh``.
 
-Configuration
-~~~~~~~~~~~~~
+.. _Example Configurations:
 
-Enable archiving in your workflow YAML:
+Example Configurations
+----------------------
 
-.. code-block:: yaml
-
-   archive:
-     enabled: true               # Enable archiving
-     per_stage: true             # Archive after each curriculum stage (or false for post-training)
-     pattern: 'comb_*'           # Glob pattern for directories to archive (post-training only)
-     remove_after: false         # Remove originals after successful archiving
-     archive_dir: /path/to/archives  # Where to store .tar.gz files
-
-Per-Stage Archiving (Curriculum Training)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**Best for**: Long curriculum training runs where disk space is limited.
-
-When ``per_stage: true``, the workflow archives combinations at the end of each
-curriculum stage **in the background** while the next stage's simulations begin.
-This provides:
-
-* **Immediate space recovery**: Free up disk as soon as each stage completes
-* **No training delays**: Archiving runs concurrently with next stage setup
-* **Stage-specific organization**: Each stage gets its own archive directory
-
-**Behavior**:
-
-1. After a curriculum stage completes (e.g., after epoch 50 of stage 1)
-2. Archive job launches in background (bash script with tar commands)
-3. Next stage begins immediately (simulations submit while archiving runs)
-4. After training completes, workflow waits for any remaining archive jobs
-
-**Configuration Example**:
-
-.. code-block:: yaml
-
-   curriculum:
-     enabled: true
-     stages:
-       - name: pairs_single_site_easy
-         min_subs_per_site: 2
-         max_subs_per_site: 2
-         epochs: 50
-       - name: pairs_single_site_full
-         min_subs_per_site: 2
-         max_subs_per_site: 2
-         epochs: 50
-   
-   archive:
-     enabled: true
-     per_stage: true              # Archive after each stage
-     remove_after: false
-     archive_dir: /path/to/archives
-
-**Timeline**:
-
-.. code-block:: text
-
-   Epoch 1-50 (Stage 1) → Stage 1 completes → Archive job starts in background
-                                             ↓
-   Epoch 51 begins (Stage 2) ← Simulations submit while Stage 1 archives
-   
-   Epoch 51-100 (Stage 2) → Stage 2 completes → Archive job starts in background
-                                               ↓
-   Epoch 101 begins (Stage 3) ← Stage 2 continues archiving in background
-
-Post-Training Archiving
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-**Best for**: Non-curriculum training or when you want to keep all data until
-the end.
-
-When ``per_stage: false`` (or not specified), the workflow archives combinations
-once after all training completes.
-
-**Behavior**:
-
-1. After training completes successfully, all directories matching ``pattern``
-   are compressed into individual ``.tar.gz`` archives
-2. Archives are moved to ``archive_dir`` (if different from source)
-3. Original directories are removed if ``remove_after`` is ``true``
-
-
-**Configuration Example**:
-
-.. code-block:: yaml
-
-   archive:
-     enabled: true
-     per_stage: false             # Archive once at the end (default)
-     pattern: 'comb_*'            # Directories to archive
-     remove_after: false
-     archive_dir: /path/to/archives
-
-
-Manual Archiving
-~~~~~~~~~~~~~~~~
-
-You can also archive combinations manually:
-
-.. code-block:: python
-
-   from mllf.file_handling.generate_combinations import archive_combo_dirs
-   from pathlib import Path
-   
-   # Archive all comb_* directories
-   archived = archive_combo_dirs(
-       out_dir=Path('generated_combos'),
-       pattern='comb_*',
-       remove=False  # Keep originals
-   )
-   
-   print(f"Created {len(archived)} archive files")
-
-
-Complete Workflow Example
---------------------------
-
-Full Pipeline Script
-~~~~~~~~~~~~~~~~~~~~
-
-The main online-training workflow is implemented in ``mllf.cli.train_workflow``
-(``run_training``), invoked either as a module or via the ``training/workflow.py`` wrapper:
-
-.. code-block:: bash
-
-   cd mllf   # repository root
-   python -m mllf.cli.train_workflow examples/workflow_14benz.yaml
-
-This executes:
-
-1. Combination manifest generation for every system in ``systems:`` (parallelized across
-   systems; large combo pools are handled separately from small ones to avoid OOM)
-2. Curriculum stage setup and held-out validation split (if ``validation_fraction > 0`` and
-   enough combos are available). To reuse another run's held-out set exactly, set
-   ``validation_combos_file`` to its ``validation_combos.json``. The seeded split picks
-   by index, so it changes whenever the combo pool changes.
-3. Policy initialization (``UnimolPolicy``, optionally with Bayesian heads)
-4. Checkpoint detection and resume, or warm start from ``pretrain.model_path``
-5. Training loop: per epoch, sample/filter combos, compute Uni-Mol embeddings, sample
-   actions, submit SLURM simulations, compute per-edge rewards, and update the policy
-6. Checkpoint saving at ``checkpoint_freq`` intervals, plus a final ``final_model.pt``
-
-.. _Complete Configuration Example:
-
-Configuration File
-~~~~~~~~~~~~~~~~~~
-
-A minimal single-system workflow configuration (``examples/workflow_14benz.yaml``, trimmed
-here — see the file itself for full inline documentation):
-
-.. code-block:: yaml
-
-   seed: 42
-
-   # One system is still a list -- see "Configuration Format" above
-   systems:
-     - name: 14benz_solv
-       input_dir: examples/14benz
-       out_dir: examples/14benz/generated_combos
-       solvent_state: solv
-       include_patterns: [msld_flat.py]
-       max_subs_per_site: 3
-
-   # Warm start from a behavior-cloned checkpoint (optional -- see :doc:`cb_pretraining`).
-   # Omitted here; UnimolPolicy trains from a random initialization by default.
-   # pretrain:
-   #   model_path: models/<your_pretrain_run>/best_policy.pt
-
-   # Curriculum: restrict to the easiest stage so this example runs quickly
-   curriculum:
-     enabled: true
-     max_train_combos_per_stage: 20
-     stages:
-       - name: pairs_single_site
-         min_sites: 1
-         max_sites: 1
-         min_subs_per_site: 2
-         max_subs_per_site: 2
-         epochs: 5
-     progression:
-       type: epoch
-
-   validation_fraction: 0.0   # too few combos for a held-out split in this tiny example
-
-   # Policy architecture (UnimolPolicy -- see :doc:`cb_setup`)
-   training:
-     policy:
-       unimol_dim: 512
-       mlp_hidden: 64
-     optimizer:
-       lr: 0.0001
-     bias_clip: 1000.0
-
-   output:
-     base_dir: examples/14benz/training_output
-     save_checkpoints: true
-     checkpoint_freq: 1
-
-   run_sims: true
-   wait_for_jobs: true
-   max_concurrent_jobs: 10
-   timeout: 1200
-
-   # All four keys are optional (see below); only `time` has a generic
-   # default (01:00:00) if the block is omitted entirely.
-   slurm:
-     partition: gpu
-     gres: gpu:1
-     time: '01:00:00'
-     module: charmm/charmm/c51a1
-
-   reward:
-     w_P: 0.5
-     w_T: 0.75
-     w_U: 0.3
-     gamma: 4.0
-     entropy_bonus: 8.0
-     P_baseline: 500.0
-     T_baseline: 50.0
-     min_transitions_per_site: 10
-     no_transition_weight: 0.15
-
-For a large-scale, multi-system production config (30+ systems, curriculum stages through
-cross-site combinations, per-system overrides, NeuralLinear + Thompson Sampling) see the
-``bandit:``, ``curriculum.stratified_sampling``, and per-system override options referenced
-throughout this page — ``examples/workflow_14benz.yaml`` intentionally keeps most of these
-at their defaults.
+* ``examples/workflow_14benz.yaml``: the smallest working config (one system, REINFORCE,
+  global curriculum, no pretrained model), walked through in :doc:`examples`.
+* ``training/online_*.yaml``: the staged setup used for production biases, with many
+  systems, per-system stages over ALF-derived combo sets, a pretrained Bayesian model,
+  hindsight targets with per-pair offsets, and full-network regression. Each header
+  explains which systems the run covers and why.
 
 See Also
-~~~~~~~~
+--------
 
-* :doc:`file_handling` - File format documentation and parsers
-* :doc:`cb_setup` - CB infrastructure and policy architecture
+* :doc:`file_handling` - file formats and parsers
+* :doc:`cb_setup` - policy architecture, hindsight targets and per-pair offsets
 * :doc:`unimol_representation` - Uni-Mol embeddings for node features
-* :doc:`cb_pretraining` - Behavior cloning from expert coefficients
-* :doc:`examples` - Example workflows and usage patterns
-* :doc:`api` - API reference for workflow modules
+* :doc:`cb_pretraining` - behavior cloning from completed simulations
+* :doc:`examples` - example workflows and usage
+* :doc:`api` - API reference

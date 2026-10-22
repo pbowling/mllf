@@ -1,393 +1,181 @@
 CB Behavior Cloning
 ===================
 
-Overview
---------
+Before online training, the policy is **pretrained** by behavior cloning on bias
+coefficients from completed simulations. Online training then starts near working biases,
+so its first runs correct the model instead of searching for a region where λ moves at
+all. Pretraining also supplies what online training relies on: the prior of the Bayesian
+heads, and the replay set that keeps online updates from overwriting what the model
+learned (:doc:`cb_setup`). How much it helps a new system depends on how similar that
+system is to the pretraining data; the online stages handle the rest.
 
-Before reinforcement learning, the policy network can be **pretrained** using behavior cloning
-on expert bias coefficients from existing optimized systems. This provides a warm start that:
+Pretraining Data
+----------------
 
-* Accelerates CB training by starting near good solutions
-* Reduces early exploration waste on poor bias values
-* Stabilizes training by preventing catastrophic forgetting
-* Transfers knowledge across similar chemical systems
+``mllf.cli.collect_pretraining_data`` turns completed run directories (``variables.py``,
+output, ``prep/``) into records under ``pretraining/``. Three layouts are recognized:
 
-Behavior cloning learns to imitate expert bias coefficients by supervised learning on
-(graph structure → bias coefficients) pairs collected from pretraining systems.
+.. code-block:: text
 
+   pretraining/
+   ├── 14benz_solv/run1/{prep/, variables.py}           # per-run prep
+   ├── 123benz_solvent_group1/{prep/, run1/, run2/...}  # shared prep (takes priority)
+   └── 14benz_pair_combos/comb_0063.../run_001/         # one directory per combination
 
-Running Pretraining
---------------------
+Each run needs ``variables.py`` and a ``prep/`` with the RTF/PDB files; ``metadata.json``
+with the run's metrics is optional. The data come from iterative-flattening runs and from
+online runs added later (below).
 
-Pretraining is invoked via ``mllf.cb.pretrain_policy``'s CLI:
+**Which substituent is which.** A ``variables.py`` lists biases by position
+(``lams1s1``, ``lams1s2``, ...), so every coefficient is only as correct as the mapping
+from position to substituent. That mapping is read from the BLOCK setup the run actually
+executed (in its output). The prep ``.inp`` files are used only when the output does not
+echo it, and sequential numbering is the last resort. The ``.inp`` files are not reliable
+on their own: a prep can hold several, or define blocks out of read order, and either
+case silently mislabels substituents. Datasets collected before this change can be
+corrected in place (the original is kept as ``graph_info.orig.json``):
 
 .. code-block:: bash
 
-   python -m mllf.cb.pretrain_policy \
-       --pretraining-dir pretraining/ \
-       --output-dir models/my_pretrain_run \
-       --config examples/workflow_pretrain.yaml \
+   python -m mllf.cli.collect_pretraining_data --relabel-subs pretraining \
+       [--datasets luis_bace_solvent ...] [--dry-run]
+
+Adding Online Runs
+~~~~~~~~~~~~~~~~~~
+
+Online runs can be added so that a later model starts from what they learned:
+
+.. code-block:: bash
+
+   python training/collect_online_runs.py --simulations-dir training/simulations_online_A \
+       --output-dir pretraining \
+       --exclude-combos-file checkpoints_online_A/validation_combos.json
+
+Only runs with more than ``--min-transitions`` total transitions (default 3) are
+collected. Each is named ``<run>__<tag>`` (``--tag``, by default the simulations
+directory name), so runs from different online trainings that share combo and run names
+do not overwrite each other. Its ``metadata.json`` records the source run, online run,
+epoch and ``collection_tag``. Two rules keep later comparisons fair:
+
+* **Held-out pairs stay held out.** ``--exclude-combos-file`` skips the online run's
+  validation pairs, so a later test on the same held-out set still tests unseen pairs. To
+  keep them anyway, collect them alone (``--only-combos-file``) into a directory that
+  pretraining does not read.
+* **Replay uses only the original data.** ``regression.replay_pretraining_only`` (default
+  ``true``) skips tagged runs during online regression, so a new test does not replay
+  earlier tests.
+
+Running Pretraining
+-------------------
+
+.. code-block:: bash
+
+   python -m mllf.cb.pretrain_policy --pretraining-dir pretraining/ \
+       --output-dir models/my_pretrain_run --config examples/workflow_pretrain.yaml \
        --epochs 50
 
-``--pretraining-dir`` may be repeated to combine multiple collected-data directories into
-one training set. Key flags (all optional, sensible defaults shown):
+``--pretraining-dir`` can be repeated. The ``--config`` file sets the Uni-Mol options
+(``unimol.structure_selection``, ``unimol.environment_cutoff``,
+``unimol.cache_embeddings``) and the reward weights used for run weighting. Filters and
+optimizer settings are command-line flags:
 
-* ``--use-best-only`` — keep only the highest-reward run per system (default: use all valid runs)
-* ``--no-data-hygiene`` — disable the per-pair, per-bias-type measured-target mask (see
-  "Data Hygiene" below; on by default)
-* ``--no-per-pair-awr`` — disable per-pair AWR weighting and fall back to one scalar weight
-  per run (see "Per-Pair AWR Weighting" below; per-pair is the default)
-* ``--awr-temperature`` (default 0.5) — AWR temperature :math:`\beta`
-* ``--min-transitions N`` / ``--min-reward-threshold`` / ``--stratified-negative-fraction`` —
-  quality filters, see "Quality Filtering" below (mutually exclusive; ``--min-transitions``
-  takes precedence)
-* ``--no-filter-outliers`` / ``--outlier-std-threshold`` — statistical outlier filtering
-  (enabled by default at ±3σ)
-* ``--reward-weighted`` — additionally weight each run's loss by its (clamped, normalized)
-  reward
-* ``--bayesian-heads`` / ``--bayesian-prior-precision`` — after the normal behavior-cloning
-  loop, also save a ``use_bayesian_heads=True`` sibling policy
-  (``best_policy_bayesian.pt`` / ``final_policy_bayesian.pt``) for NeuralLinear + Thompson
-  Sampling online training (see :doc:`cb_setup`), warm-started from the trained
-  deterministic readout
+* ``--no-data-hygiene``, ``--no-per-pair-awr``, ``--awr-temperature`` (default 0.5):
+  the objective (below)
+* ``--use-best-only``, ``--min-transitions``, ``--min-reward-threshold``,
+  ``--stratified-negative-fraction``, ``--no-filter-outliers`` /
+  ``--outlier-std-threshold``: run filters (below)
+* ``--reward-weighted``, ``--emphasize-systems``: extra per-run weights
+* ``--bayesian-heads`` / ``--bayesian-prior-precision``: also save a Bayesian-head copy
+  (``best_policy_bayesian.pt``) for NeuralLinear + Thompson sampling, with each posterior
+  mean started from the trained readout
 
-The ``--config`` file (e.g. ``examples/workflow_pretrain.yaml``) controls the Uni-Mol
-representation settings — ``unimol.structure_selection`` (minimized vs. unrelaxed
-structures), ``unimol.environment_cutoff``, ``unimol.cache_embeddings`` — and the reward
-function weights used to compute the per-run/per-pair AWR weights described above; it does
-**not** control filtering or optimizer flags, which are CLI-only. See
-``examples/pretrain_wUnimol.sh`` for a complete SLURM submission example (which sources
-``examples/pretrain_with_filtering.sh`` and sets these flags via environment variables), and
-:doc:`examples` for a walkthrough.
+``examples/pretrain_wUnimol.sh`` is a complete SLURM example. The outputs are
+``best_policy.pt`` (set it as ``pretrain.model_path`` in a workflow config),
+``training_log.txt``, ``filtering_stats.json`` (which runs were excluded and why) and
+checkpoints. The learning rate follows a cosine schedule down to ``lr / 100``.
 
-Behavior Cloning Training
---------------------------
+Objective
+---------
 
-.. _Training Objective:
-
-**Training Objective**:
-
-The model minimises an **Advantage-Weighted Regression (AWR)** loss: the negative
-log-likelihood of the expert action under the current policy distribution, scaled by
-an exponential weight derived from the run’s reward. Backpropagation runs only through
-the *active* (non-zero) target for each edge via an ``active_mask``:
+The loss is an advantage-weighted regression (AWR): the Gaussian negative log-likelihood
+of each target coefficient, weighted by how well the run sampled:
 
 .. math::
 
    \mathcal{L}_{\text{AWR}} = -\frac{1}{|\mathcal{G}|}
    \sum_{r \in \mathcal{G}}
-   \exp\!\left(\frac{R_r}{\beta}\right)
-   \cdot
    \frac{1}{|\mathcal{A}_r|}
    \sum_{(i,j,k) \in \mathcal{A}_r}
-   \log \mathcal{N}\!\left(a_{ij}^{(k)};
+   w_{ij}^{(k)} \log \mathcal{N}\!\left(a_{ij}^{(k)};
      \mu_{ij}^{(k)}, (\sigma_{ij}^{(k)})^2\right)
 
-where:
+where :math:`\mathcal{G}` is a group of runs with the same graph, :math:`\mathcal{A}_r`
+the run's active targets, :math:`k` the bias type, and :math:`w = \exp(R/\beta)` (capped
+at 20). The NLL trains σ as well as μ, and σ later sets the starting exploration scale.
 
-- :math:`\mathcal{G}` is the set of runs sharing the same graph structure (gradient-accumulated
-  before a single optimizer step)
-- :math:`R_r` is the pre-computed BC reward for run :math:`r` (stored in ``run["_bc_reward"]``)
-- :math:`\beta` is the AWR temperature (``--awr-temperature``, default: 0.5)
-- :math:`\mathcal{A}_r = \{(i,j,k) : |a_{ij}^{(k)}| > \epsilon\}` is the set of active
-  (non-zero) target entries for run :math:`r`
-- :math:`k \in \{\text{linear, quadratic, skew, end}\}` are bias types
-- :math:`a_{ij}^{(k)}` is the expert coefficient; :math:`\mu_{ij}^{(k)}, \sigma_{ij}^{(k)}`
-  are the predicted mean and standard deviation
-- :math:`\epsilon = 10^{-8}` is a small threshold to identify non-zero targets
-- The exponential weight is capped at 20 to prevent a single excellent run from dominating
+* **Per-pair weighting** (default). :math:`R` is computed per edge and per coefficient with
+  the same per-edge reward used online (:doc:`cb_setup`), so well-resolved pairs drive
+  more gradient than poorly resolved pairs in the same run. A pair's weight is zero if a
+  substituent was never sampled or its ΔΔG is missing (a missing direction is filled from
+  the reverse one). ``--no-per-pair-awr`` uses one weight per run.
+* **Run length.** The data mix short runs (~0.1 ns) with 1 ns runs, and a short run has a
+  tenth of the time to cross and balance. Pretraining judges each run the way online
+  training judges its own short and full runs. A run under half of ``full_length_ns``
+  (default 1.0) is short.
 
-When ``_bc_reward`` is 0.0 (default), :math:`\exp(0/\beta) = 1.0` and AWR reduces to
-unweighted NLL — pure behavior cloning with no weighting.
+  - *Success gate.* A pair counts as a success when it passes online training's test for
+    a run of its length. A full run needs at least 10 crossings and a minority fraction of
+    at least 0.2. A short run needs only ``explore_min_transitions`` crossings and
+    ``explore_min_fraction`` (defaults 3 and 0.0, the same values as the online pair stage).
+    A pair that passed gets an advantage of at least 0, so its biases are imitated at least
+    as much as average. A pair that failed gets at most 0. The reward then ranks pairs
+    within each side. As in online training, a pass in a short run counts as much as a
+    pass in a full one: length decides which test a pair must pass, not how much passing
+    is worth. ``success_gate: false`` turns the gate off.
+  - *Counts scale with length.* In the whole-run reward used for stratified sampling,
+    reward filtering and the fallback weight, the population and transition baselines
+    scale with run length. A short run there needs only ``explore_min_transitions``
+    crossings per site.
 
-The AWR objective uses the Gaussian NLL rather than MSE, which trains the standard deviation
-:math:`\sigma` alongside the mean. Larger :math:`\sigma` values allow the policy more
-exploratory freedom in RL fine-tuning; the learned :math:`\sigma` is a useful prior for
-initialising the exploration scale.
+  All of these keys go in the config's ``reward`` section. The length comes from
+  ``simulated_ns`` in ``simulation_results.json``. It is recorded at collection, and
+  ``collect_pretraining_data --backfill-barrier PRETRAINING_ROOT --workers N`` adds it to
+  older data. Runs without it count as full length.
+* **Data hygiene** (default). A run's coefficients are evidence for a coefficient only
+  when the run sampled the part of λ space that coefficient shapes. A trapped run leaves
+  the others wherever its optimizer stopped: flattening runs that never reached their
+  endpoints drove end biases to 10–18, far outside converged values. Each target is
+  therefore kept only when the run measured it: **linear** when both substituents were
+  sampled with a finite ΔΔG, **quadratic** when the midpoint barrier was measured,
+  **skew / end** when the asymmetry was measured (frames at both endpoint cores). Runs
+  collected without profile signals keep only their linear targets. Each run's loss is
+  divided by its number of active targets, so a run with few measured targets counts
+  less. The Bayesian heads' noise and prior use the same mask.
 
+Run Filters
+-----------
 
-**Per-Pair AWR Weighting** (default):
+Without hygiene, every run counts equally and the weights only rank targets within a run,
+so poor runs must be filtered out. With hygiene, a run that never sampled a pair adds no
+weight for it, so the filters are optional; ``examples/pretrain_wUnimol.sh`` uses none.
+They remain available:
 
-By default (``--no-per-pair-awr`` to disable), the AWR weight above is not a single scalar
-per run — it is computed **per edge, per dimension** via
-``compute_pairwise_confidence_weights`` / ``compute_pair_reward`` (the same reward function
-used by online REINFORCE, see :doc:`cb_setup`). Concretely, each pair's confidence weight
-combines:
+* **Outliers** (default ±3σ): drops runs with coefficients far from the dataset mean,
+  which usually reflect a diverging run rather than a sampling strategy.
+* **Minimum reward** or **minimum transitions**: drops runs that sampled poorly.
+* **Best only**: keeps the highest-reward run per system. This is clean but narrow, and
+  it works poorly with few systems.
+* **Stratified negatives**: keeps every positive-reward run and a share of each
+  negative-reward bucket that rises quadratically toward zero (up to 55% for the best
+  bucket). The model then sees near-misses as well as successes.
 
-* **Population balance**: :math:`\min(p_i, p_j) / \max(p_i, p_j)` — zero if either
-  substituent was never sampled
-* **DDG reliability**: zero weight if the pair's ΔΔG is missing, NaN, or infinite (no usable
-  λ-space crossing was observed for that specific pair)
-* **Antisymmetric handling**: a missing forward-direction DDG is filled in from the reverse
-  direction's negation when available, rather than being treated as unobserved
-
-This means that within one run, well-resolved pairs (balanced populations, a clean DDG)
-drive more gradient than poorly-resolved pairs, instead of every pair in the run sharing one
-flat run-level weight. This keeps the pretraining signal consistent with what online
-REINFORCE later optimizes against. The AWR temperature :math:`\beta` (``--awr-temperature``,
-default 0.5) still controls how sharply confidence is weighted.
-
-**Data Hygiene** (default; ``--no-data-hygiene`` to disable):
-
-A run's bias coefficients are evidence for a coefficient only when the simulation sampled
-the part of λ space that coefficient shapes. A trapped or diverging run leaves the other
-coefficients wherever the optimizer that produced it stopped. For example, flattening runs
-that never reached their endpoints drove end biases to 10–18, far outside converged
-values. Cloning those teaches the model coefficients that prevent sampling.
-
-``compute_pairwise_measured_mask`` therefore keeps each edge's target, per bias type, only
-when the run measured what sets it:
-
-* **linear**: both substituents sampled and a finite pair ΔΔG (the rule above);
-* **quadratic**: the pair's midpoint barrier was measured;
-* **skew / end**: the pair's skew / end asymmetry of the λ profile was measured (these
-  need frames at both endpoint cores).
-
-The profile signals come from ``simulation_results.json`` (see
-``read_output.parse_pair_profile``). Runs collected without them keep only their
-linear targets, and runs without usable populations contribute nothing, where legacy
-mode gives every edge full weight. The Bayesian heads' noise and prior calibration use the
-same mask.
-
-Hygiene also changes how runs are normalized. In legacy mode each run's loss is a weighted
-mean over its targets (divided by the sum of weights), so every run counts equally and the
-weights only rank targets within a run, which is why run-level filters were needed. Under
-hygiene each run's weighted sum is divided by its number of active targets, so a run whose
-targets are unmeasured or poorly resolved contributes proportionally less. With hygiene
-on, the quality filters below are optional: runs that never sampled a pair add no weight
-for it. ``examples/pretrain_wUnimol.sh`` runs this way (``STRATIFIED_FRACTION=0``,
-``REWARD_THRESHOLD=none``).
-
-Per-run weights from ``--reward-weighted`` and ``--emphasize-systems`` multiply each run's
-loss in both modes.
-
-**Graph Caching**:
-
-Before training begins, all pretraining graphs are built once and stored in an in-memory
-cache. Each subsequent epoch iterates over the cached graphs instead of re-parsing RTF/PDB
-files and recomputing Uni-Mol embeddings on every pass. This is the dominant source of
-training speedup: for example, a dataset of ~25,000 runs may span only ~250 unique prep
-directories (many runs share the same prep). Embedding computation then runs ~250 times
-rather than ~25,000 times as it would without structure sharing. Rebuilding on every epoch
-would cost many hours over a full training run. Set ``unimol.cache_embeddings: true`` in the
-``--config`` file (see "Running Pretraining" above) to additionally persist computed
-embeddings to disk across separate pretraining invocations.
-
-**Learning Rate Schedule**:
-
-A cosine annealing schedule decays the learning rate from the initial value down to
-``lr / 100`` over the full number of training epochs. This allows the optimizer to make
-large updates early in training while converging smoothly at the end, and helps avoid
-escape from a good minimum once one is found. The current learning rate is printed
-after each epoch and saved in the checkpoint.
-
-**Training Outputs**:
-
-The pretraining process produces several artifacts:
-
-* **best_policy.pt:** Trained policy network weights ready for downstream use
-* **training_log.txt:** Loss curves and convergence metrics across epochs
-* **filtering_stats.json:** Record of which runs were excluded and why
-* **checkpoint files:** Intermediate model states for recovery or analysis
-
-**Using Pretrained Models**:
-
-Point an online workflow at ``best_policy.pt`` via its ``pretrain.model_path`` (see
-:doc:`workflow`). Transfer is most effective when pretraining systems share structural or
-chemical similarity with the target system, but even diverse pretraining data improves
-learning efficiency by teaching general principles of bias coefficient assignment.
-
-Expert Coefficient Collection
-------------------------------
-
-Expert bias coefficients come from two sources:
-
-1. **ALF-predicted coefficients**: Bias values predicted by the Adaptive Landscape Flattening (ALF) algorithm
-2. **CB-optimized coefficients**: Bias values from converged CB training runs
-
-Both are stored in ``variables.py`` files in prep directories:
-
-.. code-block:: python
-
-   # variables.py from an optimized system
-   bias_string = '''
-   b:  # Linear bias
-   - 0.245
-   - -0.132
-   - 0.089
-   c:  # Quadratic bias (symmetric, upper triangle stored)
-   - [0.0, 2.34, -1.56]
-   - [0.0, 0.0, 3.12]
-   - [0.0, 0.0, 0.0]
-   # ... skew and end biases ...
-   '''
-
-Pretraining Dataset Generation
--------------------------------
-
-The pretraining system automatically discovers and collects expert demonstrations from
-the ``pretraining/`` directory structure:
-
-**Directory Structure**:
-
-.. code-block:: text
-
-   pretraining/
-   ├── 14benz_solv/            # Per-run prep (each run carries its own prep/)
-   │   ├── run1/
-   │   │   ├── prep/
-   │   │   │   ├── core.pdb
-   │   │   │   ├── site1_sub1_pres.rtf
-   │   │   │   └── ...
-   │   │   └── variables.py  # Expert coefficients
-   │   ├── run2/
-   │   └── ...
-   ├── 123benz_solvent_group1/ # Shared prep (all runs share a single prep/)
-   │   ├── prep/
-   │   │   ├── core.pdb
-   │   │   ├── site1_sub1_pres.rtf
-   │   │   └── ...
-   │   ├── run1/
-   │   │   └── variables.py  # Expert coefficients
-   │   ├── run2/
-   │   └── ...
-   ├── abl_protein_mutant_group1/
-   │   ├── run1/
-   │   └── ...
-   ├── 14benz_pair_combos/  # Multi-combo structure
-   │   ├── comb_0063.../
-   │   │   ├── run_001/
-   │   │   │   ├── prep/
-   │   │   │   └── variables.py
-   │   │   └── ...
-   │   └── ...
-   └── ...
-
-**Automatic Discovery**:
-
-``mllf.cli.collect_pretraining_data`` scans all subdirectories and collects:
-
-1. **System identification**: Detects all systems in ``pretraining/``
-2. **Run enumeration**: Finds all run directories per system
-3. **Variables extraction**: Parses ``variables.py`` for bias coefficients
-4. **RTF parsing**: Builds graph structure from ``prep/*.rtf`` files
-5. **Performance metrics**: Extracts rewards from simulation metadata
-
-**Supported Structures**:
-
-* **Standard**: ``pretraining/system_name/run*/`` (e.g., ``14benz_solv/run1/``)
-* **Combo**: ``pretraining/system_name/comb_*/run_*/`` (e.g., ``14benz_pair_combos/comb_0063.../run_046/``)
-
-Each run directory must contain:
-
-* ``variables.py`` with bias coefficients (b, c, x, s matrices)
-* ``prep/`` with RTF/PDB files — either as a subdirectory of the run directory
-  (per-run prep) or as a shared ``prep/`` in the parent system directory (takes
-  priority when both exist)
-* Optional: ``metadata.json`` with reward/performance data
-
-**Dataset Format** (internal):
-
-.. code-block:: python
-
-   # Collected dataset structure
-   # [
-   #   {
-   #     'graph': Graph object,
-   #     'bias_coefficients': {
-   #       'linear': [...],
-   #       'quadratic': [[...]],
-   #       'skew': [[...]],
-   #       'end': [[...]]
-   #     },
-   #     'system_name': 'abl_protein_mutant_group1',
-   #     'run_name': 'run1',
-   #     'reward': 0.89,
-   #   },
-   #   ...
-   # ]
-
-**Quality Filtering**:
-
-The pretraining pipeline includes automatic filtering to exclude poorly-performing data.
-These filters ensure the policy learns from successful, generalizable bias configurations
-rather than unstable or failed simulation runs.
-
-**1. Statistical Outlier Filtering**
-
-Expert demonstrations with abnormally large bias coefficient values are excluded based on
-statistical deviation from the dataset mean. By default, runs with coefficients beyond
-±3 standard deviations (σ) are filtered out.
-
-*Why this matters:* Unstable simulations can produce extreme bias values that reflect
-numerical issues rather than effective sampling strategies. Including these outliers in
-training would corrupt the learned policy, causing it to predict unrealistic coefficients
-for new systems. The threshold can be adjusted to be more permissive (e.g., ±4σ) for
-diverse datasets or stricter (e.g., ±2σ) when data quality is uncertain.
-
-**2. Minimum Reward Threshold**
-
-Demonstrations can be filtered based on their achieved sampling performance (reward).
-Only runs that meet a minimum reward criterion are included in the training dataset.
-
-*Why this matters:* Not all expert bias coefficients lead to adequate sampling. Some
-ALF predictions or early CB attempts may stabilize the simulation but fail to achieve
-sufficient transitions between states. By setting a reward threshold (e.g., ≥0.5),
-the policy learns only from configurations that demonstrably improved sampling efficiency.
-This prevents the model from imitating mediocre solutions.
-
-**3. Best-Only Mode**
-
-When multiple runs exist for the same system, only the highest-reward run is included
-in training. All other runs from that system are excluded, regardless of their individual
-quality.
-
-*Why this matters:* Multiple runs per system often represent iterative refinement—early
-attempts with suboptimal coefficients followed by improved solutions. Training on all
-runs would give equal weight to both poor and excellent solutions from the same system.
-Best-only mode focuses learning on proven successful configurations, which is particularly
-valuable when pretraining data includes many exploratory runs.
-
-If the number of systems is small, then behavior cloning may not be as effective due to
-limited data diversity.
-
-**4. Stratified Negative Sampling**
-
-As an alternative to a hard reward threshold, stratified negative sampling keeps all
-positive-reward runs and samples a fraction from each negative-reward bucket
-(``(-inf,−50]``, ``(-50,−40]``, …, ``(-10,0)``) using a **quadratic ramp**: the
-worst bucket retains 0% and the best negative bucket retains at most
-``fraction_per_bucket`` (default: **55%**). Intermediate buckets scale as
-:math:`f_i = f_{\max} \times (i / (N-1))^2`, concentrating sampling on near-zero runs
-whose coefficients were almost correct.
-
-*Why this matters:* Pure best-only cloning can give the policy an impoverished view of the
-reward distribution, making it hard to distinguish near-success from complete failure.
-Stratified sampling exposes it to the full reward landscape while still over-representing
-higher-quality runs. Positive-reward runs are always retained in full. (Current training
-has no separate Q-critic or value network — see :doc:`cb_setup` — so this filter shapes the
-data the single behavior-cloned policy sees, not a critic's warmup data.)
-
-**Combined Filtering Strategy**:
-
-Filters can be combined to implement sophisticated data selection policies. A typical
-production configuration uses **outlier filtering** (default, ±3σ) + **per-pair AWR**
-(default) + either **best-only** (``--use-best-only``, narrow but clean) or **stratified
-negative sampling** (``--stratified-negative-fraction``, broader reward coverage), depending
-on how much exploratory/failed data the pretraining set contains.
-
+Graphs are built once and kept in memory for all epochs. Many runs share a prep
+directory, so embedding computation scales with the number of distinct preps, not runs.
+``unimol.cache_embeddings`` also keeps them on disk between invocations.
 
 See Also
 --------
 
-* :doc:`file_handling` - Bias coefficient file formats, ``parse_single_ddg`` reference
-* :doc:`unimol_representation` - Pretrained Uni-Mol node embeddings pretraining trains on top of
-* :doc:`cb_setup` - CB infrastructure and policy architecture
-* :doc:`workflow` - Complete CB training workflow
-* :doc:`examples` - Running pretraining and workflows
-* ``examples/pretrain_wUnimol.sh`` / ``examples/pretrain_with_filtering.sh`` - Pretraining SLURM scripts
-* ``examples/workflow_pretrain.yaml`` - Pretraining ``--config`` file template
-* ``src/mllf/cb/pretrain_policy.py`` - Behavior cloning implementation
-* ``src/mllf/cb/policy.py`` - Policy network architecture
-* ``src/mllf/cb/bayesian_head.py`` - NeuralLinear + Thompson Sampling head, used by ``--bayesian-heads``
-* ``src/mllf/cb/workflow_utils.py`` - ``compute_pair_reward``, ``parse_simulation_metrics``
+* :doc:`cb_setup` - the policy and the online signals pretraining prepares for
+* :doc:`unimol_representation` - the frozen embeddings pretraining builds on
+* :doc:`file_handling` - ``variables.py`` and output formats
