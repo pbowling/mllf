@@ -19,6 +19,44 @@ import torch
 from mllf.cli.workflow import load_manifest
 
 
+_STEPS_RE = {'equil': re.compile(r"^(esteps\s*=\s*)(\d+)", re.M),
+             'prod': re.compile(r"^(nsteps\s*=\s*)(\d+)", re.M)}
+_TIMESTEP_RE = re.compile(r"^timestep\s*=\s*([\d.eE+-]+)", re.M)
+
+
+def template_steps(input_dir) -> Optional[Dict[str, float]]:
+    """{'equil', 'prod' (MD steps), 'timestep' (ps)} from a system's own
+    msld_flat.py (its ``esteps`` / ``nsteps`` lines), i.e. the full run
+    length; None if they cannot be read."""
+    path = Path(input_dir) / 'msld_flat.py'
+    if not path.exists():
+        return None
+    text = path.read_text()
+    m_e, m_p = _STEPS_RE['equil'].search(text), _STEPS_RE['prod'].search(text)
+    if not (m_e and m_p):
+        return None
+    m_t = _TIMESTEP_RE.search(text)
+    return {'equil': int(m_e.group(2)), 'prod': int(m_p.group(2)),
+            'timestep': float(m_t.group(1)) if m_t else 0.002}
+
+
+def set_msld_steps(combo_path: Path, equil: int, prod: int) -> bool:
+    """Set the equilibration / production MD steps (``esteps`` / ``nsteps``)
+    in a combo's copy of msld_flat.py, so run length can change per stage or
+    per run without editing the system templates. Returns True if the file
+    changed."""
+    path = Path(combo_path) / 'msld_flat.py'
+    if not path.exists():
+        return False
+    text = path.read_text()
+    new = _STEPS_RE['equil'].sub(lambda m: f"{m.group(1)}{int(equil)}", text, count=1)
+    new = _STEPS_RE['prod'].sub(lambda m: f"{m.group(1)}{int(prod)}", new, count=1)
+    if new != text:
+        path.write_text(new)
+        return True
+    return False
+
+
 def fix_msld_flat_for_single_site(combo_path: Path, 
                                    site_atoms: Dict[int, str] = None) -> bool:
     """Modify msld_flat.py to delete only atoms that overlap with present sites.
@@ -660,6 +698,7 @@ def select_combos_by_uncertainty(
     score_fn: Optional[Callable] = None,
     attention_fn: Optional[Callable] = None,
     attention_weight: float = 0.0,
+    system_quota: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """Rank candidate combos by a per-combo score and return the top ``n_select``.
 
@@ -720,6 +759,10 @@ def select_combos_by_uncertainty(
             the percentile rank of ``score_fn`` (0-1, since its scale is
             arbitrary) plus ``attention_weight`` x attention, so pairs that
             are stuck or still converging keep being revisited.
+        system_quota: Optional {system: n}: each system first contributes its
+            own top ``max(n, min_per_system)`` combos (e.g. a share of the
+            epoch proportional to its number of reference pairs), then the
+            remaining slots are filled by global rank.
 
     Returns:
         List of up to ``n_select`` combo path strings. If fewer than
@@ -766,15 +809,16 @@ def select_combos_by_uncertainty(
 
     scored.sort(key=lambda t: t[0], reverse=True)
 
-    if min_per_system > 0:
+    if min_per_system > 0 or system_quota:
         by_system: Dict[str, List[str]] = {}
         for _, combo_dir in scored:
             sys_name = combo_system_map.get(combo_dir, {}).get('name', 'unknown')
             by_system.setdefault(sys_name, []).append(combo_dir)
         selected: List[str] = []
         selected_set = set()
-        for combo_list in by_system.values():
-            for combo_dir in combo_list[:min_per_system]:
+        for sys_name, combo_list in by_system.items():
+            n_first = max(min_per_system, int((system_quota or {}).get(sys_name, 0)))
+            for combo_dir in combo_list[:n_first]:
                 if combo_dir not in selected_set:
                     selected.append(combo_dir)
                     selected_set.add(combo_dir)

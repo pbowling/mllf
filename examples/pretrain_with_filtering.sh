@@ -187,7 +187,9 @@ echo ""
 # 2. Nested combos: pretraining/system_name/comb_*/ at any depth
 # 3. Regular runs: pretraining/system_name/run_*/ (no combos)
 #
-# Strategy: For each system-level directory, recursively find all comb_* subdirectories
+# Combo directories are comb_* (pair combos) and pairNN_site*/groupNN_site* (staged
+# online training, training/collect_online_runs.py); "comb_*" below covers all three.
+# Strategy: For each system-level directory, recursively find all combo subdirectories
 # (at any depth) and add each. If a system has no combos, add the system directory itself.
 total_systems=0
 total_runs_available=0
@@ -222,7 +224,8 @@ for dataset_dir in "$PRETRAIN_DIR"/*/; do
     fi
     
     # Find all comb_* directories recursively under this system
-    comb_dirs=$(find "$dataset_dir" -type d -name "comb_*" 2>/dev/null | sort)
+    comb_dirs=$(find "$dataset_dir" -mindepth 1 -type d \( -name "comb_*" \
+        -o -name "pair[0-9]*_site*" -o -name "group[0-9]*_site*" \) 2>/dev/null | sort)
     
     if [ -n "$comb_dirs" ]; then
         # This system has nested or direct combo directories

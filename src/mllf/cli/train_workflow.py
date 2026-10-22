@@ -15,7 +15,7 @@ See ``training/workflow.py`` for a thin repo-local wrapper around this same
 entry point, and :doc:`workflow` for the full configuration reference.
 """
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import collections
 import copy
 import concurrent.futures
@@ -29,13 +29,17 @@ import numpy as np
 import torch
 import yaml
 
+from mllf.cb import epoch_log, system_stages
+from mllf.cb.cost_ledger import LEDGER_FILE, load_ledger, record_runs, summarize_ledger
 from mllf.cb.curriculum import (
     apply_stage_combo_filter,
     build_system_index,
+    filter_combos_by_curriculum,
     sample_combos_stratified,
 )
+from mllf.cb.export_biases import export_final_biases, label_final_biases
 from mllf.cb.graph_build import build_graph_and_data
-from mllf.cb.hindsight import combo_node_labels, pair_attention
+from mllf.cb.hindsight import combo_node_labels, merge_revisits, pair_attention, select_revisits
 from mllf.cb.policy import ContextBaseline, UnimolPolicy
 from mllf.cb.reinforce_trainer import append_summary, format_pair_success, train_epoch
 from mllf.cb.workflow_utils import (
@@ -45,6 +49,7 @@ from mllf.cb.workflow_utils import (
     save_bandit_state,
     select_combos_by_uncertainty,
 )
+from mllf.file_handling.combo_sets import build_combo_sets, reversed_pair
 from mllf.file_handling.generate_combinations import find_site_sub_files
 from mllf.file_handling.manifests import (
     build_combo_dir_lookup,
@@ -53,6 +58,13 @@ from mllf.file_handling.manifests import (
     create_and_load_system_manifest,
     ensure_combo_dir_exists,
 )
+
+
+def _policy_weights(checkpoint: Dict):
+    """Policy weights from a pretraining checkpoint ('policy_state') or an
+    online-training one ('policy_state_dict': checkpoint_*.pt, final_model.pt,
+    best_model.pt); None if neither."""
+    return checkpoint.get('policy_state') or checkpoint.get('policy_state_dict')
 
 
 def run_training(config_path: str) -> None:
@@ -65,12 +77,45 @@ def run_training(config_path: str) -> None:
     via ``mllf.cb.reinforce_trainer.train_epoch``, and checkpoint along the
     way.
 
+    ``mode: deploy`` tests a trained model on systems it has not seen: it
+    loads ``deploy.model_path``, runs each system through the curriculum
+    stages on its own (``mllf.cb.system_stages``) with per-pair offsets
+    learning, keeps the shared model fixed unless
+    ``deploy.update_shared_model`` is true, holds out no validation set, and
+    writes only to its own ``output.base_dir`` (never the model's directory).
+
     Args:
         config_path: Path to a workflow YAML config (see docs/workflow.rst).
     """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     print(f"Loaded config from {config_path}")
+
+    mode = config.get('mode', 'train')
+    if mode not in ('train', 'deploy'):
+        raise ValueError(f"mode must be 'train' or 'deploy', got {mode!r}")
+    deploy = mode == 'deploy'
+    deploy_cfg = config.get('deploy') or {}
+    if deploy:
+        _bc = config.get('bandit') or {}
+        if not (config.get('curriculum') or {}).get('enabled'):
+            raise ValueError("mode: deploy needs curriculum stages (curriculum.enabled: true)")
+        if (_bc.get('algorithm') != 'neurallinear_ts' or _bc.get('update_target') != 'hindsight'
+                or not _bc.get('pair_offsets', True)):
+            raise ValueError("mode: deploy needs bandit.algorithm: neurallinear_ts, "
+                             "update_target: hindsight and pair_offsets (per-pair learning)")
+        _model = deploy_cfg.get('model_path')
+        if not _model or not Path(_model).exists():
+            raise FileNotFoundError(f"deploy.model_path not found: {_model}")
+        _out = Path((config.get('output') or {}).get('base_dir', 'checkpoints')).resolve()
+        if Path(_model).resolve().parent == _out:
+            raise ValueError("deploy output.base_dir is the trained model's directory; "
+                             "use a separate directory so the trained model is never overwritten")
+        # The trained model is the starting point (loaded like a pretrain checkpoint).
+        config.setdefault('pretrain', {})['model_path'] = _model
+        print(f"Mode: deploy (model {_model}; shared model "
+              f"{'updated' if deploy_cfg.get('update_shared_model') else 'fixed'}; "
+              f"per-pair offsets learn)")
 
     verbose = config.get('verbose', False)
 
@@ -190,6 +235,23 @@ def run_training(config_path: str) -> None:
         all_combo_paths.extend(result['combos'])
 
     print(f"\n=== Total combos across all systems: {len(all_combo_paths)} ===")
+
+    # Explicit combo sets (systems' `combo_sets:`, e.g. ALF's substituent
+    # groups and their pairs; mllf.file_handling.combo_sets), selected by a
+    # stage's `combo_set:`. Not in the manifests; created on demand.
+    combo_sets_by_system: Dict[str, Dict[str, List[str]]] = {}
+    for sys_entry in systems_cfg:
+        if not sys_entry.get('combo_sets'):
+            continue
+        _sets, _warns = build_combo_sets(sys_entry, config.get('alf_root'))
+        combo_sets_by_system[sys_entry.get('name')] = _sets
+        for _paths in _sets.values():
+            for _p in _paths:
+                combo_system_map[_p] = sys_entry
+        print(f"  [{sys_entry.get('name')}] combo sets: "
+              + ', '.join(f"{k} {len(v)}" for k, v in _sets.items()))
+        for _w in _warns:
+            print(f"    warning: {_w}")
 
     # Validation is now handled per-epoch via held-out validation_fraction
     # (deterministic sampling from active_train_combos at epoch 0).
@@ -378,15 +440,15 @@ def run_training(config_path: str) -> None:
                 start_epoch = 0
                 if pretrain_path and Path(pretrain_path).exists():
                     ckpt = torch.load(pretrain_path, map_location=device, weights_only=False)
-                    if 'policy_state' in ckpt:
-                        policy.load_state_dict(ckpt['policy_state'])
+                    if _policy_weights(ckpt) is not None:
+                        policy.load_state_dict(_policy_weights(ckpt))
                         print("  Loaded policy weights from pretrain checkpoint")
         # No checkpoints found in checkpoint_dir — load pretrained model instead
         elif pretrain_path and Path(pretrain_path).exists():
             print(f"Loading pretrained policy from {pretrain_path}")
             checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
-            if 'policy_state' in checkpoint:
-                missing, unexpected = policy.load_state_dict(checkpoint['policy_state'], strict=False)
+            if _policy_weights(checkpoint) is not None:
+                missing, unexpected = policy.load_state_dict(_policy_weights(checkpoint), strict=False)
                 if missing or unexpected:
                     print(f"  Warning: partial weight load — "
                           f"{len(missing)} missing, {len(unexpected)} unexpected keys")
@@ -399,8 +461,8 @@ def run_training(config_path: str) -> None:
     elif pretrain_path and Path(pretrain_path).exists():
         print(f"Loading pretrained policy from {pretrain_path}")
         checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
-        if 'policy_state' in checkpoint:
-            missing, unexpected = policy.load_state_dict(checkpoint['policy_state'], strict=False)
+        if _policy_weights(checkpoint) is not None:
+            missing, unexpected = policy.load_state_dict(_policy_weights(checkpoint), strict=False)
             if missing or unexpected:
                 print(f"  Warning: partial weight load — "
                       f"{len(missing)} missing, {len(unexpected)} unexpected keys")
@@ -461,7 +523,9 @@ def run_training(config_path: str) -> None:
         resumed = start_epoch > 0
         print(f"\n=== Stage {current_stage_idx+1}/{len(stages)}: {current_stage['name']}"
               f"{' (resumed)' if resumed else ''} ===")
-        active_train_combos = apply_stage_combo_filter(
+        # A combo_set stage (per-system mode only) has no manifest filter; the
+        # per-system pools are rebuilt every epoch.
+        active_train_combos = list(train_combos) if current_stage.get('combo_set') else apply_stage_combo_filter(
             train_combos, current_stage, curriculum_config,
             stage_idx=current_stage_idx, seed=seed,
             apply_transition_filter=(resumed and current_stage_idx > 0),
@@ -481,6 +545,145 @@ def run_training(config_path: str) -> None:
         active_train_combos = train_combos
         epoch_config = config
 
+    # Per-system stages (curriculum.per_system; always in mode: deploy): each
+    # system moves through the stages on its own when its stage's `advance`
+    # criterion holds (mllf.cb.system_stages). Stage keys that change the
+    # whole epoch's training settings cannot differ between systems in one
+    # batch, so they are ignored here.
+    per_system = curriculum_enabled and (deploy or bool(curriculum_config.get('per_system', False)))
+    if curriculum_enabled and not per_system and any(st.get('combo_set') for st in stages):
+        raise ValueError("a stage's combo_set needs curriculum.per_system: true")
+    stage_state: Dict[str, Dict] = {}
+    stage_state_path = checkpoint_dir / system_stages.STATE_FILE
+    combos_by_system: Dict[str, List[str]] = {}
+    _ps_pool_cache: Dict[tuple, List[str]] = {}
+    if per_system:
+        epoch_config = config
+        for c in train_combos:
+            combos_by_system.setdefault(combo_system_map.get(c, {}).get('name'), []).append(c)
+        _ignored = sorted({k for st in stages for k in st if k in (
+            'update_policy', 'reward_override', 'policy_lr', 'bc_mode', 'bc_source_epoch',
+            'replay_from_epoch', 'deterministic_actions', 'bc_auxiliary_weight', 'max_train_combos')})
+        if _ignored:
+            print(f"  Warning: per-system stages ignore stage keys {_ignored} "
+                  f"(they would apply to every system in the epoch)")
+        stage_state = (system_stages.load_state(stage_state_path) if start_epoch > 0 else None) or {}
+        _fresh = system_stages.init_state([s.get('name') for s in systems_cfg], stages)
+        for _name, _st in _fresh.items():
+            stage_state.setdefault(_name, _st)
+        system_stages.save_state(stage_state_path, stage_state)
+        print("Per-system stages:")
+        for _name, _st in stage_state.items():
+            print(f"  {_name}: " + ('done' if _st['done'] else
+                                   f"{stages[_st['stage']]['name']} (epoch {_st['stage_epochs']} "
+                                   f"of {stages[_st['stage']]['epochs']})"))
+
+    def _system_stage_pool(sys_name: str) -> List[str]:
+        """The system's combos for its current stage (stage filters, minus `systems`)."""
+        st = stage_state.get(sys_name)
+        if not st or st['done'] or st['stage'] is None:
+            return []
+        key = (sys_name, st['stage'])
+        if key not in _ps_pool_cache:
+            _stage = dict(stages[st['stage']])
+            _stage.pop('systems', None)
+            print(f"  [{sys_name}] stage {_stage['name']}:")
+            if _stage.get('combo_set'):
+                # An explicit set (e.g. ALF's groups); the stage's site/sub
+                # filters, if given, still apply to it.
+                _cands = combo_sets_by_system.get(sys_name, {}).get(_stage['combo_set'], [])
+                _ps_pool_cache[key] = (apply_stage_combo_filter(
+                    _cands, _stage, curriculum_config, stage_idx=st['stage'], seed=seed,
+                    apply_transition_filter=False) if 'min_sites' in _stage else list(_cands))
+                print(f"  combo set {_stage['combo_set']}: {len(_ps_pool_cache[key])} combos")
+            else:
+                _ps_pool_cache[key] = apply_stage_combo_filter(
+                    combos_by_system.get(sys_name, []), _stage, curriculum_config,
+                    stage_idx=st['stage'], seed=seed, apply_transition_filter=st['stage'] > 0)
+        return _ps_pool_cache[key]
+
+    def _system_group_pool(sys_name: str) -> List[str]:
+        """Groups (the current stage's ``group_set``) that join the pool once ready."""
+        st = stage_state.get(sys_name)
+        if not st or st['done'] or st['stage'] is None:
+            return []
+        gset = stages[st['stage']].get('group_set')
+        return list(combo_sets_by_system.get(sys_name, {}).get(gset, [])) if gset else []
+
+    def _stage_names() -> Dict[str, str]:
+        """System -> the stage it is training in (for per-pair stage counts and the ledger)."""
+        if per_system:
+            return {s: stages[st['stage']]['name'] for s, st in stage_state.items()
+                    if not st['done'] and st['stage'] is not None}
+        if curriculum_enabled:
+            return {s.get('name'): stages[current_stage_idx]['name'] for s in systems_cfg}
+        return {}
+
+    def _epoch_log_block(epoch, epoch_combos, stats, val_ps, gate, passed, reopened, rows,
+                         changes, cost) -> str:
+        """The epoch's epoch_summary.log block (mllf.cb.epoch_log)."""
+        runs = {'groups': 0, 'reference': 0, 'reversed': 0, 'other': 0}
+        for c in epoch_combos:
+            sn = combo_system_map.get(c, {}).get('name') or Path(c).parent.name
+            if Path(c).name in {Path(g).name for g in _system_group_pool(sn)}:
+                runs['groups'] += 1
+                continue
+            want = set(_ref_keys.get(sn, ()))
+            for ks in ((stage_state.get(sn) or {}).get('group_hold') or {}).values():
+                want |= set(ks)
+            keys = system_stages.combo_pair_keys(sn, c)
+            if keys and all(k in want for k in keys):
+                runs['reference'] += 1
+                runs['reversed'] += bool(re.match(r'pair\d+r_', Path(c).name))
+            else:
+                runs['other'] += 1
+        for r in rows:
+            r['ns'] = ((cost or {}).get(r['system']) or {}).get('train', {}).get('ns', 0.0)
+        return epoch_log.format_epoch_block(
+            epoch, runs, failed=stats.get('permanently_failed', []),
+            pair_short=stats.get('pair_success_short'), pair_full=stats.get('pair_success_full'),
+            groups_run=runs['groups'], groups_passed=passed, groups_reopened=reopened,
+            validation=val_ps, gate=gate, regression=stats.get('regression'),
+            hindsight=stats.get('hindsight'), systems=rows, stage_changes=changes,
+            ns_train=sum(c['train']['ns'] for c in (cost or {}).values()) if cost else None,
+            ns_validation=sum(c['validation']['ns'] for c in (cost or {}).values()) if cost else None)
+
+    def _export_final(sys_name: str) -> None:
+        """Production biases for a system that finished its last stage."""
+        if not curriculum_config.get('export_final_biases', True):
+            return
+        sys_cfg = next((s for s in systems_cfg if s.get('name') == sys_name), None)
+        if sys_cfg is None:
+            return
+        # export_combo_set: one export per combo of that set (e.g. each ALF
+        # group, as ALF ran production); else the whole system (or
+        # export_combo_dir).
+        _set = sys_cfg.get('export_combo_set')
+        _targets = ([(Path(c).name, c) for c in combo_sets_by_system.get(sys_name, {}).get(_set, [])]
+                    if _set else [(None, sys_cfg.get('export_combo_dir'))])
+        for _sub, _cdir in _targets:
+            try:
+                if _sub is not None:
+                    _cdir = ensure_combo_dir_exists(Path(_cdir), sys_cfg, config)
+                _out = checkpoint_dir / 'final_biases' / sys_name
+                path = export_final_biases(
+                    policy, sys_cfg, config, bandit_state, _out / _sub if _sub else _out,
+                    device=device, combo_dir=_cdir)
+                print(f"  [EXPORT] {sys_name}: final biases written to {path}")
+            except Exception as _exp_err:
+                print(f"  [EXPORT] {sys_name}{'/' + _sub if _sub else ''}: export failed: {_exp_err}")
+        # Confidence labels: CONFIDENCE.txt per group; groups that never passed
+        # are renamed <group>_unconverged.
+        try:
+            _n = label_final_biases(checkpoint_dir, config, [sys_name])
+            if _n:
+                print(f"  [EXPORT] {sys_name}: confidence labels for {_n} group(s)")
+        except Exception as _lab_err:
+            print(f"  [EXPORT] {sys_name}: labelling failed: {_lab_err}")
+
+    # Shared-model updates: always in training; in deploy only on request.
+    update_shared = (not deploy) or bool(deploy_cfg.get('update_shared_model', False))
+
     # Set up held-out validation set (before epochs start)
     # Provides ground truth for policy improvement, avoiding the misleading
     # batch-stat inference that allowed baseline chasing to hide degradation.
@@ -494,16 +697,37 @@ def run_training(config_path: str) -> None:
     # index, so it changes whenever the combo pool does.
     _fixed_val_file = config.get('validation_combos_file')
     _val_per_system = config.get('validation_per_system')
-    if start_epoch == 0 and num_epochs > 0 and _val_per_system and not _fixed_val_file:
+    # mode: deploy holds out nothing: every pair of a test system is part of the test.
+    if deploy:
+        print("Held-out validation: none (mode: deploy)")
+    elif _val_per_system is not None and int(_val_per_system) == 0 and not _fixed_val_file:
+        # validation_per_system: 0 -- hold nothing out (e.g. a small test run).
+        print("Held-out validation: none (validation_per_system: 0)")
+    elif start_epoch == 0 and num_epochs > 0 and _val_per_system and not _fixed_val_file:
         # A fixed number of held-out pairs per system, drawn from every system
         # in the run (all curriculum stages, so a system that only joins in a
         # later stage is held out from the start), with the first stage's
         # site/substituent limits.
         _stage0 = dict((curriculum_config.get('stages') or [{}])[0]) if curriculum_enabled else {}
         _stage0.pop('systems', None)
-        _pool = (apply_stage_combo_filter(train_combos, _stage0, curriculum_config, stage_idx=0,
-                                          seed=seed, apply_transition_filter=False)
-                 if _stage0 else list(train_combos))
+        if _stage0.get('combo_set'):
+            # Training runs explicit sets (e.g. ALF's groups and their pairs):
+            # hold out manifest pairs in no combo of any of the system's sets,
+            # so validation measures the shared model on pairs training never
+            # runs (in any stage).
+            _pool = []
+            _used: Dict[str, set] = {
+                _name: {k for _paths in _sets.values() for p in _paths
+                        for k in system_stages.combo_pair_keys(_name, p)}
+                for _name, _sets in combo_sets_by_system.items()}
+            for c in filter_combos_by_curriculum(train_combos, 1, 1, 2, 2):
+                _name = combo_system_map.get(c, {}).get('name')
+                if _name in _used and not set(system_stages.combo_pair_keys(_name, c)) & _used[_name]:
+                    _pool.append(c)
+        else:
+            _pool = (apply_stage_combo_filter(train_combos, _stage0, curriculum_config, stage_idx=0,
+                                              seed=seed, apply_transition_filter=False)
+                     if _stage0 else list(train_combos))
         _by_sys: Dict[str, List[str]] = {}
         for c in _pool:
             _by_sys.setdefault(combo_system_map.get(c, {}).get('name'), []).append(c)
@@ -602,7 +826,76 @@ def run_training(config_path: str) -> None:
     # best_model.pt, and what the run ends on if the last validation is worse.
     _best_state, _best_score, _best_epoch, _last_val_score = None, None, None, None
     for epoch in range(start_epoch, num_epochs):
-        if curriculum_enabled:
+        _active_systems: List[str] = []
+        if per_system:
+            # A stage with no combos for a system (filters leave none) is skipped.
+            _val_set_ps = set(validation_combos)
+            for _sn in sorted(stage_state):
+                _st = stage_state[_sn]
+                while not _st['done'] and not [c for c in _system_stage_pool(_sn) if c not in _val_set_ps]:
+                    _skipped = stages[_st['stage']]['name']
+                    _nxt = system_stages.advance(_st, stages, _sn, epoch, 'no_combos')
+                    print(f"  [STAGE] {_sn}: no combos for stage {_skipped}; skipped")
+                    if _nxt is None:
+                        _export_final(_sn)
+            system_stages.save_state(stage_state_path, stage_state)
+            _active_systems = sorted(s for s, st in stage_state.items() if not st['done'])
+            if not _active_systems:
+                print(f"\nAll systems finished their last stage (epoch {epoch}); stopping.")
+                break
+            active_train_combos = [c for s in _active_systems for c in _system_stage_pool(s)
+                                   if c not in _val_set_ps]
+            # A pairs_resolved stage stops running pairs that are resolved,
+            # and, with retire_after_epochs, pairs run in that many of the
+            # stage's epochs without resolving (retired).
+            _n_before = len(active_train_combos)
+            _keep = []
+            for c in active_train_combos:
+                _sn = combo_system_map.get(c, {}).get('name')
+                _stg = stages[stage_state[_sn]['stage']]
+                _adv = _stg.get('advance') or {}
+                if _adv.get('type') in ('pairs_resolved', 'groups_done') and system_stages.combo_resolved(
+                        bandit_state, _sn, c, _stg['name'], _adv, bandit_cfg.get('offset_prior_sd'),
+                        retire_after=_stg.get('retire_after_epochs')):
+                    continue
+                _keep.append(c)
+            active_train_combos = _keep
+            if len(_keep) < _n_before:
+                print(f"  Resolved or retired pairs left the pool: {_n_before - len(_keep)} combo(s)")
+            # Reference pairs per system: the stage's reference_set (e.g. each
+            # ALF group's reference vs the others) when the pool holds more
+            # pairs than those, else the pool itself.
+            _ref_keys: Dict[str, set] = {}
+            for _sn in _active_systems:
+                _stg = stages[stage_state[_sn]['stage']]
+                _rset = _stg.get('reference_set')
+                _src = (combo_sets_by_system.get(_sn, {}).get(_rset, []) if _rset
+                        else _system_stage_pool(_sn))
+                _ref_keys[_sn] = {k for c in _src for k in system_stages.combo_pair_keys(_sn, c)}
+            # A stage with a group_set runs each group once group_ready_fraction
+            # of its reference pairs are resolved (retired ones left out),
+            # until the group passes the group test. A group sent back to the
+            # pair phase (group_max_failures) waits for its reopened pairs.
+            _ready_groups: List[str] = []
+            for _sn in _active_systems:
+                _stg = stages[stage_state[_sn]['stage']]
+                if not _stg.get('group_set'):
+                    continue
+                _passed = stage_state[_sn].get('groups_done') or {}
+                _holds = stage_state[_sn].get('group_hold') or {}
+                for g in _system_group_pool(_sn):
+                    if Path(g).name not in _passed and system_stages.group_ready(
+                            bandit_state, _sn, g, _ref_keys[_sn], _stg['name'], _stg.get('advance') or {},
+                            bandit_cfg.get('offset_prior_sd'),
+                            fraction=float(_stg.get('group_ready_fraction', 1.0)),
+                            retire_after=_stg.get('retire_after_epochs'),
+                            held=_holds.get(Path(g).name)):
+                        _ready_groups.append(g)
+                        _holds.pop(Path(g).name, None)
+            if _ready_groups:
+                active_train_combos = active_train_combos + _ready_groups
+                print(f"  Ready groups in the pool: {len(_ready_groups)}")
+        elif curriculum_enabled:
             stages = curriculum_config.get('stages', [])
             stage_epochs = stages[current_stage_idx]['epochs']
             if current_stage_epoch >= stage_epochs:
@@ -647,16 +940,24 @@ def run_training(config_path: str) -> None:
                         epoch_reward = {**config.get('reward', {}), **current_stage['reward_override']}
                         epoch_config = {**config, 'reward': epoch_reward}
 
-        stage_label = (
-            f"Stage {current_stage_idx+1}/{len(stages)} "
-            f"({stages[current_stage_idx]['name']}) "
-            f"epoch {current_stage_epoch+1}/{stages[current_stage_idx]['epochs']}"
-        ) if curriculum_enabled else f"epoch {epoch}"
+        if per_system:
+            _counts = collections.Counter(stages[stage_state[s]['stage']]['name'] for s in _active_systems)
+            stage_label = ("per-system stages: "
+                           + ', '.join(f"{n} {c}" for n, c in _counts.items())
+                           + f"; done {len(stage_state) - len(_active_systems)}")
+        elif curriculum_enabled:
+            stage_label = (
+                f"Stage {current_stage_idx+1}/{len(stages)} "
+                f"({stages[current_stage_idx]['name']}) "
+                f"epoch {current_stage_epoch+1}/{stages[current_stage_idx]['epochs']}"
+            )
+        else:
+            stage_label = f"epoch {epoch}"
         print(f"\n{'='*80}")
         print(f"EPOCH {epoch}/{num_epochs-1}  [{stage_label}]")
         print(f"{'='*80}")
 
-        if curriculum_enabled:
+        if curriculum_enabled and not per_system:
             _cur_stage = stages[current_stage_idx]
         else:
             _cur_stage = {}
@@ -671,6 +972,23 @@ def run_training(config_path: str) -> None:
         # random subset rather than reusing the same one fixed at stage start.
         _max_epoch_combos = _cur_stage.get('max_train_combos',
                             curriculum_config.get('max_train_combos_per_stage'))
+        # curriculum.combos_per_system: reference_pairs -- each system's share
+        # of the epoch is proportional to its number of reference pairs (at
+        # least min_combos_per_system), so a system with 50+ substituents can
+        # cover its reference pairs as a 4-substituent one does. The epoch
+        # budget grows if the floors push the shares past it.
+        _system_quota: Optional[Dict[str, int]] = None
+        if (per_system and _max_epoch_combos is not None
+                and curriculum_config.get('combos_per_system') == 'reference_pairs'):
+            _nref = {s: len(_ref_keys.get(s, ())) for s in _active_systems}
+            _tot = sum(_nref.values())
+            if _tot:
+                _qmin = int(curriculum_config.get('min_combos_per_system', 5))
+                _system_quota = {s: max(_qmin, int(round(_max_epoch_combos * n / _tot)))
+                                 for s, n in _nref.items()}
+                _max_epoch_combos = max(_max_epoch_combos, sum(_system_quota.values()))
+                print("  Per-system shares (reference pairs): " + ', '.join(
+                    f"{s} {q}" for s, q in sorted(_system_quota.items())))
 
         # Uncertainty-driven combo selection. active_train_combos has already
         # been through the curriculum/transition filters above — that is the
@@ -753,9 +1071,16 @@ def run_training(config_path: str) -> None:
             # Pairs' own online state (last run failed, exploration widened)
             # adds to the ranking so stuck pairs keep being revisited.
             def _pair_attention_fn(combo_dir, data):
-                return pair_attention(
-                    bandit_state, combo_system_map.get(combo_dir, {}).get('name', 'unknown'),
-                    combo_node_labels(combo_dir), data.edge_index)
+                _sn = combo_system_map.get(combo_dir, {}).get('name', 'unknown')
+                att = pair_attention(bandit_state, _sn, combo_node_labels(combo_dir), data.edge_index)
+                # A stage's reference_pair_bonus ranks reference pairs ahead of
+                # other pairs of similar uncertainty.
+                if per_system and _sn in stage_state and not stage_state[_sn]['done']:
+                    _bonus = float(stages[stage_state[_sn]['stage']].get('reference_pair_bonus', 0.0))
+                    _keys = system_stages.combo_pair_keys(_sn, combo_dir)
+                    if _bonus and _keys and all(k in _ref_keys.get(_sn, ()) for k in _keys):
+                        att += _bonus
+                return att
             epoch_combos = select_combos_by_uncertainty(
                 _uncertainty_candidates, policy, combo_system_map, config,
                 n_select=_max_epoch_combos, bandit_state=bandit_state,
@@ -765,6 +1090,7 @@ def run_training(config_path: str) -> None:
                 score_fn=_uncertainty_score_fn,
                 attention_fn=_pair_attention_fn,
                 attention_weight=float(bandit_cfg.get('selection_attention_weight', 0.0)),
+                system_quota=_system_quota,
             )
             _score_label = 'posterior variance' if algorithm == 'neurallinear_ts' else 'action std'
             print(f"  Epoch combo sample (uncertainty-driven, {_score_label}): "
@@ -809,6 +1135,142 @@ def run_training(config_path: str) -> None:
         else:
             epoch_combos = active_train_combos
 
+        # Revisits (bandit.revisit): rerun pairs already in progress until their
+        # exploration is satisfactory, so per-pair corrections (b bracket, c
+        # steps) get the consecutive visits they need instead of waiting to be
+        # drawn again from a large pool. They take up to `fraction` of each
+        # system's minimum allocation; the selection above fills the rest.
+        _revisit_cfg = bandit_cfg.get('revisit') or {}
+        _revisit_detail_lines: List[str] = []
+        if (_revisit_cfg.get('enabled') and _update_policy and algorithm == 'neurallinear_ts'
+                and _max_epoch_combos is not None):
+            _rv_min = int(curriculum_config.get('min_combos_per_system', 5))
+            _rv_frac = float(_revisit_cfg.get('fraction', 0.5))
+            _rv_sys_cfg = {s.get('name'): s for s in systems_cfg}
+            _rv_systems = {combo_system_map.get(c, {}).get('name') for c in active_train_combos}
+            _rv_active = {(combo_system_map.get(c, {}).get('name'), Path(c).name)
+                          for c in active_train_combos}
+            _rv_val = {(combo_system_map.get(c, {}).get('name'), Path(c).name)
+                       for c in validation_combos}
+
+            def _rv_system(c):
+                return combo_system_map.get(c, {}).get('name') or Path(c).parent.name
+
+            def _rv_allowed(c):
+                k = (_rv_system(c), Path(c).name)
+                return (k in _rv_active and k not in _rv_val and Path(c).is_dir()
+                        and not bandit_state.get(c, {}).get('deferred', False))
+
+            _rv_quota = {s: int(round(_rv_frac * _rv_min)) for s in _rv_systems if s}
+            _revisits, _rv_counts = select_revisits(
+                bandit_state, _rv_quota, _rv_allowed,
+                successes_needed=int(_revisit_cfg.get('successes', 2)),
+                max_visits=int(_revisit_cfg.get('max_visits', 8)))
+            for _c in _revisits:   # out_dir paths (also after a restart)
+                if _c not in combo_system_map:
+                    _s = Path(_c).parent.name
+                    if _s in _rv_sys_cfg:
+                        combo_system_map[_c] = _rv_sys_cfg[_s]
+            epoch_combos = merge_revisits(_revisits, epoch_combos, _rv_system,
+                                          n_total=_max_epoch_combos, min_per_system=_rv_min)
+            _rv_msg = (f"  Revisits: {len(_revisits)} in-progress pair(s) rerun "
+                       f"(pool: {_rv_counts['active']} active, {_rv_counts['satisfied']} satisfied, "
+                       f"{_rv_counts['exhausted']} exhausted); {len(epoch_combos)} combos this epoch")
+            print(_rv_msg)
+            _revisit_detail_lines = [_rv_msg]
+
+        # Per-system stages: pairs awaiting a full-length confirming run go
+        # first (all of them), then pairs not yet run in this stage (up to
+        # min_combos_per_system per system), then the selection above. In
+        # the first run A, selection kept rerunning the same pairs while
+        # most reference pairs were never run.
+        if per_system and _max_epoch_combos is not None:
+            _pmin = int(curriculum_config.get('min_combos_per_system', 5))
+            _priority, _n_conf, _n_new = list(_ready_groups), 0, 0
+            _n_ref, _n_partner = 0, 0
+            _rank = {(combo_system_map.get(c, {}).get('name'), Path(c).name): n
+                     for n, c in enumerate(epoch_combos)}
+            _store_p = (bandit_state or {}).get('_pair_offsets', {})
+            for _sn in _active_systems:
+                _stg_p = stages[stage_state[_sn]['stage']]
+                _stg_name = _stg_p['name']
+                _short_stage = bool(_stg_p.get('run_steps'))
+                _first_new = bool(_stg_p.get('prioritize_unvisited', True))
+                _strict = _stg_p.get('reference_priority') == 'strict'
+                # reference_priority: strict -- the system's share goes to its
+                # unresolved reference pairs (and pairs a failed group sent
+                # back) before any other pair: not yet run first, then in
+                # selection rank. A pair whose run got stuck or stranded
+                # (run_both) also runs reversed, lambda starting on its
+                # other substituent; the partner takes a slot of the share.
+                _want = set(_ref_keys.get(_sn, ()))
+                for _ks in (stage_state[_sn].get('group_hold') or {}).values():
+                    _want |= set(_ks)
+                _refs = []
+                _new = []
+                for c in active_train_combos:
+                    if combo_system_map.get(c, {}).get('name') != _sn or c in _ready_groups:
+                        continue
+                    _await, _unvisited = system_stages.combo_pair_flags(bandit_state, _sn, c, _stg_name)
+                    if _strict:
+                        _keys = system_stages.combo_pair_keys(_sn, c)
+                        if _keys and all(k in _want for k in _keys):
+                            _refs.append((0 if _unvisited else 1,
+                                          _rank.get((_sn, Path(c).name), len(_rank)), c, _keys))
+                            continue
+                    if _await and _short_stage:     # confirmations exist only with short runs
+                        _priority.append(c)
+                        _n_conf += 1
+                    elif _unvisited and _first_new:
+                        _new.append(c)
+                if _strict:
+                    _share = (_system_quota or {}).get(_sn, _pmin)
+                    _taken = 0
+                    for _, _, c, _keys in sorted(_refs, key=lambda t: t[:2]):
+                        if _taken >= _share:
+                            break
+                        _priority.append(c)
+                        _taken += 1
+                        _n_ref += 1
+                        if (_taken < _share and len(_keys) == 1
+                                and (_store_p.get(_keys[0]) or {}).get('run_both')):
+                            _rev = reversed_pair(c)
+                            if _rev:
+                                combo_system_map[_rev] = combo_system_map[c]
+                                _priority.append(_rev)
+                                _taken += 1
+                                _n_partner += 1
+                _priority += _new[:_pmin]
+                _n_new += min(len(_new), _pmin)
+            if _priority:
+                epoch_combos = merge_revisits(
+                    _priority, epoch_combos,
+                    lambda c: combo_system_map.get(c, {}).get('name') or Path(c).parent.name,
+                    n_total=_max_epoch_combos, min_per_system=_pmin)
+                _pr_msg = (f"  Priority: {len(_ready_groups)} ready group(s), "
+                           + (f"{_n_ref} reference pair(s) + {_n_partner} reversed partner(s), "
+                              if _n_ref else '')
+                           + f"{_n_conf} pair(s) awaiting a full-length confirming run, "
+                           f"{_n_new} not yet run; {len(epoch_combos)} combos this epoch")
+                print(_pr_msg)
+                _revisit_detail_lines.append(_pr_msg)
+
+        def _run_steps(sys_name: str, combo_name: str):
+            """(equil, prod) MD steps for a combo's run this epoch: the stage's
+            run_steps (short exploratory runs), except a pair awaiting its
+            full-length confirming run; None = the template's full length."""
+            st = stage_state.get(sys_name) if per_system else None
+            if not st or st['done'] or st['stage'] is None:
+                return None
+            if combo_name in {Path(g).name for g in _system_group_pool(sys_name)}:
+                return None                      # group runs are full length
+            rs = stages[st['stage']].get('run_steps')
+            if not rs:
+                return None
+            _await, _ = system_stages.combo_pair_flags(bandit_state, sys_name, combo_name,
+                                                       stages[st['stage']]['name'])
+            return None if _await else (int(rs['equil']), int(rs['prod']))
+
         # Sample a reserve pool for on-the-fly replacement of permanently failed combos.
         _reserve_size = config.get('max_failed_combos_per_epoch', 50)
         _epoch_pool_set = set(epoch_combos)
@@ -841,26 +1303,169 @@ def run_training(config_path: str) -> None:
             baseline_optimizer=baseline_optimizer,
             system_to_idx=system_to_idx,
             history_replay_cfg=history_replay_cfg,
+            update_shared=update_shared,
+            stage_of_system=_stage_names(),
+            run_steps_fn=_run_steps if per_system else None,
+            stage_cfg_of_system=({s: stages[stage_state[s]['stage']] for s in _active_systems}
+                                 if per_system else None),
         )
         all_stats.append(stats)
         if algorithm == 'neurallinear_ts':
             save_bandit_state(bandit_state_path, bandit_state)
+        # Cost ledger (mllf.cb.cost_ledger): simulated ns per system and stage.
+        _ledger_path = checkpoint_dir / LEDGER_FILE
+        _stage_now = _stage_names()
+        record_runs(_ledger_path, stats.get('run_dirs', []), 'train', epoch, _stage_now)
 
+        # Per-system stage progress: record each combos_balanced stage's
+        # latest runs, then advance systems whose criterion holds (or that
+        # used up the stage's epochs). A system past its last stage is done
+        # and its final biases are exported.
+        _stage_lines: List[str] = []
+        _ended: set = set()            # systems that left a stage this epoch
+        _to_export: List[str] = []     # systems that finished their last stage
+        _ran: Dict[str, tuple] = {}    # system -> (epoch within its stage, stage max)
+        # for the epoch_summary.log block (mllf.cb.epoch_log)
+        _log_passed: List[str] = []
+        _log_reopened: List[Tuple[str, int]] = []
+        _log_rows: List[Dict] = []
+        _log_changes: List[Dict] = []
+        if per_system:
+            for _sys, _rd, _ok in stats.get('run_dirs', []):
+                _st = stage_state.get(_sys)
+                if not _st or _st['done'] or not _ok:
+                    continue
+                _adv = stages[_st['stage']].get('advance') or {}
+                if _adv.get('type') not in ('combos_balanced', 'groups_done'):
+                    continue
+                if (_adv.get('type') == 'groups_done'
+                        and Path(_rd).parent.name not in {Path(g).name for g in _system_group_pool(_sys)}):
+                    continue
+                try:
+                    _sd = torch.load(Path(_rd) / 'epoch_results.pt', weights_only=False)
+                except Exception:
+                    continue
+                _cdir = Path(_rd).parent
+                _nsubs = [len(subs) for _, subs in system_stages.combo_sites(_cdir)]
+                _passes = system_stages.site_balanced(
+                    _sd, _nsubs, float(_adv.get('min_population_ratio', 0.5)),
+                    int(_adv.get('min_site_transitions', 10)))
+                _st['combos'][_cdir.name] = _passes
+                if _passes and _adv.get('type') == 'groups_done':
+                    # first passing run: the group is retired (run kept for reference)
+                    if _cdir.name not in (_st.get('groups_done') or {}):
+                        _log_passed.append(f"{_sys}/{_cdir.name.split('_site')[0]}")
+                    _st.setdefault('groups_done', {}).setdefault(_cdir.name, str(_rd))
+                elif _adv.get('type') == 'groups_done' and _cdir.name not in (_st.get('groups_done') or {}):
+                    # group_max_failures: a group failing that many runs goes
+                    # back to the pair phase -- its pairs with an unsampled
+                    # substituent are reopened and it waits for them.
+                    _gmax = stages[_st['stage']].get('group_max_failures')
+                    _fails = _st.setdefault('group_failures', {})
+                    _fails[_cdir.name] = int(_fails.get(_cdir.name, 0)) + 1
+                    if _gmax is not None and _fails[_cdir.name] >= int(_gmax):
+                        _keys = system_stages.group_failed_pairs(_sys, _cdir, _sd)
+                        system_stages.reopen_pairs(bandit_state, _keys, stages[_st['stage']]['name'])
+                        _st.setdefault('group_hold', {})[_cdir.name] = _keys
+                        _fails[_cdir.name] = 0
+                        _st.setdefault('groups_reopened', {})[_cdir.name] = \
+                            int((_st.get('groups_reopened') or {}).get(_cdir.name, 0)) + 1
+                        _gline = (f"  [GROUP] {_sys}/{_cdir.name}: failed {_gmax} runs; back to the "
+                                  f"pair phase ({len(_keys)} pair(s) reopened)")
+                        print(_gline)
+                        _stage_lines.append(_gline)
+                        _log_reopened.append((f"{_sys}/{_cdir.name.split('_site')[0]}", len(_keys)))
+                        if algorithm == 'neurallinear_ts':
+                            save_bandit_state(bandit_state_path, bandit_state)
+            _val_set_ps = set(validation_combos)
+            for _sys in _active_systems:
+                _st = stage_state[_sys]
+                _stage = stages[_st['stage']]
+                _adv = _stage.get('advance') or {}
+                _type = _adv.get('type', 'epochs')
+                _st['stage_epochs'] += 1
+                _ran[_sys] = (_st['stage_epochs'], int(_stage['epochs']))
+                _prog = None
+                _nres = _nret = _rk = None
+                if _type == 'pairs_resolved':
+                    _keys = {k for c in _system_stage_pool(_sys) if c not in _val_set_ps
+                             for k in system_stages.combo_pair_keys(_sys, c)}
+                    _prog = system_stages.pairs_progress(
+                        bandit_state, _keys, _stage['name'], _adv, bandit_cfg.get('offset_prior_sd'))
+                elif _type == 'groups_done':
+                    _gn = [Path(g).name for g in _system_group_pool(_sys)]
+                    _prog = (sum(1 for n in _gn if n in (_st.get('groups_done') or {})), len(_gn))
+                    # reference pairs resolved (what group readiness depends on)
+                    _rk = _ref_keys.get(_sys, set())
+                    _store = (bandit_state or {}).get('_pair_offsets', {})
+                    _res = {k for k in _rk if system_stages.pair_resolved(
+                        _store.get(k), _stage['name'], int(_adv.get('successes', 2)),
+                        _adv.get('max_offset_sd'), bandit_cfg.get('offset_prior_sd'))}
+                    _nres = len(_res)
+                    _nret = sum(1 for k in _rk if k not in _res and system_stages.pair_retired(
+                        _store.get(k), _stage['name'], _stage.get('retire_after_epochs')))
+                elif _type == 'combos_balanced':
+                    _prog = system_stages.combos_progress(
+                        _st, _adv, [Path(c).name for c in _system_stage_pool(_sys)
+                                    if c not in _val_set_ps])
+                _met = (_prog is not None and _st['stage_epochs'] >= int(_adv.get('min_epochs', 1))
+                        and system_stages.criterion_met(_adv, *_prog))
+                _what = {'pairs_resolved': 'pairs resolved', 'groups_done': 'groups passed'}.get(
+                    _type, 'combos balanced')
+                _line = (f"  [STAGE] {_sys}: {_stage['name']} epoch {_st['stage_epochs']}/{_stage['epochs']}"
+                         + (f", {_prog[0]}/{_prog[1]} {_what}" if _prog else '')
+                         + (f" ({_nres}/{len(_rk)} reference pairs resolved"
+                            + (f", {_nret} retired" if _stage.get('retire_after_epochs') is not None else '')
+                            + ")" if _type == 'groups_done' else ''))
+                if _met or _st['stage_epochs'] >= int(_stage['epochs']):
+                    _reason = ('criterion' if _met else
+                               'max_epochs' if _prog is not None else 'epochs')
+                    _nxt = system_stages.advance(_st, stages, _sys, epoch, _reason, _prog)
+                    _line += f" -> {'done' if _nxt is None else stages[_nxt]['name']} ({_reason})"
+                    _log_changes.append({'system': _sys, 'stage': _stage['name'],
+                                         'next': None if _nxt is None else stages[_nxt]['name'],
+                                         'reason': _reason})
+                    _ended.add(_sys)
+                    if _nxt is None:
+                        _to_export.append(_sys)
+                print(_line)
+                _stage_lines.append(_line)
+                _log_rows.append({
+                    'system': _sys, 'stage': _stage['name'],
+                    'stage_epoch': _ran[_sys][0], 'stage_max': _ran[_sys][1],
+                    'progress': ((_prog[0], _prog[1], epoch_log.PROGRESS_UNITS.get(_type, 'combos'))
+                                 if _prog else None),
+                    'ref': (_nres, len(_rk)) if _rk is not None else None,
+                    'retired': _nret if _stage.get('retire_after_epochs') is not None else None})
+            system_stages.save_state(stage_state_path, stage_state)
         # Held-out validation: deterministic evaluation on fixed set
         # This provides unbiased ground truth for whether policy is actually improving.
         # Buffered (not written immediately) for the same reason as
         # train_epoch's detail_lines -- see the epoch-summary-first write below.
         _val_detail_lines: List[str] = []
+        _log_val, _log_gate = None, None        # for the epoch_summary.log block
         # Validate every eval_freq epochs and always after the last epoch, so the
         # run's end point is measured (and the best model can be chosen).
         # Validate only the systems the current stage trains on (a stage with
         # `systems:` leaves the others for later).
-        _stage_systems = (set(current_stage['systems'])
-                          if curriculum_enabled and current_stage.get('systems') else None)
+        _stage_schedule = per_system and config.get('eval_schedule') == 'stage'
+        if _stage_schedule:
+            # eval_schedule: stage -- each system's held-out pairs at the start,
+            # middle and end of each of its stages (epochs 1, ceil(n/2), n of
+            # an n-epoch stage), and in the epoch it meets a stage's criterion.
+            _stage_systems = {s for s, (e, n) in _ran.items()
+                              if e in (1, (n + 1) // 2, n) or s in _ended}
+        elif per_system:
+            _stage_systems = set(_active_systems)
+        else:
+            _stage_systems = (set(current_stage['systems'])
+                              if curriculum_enabled and current_stage.get('systems') else None)
         _epoch_val = ([c for c in validation_combos
                        if combo_system_map.get(c, {}).get('name') in _stage_systems]
                       if _stage_systems else validation_combos)
-        if _epoch_val and (epoch % config.get('eval_freq', 1) == 0
+        if per_system and _stage_schedule and not _stage_systems:
+            _epoch_val = []
+        if _epoch_val and (_stage_schedule or epoch % config.get('eval_freq', 1) == 0
                            or epoch == num_epochs - 1):
             print(f"\n  [VALIDATION] Evaluating on {len(_epoch_val)} held-out combos (deterministic)...")
             val_stats = train_epoch(
@@ -875,6 +1480,7 @@ def run_training(config_path: str) -> None:
                 verbose=False,
                 summary_log_path=None,
             )
+            record_runs(_ledger_path, val_stats.get('run_dirs', []), 'validation', epoch, _stage_now)
             val_reward = val_stats.get('avg_reward', float('nan'))
             val_std = val_stats.get('reward_std', float('nan'))
             train_reward = stats.get('avg_reward', float('nan'))
@@ -900,6 +1506,7 @@ def run_training(config_path: str) -> None:
             stats['val_loss'] = val_loss
             stats['val_n_combos'] = len(_epoch_val)
             stats['val_pair_success'] = val_stats.get('pair_success', {})
+            _log_val = stats['val_pair_success']
 
             # Validation gate (bandit.shared_update: regression): the full
             # network moves each epoch, so keep it only while held-out pairs
@@ -923,11 +1530,13 @@ def run_training(config_path: str) -> None:
                     policy.load_state_dict(_gate_state)
                     _gate_msg = (f"  [VALIDATION GATE] held-out success {_score} < accepted "
                                  f"{_gate_score} - {_margin}: restored the last accepted model")
+                    _log_gate = f"below accepted {_gate_score} - {_margin}: model restored"
                 else:
                     _gate_state = copy.deepcopy(policy.state_dict())
                     _gate_score = _score if _gate_score is None else max(_gate_score, _score)
                     _gate_msg = (f"  [VALIDATION GATE] held-out success {_score}: model accepted "
                                  f"(reference {_gate_score})")
+                    _log_gate = "model accepted"
                 _last_val_score = _score
                 if _best_score is None or _score > _best_score:
                     _best_state = copy.deepcopy(policy.state_dict())
@@ -935,8 +1544,24 @@ def run_training(config_path: str) -> None:
                     torch.save({'policy_state_dict': _best_state, 'epoch': epoch,
                                 'val_success': _score}, checkpoint_dir / 'best_model.pt')
                     _gate_msg += f"; new best (epoch {epoch}) saved to best_model.pt"
+                    _log_gate += ", new best saved"
                 print(_gate_msg)
                 _val_detail_lines.append(_gate_msg)
+
+        for _sys in _to_export:
+            _export_final(_sys)
+        _cost = summarize_ledger(load_ledger(_ledger_path))
+        if _cost:
+            # Training ns only: validation runs are an internal check of the
+            # shared model, not part of converging a system (or of the ALF
+            # comparison), and are listed separately.
+            _stage_lines.append("  [COST] training ns so far: " + ', '.join(
+                f"{_s} {_c['train']['ns']:.1f}" for _s, _c in sorted(_cost.items())))
+            print(_stage_lines[-1])
+            _vns = sum(_c['validation']['ns'] for _c in _cost.values())
+            if _vns:
+                _stage_lines.append(f"  [COST] validation ns so far (not in the totals above): {_vns:.1f}")
+                print(_stage_lines[-1])
 
         try:
             _summary_lines = [f"\nEpoch {epoch} Summary:"]
@@ -959,6 +1584,13 @@ def run_training(config_path: str) -> None:
             if _train_pair_line:
                 _summary_lines.append(_train_pair_line)
                 print(_summary_lines[-1])
+            # Short exploratory and full-length runs, each judged by its own
+            # success test (the line above mixes them under one diagnostic).
+            for _key, _lab in (('pair_success_short', 'train short runs'),
+                               ('pair_success_full', 'train full-length runs')):
+                if (stats.get(_key) or {}).get('total'):
+                    _summary_lines.append(format_pair_success(stats[_key], _lab))
+                    print(_summary_lines[-1])
             if 'val_pair_success' in stats:
                 _val_pair_line_2 = format_pair_success(stats['val_pair_success'], 'validation')
                 if _val_pair_line_2:
@@ -986,10 +1618,18 @@ def run_training(config_path: str) -> None:
                 # of details trickling in ahead of the summary that explains
                 # them. Console output above is unaffected -- it stays in the
                 # original chronological order these were computed in.
-                append_summary(summary_log_path, '\n'.join(_summary_lines))
-                _epoch_detail_lines = stats.get('detail_lines', []) + _val_detail_lines
-                if _epoch_detail_lines:
-                    append_summary(summary_log_path, '\n'.join(_epoch_detail_lines))
+                if per_system:
+                    # Per-system stages: one concise block (mllf.cb.epoch_log);
+                    # the full detail stays in the job's stdout.
+                    append_summary(summary_log_path, '\n' + _epoch_log_block(
+                        epoch, epoch_combos, stats, _log_val, _log_gate, _log_passed, _log_reopened,
+                        _log_rows, _log_changes, _cost))
+                else:
+                    append_summary(summary_log_path, '\n'.join(_summary_lines))
+                    _epoch_detail_lines = (_revisit_detail_lines + stats.get('detail_lines', [])
+                                           + _val_detail_lines + _stage_lines)
+                    if _epoch_detail_lines:
+                        append_summary(summary_log_path, '\n'.join(_epoch_detail_lines))
             except Exception as _sum_err:
                 print(f"  Warning: Failed to write epoch summary to file: {_sum_err}")
                 sys.stdout.flush()

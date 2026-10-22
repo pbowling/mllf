@@ -332,7 +332,61 @@ def build_data_and_targets_from_combo(combo_dir: str, base_bias: str = 'quadrati
     return data, targets, extras
 
 
-def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: torch.Tensor, out_name: str = 'variables.py', bias_clip: float = 1000.0) -> None:
+def fit_site_b(site_nodes: List[int], linear_directed: Dict[Tuple[int, int], float],
+               edge_var: Optional[Dict[Tuple[int, int], float]] = None
+               ) -> Tuple[Dict[int, float], Dict[str, float]]:
+    """Per-substituent b for one site from every directed edge's b difference.
+
+    Each directed edge (i -> j) predicts b[j] - b[i]; (j -> i) predicts the
+    negative. With the site's reference (``site_nodes[0]``) at 0, the other
+    b values are the weighted least-squares fit to all of them (weight
+    1 / ``edge_var``, default equal), so a difference measured along any path
+    (1 -> 3 -> 5 as well as 1 -> 5) informs b. For a two-substituent site this
+    is the mean of the two directions.
+
+    Returns (b by node, {'rms', 'max', 'n_pairs'}): the misfit between each
+    pair's combined estimate and the fitted b[j] - b[i] (kcal/mol), i.e. how
+    far the predicted differences are from closing around cycles; 0 with no
+    cycles.
+    """
+    import numpy as np
+    ref, others = site_nodes[0], list(site_nodes[1:])
+    col = {n: c for c, n in enumerate(others)}
+    in_site = set(site_nodes)
+    pairs: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+    for (src, dst), val in linear_directed.items():
+        if src not in in_site or dst not in in_site or src == dst:
+            continue
+        var = (edge_var or {}).get((src, dst), 1.0)
+        w = 1.0 / var if var and np.isfinite(var) and var > 0 else 1.0
+        lo, hi = min(src, dst), max(src, dst)
+        pairs.setdefault((lo, hi), []).append((float(val) if src == lo else -float(val), w))
+    b = {n: 0.0 for n in site_nodes}
+    if not others or not pairs:
+        return b, {'rms': 0.0, 'max': 0.0, 'n_pairs': 0}
+    rows, rhs, est = [], [], {}
+    for (lo, hi), vals in pairs.items():
+        w = sum(v[1] for v in vals)
+        d = sum(v[0] * v[1] for v in vals) / w
+        est[(lo, hi)] = d
+        row = np.zeros(len(others))
+        if hi in col:
+            row[col[hi]] += 1.0
+        if lo in col:
+            row[col[lo]] -= 1.0
+        sw = np.sqrt(w)
+        rows.append(row * sw)
+        rhs.append(d * sw)
+    sol = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)[0]
+    for n, c in col.items():
+        b[n] = float(sol[c])
+    res = [est[(lo, hi)] - (b[hi] - b[lo]) for (lo, hi) in est]
+    return b, {'rms': float(np.sqrt(np.mean(np.square(res)))),
+               'max': float(np.max(np.abs(res))), 'n_pairs': len(res)}
+
+
+def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: torch.Tensor, out_name: str = 'variables.py', bias_clip: float = 1000.0,
+                                 linear_var: Optional[torch.Tensor] = None) -> None:
     """Write a variables.py file from per-directed-edge policy actions.
 
     This function maps directed relation actions back to base biases (quadratic, skew,
@@ -352,6 +406,9 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         out_name: Name of output file (default: 'variables.py').
         bias_clip: Maximum absolute value for bias coefficients (default: 1000.0).
                    All bias values will be clipped to [-bias_clip, bias_clip].
+        linear_var: Optional [E] variance of each edge's linear action (e.g.
+                   ``hindsight.linear_edge_variance``), weighting the per-site
+                   b fit (``fit_site_b``); equal weights if None.
 
     Returns:
         None. Writes a Python file containing a triple-quoted YAML bias_string with keys:
@@ -580,25 +637,26 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions: to
         elif N > 0:
             site_groups = [list(range(N))]
 
-    for site_nodes in site_groups:
+    # Every within-site edge, not only those from the reference, informs b:
+    # fit_site_b solves for one b per substituent (reference 0) from all of
+    # them, weighted by linear_var.
+    edge_var = None
+    if linear_var is not None:
+        edge_var = {(int(ei[0, k]), int(ei[1, k])): float(linear_var[k])
+                    for k in range(min(ei.shape[1], len(linear_var)))}
+    b_fit = {}
+    for s_idx, site_nodes in enumerate(site_groups):
         if not site_nodes:
             continue
-        ref = site_nodes[0]
-        b_vec[ref] = 0.0
-        for j in site_nodes[1:]:
-            fwd = linear_directed.get((ref, j))
-            bwd = linear_directed.get((j, ref))
-            if fwd is not None and bwd is not None:
-                # Average the two independent antisymmetric estimates:
-                # fwd ≈ b[j]-b[ref] = b[j],  -bwd ≈ b[j]-b[ref] = b[j]
-                val = 0.5 * (fwd - bwd)
-            elif fwd is not None:
-                val = fwd
-            elif bwd is not None:
-                val = -bwd
-            else:
-                val = 0.0
+        b_site, fit = fit_site_b(site_nodes, linear_directed, edge_var)
+        for j, val in b_site.items():
             b_vec[j] = max(-bias_clip, min(bias_clip, val))
+        if len(site_nodes) > 2:
+            b_fit[f'site{s_idx + 1}'] = fit
+    if b_fit:
+        # Cycle-closure misfit of the predicted b differences, per site.
+        import json as _json
+        (combo_dir / 'b_fit.json').write_text(_json.dumps(b_fit, indent=1))
 
     # Format bias_string manually to match expected YAML structure
     # b: single row with first element using '- -' then rest using just '-'

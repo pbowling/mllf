@@ -21,6 +21,19 @@ from mllf.file_handling.generate_combinations import (
     list_possible_combinations,
 )
 
+# Combos defined outside a system's manifest (e.g. ALF's substituent groups,
+# mllf.file_handling.combo_sets): combo path -> combo_info, consulted before
+# combo_metadata.json when a combo directory has to be created.
+EXPLICIT_COMBOS: Dict[str, Dict] = {}
+
+
+def register_explicit_combos(infos: List[Dict]) -> None:
+    """Make combos that are not in any manifest creatable on demand
+    (``ensure_combo_dir_exists``); each info needs 'path' plus the fields
+    ``create_single_combination_dir`` reads."""
+    for info in infos:
+        EXPLICIT_COMBOS[str(info['path'])] = info
+
 
 def count_combinations_fast(sys_entry: Dict, max_subs_per_site: int = 10) -> int:
     """Count combinations for a system using arithmetic only — O(1) memory.
@@ -230,7 +243,11 @@ def build_combo_dir_lookup(
     """
     # Group missing combos by their system's input_dir.
     missing_by_system: Dict[str, Set[str]] = {}
+    explicit: Dict[str, Any] = {}
     for c in combos:
+        if c in EXPLICIT_COMBOS:
+            explicit[c] = EXPLICIT_COMBOS[c]
+            continue
         if not Path(c).exists():
             sys_cfg = combo_system_map.get(c, {})
             idir = str(sys_cfg.get('input_dir', ''))
@@ -238,7 +255,7 @@ def build_combo_dir_lookup(
                 missing_by_system.setdefault(idir, set()).add(c)
 
     if not missing_by_system:
-        return {}
+        return explicit
 
     n_systems = len(missing_by_system)
     n_missing = sum(len(v) for v in missing_by_system.values())
@@ -259,6 +276,7 @@ def build_combo_dir_lookup(
                     break
 
     print(f"  [dir lookup] found {len(lookup)}/{n_missing} entries")
+    lookup.update(explicit)
     return lookup
 
 
@@ -284,7 +302,7 @@ def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
     elif combo_path.exists():
         return combo_path
 
-    combo_info = (_lookup or {}).get(str(combo_path))
+    combo_info = (_lookup or {}).get(str(combo_path)) or EXPLICIT_COMBOS.get(str(combo_path))
 
     if combo_info is None:
         # Fallback: full JSON scan.  Should only be reached if the pre-scan

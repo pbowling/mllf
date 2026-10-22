@@ -38,8 +38,20 @@ DEFAULTS = {
     'replay_consensus': None,  # environment_consensus.json of the pretrained model
     'replay_cache': None,      # where the built replay set is saved (torch)
     'embedding_cache_dir': None,
+    # Only runs the pretrained model saw: online-test runs collected later into
+    # the same dataset directories (training/collect_online_runs.py, which tags
+    # them with a collection_tag) are skipped, so a test doesn't replay earlier tests.
+    'replay_pretraining_only': True,
     'structure_type': 'unrelaxed',
     'grad_clip': 1.0,
+    # 'random': one random run per combo directory, round-robin over datasets.
+    # 'coverage': per system, the runs that best cover its pairs, replay_runs
+    # shared in proportion to substituents (mllf.cb.replay_selection); each
+    # run keeps weight only on the pairs it is the best chosen run for.
+    'replay_selection': 'random',
+    'replay_min_per_system': 3,     # budget floor and fewest graphs per system (coverage)
+    'replay_systems_root': None,   # <system>/prep for labelling (coverage)
+    'replay_workers': 8,
 }
 
 
@@ -51,25 +63,118 @@ def regression_config(bandit_cfg: Dict) -> Dict:
 
 # ── Replay set (pretraining runs) ────────────────────────────────────────────
 
-def _load_consensus(path: Optional[str], prep_dirs: set) -> Optional[Dict]:
+def _manifest_resolver(manifest):
+    """Resolve a pretraining path as written (relative to where pretraining
+    was launched) against the working directory and the manifest's
+    ancestors; None if it no longer exists."""
+    bases = [Path.cwd()] + list(Path(manifest).resolve().parents)
+
+    def resolve(d):
+        p = Path(d)
+        if p.is_absolute():
+            return p if p.exists() else None
+        for b in bases:
+            if (b / p).exists():
+                return (b / p).resolve()
+        return None
+    return resolve
+
+
+def _load_consensus(path: Optional[str], prep_dirs: Optional[set] = None,
+                    manifest=None) -> Optional[Dict]:
+    """The pretraining's environment consensus, keyed by resolved prep path.
+
+    Pretraining keys it by the prep path as it saw it (e.g.
+    ``../pretraining/<dataset>/<combo>/prep``, relative to where it ran),
+    and the embedding code looks it up by ``str(run_dir.parent / 'prep')``;
+    the replay's run dirs are resolved, so the keys are resolved too
+    (against the manifest's ancestors). With a different key the consensus
+    is silently skipped, the environment atoms differ and every Uni-Mol
+    embedding misses pretraining's cache. ``prep_dirs``: keep only these."""
     if not path or not Path(path).exists():
         return None
     with open(path) as f:
         raw = json.load(f)
+    resolve = _manifest_resolver(manifest) if manifest else (lambda d: Path(d).resolve())
     out = {}
     for prep, sites in raw.items():
-        if prep not in prep_dirs:
+        combo = resolve(str(Path(prep).parent))   # not prep itself: it may be a symlink
+        if combo is None:
             continue
-        out[prep] = {s: (None if atoms is None else {tuple(a) for a in atoms})
-                     for s, atoms in sites.items()}
+        key = str(combo / 'prep')
+        if prep_dirs is not None and key not in prep_dirs:
+            continue
+        out[key] = {s: (None if atoms is None else {tuple(a) for a in atoms})
+                    for s, atoms in sites.items()}
     return out
+
+
+def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
+    """(run, nsubs, pairs, weights) for ``replay_selection: coverage``: the
+    planned runs (``replay_selection.plan_replay``), each with its hygiene
+    weights kept only on the edges of the pairs it owns. Writes the plan's
+    per-pair report next to the replay cache (``*_pairs.csv``)."""
+    import csv
+    from mllf.cb.graph_utils import build_directed_pairs
+    from mllf.cb.pretrain_policy import compute_pairwise_confidence_weights, compute_pairwise_measured_mask
+    from mllf.cb.replay_selection import plan_replay
+    if not cfg.get('replay_systems_root'):
+        raise ValueError("replay_selection: coverage needs bandit.regression.replay_systems_root")
+    # Candidates: the directories pretraining built graphs for (the keys of
+    # its consensus file); the rest of the manifest was filtered out before
+    # training, so the model never saw them and their embeddings were never
+    # cached.
+    used = None
+    cons = _load_consensus(cfg.get('replay_consensus'), manifest=manifest)
+    if cons:
+        used = {str(Path(k).parent) for k in cons}
+    plan, report = plan_replay(manifest, cfg['replay_systems_root'], int(cfg['replay_runs']),
+                               int(cfg.get('replay_min_per_system', 3)),
+                               include_tagged=not cfg.get('replay_pretraining_only', True),
+                               workers=int(cfg.get('replay_workers', 8)), verbose=verbose,
+                               allowed_dirs=used)
+    if cfg.get('replay_cache') and report:
+        out = Path(cfg['replay_cache']).with_name(Path(cfg['replay_cache']).stem + '_pairs.csv')
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(report[0]))
+            w.writeheader()
+            w.writerows(report)
+        if verbose:
+            print(f"  [regression] replay pair report: {out}")
+    chosen = []
+    for item in plan:
+        run_dir = Path(item['run_dir'])
+        try:
+            metadata = json.loads((run_dir / 'metadata.json').read_text())
+            sim = json.loads((run_dir / 'simulation_results.json').read_text())
+        except Exception:
+            continue
+        ns = metadata.get('nsubs_per_site')
+        if not ns:
+            continue
+        pairs = build_directed_pairs(ns)
+        w = compute_pairwise_confidence_weights(sim, ns, pairs)
+        if not w:
+            continue
+        mask = compute_pairwise_measured_mask(sim, pairs, w)
+        owned = {tuple(p) for p in item['owned']} | {(j, i) for i, j in item['owned']}
+        weights = [[(wi * m if (i, j) in owned else 0.0) for m in row]
+                   for (i, j), wi, row in zip(pairs, w, mask)]
+        if not any(x > 0 for row in weights for x in row):
+            continue
+        run = {'run_dir': run_dir, 'metadata': metadata, 'sim_results': sim}
+        chosen.append((run, ns, pairs, weights))
+    return chosen
 
 
 def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tuple]:
     """Sample pretraining runs and build (x, edge_index, targets [E,4], weights [E,4]).
 
     Weights are the data-hygiene pairwise weights (balance x measured mask), so
-    only measured targets count. Cached to ``cfg['replay_cache']``.
+    only measured targets count. With ``replay_pretraining_only``, runs carrying
+    a ``collection_tag`` (online-test runs collected after pretraining) are
+    skipped. Cached to ``cfg['replay_cache']``.
     """
     cache = cfg.get('replay_cache')
     if cache and Path(cache).exists():
@@ -104,6 +209,10 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
                 return (b / p).resolve()
         return None
     rng = random.Random(seed)
+    chosen = []
+    if cfg.get('replay_selection') == 'coverage':
+        chosen = _coverage_choice(cfg, manifest, verbose)
+        raw_dirs = []                 # skip the random draw below
 
     # Round-robin over datasets (the directory under pretraining/), one run
     # per combo directory, so no single large dataset dominates the replay.
@@ -114,7 +223,6 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
         by_ds.setdefault(ds, []).append(d)
     for v in by_ds.values():
         rng.shuffle(v)
-    chosen = []
     datasets = sorted(by_ds)
     while len(chosen) < cfg['replay_runs'] and any(by_ds.values()):
         for ds in datasets:
@@ -129,6 +237,8 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
                 continue
             rng.shuffle(runs)
             for run in runs:
+                if cfg.get('replay_pretraining_only', True) and run['metadata'].get('collection_tag'):
+                    continue
                 ns = run['metadata'].get('nsubs_per_site')
                 if not ns:
                     continue
@@ -141,9 +251,10 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
                 chosen.append((run, ns, pairs, weights))
                 break
     rng.shuffle(chosen)
-    chosen = chosen[:cfg['replay_runs']]
+    if cfg.get('replay_selection') != 'coverage':
+        chosen = chosen[:cfg['replay_runs']]
     prep_dirs = {str(Path(r['run_dir']).parent / 'prep') for r, *_ in chosen}
-    consensus = _load_consensus(cfg.get('replay_consensus'), prep_dirs)
+    consensus = _load_consensus(cfg.get('replay_consensus'), prep_dirs, manifest=manifest)
 
     data = []
     for n, (run, ns, pairs, weights) in enumerate(chosen):

@@ -1,5 +1,6 @@
 """Tests for mllf.cb.hindsight: skew/end targets, held-off endpoints, and
 per-pair offset sampling and exploration."""
+import json
 import math
 import random
 
@@ -211,6 +212,30 @@ def test_record_pair_outcomes_counts_consecutive_failures():
     assert state[OFFSET_KEY][KEY]['fail_streak'] == 0
 
 
+def test_record_pair_outcomes_counts_epochs_once_per_epoch():
+    state = {}
+    for ep in (0, 0, 1, 3):           # e.g. both orientations in epoch 0
+        record_pair_outcomes(state, 'sys', LABELS, EDGES, _saved([500, 500], 30), stage='s', epoch=ep)
+    st = state[OFFSET_KEY][KEY]['stages']['s']
+    assert st['visits'] == 4 and st['epochs'] == 3 and st['last_epoch'] == 3
+
+
+@pytest.mark.parametrize('pops,trans,stuck', [([1000, 0], 0, True),     # stuck at an endpoint
+                                               ([0, 0], 0, True),       # stranded
+                                               ([500, 500], 30, False)])
+def test_stuck_or_stranded_run_sets_run_both(pops, trans, stuck):
+    state = {}
+    record_pair_outcomes(state, 'sys', LABELS, EDGES, _saved(pops, trans))
+    assert bool(state[OFFSET_KEY][KEY].get('run_both')) is stuck
+
+
+def test_run_both_stays_set_after_a_crossing():
+    state = {}
+    record_pair_outcomes(state, 'sys', LABELS, EDGES, _saved([1000, 0], 0))
+    record_pair_outcomes(state, 'sys', LABELS, EDGES, _saved([500, 500], 30))
+    assert state[OFFSET_KEY][KEY]['run_both']
+
+
 def test_persistent_explained_failure_widens_every_slot():
     # A b target on every run (a direction toward the unsampled sub) explains
     # each failure, so widening waits for the third failure in a row and then
@@ -334,6 +359,23 @@ def test_b_steps_double_while_trapped_and_cap():
     assert _trapped({}, 5.0, 4) == pytest.approx([3.0, 6.0, 12.0, 12.0])
 
 
+def test_grown_b_steps_get_smaller_variance():
+    from mllf.cb.hindsight import grow_directional_b_steps
+    state, b1, vars_ = {}, 5.0, []
+    for _ in range(3):
+        t = torch.zeros(2, 4, dtype=torch.float64)
+        t[0, 0], t[1, 0] = b1 + 3.0, -(b1 + 3.0)
+        d = torch.zeros(2, 4, dtype=torch.bool)
+        d[:, 0] = True
+        v = torch.full((2, 4), 1.5 ** 2, dtype=torch.float64)
+        grow_directional_b_steps(state, 'sys', LABELS, EDGES, t, d, {'b': [0.0, b1]},
+                                 base_step=3.0, max_step=12.0, var=v)
+        vars_.append(v[0, 0].item())
+        b1 = t[0, 0].item()
+    # steps 3, 6, 12: variance (1.5)^2 x (3/size)^2
+    assert vars_ == pytest.approx([2.25, 2.25 / 4, 2.25 / 16])
+
+
 def test_b_streak_resets_when_both_sampled():
     from mllf.cb.hindsight import grow_directional_b_steps
     state = {}
@@ -383,12 +425,38 @@ def test_bracket_midpoint_after_reversal():
     assert t == pytest.approx(11.0) and v == pytest.approx((4.0 / 4.0) ** 2)
 
 
-def test_bracket_overlapping_bounds_still_midpoint():
+def test_inverted_bracket_is_unlocked():
     # indole-like: stuck needing lower at 1.4, needing higher at 3.4 (hysteresis)
     state = {}
     _directional_run(state, 1.4, up=False)
-    t, _, br = _directional_run(state, 3.4, up=True)
-    assert br == 1 and t == pytest.approx(2.4)
+    t, v, br = _directional_run(state, 3.4, up=True)
+    entry = state[OFFSET_KEY][KEY]
+    assert br == 0 and t == pytest.approx(2.4)       # midpoint is still the best b guess
+    assert v == pytest.approx(2.25)                  # base-step variance, not locked at sd 0.25
+    assert 'b_bracket' not in entry and 'b_streak' not in entry
+    assert entry['barrier_trap'] and entry['b_unlocks'] == 1
+    # the bracket can form again; the trap flag lasts one run
+    _directional_run(state, 2.4, up=True)
+    assert 'barrier_trap' not in entry and entry['b_bracket']['lo'] == pytest.approx(2.4)
+
+
+def test_unlocked_b_bracket_steps_c_up():
+    state = {}
+    _directional_run(state, 1.4, up=False)
+    _directional_run(state, 3.4, up=True)            # inverted -> unlocked, barrier trap
+    t, _, d, n = _c_run(state, 20.0)
+    assert n == 1 and d and t == pytest.approx(32.0)
+
+
+def test_inverted_c_bracket_is_unlocked():
+    state = {}
+    _c_run(state, 30.0, trapped=False, stranded=True)           # too high at 30: hi = 30
+    _directional_run(state, 1.4, up=False)
+    _directional_run(state, 3.4, up=True)                       # barrier trap
+    t, v, d, n = _c_run(state, 40.0)                            # too low at 40: lo 40 > hi 30
+    entry = state[OFFSET_KEY][KEY]
+    assert n == 1 and d and t == pytest.approx(52.0) and v == pytest.approx(36.0)
+    assert 'c_bracket' not in entry and entry['c_unlocks'] == 1
 
 
 def test_bracket_in_reversed_node_order():
@@ -417,19 +485,21 @@ def test_bracket_cleared_when_both_sampled():
     assert br == 0 and t == pytest.approx(12.0)
 
 
-def _c_run(state, c, trapped=True, grow=True):
-    """Barrier-trap c targets for one run at c; returns (c target, var, directional, n)."""
+def _c_run(state, c, trapped=True, grow=True, pinned=False, stranded=False):
+    """c targets for one run at c; returns (c target, var, directional, n pairs stepped)."""
     from mllf.cb.hindsight import barrier_trapped_c_targets
     t = torch.zeros(2, 4, dtype=torch.float64)
     t[:, 1] = c
     v = torch.full((2, 4), math.inf, dtype=torch.float64)       # no barrier measured
     d = torch.zeros(2, 4, dtype=torch.bool)
-    d[:, 0] = trapped
+    d[:, 0] = trapped and not stranded
     applied = {'b': [0.0, 4.0], 'c': [[0.0, c], [0.0, 0.0]]}
-    n = barrier_trapped_c_targets(state, 'sys', LABELS, EDGES, t, v, d, applied,
-                                  base_step=12.0, max_step=48.0, trap_width=2.0, grow=grow)
+    up, down = barrier_trapped_c_targets(
+        state, 'sys', LABELS, EDGES, t, v, d, applied, base_step=12.0, max_step=48.0,
+        trap_width=2.0, grow=grow, pinned=torch.tensor([pinned, pinned]),
+        stranded=torch.tensor([stranded, stranded]))
     assert t[0, 1].item() == t[1, 1].item()                     # shared by both edges
-    return t[0, 1].item(), v[0, 1].item(), bool(d[0, 1]), n
+    return t[0, 1].item(), v[0, 1].item(), bool(d[0, 1]), up + down
 
 
 def test_no_c_step_until_b_bracket_closes():
@@ -447,8 +517,21 @@ def test_c_steps_up_and_grows_once_trapped_at_working_b():
     t, v, d, n = _c_run(state, 20.0)
     assert n == 1 and d and t == pytest.approx(32.0) and v == pytest.approx(36.0)
     assert _c_run(state, 32.0)[0] == pytest.approx(56.0)
-    assert _c_run(state, 56.0)[0] == pytest.approx(104.0)
+    t, v, _, _ = _c_run(state, 56.0)
+    assert t == pytest.approx(104.0) and v == pytest.approx(36.0)   # base-step variance
     assert _c_run(state, 104.0)[0] == pytest.approx(152.0)     # capped at 48
+
+
+def test_grown_c_step_moves_the_offset_most_of_the_way():
+    from mllf.cb.hindsight import pair_offset_posterior
+    state = {}
+    _directional_run(state, 4.9, up=True)
+    _directional_run(state, 4.4, up=False)
+    for c in (20.0, 32.0):
+        _c_run(state, c)
+    t, v, _, _ = _c_run(state, 56.0)                            # step 48
+    off, _ = pair_offset_posterior(56.0, [[t, v, True]], 8.0)   # quadratic prior sd 8
+    assert off > 0.6 * 48.0
 
 
 def test_shared_model_gets_base_c_step_without_touching_state():
@@ -469,3 +552,182 @@ def test_c_streak_cleared_by_a_crossing_run():
     _c_run(state, 32.0)
     assert _c_run(state, 56.0, trapped=False)[3] == 0
     assert 'c_streak' not in state[OFFSET_KEY][KEY]
+
+
+# ---------------------------------------------------------------------------
+# Revisits
+# ---------------------------------------------------------------------------
+
+def _outcome(state, combo, ok, labels=LABELS):
+    record_pair_outcomes(state, 'sys', labels, EDGES,
+                         _saved([5000, 5000], 20) if ok else _saved([10000, 0], 0), combo=combo)
+
+
+def test_outcomes_count_visits_successes_and_combos():
+    state = {}
+    _outcome(state, '/o/sys/comb_1', ok=False)
+    _outcome(state, '/o/sys/comb_2', ok=True, labels=[(1, 2), (1, 1)])   # reverse orientation
+    _outcome(state, '/o/sys/comb_1', ok=False)
+    e = state[OFFSET_KEY][KEY]
+    assert (e['visits'], e['successes']) == (3, 1)
+    assert e['combos'] == ['/o/sys/comb_2', '/o/sys/comb_1']              # most recent last
+
+
+def test_revisits_until_satisfied_or_exhausted():
+    from mllf.cb.hindsight import select_revisits
+    state = {}
+    _outcome(state, '/o/sys/comb_1', ok=False)
+    picks, counts = select_revisits(state, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
+    assert picks == ['/o/sys/comb_1'] and counts['active'] == 1
+    _outcome(state, '/o/sys/comb_1', ok=True)
+    _outcome(state, '/o/sys/comb_1', ok=True)
+    picks, counts = select_revisits(state, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
+    assert picks == [] and counts['satisfied'] == 1
+    assert state[OFFSET_KEY][KEY]['retired'] == 'satisfied'
+
+    other = {}
+    for _ in range(3):
+        _outcome(other, '/o/sys/comb_1', ok=False)
+    picks, counts = select_revisits(other, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
+    assert picks == [] and counts['exhausted'] == 1
+
+
+def test_revisits_respect_quota_order_and_allowed():
+    from mllf.cb.hindsight import select_revisits
+    state = {}
+    labels = {'a': [(1, 1), (1, 2)], 'b': [(1, 1), (1, 3)], 'c': [(1, 2), (1, 3)]}
+    for name, n in (('a', 1), ('b', 3), ('c', 2)):
+        for _ in range(n):
+            _outcome(state, f'/o/sys/comb_{name}', ok=False, labels=labels[name])
+    picks, _ = select_revisits(state, {'sys': 2}, lambda c: True, max_visits=8)
+    assert picks == ['/o/sys/comb_b', '/o/sys/comb_c']                    # most visited first
+    picks, _ = select_revisits(state, {'sys': 2}, lambda c: not c.endswith('_b'), max_visits=8)
+    assert picks == ['/o/sys/comb_c', '/o/sys/comb_a']
+
+
+def test_merge_revisits_dedupes_and_keeps_system_minimum():
+    from mllf.cb.hindsight import merge_revisits
+    system = {'/out/A/comb_1': 'A', '/man/A/comb_1': 'A', '/man/A/comb_2': 'A', '/man/A/comb_3': 'A',
+              '/man/B/comb_7': 'B', '/man/B/comb_8': 'B'}
+    out = merge_revisits(['/out/A/comb_1'],
+                         ['/man/A/comb_1', '/man/A/comb_2', '/man/A/comb_3', '/man/B/comb_7', '/man/B/comb_8'],
+                         system.get, n_total=4, min_per_system=2)
+    assert out == ['/out/A/comb_1', '/man/A/comb_2', '/man/B/comb_7', '/man/B/comb_8']
+
+
+# ---------------------------------------------------------------------------
+# Pinned / stranded runs
+# ---------------------------------------------------------------------------
+
+def _pair_run(pops, at_lo, at_hi, edge=37500):
+    return {'populations': pops,
+            'endpoint_pairs': {'2_3': {'edge': edge, 'at_lo': at_lo, 'near_lo': edge - at_lo - at_hi,
+                                       'near_hi': 0, 'at_hi': at_hi}}}
+
+
+def test_lambda_states_pinned_and_stranded():
+    from mllf.cb.hindsight import lambda_states
+    pinned, stranded = lambda_states(EDGES, _pair_run([37500, 0], 37500, 0))
+    assert pinned.tolist() == [True, True] and not stranded.any()
+    pinned, _ = lambda_states(EDGES, _pair_run([30000, 0], 30000, 0))   # left the start: moving
+    assert not pinned.any()
+    pinned, _ = lambda_states(EDGES, _pair_run([0, 37000], 0, 37000))   # went to the other side
+    assert not pinned.any()
+    pinned, stranded = lambda_states(EDGES, _pair_run([0, 0], 0, 0))
+    assert stranded.tolist() == [True, True] and not pinned.any()
+
+
+def test_pinned_runs_leave_b_bracket_and_streak_alone():
+    from mllf.cb.hindsight import grow_directional_b_steps
+    state = {}
+    _directional_run(state, 5.0, up=True)
+    before = json.loads(json.dumps(state[OFFSET_KEY][KEY]))
+    t = torch.zeros(2, 4, dtype=torch.float64)
+    t[0, 0], t[1, 0] = 2.0, -2.0                                # a "needs lower b" direction
+    d = torch.zeros(2, 4, dtype=torch.bool)
+    d[:, 0] = True
+    grow_directional_b_steps(state, 'sys', LABELS, EDGES, t, d, {'b': [0.0, 5.0]},
+                             skip=torch.tensor([True, True]))
+    assert state[OFFSET_KEY][KEY] == before
+    grow_directional_b_steps(state, 'sys', LABELS, EDGES, torch.zeros(2, 4, dtype=torch.float64),
+                             torch.zeros(2, 4, dtype=torch.bool), {'b': [0.0, 5.0]},
+                             skip=torch.tensor([True, True]))       # stranded: not "both sampled"
+    assert state[OFFSET_KEY][KEY] == before
+
+
+def test_pinned_run_steps_c_up_without_a_closed_b_bracket():
+    state = {}
+    t, v, d, n = _c_run(state, 30.0, pinned=True)
+    assert n == 1 and d and t == pytest.approx(42.0) and v == pytest.approx(36.0)
+    assert _c_run(state, 42.0, pinned=True)[0] == pytest.approx(66.0)    # grows
+
+
+def test_stranded_run_steps_c_down_and_brackets():
+    state = {}
+    _c_run(state, 30.0, pinned=True)                            # too low at 30
+    _c_run(state, 42.0, pinned=True)                            # too low at 42
+    t, v, d, n = _c_run(state, 90.0, stranded=True)             # too high at 90
+    assert n == 1 and d
+    assert t == pytest.approx(66.0)                             # midpoint of [42, 90]
+    assert v == pytest.approx(min(36.0, (48.0 / 4) ** 2))
+    t, _, _, _ = _c_run(state, 66.0, stranded=True)             # still too high: [42, 66]
+    assert t == pytest.approx(54.0)
+
+
+def test_stranded_steps_grow_down_and_stop_at_zero():
+    state = {}
+    assert _c_run(state, 100.0, stranded=True)[0] == pytest.approx(88.0)
+    assert _c_run(state, 88.0, stranded=True)[0] == pytest.approx(64.0)
+    assert _c_run(state, 20.0, stranded=True)[0] == pytest.approx(0.0)  # 20 - 48 floored
+
+
+def test_stranded_run_keeps_a_measured_barrier_target():
+    from mllf.cb.hindsight import barrier_trapped_c_targets
+    t = torch.zeros(2, 4, dtype=torch.float64)
+    t[:, 1] = 70.0                                              # measured-barrier target
+    v = torch.full((2, 4), math.inf, dtype=torch.float64)
+    v[:, 1] = 4.0
+    d = torch.zeros(2, 4, dtype=torch.bool)
+    up, down = barrier_trapped_c_targets({}, 'sys', LABELS, EDGES, t, v, d,
+                                         {'c': [[0.0, 80.0], [0.0, 0.0]]},
+                                         stranded=torch.tensor([True, True]))
+    assert (up, down) == (0, 0) and t[0, 1].item() == 70.0
+
+
+def test_crossing_run_clears_c_bracket():
+    state = {}
+    _c_run(state, 30.0, pinned=True)
+    _c_run(state, 90.0, stranded=True)
+    _c_run(state, 60.0, trapped=False)                          # crossed
+    assert 'c_bracket' not in state[OFFSET_KEY][KEY] and 'c_streak' not in state[OFFSET_KEY][KEY]
+
+
+def test_uncrossed_pairs():
+    from mllf.cb.hindsight import uncrossed_pairs
+    moving = {'populations': [30000, 0], 'transition_pairs': {'2_3': 0}}
+    assert uncrossed_pairs(EDGES, moving).tolist() == [True, True]
+    crossed = {'populations': [20000, 15000], 'transition_pairs': {'2_3': 4}}
+    assert not uncrossed_pairs(EDGES, crossed).any()
+    stranded = {'populations': [0, 0], 'transition_pairs': {'2_3': 0}}
+    assert not uncrossed_pairs(EDGES, stranded).any()          # lambda_states handles it
+    unknown = {'populations': [30000, 0]}
+    assert not uncrossed_pairs(EDGES, unknown).any()           # no count: not flagged
+
+
+def test_uncrossed_run_steps_c_up_and_leaves_b_alone():
+    # A run that moved off its start but never crossed: treated like a pinned
+    # run (the trainer ORs uncrossed_pairs into the pinned mask).
+    from mllf.cb.hindsight import grow_directional_b_steps, uncrossed_pairs
+    state = {}
+    _directional_run(state, 5.0, up=True)
+    before = json.loads(json.dumps(state[OFFSET_KEY][KEY]))
+    run = {'populations': [30000, 0], 'transition_pairs': {'2_3': 0}}
+    mask = uncrossed_pairs(EDGES, run)
+    t = torch.zeros(2, 4, dtype=torch.float64)
+    t[0, 0], t[1, 0] = 8.0, -8.0
+    d = torch.zeros(2, 4, dtype=torch.bool)
+    d[:, 0] = True
+    grow_directional_b_steps(state, 'sys', LABELS, EDGES, t, d, {'b': [0.0, 5.0]}, skip=mask)
+    assert state[OFFSET_KEY][KEY].get('b_bracket') == before.get('b_bracket')
+    assert state[OFFSET_KEY][KEY].get('b_streak') == before.get('b_streak')
+    assert _c_run(state, 30.0, pinned=bool(mask[0]))[0] == pytest.approx(42.0)

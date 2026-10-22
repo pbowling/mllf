@@ -14,7 +14,7 @@ The helper functions below (leading underscore) are implementation details
 of ``train_epoch`` and not a public API of this module.
 """
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import concurrent.futures
 import re
 import shutil
@@ -40,10 +40,18 @@ from mllf.cb.hindsight import (
     QUADRATIC_STEP_MAX,
     apply_pair_offsets,
     barrier_trapped_c_targets,
+    lambda_states,
+    uncrossed_pairs,
     combo_node_labels,
     grow_directional_b_steps,
     held_off_counts,
+    SUCCESS_MIN_FRACTION,
+    SUCCESS_MIN_TRANSITIONS,
     hindsight_targets,
+    node_transition_counts,
+    pair_succeeded,
+    site_nodes,
+    linear_edge_variance,
     preact_weights,
     read_applied_biases,
     record_pair_outcomes,
@@ -72,7 +80,10 @@ from mllf.cb.workflow_utils import (
     fix_msld_flat_for_single_site,
     parse_simulation_metrics,
     record_combo_failure,
+    set_msld_steps,
+    template_steps,
 )
+from mllf.cb.cost_ledger import simulated_ns
 from mllf.cli.slurm import submit_epoch_simulation
 from mllf.cli.workflow import write_variables_from_actions
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
@@ -439,6 +450,10 @@ def train_epoch(
     baseline_optimizer: Optional[torch.optim.Optimizer] = None,
     system_to_idx: Optional[Dict[str, int]] = None,
     history_replay_cfg: Optional[Dict] = None,
+    update_shared: bool = True,
+    stage_of_system: Optional[Dict[str, str]] = None,
+    run_steps_fn=None,
+    stage_cfg_of_system: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, float]:
     """Run one training epoch across all combos from all systems.
 
@@ -474,6 +489,23 @@ def train_epoch(
     AWR-weighted loss for them (see ``_compute_replay_awr_loss``) into the
     same gradient step as the fresh on-policy batch -- more (context,
     action, reward) signal per expensive simulation, no new simulations.
+
+    update_shared (NeuralLinear+TS): False keeps the shared model fixed (no
+    posterior update or hindsight regression) while per-pair offsets,
+    exploration and outcomes are still recorded (update_policy=True) --
+    testing a trained model on new systems (``mode: deploy``).
+    stage_of_system: system name -> its curriculum stage name, counted per
+    pair under that stage (``record_pair_outcomes``).
+
+    run_steps_fn(system, combo name) -> (equil, prod) MD steps or None: the
+    run length for each combo this call (written into the combo's
+    msld_flat.py before it runs; None restores the system template's full
+    length). A run much shorter than the template is an exploratory one:
+    ``record_pair_outcomes(short=True)`` with the stage's
+    ``explore_min_transitions`` (``stage_cfg_of_system``; default 2).
+
+    The returned stats include ``run_dirs``: (system, run directory, ok) for
+    every simulation that finished this call, for the cost ledger.
     """
     policy.train()
     # Uni-Mol representation is loaded on-demand (no explicit encoder model)
@@ -497,21 +529,93 @@ def train_epoch(
     _offset_sampling = _use_offsets and bool(_bandit_cfg.get('offset_sampling', False))
 
     def _with_pair_offsets(actions, data, combo_path, sys_cfg):
-        """Shift a Thompson-sampled proposal by the pair's offsets, if any."""
+        """Shift a Thompson-sampled proposal by the pair's offsets, if any.
+
+        Returns (actions, linear_var): linear_var is each edge's b-difference
+        variance after its pair's offset (``linear_edge_variance``), weighting
+        the per-site b fit in write_variables_from_actions; None without
+        offsets."""
         if (not _use_offsets or data.edge_type is not None
                 or not getattr(policy, 'use_bayesian_heads', False)):
-            return actions
+            return actions, None
         with torch.no_grad(), _policy_inference_lock:
             mean, _, _ = policy.get_actions_thompson(
                 data.x, data.edge_index, data.edge_type, deterministic=True)
+        labels = combo_node_labels(combo_path)
+        sys_name = sys_cfg.get('name', 'unknown')
         shifted, _n = apply_pair_offsets(
-            actions, mean.detach(), bandit_state, sys_cfg.get('name', 'unknown'),
-            combo_node_labels(combo_path), data.edge_index,
+            actions, mean.detach(), bandit_state, sys_name,
+            labels, data.edge_index,
             prior_sd=_bandit_cfg.get('offset_prior_sd'),
             sample=_offset_sampling and not deterministic_actions,
             base_sd=_bandit_cfg.get('offset_base_sd'),
             dims=_hs_dims)
-        return shifted
+        lin_var = (linear_edge_variance(bandit_state, sys_name, labels, data.edge_index,
+                                        prior_sd=_bandit_cfg.get('offset_prior_sd'))
+                   if 'linear' in _hs_dims else None)
+        return shifted, lin_var
+    _templates: Dict[str, Optional[Dict[str, float]]] = {}
+
+    def _template(sys_cfg):
+        idir = str(sys_cfg.get('input_dir', ''))
+        if idir not in _templates:
+            _templates[idir] = template_steps(idir) if idir else None
+        return _templates[idir]
+
+    def _apply_run_length(combo_path, sys_cfg):
+        """Write this run's length into the combo's msld_flat.py (no-op
+        without run_steps_fn or a readable template)."""
+        if run_steps_fn is None:
+            return
+        tpl = _template(sys_cfg)
+        if tpl is None:
+            return
+        steps = run_steps_fn(sys_cfg.get('name', 'unknown'), Path(combo_path).name)
+        equil, prod = steps if steps else (tpl['equil'], tpl['prod'])
+        set_msld_steps(Path(combo_path), equil, prod)
+
+    def _short_test(sys_name: str):
+        """(min transitions, min minority fraction) of the system's short-run
+        success test (stage keys explore_min_transitions / explore_min_fraction)."""
+        st = (stage_cfg_of_system or {}).get(sys_name) or {}
+        return int(st.get('explore_min_transitions', 2)), float(st.get('explore_min_fraction', 0.2))
+
+    def _pair_test_counts(edge_index, saved_data, min_trans: int, min_frac: float) -> Dict[str, int]:
+        """Per undirected pair: crossed (>= min_trans transitions), balanced
+        (both sampled, minority >= min_frac) and both (the success test,
+        hindsight.pair_succeeded)."""
+        out = {'total': 0, 'crossed': 0, 'balanced': 0, 'both': 0}
+        pops = saved_data.get('populations') or []
+        sites = site_nodes(edge_index)
+        for k in range(edge_index.size(1)):
+            i, j = int(edge_index[0, k]), int(edge_index[1, k])
+            if i >= j:
+                continue
+            site = sites.get(i, [i, j])
+            if len(site) > 2:
+                nt = node_transition_counts(saved_data, site) or {}
+                t = min(nt.get(i, 0), nt.get(j, 0))
+            else:
+                t = (saved_data.get('transition_pairs') or {}).get(f"{i + 2}_{j + 2}", 0) or 0
+            p_i = pops[i] if i < len(pops) else 0
+            p_j = pops[j] if j < len(pops) else 0
+            out['total'] += 1
+            out['crossed'] += int(t >= min_trans)
+            out['balanced'] += int(p_i > 0 and p_j > 0 and min(p_i, p_j) / (p_i + p_j) >= min_frac)
+            out['both'] += int(pair_succeeded(saved_data, i, j, site=site,
+                                              min_transitions=min_trans, min_fraction=min_frac))
+        return out
+
+    def _is_short_run(combo_path, epoch_dir) -> bool:
+        """Simulated well under (< half) the template's full length."""
+        if run_steps_fn is None:
+            return False
+        tpl = _template(combo_system_map.get(str(combo_path), {}))
+        ns = simulated_ns(Path(epoch_dir) / 'output.out')
+        if tpl is None or ns is None:
+            return False
+        return ns < 0.5 * (tpl['equil'] + tpl['prod']) * tpl['timestep'] / 1000.0
+
     # Tags every epoch_results.pt written this call with which training run
     # (checkpoint dir) produced it -- out_dir/combo trees are shared across
     # runs reusing the same systems config, so this lets analysis tooling
@@ -525,12 +629,16 @@ def train_epoch(
     # Diagnostic-only per-pair success breakdown (see compute_pair_success_stats);
     # accumulated across every crash-free combo regardless of algorithm/floor gate.
     pair_stats_total = {'total': 0, 'crossed': 0, 'balanced': 0, 'both': 0}
+    # Split by run length, each judged by its own success test.
+    pair_stats_short = dict.fromkeys(pair_stats_total, 0)
+    pair_stats_full = dict.fromkeys(pair_stats_total, 0)
     # Lines destined for epoch_summary.log, buffered rather than appended
     # immediately -- main() writes the "Epoch N Summary" header first, then
     # this whole batch of detail lines right after it, so the file reads
     # top-down per epoch instead of details-then-summary. Console/verbose-log
     # prints are untouched and stay in their original chronological order.
     _detail_lines: List[str] = []
+    _epoch_info: Dict[str, Dict] = {}     # structured regression / hindsight numbers
 
     target_norm: Optional[torch.Tensor] = None
     if (bc_mode or bc_auxiliary_weight > 0.0) and bc_source_epoch is not None:
@@ -688,6 +796,7 @@ def train_epoch(
     max_retries = config.get('max_retries', 2)
     _reserve = list(reserve_pool) if reserve_pool else []
     _permanently_failed: List[str] = []
+    _failed_run_dirs: List[Tuple[str, str, bool]] = []   # cost ledger: failed runs
     _max_failed = config.get('max_failed_combos_per_epoch', 50)
 
     def _abort_if_too_many_failures() -> None:
@@ -734,6 +843,7 @@ def train_epoch(
             print(f"  SKIP: {_failed_sys}/{jcombo_path.name} permanently failed "
                   f"after {max_retries + 1} attempt(s) — continuing without it")
             _permanently_failed.append(f"{_failed_sys}/{jcombo_path.name}")
+            _failed_run_dirs.append((_failed_sys, str(jepoch_dir), False))
             if bandit_state is not None:
                 # Infrastructure/software failure, not a poor-sampling result —
                 # record it so uncertainty-driven selection (NeuralLinear+TS)
@@ -753,6 +863,7 @@ def train_epoch(
                         _rep_path, _rep_sys, config, verbose=verbose,
                         _lookup=_combo_dir_lookup)
                     fix_msld_flat_for_single_site(_rep_path, SITE_ATOMS_MAPPING)
+                    _apply_run_length(_rep_path, _rep_sys)
                     _rep_epoch_dir = _rep_path / f"run_{epoch:03d}"
                     _rep_epoch_dir.mkdir(exist_ok=True, parents=True)
                     if (_rep_epoch_dir / 'epoch_results.pt').exists():
@@ -764,11 +875,13 @@ def train_epoch(
                         _rep_act, _rep_lp = _policy_sample_actions(
                             policy, _rep_data.x, _rep_data.edge_index, _rep_data.edge_type,
                             exploration_scale=_exploration_scale)
-                    _rep_act = _with_pair_offsets(_rep_act.detach(), _rep_data, _rep_path, _rep_sys)
+                    _rep_act, _rep_lv = _with_pair_offsets(
+                        _rep_act.detach(), _rep_data, _rep_path, _rep_sys)
                     _rep_lp = _detach_cpu_or_none(_rep_lp)
                     write_variables_from_actions(
                         str(_rep_epoch_dir), _rep_data, _rep_extras, _rep_act,
-                        bias_clip=config.get('training', {}).get('bias_clip', 1000.0))
+                        bias_clip=config.get('training', {}).get('bias_clip', 1000.0),
+                        linear_var=_rep_lv)
                     _rep_job_id = submit_epoch_simulation(
                         str(_rep_path), str(_rep_epoch_dir), config=config,
                         solvent_state=_rep_sys.get('solvent_state', 'solv'))
@@ -871,6 +984,7 @@ def train_epoch(
                 combo_system_map[str(combo_path)] = sys_cfg
 
         fix_msld_flat_for_single_site(combo_path, SITE_ATOMS_MAPPING)
+        _apply_run_length(combo_path, sys_cfg)
 
         epoch_dir = combo_path / f"run_{epoch:03d}"
         epoch_dir.mkdir(exist_ok=True, parents=True)
@@ -992,6 +1106,7 @@ def train_epoch(
             return ('error', combo_idx)
         _save_graph_data_cache(epoch_dir, data)
 
+        lin_var = None
         with torch.no_grad():
             if getattr(policy, 'use_bayesian_heads', False):
                 # NeuralLinear + Thompson Sampling: sample (or, for eval combos,
@@ -1001,7 +1116,7 @@ def train_epoch(
                     actions, logp = _policy_sample_actions(
                         policy, data.x, data.edge_index, data.edge_type,
                         deterministic=deterministic_actions, exploration_scale=_exploration_scale)
-                actions = _with_pair_offsets(actions.detach(), data, combo_path, sys_cfg)
+                actions, lin_var = _with_pair_offsets(actions.detach(), data, combo_path, sys_cfg)
             elif deterministic_actions:
                 # Thread-safety lock: policy forward passes are not thread-safe
                 with _policy_inference_lock:
@@ -1023,7 +1138,8 @@ def train_epoch(
                 actions = actions.detach()
                 logp = logp.detach()
 
-        write_variables_from_actions(str(epoch_dir), data, extras, actions, bias_clip=bias_clip)
+        write_variables_from_actions(str(epoch_dir), data, extras, actions, bias_clip=bias_clip,
+                                     linear_var=lin_var)
 
         if not run_config:
             if verbose:
@@ -1186,6 +1302,18 @@ def train_epoch(
         _hs_n_grown = 0
         _hs_n_bracketed = 0
         _hs_n_c_trapped = 0
+        _hs_n_c_down = 0
+        _hs_unlocks: Dict[str, int] = {}      # inverted b / c brackets unlocked
+        _hs_n_pinned = _hs_n_stranded = 0
+        _hs_n_uncrossed = 0
+        _b_needs_crossing = bool(bandit_cfg.get('b_direction_requires_crossing', True))
+        # bandit.c_up_requires_b_bracket: b moves before c for pinned runs too.
+        # A run pinned at its start (lambda_states) normally drops its b target
+        # and steps c up at once; with this on it is treated like any one-sided
+        # run (a b step toward the other substituent), and c steps up only
+        # through the barrier trap (the pair's b bracket closed without a
+        # crossing, hindsight.barrier_trapped_c_targets).
+        _c_needs_bracket = bool(bandit_cfg.get('c_up_requires_b_bracket', False))
         _hs_c_trap = dict(
             base_step=_hs_caps['quadratic_step_cap'],
             max_step=float(bandit_cfg.get('quadratic_step_max', QUADRATIC_STEP_MAX)),
@@ -1221,6 +1349,16 @@ def train_epoch(
                 )
                 for _k in pair_stats_total:
                     pair_stats_total[_k] += _ps[_k]
+                _sys_u = combo_system_map.get(str(combo_path_u), {}).get('name', 'unknown')
+                if _is_short_run(combo_path_u, epoch_dir_u):
+                    _ls = _pair_test_counts(vdata_u.edge_index, saved_data, *_short_test(_sys_u))
+                    _tgt = pair_stats_short
+                else:
+                    _ls = _pair_test_counts(vdata_u.edge_index, saved_data,
+                                            SUCCESS_MIN_TRANSITIONS, SUCCESS_MIN_FRACTION)
+                    _tgt = pair_stats_full
+                for _k in _tgt:
+                    _tgt[_k] += _ls[_k]
                 if vdata_u.edge_type is None:
                     # Online-training graph structure (the only one
                     # build_graph_and_data produces): one edge per pair,
@@ -1263,6 +1401,26 @@ def train_epoch(
                         )
                         _labels = combo_node_labels(combo_path_u) if _use_offsets else None
                         _sys_name = combo_system_map.get(str(combo_path_u), {}).get('name', 'unknown')
+                        # A run pinned at its start says the barrier, not b,
+                        # held lambda: no b target (shared or per-pair) and
+                        # its b streak/bracket are left alone; it steps c up.
+                        # A stranded run (neither endpoint) steps c down.
+                        _pinned, _stranded = lambda_states(vdata_u.edge_index, saved_data)
+                        _fwd = vdata_u.edge_index[0] < vdata_u.edge_index[1]
+                        _hs_n_pinned += int((_pinned & _fwd).sum())
+                        _hs_n_stranded += int((_stranded & _fwd).sum())
+                        # bandit.b_direction_requires_crossing: any run that
+                        # never crossed (pinned or not) gives no b direction
+                        # and steps c up, like a pinned run.
+                        if _b_needs_crossing:
+                            _uncrossed = uncrossed_pairs(vdata_u.edge_index, saved_data)
+                            _hs_n_uncrossed += int((_uncrossed & ~_pinned & _fwd).sum())
+                            _pinned = _pinned | _uncrossed
+                        if _c_needs_bracket:
+                            _pinned = torch.zeros_like(_pinned)
+                        if _pinned.any():
+                            hs_v[_pinned, 0] = float('inf')
+                            hs_dir[_pinned, 0] = False
                         if update_policy and _labels:
                             # Per-pair offsets get grown directional b and
                             # (barrier-trapped) c steps; the shared model
@@ -1273,31 +1431,48 @@ def train_epoch(
                                 _g, _br = grow_directional_b_steps(
                                     bandit_state, _sys_name, _labels, vdata_u.edge_index,
                                     hs_t_pair, hs_dir, _applied,
-                                    base_step=_hs_b_base, max_step=_hs_b_max, var=hs_v_pair)
+                                    base_step=_hs_b_base, max_step=_hs_b_max, var=hs_v_pair,
+                                    skip=_pinned | _stranded, counts=_hs_unlocks)
                                 _hs_n_grown += _g
                                 _hs_n_bracketed += _br
                             if 'quadratic' in _hs_dims:
-                                _hs_n_c_trapped += barrier_trapped_c_targets(
+                                _up, _down = barrier_trapped_c_targets(
                                     bandit_state, _sys_name, _labels, vdata_u.edge_index,
-                                    hs_t_pair, hs_v_pair, hs_dir_pair, _applied, **_hs_c_trap)
+                                    hs_t_pair, hs_v_pair, hs_dir_pair, _applied,
+                                    pinned=_pinned, stranded=_stranded, counts=_hs_unlocks,
+                                    **_hs_c_trap)
+                                _hs_n_c_trapped += _up
+                                _hs_n_c_down += _down
                             _hs_n_offsets += record_pair_targets(
                                 bandit_state, _sys_name, _labels, vdata_u.edge_index,
                                 hs_t_pair, hs_v_pair, history=int(bandit_cfg.get('offset_history', 5)),
                                 dims=_hs_dims, directional=hs_dir_pair,
                             )
+                            _short = _is_short_run(combo_path_u, epoch_dir_u)
+                            _short_min, _short_frac = _short_test(_sys_name)
                             record_pair_outcomes(bandit_state, _sys_name, _labels,
-                                                 vdata_u.edge_index, saved_data)
+                                                 vdata_u.edge_index, saved_data,
+                                                 combo=str(combo_path_u),
+                                                 stage=(stage_of_system or {}).get(_sys_name),
+                                                 short=_short, short_min_transitions=_short_min,
+                                                 short_min_fraction=_short_frac,
+                                                 confirm=bool(((stage_cfg_of_system or {}).get(_sys_name) or {})
+                                                              .get('confirm_full_length', True)),
+                                                 epoch=epoch)
                             if _offset_sampling:
                                 _wd, _nr = update_exploration(
                                     bandit_state, _sys_name, _labels, vdata_u.edge_index,
-                                    hs_v, saved_data, factor_max=_hs_factor_max, dims=_hs_dims,
-                                    persistent_failures=_hs_persistent)
+                                    hs_v_pair, saved_data, factor_max=_hs_factor_max, dims=_hs_dims,
+                                    persistent_failures=_hs_persistent,
+                                    min_transitions=_short_min if _short else SUCCESS_MIN_TRANSITIONS,
+                                    min_fraction=_short_frac if _short else SUCCESS_MIN_FRACTION)
                                 _hs_widened += _wd
                                 _hs_narrowed += _nr
                         if _labels and 'quadratic' in _hs_dims:
                             barrier_trapped_c_targets(
                                 bandit_state, _sys_name, _labels, vdata_u.edge_index,
                                 hs_t, hs_v, hs_dir.clone(), _applied,
+                                pinned=_pinned, stranded=_stranded,
                                 **{**_hs_c_trap, 'grow': False})
                         hs_t_dev = hs_t.to(saved_actions.dtype).to(device)
                         finite = torch.isfinite(hs_v).to(device)
@@ -1317,12 +1492,12 @@ def train_epoch(
                         _hs_n_edges += int(vdata_u.edge_index.size(1))
                         _hs_n_held_off += held_off_counts(vdata_u.edge_index, saved_data)
 
-                if update_policy and _shared_regression:
+                if update_policy and update_shared and _shared_regression:
                     if vdata_u.edge_type is None and _applied is not None:
                         _it = online_item(vdata_u.x, vdata_u.edge_index, hs_t, hs_v)
                         if _it is not None:
                             _reg_items.append(_it)
-                elif update_policy:
+                elif update_policy and update_shared:
                     policy.update_bayesian_posteriors(
                         vdata_u.x, vdata_u.edge_index, vdata_u.edge_type,
                         update_targets, weights=combined_weight,
@@ -1349,7 +1524,7 @@ def train_epoch(
             )
             print(_stats_msg)
             _detail_lines.append(_stats_msg)
-        if update_policy and _shared_regression:
+        if update_policy and update_shared and _shared_regression:
             _reg_cfg = regression_config(bandit_cfg)
             _ck = Path(config.get('output', {}).get('base_dir', 'checkpoints'))
             _buf_path = _ck / 'regression_online_buffer.pt'
@@ -1376,6 +1551,7 @@ def train_epoch(
                         f"{_rs.get('replay_after', float('nan')):.3f}")
             print(_reg_msg)
             _detail_lines.append(_reg_msg)
+            _epoch_info['regression'] = dict(_rs)
         if _hs_n_edges:
             def _med(v):
                 return f"{float(np.median(v)):.2f} (n={len(v)})" if v else "n/a"
@@ -1385,12 +1561,21 @@ def train_epoch(
                 + f"; held-off endpoints {_hs_n_held_off}; grown b steps {_hs_n_grown}"
                 + f"; bracketed b {_hs_n_bracketed}"
                 + f"; barrier-trapped c {_hs_n_c_trapped}"
+                + f"; c stepped down {_hs_n_c_down}"
+                + f"; pinned runs {_hs_n_pinned}, stranded runs {_hs_n_stranded}"
+                + f", other uncrossed runs {_hs_n_uncrossed}"
                 + f"; pair-offset observations {_hs_n_offsets}"
                 + (f"; exploration widened {_hs_widened}, narrowed {_hs_narrowed}"
                    if _offset_sampling else "")
             )
             print(_hs_msg)
             _detail_lines.append(_hs_msg)
+            _epoch_info['hindsight'] = {
+                'median_step': {d: (float(np.median(v)) if v else None) for d, v in _hs_steps.items()},
+                'held_off': _hs_n_held_off, 'b_grown': _hs_n_grown, 'b_bisected': _hs_n_bracketed,
+                'b_unlocked': _hs_unlocks.get('b_unlocked', 0), 'c_up': _hs_n_c_trapped,
+                'c_down': _hs_n_c_down, 'c_unlocked': _hs_unlocks.get('c_unlocked', 0),
+                'pinned': _hs_n_pinned, 'stranded': _hs_n_stranded}
 
     # === Epoch-batch REINFORCE update ===
     elif deferred_updates:
@@ -1813,5 +1998,10 @@ def train_epoch(
         'n_success': n_success,
         'permanently_failed': _permanently_failed,
         'pair_success': pair_stats_total,
+        'pair_success_short': pair_stats_short,
+        'pair_success_full': pair_stats_full,
         'detail_lines': _detail_lines,
+        **_epoch_info,
+        'run_dirs': [(combo_system_map.get(str(cp), {}).get('name', 'unknown'), str(ed), True)
+                     for cp, ed, _ in deferred_updates] + _failed_run_dirs,
     }
