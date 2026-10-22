@@ -365,9 +365,25 @@ class TestBackfillLambdaProfile:
         assert sr['barrier_pairs']['2_3'] is not None
         assert sr['skew_pairs']['2_3'] == pytest.approx(0.0, abs=1e-9)   # symmetric profile
         assert sr['end_pairs']['2_3'] == pytest.approx(0.0, abs=1e-9)
+        assert sr['simulated_ns'] is None              # output has no dynamics header
         assert 'barrier_pairs' not in json.loads((no_out / 'simulation_results.json').read_text())
         # second pass skips the run that already has the fields
         assert backfill_barrier_pairs(tmp_path, workers=workers) == (0, 2)
+
+    def test_adds_only_the_run_length_to_profiled_runs(self, tmp_path):
+        with_out, _ = self._make(tmp_path)
+        profiled = {'ddg_pairs': {'2_3': -1.0}, 'barrier_pairs': {'2_3': 9.9}, 'skew_pairs': {},
+                    'end_pairs': {}, 'transition_pairs': {}}
+        (with_out / 'simulation_results.json').write_text(json.dumps(profiled))
+        header = ("   NSTEP =    13000    NSAVC =     1000    NSAVV =       10\n"
+                  "  TIME STEP =  1.6E-01 AKMA       4.00000E-03 PS\n"
+                  "   NSTEP =    13000    NSAVC =     1000    NSAVV =       10\n"
+                  "  TIME STEP =  1.6E-01 AKMA       4.00000E-03 PS\n")
+        (with_out / 'output.out').write_text(header + self._output_text())
+        assert backfill_barrier_pairs(tmp_path)[0] == 1
+        sr = json.loads((with_out / 'simulation_results.json').read_text())
+        assert sr['simulated_ns'] == pytest.approx(0.104)
+        assert sr['barrier_pairs'] == {'2_3': 9.9}      # profile left as it was
 
     def test_dry_run_writes_nothing(self, tmp_path):
         with_out, _ = self._make(tmp_path)
@@ -793,3 +809,117 @@ class TestBackfillDdgPairs:
         assert n_updated == 1
         assert n_skipped == 1
 
+
+
+# ---------------------------------------------------------------------------
+# Active-substituent mapping (which master sub carries each bias position)
+# ---------------------------------------------------------------------------
+
+from mllf.cli.collect_pretraining_data import (  # noqa: E402
+    parse_active_subs_from_inp,
+    parse_active_subs_from_output,
+)
+
+# master sub -> atom names in its _pres.rtf
+_MASTERS = {
+    'site1_sub1': ['C010', 'H011'], 'site1_sub2': ['C020', 'H021'], 'site1_sub3': ['C030', 'H031'],
+    'site1_sub7': ['C070', 'H071'], 'site1_sub8': ['C080', 'H081'],
+    'site2_sub1': ['C110', 'H111'], 'site2_sub6': ['C160', 'H161'], 'site2_sub2': ['C120', 'H121'],
+}
+
+
+def _prep(tmp_path):
+    prep = tmp_path / 'prep'
+    prep.mkdir()
+    for master, names in _MASTERS.items():
+        s, j = re.match(r'site(\d+)_sub(\d+)', master).groups()
+        atoms = '\n'.join(f'ATOM {n} CT00 0.0' for n in names)
+        (prep / f'{master}_pres.rtf').write_text(f'PRES p{s}_{j} 0.0\nGROUP\n{atoms}\n')
+    return prep
+
+
+def _script(blocks, reads, echo=False):
+    """CHARMM script (or its output echo) reading `reads`, defining local
+    labels -> master atoms, and calling them in `blocks` order."""
+    c = ' CHARMM>    ' if echo else ''
+    b = '  BLOCK>       ' if echo else '   '
+    lines = [f'{c}read rtf append card name @builddir/{m}_pres.rtf' for m in reads]
+    for label, master in blocks:
+        lines.append(f'{c}define {label} -')
+        lines.append(f'{c}   select ( -')
+        lines += [f'{c}   atom @ligseg @resnum {n} .or. -' for n in _MASTERS[master]]
+        lines.append(f'{c}   none ) end')
+        if echo:
+            lines.append(' Parameter: LIGSEG -> "LIG"')
+    lines.append(f'{c}BLOCK 6')
+    lines += [f'{b}Call {k + 2} sele {label} show end' for k, (label, _) in enumerate(blocks)]
+    return '\n'.join(lines) + '\n'
+
+
+# p38 group2-like: blocks site1 = (1, 7, 8), site2 = (1, 6); a second .inp
+# reads every sub, and the selections are defined out of label order.
+_BLOCKS = [('site1_sub1', 'site1_sub1'), ('site1_sub2', 'site1_sub7'), ('site1_sub3', 'site1_sub8'),
+           ('site2_sub1', 'site2_sub1'), ('site2_sub2', 'site2_sub6')]
+_EXPECTED = {'site1': ['site1_sub1', 'site1_sub7', 'site1_sub8'], 'site2': ['site2_sub1', 'site2_sub6']}
+
+
+def test_active_subs_from_output_follow_block_calls(tmp_path):
+    prep = _prep(tmp_path)
+    out = tmp_path / 'output'
+    shuffled = [_BLOCKS[2], _BLOCKS[0], _BLOCKS[4], _BLOCKS[1], _BLOCKS[3]]
+    text = _script(shuffled, reads=['site1_sub8', 'site1_sub1', 'site1_sub7', 'site2_sub6', 'site2_sub1'],
+                   echo=True)
+    # calls are in label order regardless of define order
+    text = re.sub(r'(BLOCK>\s+Call \d+ sele \S+ show end\n)+', lambda m: ''.join(
+        f'  BLOCK>       Call {k + 2} sele {lab} show end\n' for k, (lab, _) in enumerate(_BLOCKS)), text)
+    out.write_text(text)
+    assert parse_active_subs_from_output(out, prep, [3, 2]) == _EXPECTED
+
+
+def test_active_subs_from_output_none_without_echo_or_count_mismatch(tmp_path):
+    prep = _prep(tmp_path)
+    out = tmp_path / 'output'
+    out.write_text('no block setup here\n')
+    assert parse_active_subs_from_output(out, prep, [3, 2]) is None
+    out.write_text(_script(_BLOCKS, reads=[], echo=True))
+    assert parse_active_subs_from_output(out, prep, [2, 2]) is None
+
+
+def test_active_subs_from_inp_ignores_extra_inp_listing_all_subs(tmp_path):
+    # benz.inp sorts first and lists every sub; p38.inp is the script that ran.
+    prep = _prep(tmp_path)
+    (prep / 'benz.inp').write_text('\n'.join(
+        f'read rtf append card name @builddir/{m}_pres.rtf' for m in sorted(_MASTERS)) + '\n')
+    (prep / 'p38.inp').write_text(_script(_BLOCKS, reads=[m for _, m in _BLOCKS]))
+    assert parse_active_subs_from_inp(prep, [3, 2]) == _EXPECTED
+
+
+def test_active_subs_from_inp_reads_when_no_block_setup(tmp_path):
+    prep = _prep(tmp_path)
+    (prep / 'a_all.inp').write_text('\n'.join(
+        f'read rtf append card name @builddir/{m}_pres.rtf' for m in sorted(_MASTERS)) + '\n')
+    (prep / 'b_ran.inp').write_text('\n'.join(
+        ['! read rtf append card name @builddir/site1_sub2_pres.rtf'] +
+        [f'read rtf append card name @builddir/{m}_pres.rtf'
+         for m in ('site1_sub1', 'site1_sub7', 'site1_sub8', 'site2_sub1', 'site2_sub6')]) + '\n')
+    assert parse_active_subs_from_inp(prep, [3, 2]) == _EXPECTED
+
+
+def test_rekey_uses_msld_site_and_records_master():
+    from mllf.cli.collect_pretraining_data import rekey_graph_info
+    gi = {'solvent_state': 'solvent', 'sites': {
+        'site2_sub21': {'site': 2, 'sub': 21, 'atom_types': ['CT00'], 'filename': 'site2_sub21_pres.rtf'},
+        'site2_sub1': {'site': 2, 'sub': 1, 'atom_types': ['CT00'], 'filename': 'site2_sub1_pres.rtf'},
+        'site2_sub2': {'site': 2, 'sub': 2, 'atom_types': ['NG00'], 'filename': 'site2_sub2_pres.rtf'}}}
+    out = rekey_graph_info(gi, {'site1': ['site2_sub21'], 'site2': ['site2_sub2', 'site2_sub1']}, [1, 2])
+    assert {k: (v['site'], v['sub'], v['master']) for k, v in out['sites'].items()} == {
+        'site1_sub1': (1, 1, 'site2_sub21'), 'site2_sub1': (2, 1, 'site2_sub2'),
+        'site2_sub2': (2, 2, 'site2_sub1')}
+    assert out['sites']['site2_sub1']['atom_types'] == ['NG00']
+
+
+def test_node_fragment_is_the_master_sub():
+    from mllf.cb.pretrain_policy import _node_master_sub
+    assert _node_master_sub({'master': 'site1_sub12'}, 1, 2) == 'site1_sub12'
+    assert _node_master_sub({'filename': 'site1_sub12_pres.rtf'}, 1, 2) == 'site1_sub12'
+    assert _node_master_sub({}, 1, 2) == 'site1_sub2'

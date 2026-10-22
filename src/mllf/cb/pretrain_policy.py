@@ -56,7 +56,7 @@ import sys
 import threading
 import warnings
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 import yaml
 
@@ -68,6 +68,7 @@ from torch_geometric.data import Data
 
 from mllf.cb.policy import UnimolPolicy
 from mllf.file_handling.read_pdb import parse_pdb_file
+from mllf.file_handling.generate_combinations import is_combo_dir_name
 
 
 # ── Representation tracking ────────────────────────────────────────────────────
@@ -332,6 +333,22 @@ def prepare_pretraining_config(
 
 # ── Uni-Mol embedding computation for pretraining ────────────────────────────
 
+def _node_master_sub(site_info: Dict, site_id: int, sub_id: int) -> str:
+    """Master substituent ('site1_sub12') whose fragment PDB a graph node uses.
+
+    graph_info keys nodes by bias position ('sub' = position in its site),
+    which differs from the master numbering of the prep files whenever a
+    group runs a subset of a system's substituents. The master comes from the
+    node's 'master' field, else from the RTF file it was read from; only
+    graph_info without either falls back to the position.
+    """
+    master = site_info.get('master')
+    if master:
+        return master
+    m = re.match(r'(site\d+_sub\d+)_pres\.rtf$', str(site_info.get('filename') or ''))
+    return m.group(1) if m else f"site{site_id}_sub{sub_id}"
+
+
 def _compute_unimol_embeddings_and_edges(
     run_dir: Path,
     graph_info_path: Path,
@@ -454,7 +471,7 @@ def _compute_unimol_embeddings_and_edges(
     # Both minimized and unrelaxed use the same prep_dir; only the choice is tracked
     # Handle nested combos: need to look TWO levels up if in comb_* directory
     sys_name = prep_dir.parent.name
-    if sys_name.startswith('comb_'):
+    if is_combo_dir_name(sys_name):
         sys_name = prep_dir.parent.parent.name
     active_prep_dir = prep_dir
     explicit_mapping = False
@@ -505,7 +522,7 @@ def _compute_unimol_embeddings_and_edges(
             continue
         
         try:
-            sub_pdb = active_prep_dir / f"site{site_id}_sub{sub_id}_frag.pdb"
+            sub_pdb = active_prep_dir / f"{_node_master_sub(site_info, site_id, sub_id)}_frag.pdb"
             if not sub_pdb.exists():
                 print(f"  Warning: Sub PDB not found: {sub_pdb}, using zeros")
                 continue
@@ -1075,7 +1092,7 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
             grandparent_dir = run_dir.parent.parent.name  # e.g., "pretraining" or "14benz_good_runs"
             
             # Check if parent looks like a combo directory (starts with "comb_")
-            if parent_dir.startswith('comb_'):
+            if is_combo_dir_name(parent_dir):
                 # Nested structure: use grandparent/combo as system ID
                 system_id = f"{grandparent_dir}/{parent_dir}"
             # Check if dataset name contains 'combo' or 'best' (legacy flat structure)
@@ -1143,12 +1160,7 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
                     nsubs_per_site = [3] * num_sites
             
             # Compute reward using config parameters (filter out legacy/unknown parameters)
-            valid_params = {
-                'w_P', 'w_T', 'w_U', 'gamma', 'P_baseline', 'T_baseline',
-                'min_transitions_per_site', 'min_coverage_ratio', 'entropy_bonus',
-                'concentration_penalty_threshold'
-            }
-            filtered_config = {k: v for k, v in reward_config.items() if k in valid_params}
+            filtered_config = _reward_kwargs(reward_config)
             
             reward = compute_reward_from_sim_results(
                 run['sim_results'],
@@ -1236,6 +1248,48 @@ def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
     return runs
 
 
+# ── Run length ───────────────────────────────────────────────────────────────
+# Pretraining mixes ALF's short runs (~0.1 ns) with 1 ns production runs. A
+# short run has had a tenth of the time to cross and to balance, so it is
+# judged the way online training judges its short exploratory runs: by the
+# looser success test of the curriculum stage keys explore_min_transitions /
+# explore_min_fraction (see training/online_A_well_solv_vac.yaml), with
+# count-based reward terms scaled by its length. Set in the config's
+# ``reward`` section (``full_length_ns``, ``explore_min_transitions``,
+# ``explore_min_fraction``); runs collected without 'simulated_ns' count as
+# full length (``collect_pretraining_data --backfill-barrier`` adds it).
+FULL_LENGTH_NS = 1.0
+EXPLORE_MIN_TRANSITIONS = 3
+EXPLORE_MIN_FRACTION = 0.0
+
+# Keyword arguments of compute_reward_from_sim_results a config's reward section may set.
+REWARD_KWARGS = {
+    'w_P', 'w_T', 'w_U', 'gamma', 'P_baseline', 'T_baseline',
+    'min_transitions_per_site', 'min_coverage_ratio', 'entropy_bonus',
+    'concentration_penalty_threshold', 'full_length_ns', 'explore_min_transitions',
+}
+
+
+def _reward_kwargs(reward_config: Optional[Dict]) -> Dict:
+    return {k: v for k, v in (reward_config or {}).items() if k in REWARD_KWARGS}
+
+
+def run_length(sim_results: Dict, full_length_ns: float = FULL_LENGTH_NS) -> Tuple[float, bool]:
+    """(length / full length, short) of one run from its 'simulated_ns'.
+
+    Short means under half the full length, online's test for an exploratory
+    run (``train_epoch``'s ``_is_short_run``). Without a usable length the
+    run counts as full: (1.0, False).
+    """
+    try:
+        ns = float(sim_results.get('simulated_ns'))
+    except (TypeError, ValueError):
+        return 1.0, False
+    if not math.isfinite(ns) or ns <= 0 or full_length_ns <= 0:
+        return 1.0, False
+    return ns / full_length_ns, ns < 0.5 * full_length_ns
+
+
 def compute_reward_from_sim_results(
     sim_results: Dict,
     num_sites: int,
@@ -1250,6 +1304,8 @@ def compute_reward_from_sim_results(
     min_coverage_ratio: float = 0.5,
     entropy_bonus: float = 8.0,
     concentration_penalty_threshold: float = 0.8,
+    full_length_ns: float = FULL_LENGTH_NS,
+    explore_min_transitions: int = EXPLORE_MIN_TRANSITIONS,
 ) -> float:
     """Compute reward from simulation results dict using improved reward logic.
     
@@ -1283,10 +1339,21 @@ def compute_reward_from_sim_results(
         min_coverage_ratio: Minimum ratio of substituents that must be visited
         entropy_bonus: Bonus for uniform distributions
         concentration_penalty_threshold: Threshold for concentration penalty (e.g., 0.8 = 80%)
+        full_length_ns, explore_min_transitions: run-length handling (see
+            ``run_length``). Populations and transitions are counts, so
+            P_baseline and T_baseline scale with the run's length; a short run
+            needs only explore_min_transitions per site (online's short-run
+            test) where a full one needs min_transitions_per_site.
     
     Returns:
         Scalar reward value
     """
+    length_ratio, short = run_length(sim_results, full_length_ns)
+    P_baseline *= length_ratio
+    T_baseline *= length_ratio
+    if short:
+        min_transitions_per_site = min(min_transitions_per_site, explore_min_transitions)
+
     populations = sim_results.get("populations", {})
     transitions = sim_results.get("transitions", {})
     
@@ -1675,6 +1742,7 @@ def filter_runs_by_coefficient_range(
 def filter_runs_by_reward(
     runs: List[Dict],
     min_reward: float = 0.0,
+    reward_config: Optional[Dict] = None,
 ) -> List[Dict]:
     """Filter runs by minimum reward threshold.
     
@@ -1684,6 +1752,8 @@ def filter_runs_by_reward(
     Args:
         runs: List of run dicts from load_pretraining_runs
         min_reward: Minimum reward threshold (default: 0.0)
+        reward_config: Optional config ``reward`` section (reward weights and
+            run-length handling; defaults otherwise)
     
     Returns:
         Filtered list of runs meeting reward threshold
@@ -1744,7 +1814,8 @@ def filter_runs_by_reward(
             nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
             
             # Compute reward
-            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
+            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site,
+                                                     **_reward_kwargs(reward_config))
             
             # Filter by threshold
             if reward >= min_reward:
@@ -1919,6 +1990,7 @@ def sample_runs_stratified_negative(
     runs: List[Dict],
     fraction_per_bucket: float = 0.55,
     seed: int = 42,
+    reward_config: Optional[Dict] = None,
 ) -> List[Dict]:
     """Keep all positive-reward runs and sample negative-reward buckets with a
     quadratic ramp: the worst bucket ((-inf, -50]) keeps 0% and the best
@@ -1938,6 +2010,8 @@ def sample_runs_stratified_negative(
         fraction_per_bucket: Maximum sampling fraction applied to the best negative
             bucket ((-10, 0)).  Worst bucket gets 0%.  Default: 0.55.
         seed: Random seed for reproducibility (default: 42).
+        reward_config: Optional config ``reward`` section (reward weights and
+            run-length handling; defaults otherwise).
 
     Returns:
         Filtered + sampled list of runs.
@@ -1989,7 +2063,8 @@ def sample_runs_stratified_negative(
             num_sites = len(site_counts)
             nsubs_per_site = [site_counts[s] for s in sorted(site_counts)]
 
-            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site)
+            reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site,
+                                                     **_reward_kwargs(reward_config))
             scored.append((reward, run))
         except Exception as e:
             n_error += 1
@@ -2143,10 +2218,7 @@ def pretrain_epoch(
     pairwise_weights_cache: Optional[List] = None,
     unimol_config: Optional[Dict] = None,
     consensus_dict: Optional[Dict[str, Optional[set]]] = None,
-    pair_reward_cache: Optional[List] = None,
-    baseline_mean: Optional[torch.Tensor] = None,
-    baseline_std: Optional[torch.Tensor] = None,
-    success_floor: Optional[float] = None,
+    pair_advantage_cache: Optional[List] = None,
     system_emphasis: Optional[Dict[str, float]] = None,
     data_hygiene: bool = False,
 ) -> Dict[str, float]:
@@ -2171,21 +2243,15 @@ def pretrain_epoch(
                         getting full weight on every edge (see
                         ``compute_pairwise_measured_mask``).
         unimol_config: Optional dict with 'environment_cutoff' and 'use_environment_difference'
-        pair_reward_cache: Optional per-run [E, 4] per-edge, per-dimension reward tensor
-                        (from compute_pair_reward(), same reward used by online REINFORCE
-                        training). When provided (together with baseline_mean/baseline_std),
-                        the AWR weight is computed per-edge/per-dimension instead of as a
-                        single scalar for the whole run, so pairs with better bias
-                        coefficients within an otherwise-successful run get emphasised more
-                        than pairs that were poorly resolved. Runs whose entry is None fall
-                        back to the whole-run scalar ``_bc_reward`` weight.
-        baseline_mean: [4] global per-dimension reward mean (weighted across all cached
-                        pair rewards) used to normalise ``pair_reward_cache`` into an
-                        advantage. Required (with baseline_std) to enable per-pair AWR.
-        baseline_std: [4] global per-dimension reward std, paired with baseline_mean.
-        success_floor: Optional floor to clamp the per-pair advantage from below (mirrors
-                        ``reward.success_advantage_floor`` in online training), so a single
-                        badly-scored pair can't dominate the run's loss.
+        pair_advantage_cache: Optional per-run [E, 4] per-edge, per-dimension AWR
+                        advantage (``pair_advantages``: compute_pair_reward(), the reward
+                        online training uses, normalised over all runs and gated by the
+                        online success test for the run's length). The AWR weight is then
+                        per-edge/per-dimension instead of one scalar for the whole run, so
+                        pairs with better bias coefficients within an otherwise-successful
+                        run get emphasised more than pairs that were poorly resolved. Runs
+                        whose entry is None fall back to the whole-run scalar
+                        ``_bc_reward`` weight.
         system_emphasis: Optional {system_name_substring: weight} dict to up-weight
                         specific (typically under-represented) systems' runs, matched
                         case-insensitively against each run's 'system_label'. See
@@ -2199,8 +2265,6 @@ def pretrain_epoch(
     
     env_cutoff = unimol_config.get('environment_cutoff', 8.0)
     use_environment_difference = unimol_config.get('use_environment_difference', True)
-    per_pair_awr_enabled = pair_reward_cache is not None and baseline_mean is not None and baseline_std is not None
-    
     policy.train()
 
     # Build normalised reward weights (mean = 1.0) so the learning rate is unchanged.
@@ -2283,19 +2347,14 @@ def pretrain_epoch(
                 if edge_conf is None:
                     continue
 
-                r_pair = pair_reward_cache[run_idx] if per_pair_awr_enabled else None
-                if r_pair is not None and r_pair.shape[0] == logp_per.shape[0]:
-                    # Per-edge, per-dimension AWR advantage -- consistent with the
-                    # per-pair REINFORCE advantage used by online training
-                    # (compute_pair_reward() + batch-level (r-mean)/std in
-                    # train_epoch()). This lets pairs with better bias
-                    # coefficients within an otherwise-successful run get
-                    # emphasised more than pairs that were poorly resolved,
-                    # instead of every pair in the run sharing one scalar weight.
-                    advantage = (r_pair.to(device) - baseline_mean.to(device)) / baseline_std.to(device)
-                    if success_floor is not None:
-                        advantage = advantage.clamp(min=float(success_floor))
-                    awr_w = torch.clamp(torch.exp(advantage / awr_temperature), max=20.0)  # [E, D]
+                advantage = pair_advantage_cache[run_idx] if pair_advantage_cache is not None else None
+                if advantage is not None and advantage.shape[0] == logp_per.shape[0]:
+                    # Per-edge, per-dimension AWR advantage (pair_advantages):
+                    # pairs with better bias coefficients within an
+                    # otherwise-successful run get emphasised more than pairs
+                    # that were poorly resolved, instead of every pair in the
+                    # run sharing one scalar weight.
+                    awr_w = torch.clamp(torch.exp(advantage.to(device) / awr_temperature), max=20.0)  # [E, D]
                 else:
                     # Fall back to the whole-run scalar reward when per-pair
                     # data is unavailable for this run (e.g. older collected
@@ -2383,12 +2442,9 @@ def pretrain_epoch(
         if edge_conf is None:
             continue
 
-        r_pair = pair_reward_cache[run_idx] if per_pair_awr_enabled else None
-        if r_pair is not None and r_pair.shape[0] == logp_per.shape[0]:
-            advantage = (r_pair.to(device) - baseline_mean.to(device)) / baseline_std.to(device)
-            if success_floor is not None:
-                advantage = advantage.clamp(min=float(success_floor))
-            awr_w = torch.clamp(torch.exp(advantage / awr_temperature), max=20.0)  # [E, D]
+        advantage = pair_advantage_cache[run_idx] if pair_advantage_cache is not None else None
+        if advantage is not None and advantage.shape[0] == logp_per.shape[0]:
+            awr_w = torch.clamp(torch.exp(advantage.to(device) / awr_temperature), max=20.0)  # [E, D]
         else:
             raw_r = run.get("_bc_reward", 0.0)
             awr_w = torch.full_like(logp_per, min(math.exp(raw_r / awr_temperature), 20.0))
@@ -2507,6 +2563,10 @@ def _compute_run_pair_reward(
     typically much better resolved (more transitions, cleaner DDG) than
     others in the same run.
 
+    The legacy transition-quality proxy compares the run's transitions with
+    T_baseline scaled by the run's length (``run_length``), so a short run is
+    not scored against what a full run has time for.
+
     Returns None if the run's ``sim_results`` lacks the population or
     per-pair DDG data needed (e.g. older collected runs, or a
     ``simulation_results.json`` that predates per-pair DDG collection) --
@@ -2522,7 +2582,8 @@ def _compute_run_pair_reward(
     try:
         populations = _extract_highest_lambda_counts(populations_raw)
         total_transitions = _extract_total_transitions(sim_results.get("transitions", {}))
-        t_baseline = reward_config.get("T_baseline", 50.0)
+        length_ratio, _ = run_length(sim_results, reward_config.get("full_length_ns", FULL_LENGTH_NS))
+        t_baseline = reward_config.get("T_baseline", 50.0) * length_ratio
         fraction_physical = sim_results.get("fraction_physical")
         from mllf.cb.workflow_utils import (BARRIER_TARGET, BARRIER_WIDTH, END_WIDTH, SKEW_WIDTH,
                                             compute_pair_reward)
@@ -2541,6 +2602,85 @@ def _compute_run_pair_reward(
         )
     except Exception:
         return None
+
+
+def _run_pair_success(run: Dict, edge_index: torch.Tensor,
+                      reward_config: Dict) -> Optional[torch.Tensor]:
+    """Per edge: did the run pass online training's success test for that pair?
+
+    The test online training uses to call a pair's run good
+    (``hindsight.pair_succeeded``): both substituents sampled with minority
+    fraction >= min_fraction, and >= min_transitions crossings (on a site of
+    3+ substituents, each of the two entered or left that often). A full run
+    needs SUCCESS_MIN_TRANSITIONS / SUCCESS_MIN_FRACTION; a short one
+    (``run_length``) the reward config's explore_min_transitions /
+    explore_min_fraction, the curriculum stage keys of the same name.
+
+    Returns a [E] bool tensor, or None when the run lacks per-pair transitions
+    ('transition_pairs'; ``collect_pretraining_data --backfill-barrier``).
+    """
+    from mllf.cb.hindsight import (SUCCESS_MIN_FRACTION, SUCCESS_MIN_TRANSITIONS,
+                                   pair_succeeded, site_nodes)
+    sim_results = run.get("sim_results", {})
+    pair_trans = sim_results.get("transition_pairs")
+    if not pair_trans:
+        return None
+    _, short = run_length(sim_results, reward_config.get("full_length_ns", FULL_LENGTH_NS))
+    if short:
+        min_t = int(reward_config.get("explore_min_transitions", EXPLORE_MIN_TRANSITIONS))
+        min_f = float(reward_config.get("explore_min_fraction", EXPLORE_MIN_FRACTION))
+    else:
+        min_t, min_f = SUCCESS_MIN_TRANSITIONS, SUCCESS_MIN_FRACTION
+    saved = {"populations": _extract_highest_lambda_counts(sim_results.get("populations", {})),
+             "transition_pairs": pair_trans}
+    ei = edge_index.detach().cpu()
+    sites = site_nodes(ei)
+    return torch.tensor([
+        pair_succeeded(saved, int(ei[0, k]), int(ei[1, k]), min_fraction=min_f,
+                       min_transitions=min_t, site=sites.get(int(ei[0, k])))
+        for k in range(ei.size(1))
+    ], dtype=torch.bool)
+
+
+def pair_advantages(
+    pair_rewards: List[Optional[torch.Tensor]],
+    pair_success: Optional[List[Optional[torch.Tensor]]] = None,
+    success_floor: Optional[float] = None,
+) -> Tuple[List[Optional[torch.Tensor]], torch.Tensor, torch.Tensor]:
+    """Per-pair AWR advantages for every run.
+
+    * Rewards are normalised per bias type by the mean / std over all runs.
+    * ``success_floor`` (``reward.success_advantage_floor``) clamps from below,
+      so one badly scored pair cannot dominate its run's loss.
+    * Success gate (``pair_success``, from ``_run_pair_success``): the online
+      success test for a run of that length decides whether a pair's biases
+      are imitated more or less than average -- a pair that passed gets
+      advantage >= 0, one that failed <= 0 -- and the reward ranks pairs
+      within each side. As online, a short run's success counts as much as a
+      full run's: the length sets which test a pair must pass, not how much a
+      pass is worth. Runs without a success entry are not gated.
+
+    Returns (advantages aligned with ``pair_rewards``, baseline mean [4], std [4]).
+    """
+    valid = [r.reshape(-1, 4) for r in pair_rewards if r is not None]
+    if not valid:
+        return [None] * len(pair_rewards), torch.zeros(4), torch.ones(4)
+    stacked = torch.cat(valid)
+    mean, std = stacked.mean(dim=0), stacked.std(dim=0).clamp(min=1e-6)
+
+    out: List[Optional[torch.Tensor]] = []
+    for idx, r in enumerate(pair_rewards):
+        if r is None:
+            out.append(None)
+            continue
+        adv = (r - mean) / std
+        if success_floor is not None:
+            adv = adv.clamp(min=float(success_floor))
+        ok = pair_success[idx] if pair_success is not None else None
+        if ok is not None and ok.shape[0] == adv.shape[0]:
+            adv = torch.where(ok.unsqueeze(-1), adv.clamp(min=0.0), adv.clamp(max=0.0))
+        out.append(adv)
+    return out, mean, std
 
 
 def pretrain(
@@ -3018,7 +3158,8 @@ def pretrain_with_runs(
     # Stratified negative sampling (takes precedence over min_reward_threshold)
     elif stratified_negative_fraction is not None:
         print(f"\nApplying stratified negative sampling (max_fraction={stratified_negative_fraction:.0%}, quadratic ramp)...")
-        runs = sample_runs_stratified_negative(runs, fraction_per_bucket=stratified_negative_fraction)
+        runs = sample_runs_stratified_negative(runs, fraction_per_bucket=stratified_negative_fraction,
+                                               reward_config=config.get('reward', {}))
 
         if len(runs) == 0:
             print("Error: No runs remaining after stratified negative sampling")
@@ -3027,7 +3168,8 @@ def pretrain_with_runs(
     # Optionally filter runs by minimum reward threshold (applied when stratified sampling not used)
     elif min_reward_threshold is not None:
         print(f"\nApplying reward filtering (threshold: >= {min_reward_threshold})...")
-        runs = filter_runs_by_reward(runs, min_reward=min_reward_threshold)
+        runs = filter_runs_by_reward(runs, min_reward=min_reward_threshold,
+                                     reward_config=config.get('reward', {}))
         
         if len(runs) == 0:
             print("Error: No runs remaining after reward filtering")
@@ -3264,7 +3406,8 @@ def pretrain_with_runs(
                     site_to_subs[site_num].append(sub_pdb)
             
             # Also search in combo subdirectories (for combo structures)
-            for comb_dir in sorted(prep_dir.glob('comb_*/')):
+            for comb_dir in sorted(d for d in prep_dir.iterdir()
+                                   if d.is_dir() and is_combo_dir_name(d.name)):
                 for sub_pdb in sorted(comb_dir.glob('site*_sub*_frag.pdb')):
                     site_num = sub_pdb.stem.split('_')[0]  # e.g., "site1"
                     if site_num not in site_to_subs:
@@ -3282,7 +3425,8 @@ def pretrain_with_runs(
                     core_pdb = str(prep_dir / 'core.pdb')
                 else:
                     # Try first combo directory
-                    for comb_dir in sorted(prep_dir.glob('comb_*/')):
+                    for comb_dir in sorted(d for d in prep_dir.iterdir()
+                                           if d.is_dir() and is_combo_dir_name(d.name)):
                         if (comb_dir / 'core.pdb').exists():
                             core_pdb = str(comb_dir / 'core.pdb')
                             break
@@ -3291,7 +3435,7 @@ def pretrain_with_runs(
                     # Extract system name for logging
                     # Handle nested combos: system/comb_ID/prep or system/prep
                     system_path = Path(prep_dir_str)
-                    if system_path.parent.name.startswith('comb_'):
+                    if is_combo_dir_name(system_path.parent.name):
                         # Nested combo: .../system/comb_ID/prep
                         system_label = system_path.parent.parent.name
                     else:
@@ -3383,7 +3527,7 @@ def pretrain_with_runs(
                 
                 # Handle nested combos: look TWO levels up if in comb_* directory
                 display_name = prep_dir.parent.name
-                if display_name.startswith('comb_'):
+                if is_combo_dir_name(display_name):
                     display_name = prep_dir.parent.parent.name + '/' + display_name
                 print(f"  [{system_idx + 1}/{len(system_to_runs)}] {display_name}: "
                       f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, {edge_idx.size(1)} edges")
@@ -3455,7 +3599,7 @@ def pretrain_with_runs(
                 # Random or unrelaxed mode: compute per-run with selected structure
                 # Handle nested combos: look TWO levels up if in comb_* directory
                 system_name = prep_dir.parent.name
-                if system_name.startswith('comb_'):
+                if is_combo_dir_name(system_name):
                     system_name = prep_dir.parent.parent.name
                 struct_type_used = _select_structure_type_for_run(
                     run_idx, 
@@ -3571,19 +3715,20 @@ def pretrain_with_runs(
               f"end {_frac[3]:.1%}; {len(runs) - n_weights_ok} runs without usable "
               f"populations contribute nothing")
     
-    # Build per-pair reward cache if requested (enables per-edge, per-dimension AWR in pretrain_epoch)
+    # Build per-pair advantage cache if requested (enables per-edge, per-dimension AWR in pretrain_epoch)
     pair_reward_cache = [None] * len(runs)
-    baseline_mean = None
-    baseline_std = None
-    success_floor = None
-    
+    pair_success_cache = [None] * len(runs)
+    pair_advantage_cache = None
+    full_length_ns = reward_config.get("full_length_ns", FULL_LENGTH_NS)
+    short_runs = [run_length(run.get("sim_results", {}), full_length_ns)[1] for run in runs]
+    success_gate = bool(reward_config.get("success_gate", True))
+
     if use_per_pair_awr:
         print(f"\n{'='*60}")
         print(f"Building per-pair reward cache for per-edge, per-dimension AWR...")
         print(f"{'='*60}")
         
         n_pair_ok = 0
-        all_pair_rewards = []  # Collect [E, D] rewards to compute global baseline/std
         
         for run_idx, run in enumerate(runs):
             try:
@@ -3600,7 +3745,8 @@ def pretrain_with_runs(
                 r_pair = _compute_run_pair_reward(run, edge_idx, reward_config)
                 if r_pair is not None:
                     pair_reward_cache[run_idx] = r_pair
-                    all_pair_rewards.append(r_pair.flatten())
+                    if success_gate:
+                        pair_success_cache[run_idx] = _run_pair_success(run, edge_idx, reward_config)
                     n_pair_ok += 1
             
             except Exception as e:
@@ -3610,22 +3756,26 @@ def pretrain_with_runs(
             if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
                 print(f"  {run_idx + 1}/{len(runs)} runs ({n_pair_ok} with pair rewards)...")
         
-        if all_pair_rewards:
-            all_pair_rewards_tensor = torch.cat(all_pair_rewards)  # [N*E*D,]
-            # Reshape to [N*E, D] to compute per-dimension baseline/std
-            n_total = sum(len(p) for p in all_pair_rewards) // 4
-            all_pair_rewards_stacked = all_pair_rewards_tensor.view(-1, 4)
-            baseline_mean = all_pair_rewards_stacked.mean(dim=0)  # [4]
-            baseline_std = all_pair_rewards_stacked.std(dim=0)  # [4]
-            # Clamp std to avoid division by zero
-            baseline_std = baseline_std.clamp(min=1e-6)
-            
+        if n_pair_ok:
             success_floor = reward_config.get("success_advantage_floor", -2.0)
+            pair_advantage_cache, baseline_mean, baseline_std = pair_advantages(
+                pair_reward_cache,
+                pair_success=pair_success_cache if success_gate else None,
+                success_floor=success_floor)
             print(f"\nPer-pair reward baseline computed:")
             print(f"  Runs with per-pair rewards: {n_pair_ok}/{len(runs)}")
             print(f"  Baseline mean [lin, quad, skew, end]: {baseline_mean.numpy()}")
             print(f"  Baseline  std [lin, quad, skew, end]: {baseline_std.numpy()}")
             print(f"  Success floor: {success_floor}")
+            if success_gate:
+                for name, short in (('full', False), ('short', True)):
+                    flags = [ok for ok, sh in zip(pair_success_cache, short_runs)
+                             if ok is not None and sh == short]
+                    n_edges = sum(int(f.numel()) for f in flags)
+                    n_passed = sum(int(f.sum()) for f in flags)
+                    print(f"  Success gate, {name} runs (short = under {0.5 * full_length_ns:g} ns): "
+                          f"{n_passed}/{n_edges} edges passed the online "
+                          f"{'short-run' if short else 'full-run'} test")
     
     # For compatibility with pretrain_epoch, use a simple grouping (one run per group)
     # This allows us to reuse the per-graph gradient accumulation logic if needed
@@ -3633,12 +3783,7 @@ def pretrain_with_runs(
 
     # Always pre-compute per-run rewards: AWR uses exp(r/β) weighting directly.
     # Stored as run["_bc_reward"] = max(0, reward) so pretrain_epoch can weight by exp(r/β).
-    _VALID_RC = {
-        "w_P", "w_T", "w_U", "gamma", "P_baseline", "T_baseline",
-        "min_transitions_per_site", "min_coverage_ratio",
-        "entropy_bonus", "concentration_penalty_threshold",
-    }
-    filtered_rc = {k: v for k, v in reward_config.items() if k in _VALID_RC}
+    filtered_rc = _reward_kwargs(reward_config)
     print("\nPre-computing per-run rewards for AWR loss weighting...")
     n_pos_w = 0
     total_pos_w = 0.0
@@ -3690,10 +3835,7 @@ def pretrain_with_runs(
             pairwise_weights_cache=pairwise_weights_cache,
             unimol_config={'environment_cutoff': env_cutoff, 'use_environment_difference': use_environment_difference},
             consensus_dict=consensus_dict,  # Pass consensus for environment filtering
-            pair_reward_cache=pair_reward_cache,
-            baseline_mean=baseline_mean,
-            baseline_std=baseline_std,
-            success_floor=success_floor,
+            pair_advantage_cache=pair_advantage_cache,
             system_emphasis=system_emphasis,
             data_hygiene=data_hygiene,
         )
@@ -4093,7 +4235,7 @@ def main():
         # --pretraining-dir passed in, unwrapping one level for comb_* dirs)
         # so --emphasize-systems can match against it.
         system_label = pretrain_dir.name
-        if system_label.startswith('comb_'):
+        if is_combo_dir_name(system_label):
             system_label = pretrain_dir.parent.name
         for run in runs:
             run['system_label'] = system_label
