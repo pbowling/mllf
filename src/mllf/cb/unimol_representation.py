@@ -30,6 +30,7 @@ import re
 
 from unimol_tools import UniMolRepr
 
+from mllf.file_handling.generate_combinations import is_combo_dir_name
 # Import existing infrastructure for coordinate extraction
 from mllf.file_handling.read_pdb import (
     parse_pdb_file,
@@ -343,6 +344,39 @@ def _default_solvent_pdb_candidates(base_dir: Path) -> List[Path]:
     ]
 
 
+def _system_name_for_prep(prep_dir: Path) -> str:
+    """Lower-cased system directory name owning a prep dir: the directory above
+    it, or above that for a combo layout (``<system>/comb_*|pair*|group*/prep``)."""
+    parent = Path(prep_dir).parent
+    if is_combo_dir_name(parent.name):
+        parent = parent.parent
+    return parent.name.lower()
+
+
+def _is_solvent_phase_prep(prep_dir: Path) -> bool:
+    """True for a solvent-leg system (name has solv/water and no prot).
+
+    A solvent leg's prep can still hold its protein leg's structure (e.g. the
+    luis_* solvent systems ship proa.pdb / protein.pdb, which their solvent
+    simulations never read); its environment must come from the solvent files.
+    """
+    name = _system_name_for_prep(prep_dir)
+    return ('solv' in name or 'water' in name) and 'prot' not in name
+
+
+def _environment_protein_candidates(prep_dir: Path) -> List[Path]:
+    """Protein environment candidates for a prep dir; none for a solvent leg."""
+    if _is_solvent_phase_prep(prep_dir):
+        return []
+    return _default_protein_pdb_candidates(prep_dir)
+
+
+def _solvent_leg_with_protein_file(prep_dir: Path) -> bool:
+    """A solvent-leg prep that holds a protein file the environment now skips."""
+    return _is_solvent_phase_prep(prep_dir) and any(
+        c.exists() for c in _default_protein_pdb_candidates(prep_dir))
+
+
 def build_environment_consensus(
     core_pdb: str,
     prep_dir: Path,
@@ -399,8 +433,9 @@ def build_environment_consensus(
             # Priority: protein variants → solvent variants → minimized (fallback)
             # Uses the SAME candidate helpers as _load_environment_pdb() to
             # guarantee both functions resolve to the identical physical file.
+            # A solvent leg skips protein files (_environment_protein_candidates).
             env_candidates = (
-                _default_protein_pdb_candidates(prep_dir)
+                _environment_protein_candidates(prep_dir)
                 + _default_solvent_pdb_candidates(prep_dir)
                 + [prep_dir / "pre_min.pdb", prep_dir / "minimized.pdb"]
             )
@@ -408,7 +443,7 @@ def build_environment_consensus(
             core_parent = Path(core_pdb).parent
             if core_parent != prep_dir:
                 env_candidates.extend(
-                    _default_protein_pdb_candidates(core_parent)
+                    ([] if _is_solvent_phase_prep(prep_dir) else _default_protein_pdb_candidates(core_parent))
                     + _default_solvent_pdb_candidates(core_parent)
                     + [core_parent / "pre_min.pdb", core_parent / "minimized.pdb"]
                 )
@@ -527,7 +562,7 @@ def _system_label_from_prep_dir(prep_dir: str) -> str:
     """
     prep_path = Path(prep_dir)
     parent = prep_path.parent
-    if parent.name.startswith('comb_'):
+    if is_combo_dir_name(parent.name):
         label = f"{parent.parent.name}__{parent.name}"
     else:
         label = parent.name
@@ -591,6 +626,10 @@ def _generate_embedding_cache_key(
         'consensus_atoms': sorted(list(a) for a in consensus_atoms) if consensus_atoms else None,
         'variant': variant,
     }
+    if _solvent_leg_with_protein_file(Path(prep_dir)):
+        # Environment from the solvent files, not the protein file earlier
+        # code loaded for this solvent leg.
+        key_components['solvent_env_skips_protein'] = True
 
     # Create deterministic JSON string and hash it
     key_str = json.dumps(key_components, sort_keys=True)
@@ -1381,7 +1420,8 @@ def _load_environment_pdb(
     # Fallback: Try individual protein PDB files (for unrelaxed structures)
     # Uses the same candidate list as build_environment_consensus() to ensure
     # both resolve to the identical file (see _default_protein_pdb_candidates).
-    protein_candidates = _default_protein_pdb_candidates(prep_dir)
+    # A solvent leg skips protein files left in its prep (_environment_protein_candidates).
+    protein_candidates = _environment_protein_candidates(prep_dir)
     
     for protein_pdb in protein_candidates:
         if protein_pdb.exists():
@@ -1946,12 +1986,7 @@ def get_substituent_unimol_with_environment(
     # Vacuum systems should have NO environment atoms, even if PDB files exist by accident
     # For nested combos (pretraining/SYSTEM/comb_*/prep), need to look TWO levels up
     # For direct systems (pretraining/SYSTEM/prep), look ONE level up
-    potential_system = prep_dir.parent  # First level up: comb_* or direct system
-    system_name = potential_system.name.lower()
-    
-    # If this looks like a combo directory, go up another level
-    if system_name.startswith('comb_'):
-        system_name = potential_system.parent.name.lower()
+    system_name = _system_name_for_prep(prep_dir)
     
     is_vacuum_system = 'vac' in system_name or 'vacuum' in system_name
     

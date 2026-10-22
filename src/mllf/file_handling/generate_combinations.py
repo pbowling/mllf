@@ -286,6 +286,16 @@ def make_combo_dir_name(counter: int, sites: List[int], subs: List[int],
     return f"comb_{counter:04d}_{joined}"
 
 
+# Combo directory names: generated (comb_0001_...) and staged ALF-style sets
+# from combo_sets.group_combo_info (pair01_..., group01_...).
+COMBO_DIR_RE = re.compile(r"^(comb_|(pair|group)\d+_site\d+_)")
+
+
+def is_combo_dir_name(name: str) -> bool:
+    """True if ``name`` is a combo directory (comb_*, pair*, group*)."""
+    return bool(COMBO_DIR_RE.match(name))
+
+
 def renumber_pres_tokens(content: str, old_site: int, old_sub: int, new_site: int, new_sub: int) -> str:
     """Renumber PRES tokens in RTF file content.
 
