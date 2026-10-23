@@ -37,17 +37,10 @@ from mllf.file_handling.read_bias_coeff import (
 
 
 def find_run_directories(base_path: Path) -> List[Path]:
-    """Find all run directories in the base path.
-    
-    Handles two directory structures:
-    1. MSLD runs: base_path/run#/ (each contains prep/, output, variables)
-    2. Generated combos: base_path/comb_###/run_###/ (shared prep/ at comb level)
-    
-    Args:
-        base_path: Base directory to search for run# directories
-        
-    Returns:
-        List of Path objects for run directories, sorted numerically
+    """Find completed runs under a direct or generated-combo dataset root.
+
+    Supports ``run*/`` and ``comb_*/run_*/`` layouts; excludes failed or
+    incomplete directories and sorts results by run number.
     """
     run_dirs = []
     

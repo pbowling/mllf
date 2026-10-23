@@ -37,7 +37,10 @@ def filter_combos_by_curriculum(combos: List[Path],
                                  min_subs_per_site: int = 1,
                                  max_subs_per_site: Optional[int] = None,
                                  whitelist: Optional[List[str]] = None) -> List[Path]:
-    """Filter combinations based on curriculum stage criteria."""
+    """Keep combos whose encoded site and substituent counts meet the limits.
+
+    If provided, ``whitelist`` further restricts results to matching names.
+    """
     filtered = []
     for combo_path in combos:
         combo_name = Path(combo_path).name
@@ -69,7 +72,7 @@ def filter_combos_by_curriculum(combos: List[Path],
 
 def filter_combos_by_transitions(combos: List, min_transitions: int,
                                   lookback: int = 3) -> List:
-    """Filter combos by minimum transitions observed in recent runs."""
+    """Keep combos whose recent results meet the per-site transition floor."""
     qualifying = []
     for combo_dir in combos:
         combo_path = Path(combo_dir)

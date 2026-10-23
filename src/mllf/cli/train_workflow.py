@@ -68,24 +68,11 @@ def _policy_weights(checkpoint: Dict):
 
 
 def run_training(config_path: str) -> None:
-    """Run the full online CB-policy training workflow from a YAML config.
+    """Run online policy training from a workflow YAML file.
 
-    This is everything the training driver does end to end: build/load
-    per-system combo manifests, initialize the ``UnimolPolicy`` (optionally
-    warm-started from a pretrain checkpoint or resumed from the latest
-    ``checkpoint_*.pt``), run the (optionally curriculum-staged) epoch loop
-    via ``mllf.cb.reinforce_trainer.train_epoch``, and checkpoint along the
-    way.
-
-    ``mode: deploy`` tests a trained model on systems it has not seen: it
-    loads ``deploy.model_path``, runs each system through the curriculum
-    stages on its own (``mllf.cb.system_stages``) with per-pair offsets
-    learning, keeps the shared model fixed unless
-    ``deploy.update_shared_model`` is true, holds out no validation set, and
-    writes only to its own ``output.base_dir`` (never the model's directory).
-
-    Args:
-        config_path: Path to a workflow YAML config (see docs/workflow.rst).
+    Builds or loads combo manifests, initializes or resumes the policy, runs
+    the configured training stages, and saves checkpoints. In deploy mode,
+    model and output paths come from the deploy configuration.
     """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -307,6 +294,8 @@ def run_training(config_path: str) -> None:
         mlp_hidden=mlp_hidden,
         mlp_out_dim=num_bias_types,
         use_dual_embeddings=True,  # Enable dual embedding mode for online training
+        # unimol.env_input must match the pretrained model's (UnimolPolicy)
+        env_input=config.get('unimol', {}).get('env_input', 'dual'),
         use_bayesian_heads=use_bayesian_heads,
         bayesian_prior_precision=bandit_cfg.get('prior_precision', 1.0),
     ).to(device)
@@ -1068,9 +1057,8 @@ def run_training(config_path: str) -> None:
                     combo_path, sys_cfg, cfg, verbose=verbose,
                     _lookup=_uncertainty_dir_lookup)
 
-            # Pairs' own online state (last run failed, exploration widened)
-            # adds to the ranking so stuck pairs keep being revisited.
             def _pair_attention_fn(combo_dir, data):
+                """Score pair state and prioritize configured reference pairs."""
                 _sn = combo_system_map.get(combo_dir, {}).get('name', 'unknown')
                 att = pair_attention(bandit_state, _sn, combo_node_labels(combo_dir), data.edge_index)
                 # A stage's reference_pair_bonus ranks reference pairs ahead of

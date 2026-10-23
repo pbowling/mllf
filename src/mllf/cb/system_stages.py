@@ -57,6 +57,7 @@ _SLOTS = {'linear': ('linear',), 'quadratic': ('quadratic',),
 
 
 def stage_applies(stage: Dict, system: str) -> bool:
+    """Return whether a system is included by a stage's optional system list."""
     return not stage.get('systems') or system in stage['systems']
 
 
@@ -69,6 +70,7 @@ def next_stage(stages: Sequence[Dict], system: str, start: int = 0) -> Optional[
 
 
 def init_state(systems: Iterable[str], stages: Sequence[Dict]) -> Dict[str, Dict]:
+    """Create initial progress state at each system's first applicable stage."""
     state = {}
     for s in systems:
         idx = next_stage(stages, s)
@@ -78,6 +80,7 @@ def init_state(systems: Iterable[str], stages: Sequence[Dict]) -> Dict[str, Dict
 
 
 def load_state(path) -> Optional[Dict[str, Dict]]:
+    """Load saved stage state, returning None when the file is absent or invalid."""
     path = Path(path)
     if not path.exists():
         return None
@@ -88,6 +91,7 @@ def load_state(path) -> Optional[Dict[str, Dict]]:
 
 
 def save_state(path, state: Dict[str, Dict]) -> None:
+    """Write per-system stage progress as JSON."""
     Path(path).write_text(json.dumps(state, indent=1))
 
 

@@ -1,42 +1,8 @@
-"""Choose the regression replay set by pair coverage (``replay_selection: coverage``).
+"""Select pretraining replay runs to maximize within-system pair coverage.
 
-The replay anchors the shared model to pretraining while online training
-moves it. A random run per combo directory mostly replays runs that did not
-sample their pairs well, so with a fixed budget the replay carries little of
-what pretraining knows. Here each system instead gets the runs that cover
-its pairs best:
-
-1. Every run in the pretraining manifest (ALF groups, manifest combos and
-   online runs collected into pretraining alike) has its nodes labelled with
-   the system's own (site, substituent) numbering, by matching each node's
-   fragment to the system's prep (``_rtf_signature``, as the combo sets do).
-2. Each within-site pair a run sampled gets a flatness score
-   (``pair_quality``): population balance (min/max, which does not depend on
-   run length) times its crossings relative to the run length's success test
-   (10 for a full run, 3 for a short one).
-3. Each system gets a share of the budget proportional to its number of
-   substituents (at least ``min_per_system``), and runs are chosen greedily
-   to cover as many pairs as possible with as few graphs as possible. A
-   pair's value is min(1, score / ``COVER_QUALITY``): it is fully covered
-   once a chosen run samples it at that score, and refining it further is
-   worth nothing. A run's gain is the rise in its pairs' values, so a group
-   run that samples many pairs well beats a pair run that samples one pair
-   slightly better; the sum of scores only breaks ties. (Coverage of this
-   kind is monotone submodular, so greedy is within 1 - 1/e of the best
-   set.) A system stops below its budget once no run adds coverage, and
-   the budget it leaves goes to systems that used all of theirs, in
-   proportion to their uncovered pairs (``select_runs``).
-4. Each pair is *owned* by the coverage pick with its best score; a coverage
-   pick keeps replay weight only on the pairs it owns, so a pair enters the
-   replay once, with its best measurement.
-5. A system with fewer than ``min_per_system`` graphs (one run sampled all
-   its pairs) gets more, chosen to give its pairs a second good measurement;
-   each of these keeps weight on every pair it measured well, so no system
-   rests on a single run.
-
-Datasets map to systems by name (``system_of_dataset``); only systems in the
-manifest (the model's pretraining) are considered. ``plan_replay``
-returns the plan and a per-pair report.
+Coverage selection scores pair sampling from pretraining runs, then greedily allocates the
+replay budget across systems. ``plan_replay`` returns selected runs and a
+per-pair ownership report.
 """
 import concurrent.futures
 import heapq

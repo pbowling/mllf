@@ -1,14 +1,4 @@
-"""Consensus environment atom filtering for pretraining.
-
-Builds consensus atom sets for each site to prevent odd environment noise
-in the mean embeddings used by the policy. By using only atoms that appear
-across ALL substituents at a site, we ensure more stable environmental context.
-
-Key Functions:
-- build_site_consensus(): Build consensus atoms for all subs at a site
-- save_consensus_atoms(): Save consensus to disk
-- load_consensus_atoms(): Load consensus from disk
-"""
+"""Build and persist consistent environment atom selections for pretraining."""
 
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -31,60 +21,22 @@ def build_site_consensus(
     custom_search_paths: Optional[List[str]] = None,
     system_name: Optional[str] = None,
 ) -> Optional[set]:
-    """Build consensus environment atoms for a site using the core scaffold.
-    
-    Uses the core scaffold to determine which environment atoms should be included
-    for all substituents at a site. This ensures consistent environment representation
-    across pretraining, analysis, and online training.
-    
-    **Strategy:**
-    1. Use core scaffold coordinates to identify environment atoms within env_cutoff
-    2. Return this consistent set (capped at 256 atoms, keeping closest)
-    3. Use this same set when computing embeddings for all subs at the site
-    
-    This approach is superior to sub-based consensus because:
-    - The core is the same for all substituents (minimized or not)
-    - Environment doesn't change when swapping substituents
-    - Consistent across pretraining, analysis, and online training
-    - Simpler and faster (no need to iterate over all subs)
-    
-    **Example:**
-    ```python
-    # Build consensus for site1 using its core
-    sub_pdbs = [
-        'pretraining/SYSTEM/comb_ID/prep/site1_sub1_frag.pdb',
-        'pretraining/SYSTEM/comb_ID/prep/site1_sub2_frag.pdb',
-        ...
-    ]
-    core_pdb = 'pretraining/SYSTEM/comb_ID/prep/core.pdb'
-    prep_dir = Path('pretraining/SYSTEM/comb_ID/prep')
-    
-    consensus = build_site_consensus(
-        'site1', sub_pdbs, core_pdb, prep_dir,
-        env_cutoff=8.0,
-        system_name='12benz_solvent_group1',  # For logging
-    )
-    
-    # Then use this when computing embeddings:
-    emb = get_substituent_unimol_with_environment(
-        sub_pdbs[0], core_pdb, prep_dir,
-        consensus_atoms=consensus,  # Filter by consensus
-    )
-    ```
-    
+    """Select nearby environment atoms using the shared core structure.
+
+    The selection is based on ``core_pdb`` so every substituent at the site
+    uses the same environment context.
+
     Args:
-        site_name: Name of site for logging (e.g., 'site1', 'site2')
-        sub_pdbs: List of paths to substituent PDB files for all subs at site
-            (used only for logging/context; core is used for consensus building)
-        core_pdb: Path to core PDB (used to define environment)
-        prep_dir: Prep directory containing environment files
-        env_cutoff: Distance cutoff (Å) for identifying relevant environment (default: 8.0)
-        custom_search_paths: Optional custom PDB search paths (from yaml config)
-        system_name: Optional system name for logging (e.g., '12benz_solvent_group1')
-        
+        site_name: Site label for status messages.
+        sub_pdbs: Currently unused; retained for call-site compatibility.
+        core_pdb: Core structure used to select environment atoms.
+        prep_dir: Directory containing environment structures.
+        env_cutoff: Maximum core-to-environment distance in angstroms.
+        custom_search_paths: Additional paths to search for structures.
+        system_name: Optional system label for status messages.
+
     Returns:
-        Set of (file_index, resnum, chain, atomname) tuples (max 256), or None if
-        no consensus found
+        Selected atom identifiers, or None when none are found.
     """
     system_label = f" [{system_name}]" if system_name else ""
     print(f"\n[CONSENSUS] Building {site_name} consensus from core{system_label}")
@@ -109,19 +61,7 @@ def save_consensus_atoms(
     run_dir: Path,
     filename: str = "environment_consensus.json",
 ) -> Path:
-    """Save consensus atoms to disk for reference and debugging.
-    
-    Stores consensus atom identifiers as JSON for inspection and reuse.
-    Each consensus atom is stored as [file_index, resnum, chain, atomname].
-    
-    Args:
-        consensus_dict: Dict mapping site_name (e.g., 'site1') to consensus set
-        run_dir: Directory to save consensus file
-        filename: Filename for consensus file (default: "environment_consensus.json")
-        
-    Returns:
-        Path where consensus was saved
-    """
+    """Write per-site environment atom identifiers to a JSON file for reference and debugging."""
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     
@@ -146,15 +86,7 @@ def load_consensus_atoms(
     run_dir: Path,
     filename: str = "environment_consensus.json",
 ) -> Dict[str, Optional[set]]:
-    """Load consensus atoms from disk.
-    
-    Args:
-        run_dir: Directory containing consensus file
-        filename: Filename of consensus file
-        
-    Returns:
-        Dict mapping site_name to consensus set (or None if no consensus)
-    """
+    """Load per-site environment atom identifiers from a JSON file."""
     load_path = run_dir / filename
     
     if not load_path.exists():
