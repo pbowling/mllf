@@ -4,69 +4,65 @@ Workflow System
 Overview
 --------
 
-The online workflow takes a set of systems from fragment files to production biases. The
-shared model proposes biases, and every simulation corrects both the model and the pair it
-sampled (see :doc:`index` for the motivation and :doc:`cb_setup` for the model). The
-pipeline has five parts:
+The online workflow takes a set of systems from fragment files to production biases. A
+shared model proposes biases, and every simulation corrects both the model and the pair
+of substituents it sampled (:doc:`cb_setup`). The pipeline has five parts:
 
-1. **Combination generation**: enumerate the site/substituent combinations of each
+1. **Combination generation** enumerates the site and substituent combinations of each
    system (:ref:`Combination Generation`).
-2. **Held-out split**: set aside pairs the training never runs, so validation measures
+2. **A held-out split** sets aside pairs that training never runs, so validation measures
    the shared model alone (:ref:`Held-Out Validation`).
-3. **Staged online training**: each system moves on its own from pairs of substituents
-   to the substituent groups used in production (:ref:`Staged Online Training`).
-4. **Production biases**: fixed biases, per group, for each finished system
+3. **Staged online training** moves each system on its own schedule from pairs of
+   substituents to the substituent groups used in production
+   (:ref:`Staged Online Training`).
+4. **Production biases** are exported per group for each finished system
    (:ref:`Production Biases`).
-5. **Cost accounting**: simulated nanoseconds per system and stage, measured the same
-   way for the online run and for the iterative-flattening runs it is compared against
+5. **Cost accounting** records simulated nanoseconds per system and stage, measured the
+   same way for the online run and for the iterative-flattening runs it is compared with
    (:ref:`Simulation Cost`).
 
 Running the Workflow
 --------------------
 
-Basic Usage
-~~~~~~~~~~~
-
-Online training is driven by a YAML configuration file. The driver is
-``mllf.cli.train_workflow``, an importable entry point rather than a repo-local script,
-so it can be installed and used outside this repository:
+Online training is driven by a YAML configuration file:
 
 .. code-block:: bash
 
    cd mllf   # repository root
    python -m mllf.cli.train_workflow examples/workflow_14benz.yaml
-   python -m mllf.cli.train_workflow my_config.yaml
 
-``examples/run_workflow.py`` runs the same driver. See :doc:`examples` for a walkthrough of
-the 1,4-benzene (14benz) example. Combination generation and manifest splitting can also be
-run on their own from ``mllf.file_handling.generate_combinations`` and
-``mllf.cli.workflow``. The lighter ``mllf.cli.workflow.run_from_config`` entry point covers
-combination generation, the split, a single-combo sanity check, an optional simulation
-batch and archiving, without the training loop.
+``examples/run_workflow.py`` runs the same driver, and :doc:`examples` walks through the
+1,4-benzene (14benz) example. ``mllf.cli.workflow.run_from_config`` covers combination
+generation, the split, a single-combination check, an optional batch of simulations and
+archiving, without the training loop.
 
 Configuration Format
 ~~~~~~~~~~~~~~~~~~~~
 
-The top-level key of a workflow config is a **list of systems** (``systems:``), even for a
-single system, because the driver trains one shared model across all of them:
+A config lists its systems under ``systems:``, even when there is only one, because one
+shared model is trained across all of them. The top-level sections are:
 
-* **systems**: one entry per system, each with its own ``name``, ``input_dir``,
-  ``out_dir`` and ``solvent_state``, plus optional per-system settings
-  (``max_subs_per_site``, ``protein_pdbs``, ``solvent_pdb``, ``combo_sets``,
-  ``export_combo_set``)
+* **systems**: one entry per system with its ``name``, ``input_dir``, ``out_dir`` and
+  ``solvent_state``, plus optional ``max_subs_per_site``, ``protein_pdbs``,
+  ``solvent_pdb``, ``combo_sets`` and ``export_combo_set``
 * **mode**: ``train`` (default) or ``deploy`` (:ref:`Testing on New Systems`)
-* **pretrain**: warm start from a behavior-cloned checkpoint (see :doc:`cb_pretraining`)
+* **pretrain**: the behavior-cloned checkpoint to start from (:doc:`cb_pretraining`)
+* **unimol**: how the node features are built (``env_input``, ``ligand_other_sites``,
+  ``site_size_input``, ``cache_embeddings``, ``cache_dir``), which must match the
+  pretrained model (:doc:`unimol_representation`)
 * **curriculum**: the stages each system passes through (:ref:`Staged Online Training`)
 * **validation_per_system** / **eval_schedule**: the held-out set and when it is run
-* **alf_root**: where the iterative-flattening datasets live, for ALF-derived combo sets
-  and the cost comparison
-* **training**: policy architecture and optimizer settings
-* **bandit**: NeuralLinear + Thompson sampling, hindsight targets and per-pair offsets
-  (see :doc:`cb_setup`)
-* **reward**: reward weights and thresholds (:ref:`Reward Function`)
-* **output**: checkpoint directory and frequency
+* **alf_root**: the iterative-flattening datasets, used for ALF-derived combo sets and
+  the cost comparison
+* **training**: policy and optimizer settings
+* **bandit**: the learning algorithm (``algorithm: hindsight``) and its settings
+  (:doc:`cb_setup`)
+* **reward**: run-reward weights and thresholds (:ref:`Reward Function`)
+* **output**: the checkpoint directory and frequency
 * **slurm**: cluster submission settings (:ref:`Launching Simulations`)
 
+With ``algorithm: hindsight``, most bandit and stage settings have defaults chosen for
+staged training (:ref:`Bandit Defaults`), so a config sets only what differs from them.
 Working configs are listed in :ref:`Example Configurations`.
 
 .. _Combination Generation:
@@ -74,182 +70,141 @@ Working configs are listed in :ref:`Example Configurations`.
 Combination Generation
 ----------------------
 
-Principles
-~~~~~~~~~~
-
-A combination is the set of substituents simulated together in one MSLD run. Combinations
-are generated from the fragment files ``site{N}_sub{M}_{label}.{rtf,pdb}`` in a system's
-input directory (and its ``prep/``), where N is the site and M the substituent.
+A combination is the set of substituents simulated together in one MSLD run.
+Combinations are generated from the fragment files ``site{N}_sub{M}_{label}.{rtf,pdb}``
+in a system's input directory (and its ``prep/``), where N is the site and M the
+substituent.
 
 .. warning::
-   **At least two substituents per site.** MSLD does not run correctly with a single
-   substituent at a site, so generation stops with an error if any site has only one.
-   Either add substituents or move that site into the core files (``core.pdb``,
-   ``core.rtf``).
+   MSLD does not run correctly with a single substituent at a site, so generation stops
+   with an error if any site has only one. Either add substituents or move that site into
+   the core files (``core.pdb``, ``core.rtf``).
 
-* **Within-site combinations** use a rotating anchor: each substituent in turn is the
-  first one (the site's reference in that run), followed by subsets of the others. With
-  substituents [1, 2, 3], anchor 1 gives [1,2], [1,3], [1,2,3]; anchor 2 gives [2,1],
-  [2,3], [2,1,3]; and so on.
+* **Within-site combinations** use a rotating anchor, in which each substituent in turn
+  is the site's reference, followed by subsets of the others. With substituents
+  [1, 2, 3], anchor 1 gives [1,2], [1,3] and [1,2,3], anchor 2 gives [2,1], [2,3] and
+  [2,1,3], and so on.
 * **Cross-site combinations** are the Cartesian product of the within-site selections,
   with at least two substituents per site.
-* **Size limit.** At most ``max_subs_per_site`` substituents per site (default 10;
-  ``--max-subs``). Every substituent still appears in some combination, but the count
-  stays finite.
-* **Single-site combinations of a multi-site system** keep the molecule whole: the core
-  files are augmented with the first substituent of each site left out.
+* **Size limit.** At most ``max_subs_per_site`` substituents per site (default 10) keeps
+  the count finite while every substituent still appears in some combination.
+* **Single-site combinations of a multi-site system** keep the molecule whole by adding
+  each other site's first substituent to the core files.
 
 Each combination's files are renumbered (original substituents [2, 5] become [1, 2]), and
-the PRES tokens in the RTF files are rewritten to match so CHARMM reads the topology
-correctly. ``mapping.json`` records the original numbers.
+the PRES tokens in the RTF files are rewritten to match, so CHARMM reads the topology
+correctly. ``mapping.json`` records the original numbers, and all per-pair state
+(offsets, visits, outcomes) is stored under those original numbers, so a pair keeps its
+history across every combination it appears in.
 
-For a large site, the cross-site product is usually too large to run, and the pairs
-alone are what training needs; :ref:`Combo Sets` select explicit combinations instead.
+For a large site, the cross-site product is far larger than what training needs, which is
+mostly pairs. :ref:`Combo Sets` select explicit combinations instead.
 
 Lazy Directory Creation
-^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~
 
-A large system can have tens of thousands of combinations, of which training runs only a
-small fraction. Generation therefore only lists them, in ``combo_metadata.json`` (name,
-path, sites and substituents) and the manifest files. A directory is created the first
-time its combination is needed for training, validation or uncertainty scoring. The split
-then takes seconds rather than hours, and disk use scales with the combinations actually
-run.
+A large system can have tens of thousands of combinations, of which training runs a small
+fraction. Generation therefore only lists them, in ``combo_metadata.json`` (name, path,
+sites and substituents) and the manifest files, and a combination's directory is created
+the first time it is needed for training, validation or uncertainty scoring. Disk use then
+scales with the combinations actually run. Manifests store names rather than paths
+(``{out_dir}/{combo_name}``), so a split can be reused exactly by later runs.
 
 Directory Structure
 ~~~~~~~~~~~~~~~~~~~
 
-Each combination directory (created on demand) has a standard layout:
-
 .. code-block:: text
 
    generated_combos/
-   ├── combo_metadata.json                  # Metadata for all combinations
-   ├── manifest.txt                         # List of all combination names
-   ├── train_manifest.txt                   # Training combination names
-   ├── val_manifest.txt                     # Validation combination names
-   ├── test_manifest.txt                    # Test combination names
-   ├── comb_0001_site2_1__site2_2/          # Created on demand
-   │   ├── info.py                          # System configuration
-   │   ├── mapping.json                     # File renumbering mapping
-   │   ├── msld_flat.py                     # Simulation script (copied)
+   ├── combo_metadata.json                  # metadata for all combinations
+   ├── manifest.txt                         # all combination names
+   ├── train_manifest.txt / val_manifest.txt / test_manifest.txt
+   ├── comb_0001_site2_1__site2_2/          # created on demand
+   │   ├── info.py                          # system configuration
+   │   ├── mapping.json                     # file renumbering
+   │   ├── msld_flat.py                     # simulation script (copied)
    │   └── prep/
-   │       ├── site2_sub1_pres.rtf
-   │       ├── site2_sub1_frag.pdb
-   │       ├── site2_sub2_pres.rtf
-   │       ├── site2_sub2_frag.pdb
-   │       ├── core.rtf
-   │       ├── core.prm
-   │       └── other_support_files...
-   ├── comb_0262_site1_1__site1_2__site2_1__site2_2/  # Cross-site
-   │   ├── info.py
-   │   ├── mapping.json
-   │   ├── msld_flat.py
-   │   └── prep/
-   │       ├── site1_sub1_pres.rtf          # Preserves site numbering
-   │       ├── site1_sub2_pres.rtf
-   │       ├── site2_sub1_pres.rtf          # Site 2 keeps site2_ prefix
-   │       ├── site2_sub2_pres.rtf
-   │       └── ...
-   └── ...
+   │       ├── site2_sub1_pres.rtf, site2_sub1_frag.pdb
+   │       ├── site2_sub2_pres.rtf, site2_sub2_frag.pdb
+   │       └── core.rtf, core.prm, ...
+   └── comb_0262_site1_1__site1_2__site2_1__site2_2/   # cross-site; keeps site numbering
 
-Combination Metadata Files
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**info.py** holds the system configuration read by the simulation script:
+``info.py`` holds the system configuration read by the simulation script:
 
 .. code-block:: python
 
-   import numpy as np
-   import os
-
    info = {}
    info['name'] = 'comb_0262_site1_1__site1_2__site2_1__site2_2'
-   info['nsubs'] = [2, 2]              # Substituents per site [site1, site2]
-   info['nblocks'] = np.sum(info['nsubs'])  # Total substituents (4)
-   info['ncentral'] = 0                # Central replica for replica exchange
-   info['nreps'] = 1                   # Number of replicas
-   info['nnodes'] = 1                  # MPI nodes
+   info['nsubs'] = [2, 2]                    # substituents per site
+   info['nblocks'] = np.sum(info['nsubs'])
+   info['ncentral'] = 0                      # central replica
+   info['nreps'] = 1
+   info['nnodes'] = 1
    info['enginepath'] = os.environ.get('CHARMMEXEC', '')
-   info['temp'] = 298.15               # Temperature in Kelvin
+   info['temp'] = 298.15                     # K
 
-**mapping.json** records each file's original and new site/sub numbers:
+``mapping.json`` records each file's original and new numbers:
 
 .. code-block:: json
 
-   [
-     {
-       "original": "/path/to/site1_sub2_pres.rtf",
-       "new_name": "site1_sub1_pres.rtf",
-       "original_site": 1, "original_sub": 2,
-       "new_site": 1, "new_sub": 1
-     }
-   ]
-
-Per-pair state (offsets, visits, outcomes) is stored under the *original* numbers, so a
-pair keeps its history across every combination it appears in.
-
-Manifest files list combination names, one per line (``comb_0001_site2_1__site2_2``,
-...); the full path is ``{out_dir}/{combo_name}``. Because splits are stored as names,
-they are reproducible and can be reused by later runs.
-
-Each combination becomes a graph of its substituents for the policy (:doc:`cb_setup`).
-The system's ``solvent_state`` (``solv``, ``protein``, or ``gas``/``vacuum``) sets which
-environment atoms are part of each substituent's embedding (:doc:`unimol_representation`).
+   [{"original": "/path/to/site1_sub2_pres.rtf", "new_name": "site1_sub1_pres.rtf",
+     "original_site": 1, "original_sub": 2, "new_site": 1, "new_sub": 1}]
 
 .. _Staged Online Training:
 
 Staged Online Training
 ----------------------
 
-Why Stages
-~~~~~~~~~~
+Why Pairs Come First
+~~~~~~~~~~~~~~~~~~~~
 
-A production run simulates a *group* of substituents at once, but a group run is a poor
-place to learn biases from. When it fails, the trajectory rarely shows which pair's
-biases were wrong, and every run costs the full simulation length. A *pair* run is the
-opposite: λ moves between two substituents, so the run measures that pair's linear (b)
-and quadratic (c) error directly (see the hindsight targets in :doc:`cb_setup`), and a
-short run is often enough to see it.
+Production simulates a *group* of substituents at once, but a group run is a poor source
+of corrections. When it fails, the trajectory rarely shows which pair's biases were wrong,
+and each attempt costs the full simulation length. A *pair* run isolates one pair, so its
+λ trajectory measures that pair's linear (b) and quadratic (c) error directly
+(:doc:`cb_setup`), and a run of ∼100 ps is often enough to see it. The workflow therefore
+resolves pairs first and runs each group only once the pairs it depends on are known.
 
-The workflow therefore resolves pairs first and only then runs the groups built from
-them. With ``curriculum.per_system: true``, each system does this on its own schedule: a
-system the model already predicts well can finish its pairs in a few epochs, while a
-poorly predicted one keeps running pairs, and every epoch's batch mixes systems at
-different points. (The older mode, in which all systems move through the stages
-together, is described in :ref:`Global Curriculum`.)
+With ``curriculum.per_system: true``, each system follows this schedule on its own. A
+system the model already predicts well finishes its pairs in a few epochs, while a poorly
+predicted one keeps running pairs, and every epoch's batch mixes systems at different
+points. Progress is kept in ``<output.base_dir>/system_stages.json``, so a resumed run
+continues each system where it stopped.
 
 Terms
 ~~~~~
 
 The following terms are used throughout this section and in the code
-(``mllf.cb.system_stages``, ``mllf.cb.hindsight``):
+(``mllf.cb.system_stages``, ``mllf.cb.hindsight``).
 
-* **Group**: a set of substituents simulated together in production, usually one of
-  the iterative-flattening groups of that system (:ref:`Combo Sets`). Its first
-  substituent at each site is the group's **reference**.
-* **Reference pair**: a group's reference paired with one of its other substituents.
-  Every substituent of a group is connected to the reference by one such pair, so these
-  pairs fix the group's b values.
-* **Good run** of a pair: both substituents were sampled, λ crossed between them at
-  least a minimum number of times, and the minority substituent held at least a minimum
-  fraction of the pair's population. Full-length runs need 10 crossings and 0.2; short
-  runs use the stage's ``explore_min_transitions`` and ``explore_min_fraction`` (defaults 2
-  and 0.2).
-* **Resolved pair**: a pair with ``advance.successes`` good runs in the current stage
-  *and* a per-pair offset whose posterior sd is at most ``advance.max_offset_sd`` for each
-  listed coefficient. Both conditions are needed: good runs show that the current biases
-  work, and the offset sd shows that the pair's correction is known, not just lucky.
-  Resolved pairs leave the stage's pool.
-* **Group test**: a group run in which, at every site, each substituent has at least
-  ``min_population_ratio / n_subs`` of the site's population and the site has at least
-  ``min_site_transitions`` transitions. A group that passes once is retired.
+* **Group**: a set of substituents simulated together in production, usually one of the
+  system's iterative-flattening groups (:ref:`Combo Sets`). Its first substituent at each
+  site is the group's **reference**.
+* **Reference pair**: the group's reference paired with one of its other substituents.
+  Every substituent is connected to the reference by one such pair, so these pairs fix
+  the group's b values.
+* **Good run** of a pair: both substituents sampled, at least a minimum number of
+  crossings between them, and at least a minimum fraction of the pair's population on
+  the minority substituent. Full-length runs need 10 crossings and 0.2. Short runs use the
+  stage's ``explore_min_transitions`` and ``explore_min_fraction``.
+* **Resolved pair**: a pair with ``advance.successes`` good runs in the stage, *and* an
+  offset posterior sd of at most ``advance.max_offset_sd`` for each listed coefficient.
+  Good runs show that the current biases sample, and the narrow offset shows that the
+  pair's correction is known rather than lucky. A pair whose scouting run passed the
+  full-length test is also resolved. Resolved pairs leave the pool.
+* **Retired pair**: a pair that has run in a set number of the stage's epochs without
+  resolving. It leaves the pool and no longer holds back its groups.
+* **Group test**: every substituent at each site holds at least
+  ``min_population_ratio / n_subs`` of the site's population, and each site has at least
+  ``min_site_transitions`` transitions, pooled over the group's last
+  ``group_pass_window`` runs. A group that passes is retired.
 
 Example
 ~~~~~~~
 
-The configuration below runs one stage that holds both pairs and groups. It is taken from
-the staged configs in ``training/online_*.yaml``, with the system list shortened:
+The stage below holds both pairs and groups. It is the stage of
+``training/online_1.yaml``, with the system list shortened; keys it leaves out take the
+hindsight defaults.
 
 .. code-block:: yaml
 
@@ -258,7 +213,7 @@ the staged configs in ``training/online_*.yaml``, with the system list shortened
    systems:
      - name: luis_bace_solvent
        input_dir: training/systems/luis_bace_solvent
-       out_dir: training/simulations_online_A/luis_bace_solvent/
+       out_dir: training/simulations_online_1/luis_bace_solvent/
        solvent_state: solv
        include_patterns: [msld_flat.py]
        combo_sets: {ref_pairs: alf_group_ref_pairs, group_pairs: alf_group_pairs,
@@ -268,26 +223,31 @@ the staged configs in ``training/online_*.yaml``, with the system list shortened
    curriculum:
      enabled: true
      per_system: true
-     max_train_combos_per_stage: 300      # pairs + groups per epoch, all systems
+     max_train_combos_per_stage: 500      # pairs + groups per epoch, all systems
      min_combos_per_system: 12
-     combos_per_system: reference_pairs   # shares proportional to reference pairs
-     export_final_biases: true
+     combos_per_system: reference_pairs
      stages:
        - name: pairs_groups
          combo_set: group_pairs           # every within-group pair
          reference_set: ref_pairs
          reference_pair_bonus: 1.0
-         reference_priority: strict       # reference pairs fill each share first
-         retire_after_epochs: 10
+         reference_priority: strict
+         retire_after_epochs: 5
+         retire_requires_success: reference
+         retire_min_successes: 0
+         reference_retire_after_epochs: 10
+         scouting: training/scouting/oct27
          prioritize_unvisited: false
          run_steps: {equil: 13000, prod: 39000}
+         bracketed_run_steps: {equil: 13000, prod: 112000}
          confirm_full_length: false
-         explore_min_transitions: 3
-         explore_min_fraction: 0.0
+         explore_min_transitions: 5
+         explore_min_fraction: 0.1
          group_set: groups
          group_ready_fraction: 0.67
+         group_min_resolved_per_site: 1
          group_max_failures: 3
-         epochs: 20
+         epochs: 25
          advance:
            type: groups_done
            fraction: 1.0
@@ -299,80 +259,109 @@ the staged configs in ``training/online_*.yaml``, with the system list shortened
    validation_per_system: 4
    eval_schedule: stage
 
-A system here runs short pair runs, reference pairs first, until two thirds of a group's
-reference pairs are resolved. That group then runs at full length, and the system is done
-once every group has passed.
+A system in this stage runs ∼104 ps pair runs, reference pairs first, until two thirds
+of a group's reference pairs are resolved. That group then runs at full length, and the
+system is done once every group has passed.
 
 What Happens Each Epoch
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-For each system that has not finished, the driver:
+For each system that has not finished, the driver carries out six steps.
 
-1. **Builds the pool**: the stage's combos for that system (from ``combo_set``, or the
-   manifest filtered by the stage's site and substituent limits), minus held-out pairs,
-   resolved pairs and, with ``retire_after_epochs``, retired pairs (run in that many of
-   the stage's epochs without resolving). A stage that leaves a system no combos is
-   skipped for that system.
-2. **Adds ready groups**: with ``group_set``, a group joins the pool once
-   ``group_ready_fraction`` of its reference pairs are resolved (retired ones are left
-   out of the count), and stays until it passes the group test. With
-   ``group_max_failures``, a group that fails that many runs goes back to the pair phase:
-   its pairs that include a substituent the last run never sampled are reopened (they
-   must resolve again, with a fresh retirement allowance), and the group waits until they
-   are resolved or retired.
-3. **Orders the batch**: ready groups first; with ``reference_priority: strict``, each
-   system's unresolved reference pairs next (not yet run first, then by uncertainty), up to
-   the system's share. A reference pair whose run never crossed (stuck at one end, or
-   stranded between them) also runs *reversed* from then on, with λ starting on its other
-   substituent, so the end a barrier holds λ at says something about b instead of the
-   starting state. The reversed partner (``pair07r_site1_subs_9_1`` for
-   ``pair07_site1_subs_1_9``) is the same pair, shares its offsets and takes a slot of the
-   share. Then (with short runs) pairs waiting for a
-   full-length confirming run, then pairs not yet run in this stage (up to
-   ``min_combos_per_system``, unless ``prioritize_unvisited: false``), then pairs still
-   in progress (``bandit.revisit``, :doc:`cb_setup`), and finally the rest by the shared
-   model's uncertainty plus each pair's own state. ``reference_pair_bonus`` is added to a
-   reference pair's ranking, so it is chosen ahead of other pairs of similar uncertainty.
-4. **Sets each system's share**: ``combos_per_system: reference_pairs`` makes each
-   system's share of ``max_train_combos_per_stage`` proportional to its number of
-   reference pairs, with ``min_combos_per_system`` as the floor. Without it, a system with
-   50 substituents would cover its reference pairs no faster than one with four. (The
-   epoch grows if the floors add up to more than the budget.)
-5. **Runs and learns**: each combo is simulated, its λ trajectory gives hindsight targets,
-   and the per-pair offsets and the shared model are updated (:doc:`cb_setup`).
-6. **Checks the stage**: a system leaves the stage when its ``advance`` criterion holds,
-   no sooner than ``advance.min_epochs`` (default 1), or once it has spent ``epochs`` in
-   the stage. In the second case it is recorded as *not converged*, and that label follows
-   its exported biases.
+1. **Builds the pool** from the stage's combos (``combo_set``, or the manifest filtered by
+   the stage's site and substituent limits), less held-out, resolved and retired pairs.
+   A stage that leaves a system no combos is skipped for that system.
+2. **Adds ready groups.** A group joins the pool once ``group_ready_fraction`` of its
+   reference pairs are resolved (retired ones are left out of the count) with at least
+   ``group_min_resolved_per_site`` resolved at every site, and stays until it passes the
+   group test.
+3. **Sets each system's share** of ``max_train_combos_per_stage``. With
+   ``combos_per_system: reference_pairs``, the share is proportional to the system's
+   number of reference pairs, with ``min_combos_per_system`` as the floor, so a system
+   with 50 substituents covers its reference pairs as fast as one with four. The epoch
+   grows if the floors add up to more than the budget.
+4. **Orders the batch.** Ready groups go first. With ``reference_priority: strict``,
+   unresolved reference pairs and pairs reopened by a failed group fill each system's
+   share next, ordered by pairs not yet run, then by scouting tier (hardest first), then
+   by selection rank. A reference pair whose run never crossed also runs *reversed* from
+   then on, with λ starting on its other substituent, so the endpoint at which a barrier
+   holds λ reflects b rather than the starting state. The reversed partner
+   (``pair07r_site1_subs_9_1`` for ``pair07_site1_subs_1_9``) is the same pair, shares
+   its offsets and takes a slot of the share. Pairs awaiting a full-length confirming run
+   come next, then pairs not yet run (with ``prioritize_unvisited``), then pairs in
+   progress (``bandit.revisit``, :doc:`cb_setup`), and finally the rest by the shared
+   model's uncertainty plus each pair's own state. ``reference_pair_bonus`` raises a
+   reference pair's selection score.
+5. **Runs and learns.** Each combo is simulated, its λ trajectory gives hindsight
+   targets, and the per-pair offsets and the shared model are updated (:doc:`cb_setup`).
+6. **Checks the stage.** A system leaves the stage when its ``advance`` criterion holds,
+   no sooner than ``advance.min_epochs`` (default 1), or after ``epochs`` epochs in the
+   stage. In the second case it is recorded as *not converged*, and that label follows its
+   exported biases.
 
-Progress is kept in ``<output.base_dir>/system_stages.json``, so a resumed run continues
-each system where it stopped.
-
-Short Runs
+Run Length
 ~~~~~~~~~~
 
-A stage's ``run_steps: {equil: 13000, prod: 39000}`` (MD steps) sets the length of its
-pair runs. It is written into each combination's copy of ``msld_flat.py`` (the ``esteps``
-and ``nsteps`` lines) before every run, so the system's template is never changed. Group
-runs are always full length.
+``run_steps: {equil, prod}`` (MD steps) sets the length of a stage's pair runs. It is
+written into each combination's copy of ``msld_flat.py`` (the ``esteps`` and ``nsteps``
+lines), so the system's template is never changed. Group runs are always full length.
 
-Short runs are cheaper, but they have fewer frames and crossings, so a good short run is
-weaker evidence than a good full-length one. How much weight a short run carries is the
-stage's choice:
+A short run has fewer frames and crossings than a full-length one, so a good short run is
+weaker evidence. With ``confirm_full_length: true`` (default), a good short run earns the
+pair one full-length confirming run in the next epoch, and only full-length runs count
+toward ``successes``. With ``false``, good short runs count directly, which is reasonable
+when the short-run thresholds already require several crossings and a later group run
+tests the same substituents again.
 
-* With ``confirm_full_length: true`` (default), a short run counts only as a signal: a
-  pair whose short run is good gets one full-length *confirming* run in the next epoch,
-  and only full-length runs count toward ``successes``.
-* With ``confirm_full_length: false``, good short runs count directly. This is
-  reasonable when the stage's thresholds already ask for enough crossings, and when a
-  later group run checks the same substituents again.
+Two settings handle pairs that cross slowly rather than not at all. A pair whose b has
+been pushed both ways (its b bracket has closed, :doc:`cb_setup`) is near its target, so a
+failure is more likely a crossing time too short for the barrier than a wrong bias. Such
+a pair runs ``bracketed_run_steps`` instead of ``run_steps``, and with
+``bracketed_runs_sticky`` it keeps the longer runs until it resolves or retires.
+``partial_runs_to_resolve`` short runs with at least ``partial_min_transitions`` crossings
+(and the short-run minority fraction) also resolve a pair, in place of
+``advance.successes`` good runs. The offset sd limits still apply.
+
+.. _Retiring Pairs:
+
+Retiring Pairs
+~~~~~~~~~~~~~~
+
+A pair that never crosses would hold its groups back for the whole stage, although a
+group run can still sample its substituents through their other pairs. With
+``retire_after_epochs``, a pair retires once it has run in that many of the stage's
+epochs without resolving. ``retire_requires_success`` sets how many good runs a pair
+needs before it may retire. With ``reference``, reference pairs retire after
+``reference_retire_after_epochs`` once they have ``retire_min_successes`` good runs
+(default 1), and other pairs retire after ``retire_after_epochs`` with none. ``true``
+requires one good run of every pair, and ``false`` (default) none.
+
+A group that fails ``group_max_failures`` runs goes back to the pair phase. Its pairs with
+a substituent its failed runs left unsampled are reopened (they must resolve again, with a
+fresh retirement allowance), and the group waits for them. A run in which the group
+correction lowered the group's end terms (:doc:`cb_setup`) does not count as a failure,
+since it tested values that have since changed.
+
+Scouting
+~~~~~~~~
+
+A stage's ``scouting:`` directory holds one ∼1 ns run per ALF group with the starting
+model's biases (``training/scouting/scout_groups.py``), and is applied once, before the
+system's first epoch in the stage. A group whose scouting run sampled every substituent
+has passed (its scouting run is the exported run), a pair whose scouting run passed the
+full-length test is resolved, and the scouting runs' simulated time enters the cost
+ledger. The directory's ``pair_priority.json`` (or the stage's ``scout_priority`` file)
+ranks the reference pairs by how hard scouting found them, from tier 0 (a substituent
+never sampled, or fewer than 5 crossings) to tier 2 (10 or more crossings). Pairs that
+scouting did not cover count as tier 1. Scouting runs must come from the same starting
+model as the stage, so each stage that uses scouting needs its own.
 
 Stage Settings
 ~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
-   :widths: 28 72
+   :widths: 30 70
 
    * - Key
      - Meaning
@@ -383,59 +372,71 @@ Stage Settings
    * - ``min_sites`` / ``max_sites`` / ``min_subs_per_site`` / ``max_subs_per_site``
      - Manifest filters, ignored when ``combo_set`` is given.
    * - ``combo_set``
-     - Run this named combo set instead of the filtered manifest (:ref:`Combo Sets`).
+     - The named combo set to run in place of the filtered manifest (:ref:`Combo Sets`).
    * - ``reference_set``
-     - Combo set whose pairs are the reference pairs. Without it, every pair in the pool
-       counts as a reference pair.
+     - The combo set whose pairs are the reference pairs. Without it, every pair in the
+       pool counts as a reference pair.
    * - ``reference_pair_bonus``
      - Added to a reference pair's selection score (default 0).
    * - ``reference_priority``
-     - ``strict``: unresolved reference pairs (and reopened pairs) fill each system's share
-       before other pairs, with reversed partners for pairs that got stuck. Omit to rank
-       them with the others.
-   * - ``retire_after_epochs``
-     - Retire a pair once it has run in this many of the stage's epochs without
-       resolving; it leaves the pool and no longer holds back its groups. Omit to never
-       retire.
-   * - ``group_set``
-     - Combo set of groups that join the pool once ready.
-   * - ``group_ready_fraction``
-     - Fraction of a group's reference pairs that must be resolved before the group
-       runs (default 1.0).
-   * - ``group_max_failures``
-     - Failed runs after which a group goes back to the pair phase (omit to keep running
-       it).
+     - ``strict`` fills each system's share with unresolved reference pairs and reopened
+       pairs first, with reversed partners for pairs that got stuck.
+   * - ``retire_after_epochs`` / ``reference_retire_after_epochs``
+     - Epochs run without resolving after which a pair (a reference pair) retires. Omit to
+       never retire.
+   * - ``retire_requires_success`` / ``retire_min_successes``
+     - Good runs a pair needs before it may retire (:ref:`Retiring Pairs`).
+   * - ``scouting`` / ``scout_priority``
+     - Scouting results applied at stage entry, and an optional separate tier file.
    * - ``prioritize_unvisited``
-     - Put pairs not yet run in this stage ahead of selection (default true).
-   * - ``run_steps``
-     - ``{equil, prod}`` MD steps for this stage's pair runs.
+     - Run pairs not yet run in this stage ahead of selection (default true).
+   * - ``run_steps`` / ``bracketed_run_steps``
+     - ``{equil, prod}`` MD steps for pair runs, and for pairs whose b bracket has closed.
+   * - ``bracketed_runs_sticky``
+     - Keep a pair on longer runs until it resolves or retires.
    * - ``confirm_full_length``
-     - Require a full-length confirming run before a short run counts (default true).
+     - Require a full-length confirming run before a good short run counts (default true).
    * - ``explore_min_transitions`` / ``explore_min_fraction``
      - Good-run thresholds for short runs (defaults 2 and 0.2).
+   * - ``partial_runs_to_resolve`` / ``partial_min_transitions``
+     - Slow-crossing runs that resolve a pair, and the crossings each needs (default 3).
+       0 turns this off.
+   * - ``group_set``
+     - The combo set of groups that join the pool once ready.
+   * - ``group_ready_fraction`` / ``group_min_resolved_per_site``
+     - Share of a group's reference pairs that must be resolved (default 1.0), and the
+       fewest resolved at each site (default 0).
+   * - ``group_pass_window``
+     - Recent group runs pooled in the group test; the run that sampled the most
+       substituents is exported.
+   * - ``group_max_failures``
+     - Failed runs after which a group goes back to the pair phase. Omit to keep running
+       it.
    * - ``advance``
      - When a system may leave the stage early (below).
 
-Keys that set the whole epoch's training in the global curriculum (``update_policy``,
-``reward_override``, ``policy_lr``, ``bc_mode`` ...) are ignored in per-system mode,
-because one epoch now holds systems at different stages.
+Keys that set an entire epoch's training in the global curriculum (``update_policy``,
+``reward_override``, ``policy_lr``, ``bc_mode``) do not apply in per-system mode, where
+one epoch holds systems at different stages.
 
 Advance Criteria
 ~~~~~~~~~~~~~~~~
 
-``advance.type`` selects the criterion; ``fraction`` is the share of the pairs, combos or
-groups that must meet it, and ``min_epochs`` the earliest epoch at which it is checked.
+``advance.type`` selects the criterion, ``fraction`` (default 1.0) is the share of pairs,
+groups or combos that must meet it, and ``min_epochs`` is the earliest epoch at which it
+is checked.
 
 * ``pairs_resolved``: ``fraction`` of the system's pairs are resolved (``successes``,
-  ``max_offset_sd``). ``scope: pool`` (default) counts every pair in the stage's pool;
-  ``scope: visited`` counts only pairs run in this stage, which lets a stage end without
-  running every pair of a large site.
+  default 2, and ``max_offset_sd``). ``scope: pool`` (default) counts every pair in the
+  pool, and ``scope: visited`` counts only pairs run in this stage, which lets a stage end
+  without running every pair of a large site.
 * ``groups_done``: ``fraction`` of the system's groups have passed the group test
-  (``min_population_ratio``, ``min_site_transitions``). ``successes`` and
-  ``max_offset_sd`` still define resolved pairs, which decide when a group is ready.
+  (``min_population_ratio``, default 0.5, and ``min_site_transitions``, default 10).
+  ``successes`` and ``max_offset_sd`` still define resolved pairs, which decide when a
+  group is ready.
 * ``combos_balanced``: the latest run of ``fraction`` of the stage's combos (at least
-  ``min_combos``) passes the group test. Use this for a stage of multi-substituent
-  combos without explicit groups.
+  ``min_combos``) passes the group test, for a stage of multi-substituent combos without
+  explicit groups.
 * ``epochs`` (default): the system stays for the full ``epochs``.
 
 .. _Combo Sets:
@@ -443,12 +444,10 @@ groups that must meet it, and ``min_epochs`` the earliest epoch at which it is c
 Combo Sets
 ~~~~~~~~~~
 
-The manifest of a large site holds mostly pairs, and enumerating every larger subset is
-impractical. Named **combo sets** let a stage run exactly the combinations that matter
-instead (``mllf.file_handling.combo_sets``). The built-in sets come from the
-iterative-flattening groups of each system (``<alf_root>/<system>_group*``), so the online
-run and the baseline simulate the same substituent sets and their costs can be compared
-directly:
+Named **combo sets** let a stage run exactly the combinations that matter
+(``mllf.file_handling.combo_sets``). The built-in sets come from each system's
+iterative-flattening groups (``<alf_root>/<system>_group*``), so the online run and the
+baseline simulate the same substituent sets and their costs compare directly:
 
 .. code-block:: yaml
 
@@ -459,39 +458,41 @@ directly:
          groups: alf_groups               # one combo per group
          group_pairs: alf_group_pairs     # every within-site pair of those groups
          ref_pairs: alf_group_ref_pairs   # each group's reference vs its other subs
-         # explicit groups ({site: [subs]}, first sub = reference), for a system
-         # without iterative-flattening runs, and pairs built from them:
+         # explicit groups ({site: [subs]}, first sub = reference) and pairs built
+         # from them, for a system without iterative-flattening runs:
          # mine: [{1: [3, 2], 2: [15, 6, 7]}]
          # mine_ref_pairs: {pairs_of: mine, reference_only: true}
        export_combo_set: groups           # production biases per group
 
-Some groups were prepared with the system's numbering and some with their own
-(``site1_sub1..n``), so each group's fragments are matched to the system's by content
-(source ligand, atom names, types and charges), not by file name. A site with a single
-substituent in a group is a fixed substituent, not a perturbation, and is dropped. A
-system with no ``_group*`` datasets uses its single dataset as one group.
+Group fragments are matched to the system's by content (source ligand, atom names, types
+and charges) rather than by file name, because a group may be numbered locally
+(``site1_sub1..n``). A site with a single substituent in a group is a fixed substituent
+rather than a perturbation and is dropped. A system with no ``_group*`` datasets uses its
+single dataset as one group.
 
 .. _Held-Out Validation:
 
 Held-Out Validation
 ~~~~~~~~~~~~~~~~~~~
 
-Validation answers one question: does the *shared model* predict biases for pairs it has
-never been trained on? To keep the answer clean, held-out pairs are never trained on, and
-validation runs never apply per-pair offsets.
+Validation tests whether the *shared model* predicts biases for pairs it has never been
+trained on. Held-out pairs are therefore never trained on, and validation runs use the
+model's posterior mean with neither Thompson sampling nor per-pair offsets.
 
-``validation_per_system: N`` holds out ``N`` pairs per system. When the first stage runs a
-combo set, the held-out pairs are drawn from manifest pairs in none of the system's sets,
-so no stage ever runs them. (A system whose groups cover every pair has nothing to hold
-out.) ``validation_per_system: 0`` holds out nothing. To reuse another run's held-out set
-exactly, set ``validation_combos_file`` to its ``validation_combos.json``; otherwise the
-seeded draw picks by index and changes whenever the combo pool changes.
+``validation_per_system: N`` holds out N pairs per system. When the first stage runs a
+combo set, they are drawn from manifest pairs in none of the system's sets, so no stage
+ever runs them (a system whose groups cover every pair has none), and
+``validation_per_system: 0`` holds out nothing. Without ``validation_per_system``,
+``validation_fraction`` (default 0.1) of a pool of more than 20 combos is held out.
+``validation_combos_file`` reuses another run's
+``validation_combos.json`` exactly; otherwise the seeded draw changes whenever the combo
+pool does.
 
-With ``eval_schedule: stage``, each system's held-out pairs are run at the start, middle
-and end of each of its stages (epochs 1, ceil(n/2) and n of an n-epoch stage) and in the
-epoch it meets a stage's criterion, instead of every ``eval_freq`` epochs. Because the set
-of systems being validated then differs from pass to pass, a validation score is
-comparable only to earlier passes of the same system.
+Validation runs every ``eval_freq`` epochs (default 1) and after the last epoch. With
+``eval_schedule: stage``, each system is validated instead at the first, middle and last
+epoch of each of its stages and in the epoch it meets a stage's criterion. The set of
+systems validated then differs from pass to pass, so a score is comparable only to
+earlier passes of the same system.
 
 .. _Production Biases:
 
@@ -500,27 +501,28 @@ Production Biases
 
 When a system finishes its last stage, its production biases are written to
 ``<output.base_dir>/final_biases/<system>/``. They are the shared model's prediction plus
-each pair's offset posterior mean, with no Thompson or offset sampling; b is fitted per
-site from every within-site edge, weighted by each pair's linear-offset variance.
+each pair's offset posterior mean, with no sampling, the c cap and the group's corrected
+end terms applied. b is fitted per site from every within-site edge, weighted by each
+pair's linear-offset variance.
 
 * With ``export_combo_set``, one ``variables.py`` is written per combo of that set
   (``final_biases/<system>/<group>/``), matching how production is run.
 * Otherwise, one export covers every substituent in the system's ``input_dir``, or the
   subset in ``export_combo_dir``.
 
-Each exported group also gets ``CONFIDENCE.txt`` and ``confidence.json``. These record
-whether the group passed its group test and, for every pair in it, whether the pair was
-resolved, run but not resolved, or never run (with visits, good runs and the b/c offset
-uncertainty). A group that never passed is renamed ``<group>_unconverged``. Its biases are
-still the best available estimate, but they have not been shown to sample, so they should
+Each exported group also gets ``CONFIDENCE.txt`` and ``confidence.json``, which record
+whether the group passed its group test and, for each of its pairs, whether the pair was
+resolved, run but not resolved, or never run (with visits, good runs and the b and c
+offset uncertainty). A group that never passed is renamed ``<group>_unconverged``. Its
+biases are the best available estimate but have not been shown to sample, so they should
 be checked before production.
 
-Cross-site couplings are not predicted and are exported as 0. Exported biases are
-therefore complete for groups whose perturbed substituents share one site, but for
-multi-site groups they are only a starting point.
+Cross-site couplings are not predicted and are exported as 0. The exported biases are
+therefore complete for groups whose perturbed substituents share one site, and a starting
+point for multi-site groups.
 
-Set ``curriculum.export_final_biases: false`` to skip the export. To export or label from a
-finished run:
+``curriculum.export_final_biases: false`` skips the export. To export or label a finished
+run:
 
 .. code-block:: bash
 
@@ -533,46 +535,45 @@ finished run:
 Testing on New Systems
 ~~~~~~~~~~~~~~~~~~~~~~
 
-``mode: deploy`` runs a trained model on systems it was not trained on, through the same
-per-system stages (always on in this mode):
+``mode: deploy`` runs a trained model through the same per-system stages on systems it
+was not trained on:
 
 .. code-block:: yaml
 
    mode: deploy
    deploy:
-     model_path: checkpoints_run/final_model.pt
+     model_path: checkpoints_online_2/final_model.pt
      update_shared_model: false   # per-pair offsets still learn
    output:
-     base_dir: deploy_test        # must not be the model's directory
+     base_dir: checkpoints_online_3   # must not be the model's directory
 
-Nothing is held out for validation, because every pair of a test system is part of the
-test, and the model file is never overwritten. With ``update_shared_model: false``, the
-cost recorded for a test system is what a user of the trained model would pay: the shared
-model's first guess plus the per-pair corrections that system needed.
+Nothing is held out, because every pair of a test system is part of the test, and the
+model file is never overwritten. With ``update_shared_model: false``, the cost recorded
+for a test system is what a user of the trained model would pay, namely the model's first
+guess plus the per-pair corrections that system needed.
 
 .. _Simulation Cost:
 
 Simulation Cost
 ~~~~~~~~~~~~~~~
 
-The comparison that matters is simulated time to converged biases, so both sides are
-measured in nanoseconds the same way. Each finished run's simulated time is added to
-``<output.base_dir>/cost_ledger.json`` by system, stage, and train or validation
+The comparison that matters is simulated time to converged biases, so both methods are
+measured in nanoseconds in the same way. Each finished run's simulated time is added to
+``<output.base_dir>/cost_ledger.json`` by system, stage, and training or validation
 (``mllf.cb.cost_ledger``). The time is read from the dynamics calls in the CHARMM output
-and includes equilibration, since that is compute spent. The iterative-flattening cost for
-the same systems is read the same way from the original run outputs named in the
-pretraining datasets:
+and includes equilibration, since that is compute spent. The iterative-flattening cost of
+the same systems is read the same way from the run outputs named in the pretraining
+datasets:
 
 .. code-block:: bash
 
    python -m mllf.cb.cost_ledger <output.base_dir> --pretraining-root pretraining
 
-The comparison is like for like only under three conditions: both sides ran the same
-substituent groups (use the ALF-derived combo sets), validation runs are reported
-separately (they measure the model and are not needed to produce biases), and the
-online cost is that of the run that produced the exported biases. A system trained on
-earlier in a ``train`` run has also contributed to the shared model, so a cost measured
-in ``deploy`` mode is the cleaner estimate for a new system.
+The comparison is like for like when both methods ran the same substituent groups (the
+ALF-derived combo sets), validation runs are reported separately (they test the model and
+are not needed to produce biases), and the online cost is that of the run that produced
+the exported biases. A system trained on in ``train`` mode has also shaped the shared
+model, so a cost measured in ``deploy`` mode is the cleaner estimate for a new system.
 
 Simulation Execution
 --------------------
@@ -582,56 +583,55 @@ Simulation Execution
 Launching Simulations
 ~~~~~~~~~~~~~~~~~~~~~
 
-Each combo's biases are written to ``variables.py`` and its simulation is submitted as one
-SLURM job per combo per epoch (``mllf.cli.slurm.submit_epoch_simulation``). Every
-cluster-specific detail comes from the config's ``slurm:`` block; nothing is hardcoded:
+Each combo's biases are written to ``variables.py``, and its simulation is submitted as one
+SLURM job per combo per epoch (``mllf.cli.slurm.submit_epoch_simulation``), with every
+cluster-specific setting taken from the config's ``slurm:`` block:
 
-* ``partition``: passed as ``#SBATCH -p``. Omit it to use the account's default partition.
-* ``gres``: passed as ``#SBATCH --gres``. Omit it on a CPU-only cluster.
-* ``time``: passed as ``#SBATCH --time``. Defaults to ``01:00:00`` if the whole ``slurm:``
-  block is omitted.
-* ``module``: passed to ``module load``. Omit it if the simulator is already on ``PATH``.
+* ``partition`` (``#SBATCH -p``), omitted for the account's default partition
+* ``gres`` (``#SBATCH --gres``), omitted on a CPU-only cluster
+* ``time`` (``#SBATCH --time``, default ``01:00:00``)
+* ``module`` (``module load``), omitted when the simulator is already on ``PATH``
 
-An empty or absent ``slurm:`` block still produces a valid script; it just omits the
-directives that were not set.
-
-When a job finishes, its output is parsed for populations, transitions, pair profiles and
-simulated time (:doc:`file_handling`).
+At most ``max_concurrent_jobs`` (default 10) run at once. A failed run is resubmitted up
+to ``max_retries`` times (default 2), and a combo that still fails is replaced from a
+reserve of unused combos. ``max_failed_combos_per_epoch`` (default 50) permanent failures
+stop training, since that many usually means a broken setup. A finished job's output is
+parsed for populations, transitions, pair profiles and simulated time
+(:doc:`file_handling`).
 
 .. _Reward Function:
 
 Reward Function
 ---------------
 
-The ``reward:`` block configures a *run reward*: one number per simulation that summarizes
-how well it sampled. It is reported as the epoch's average reward, decides
-``progression: reward`` in the global curriculum, and filters or weights runs in
-pretraining (:doc:`cb_pretraining`). Online updates do not use it: they use the per-edge,
-per-coefficient reward or the hindsight targets (:doc:`cb_setup`); the ``barrier_*``,
-``skew_width``, ``end_width`` and ``no_transition_weight`` keys below belong to that
-per-edge reward.
+The ``reward:`` block sets a *run reward*, one number per simulation summarizing how well
+it sampled. It is reported as the epoch's average reward, decides ``progression: reward``
+in the global curriculum, and weights runs in pretraining (:doc:`cb_pretraining`).
+Hindsight updates do not use it (:doc:`cb_setup`). The ``barrier_*``, ``skew_width``,
+``end_width`` and ``no_transition_weight`` keys belong to the per-edge reward described
+there.
 
-It is built so that a degenerate run, such as one that settles into a single
+The run reward is built so that a degenerate run, such as one that settles into a single
 substituent, scores below any run that samples:
 
 .. math::
 
    R = \left(\frac{N_{\text{visited}}}{N_{\text{subs}}}\right)^2 (R_P + R_T + R_{\text{entropy}}) - \min(60,\; P_{\text{trans}} + P_{\text{conc}})
 
-* :math:`R_P = w_P \, C_F \sum_{k\,\text{visited}} p_k / P_{\text{baseline}}`: population,
-  discounted by :math:`C_F = \min(1, T_{\min}/2N_{\text{req}})` because populations from
-  runs with few transitions are not yet reliable.
+* :math:`R_P = w_P \, C_F \sum_{k\,\text{visited}} p_k / P_{\text{baseline}}` rewards
+  population, discounted by :math:`C_F = \min(1, T_{\min}/2N_{\text{req}})` because
+  populations from runs with few transitions are not yet reliable.
 * :math:`R_T = w_T \sum_s T_s / T_{\text{baseline}}` if every site reaches
   :math:`N_{\text{req}}` = ``min_transitions_per_site`` transitions (×1.5 above twice that
-  on average), else 0.
-* :math:`R_{\text{entropy}}`: ``entropy_bonus`` × the normalized Shannon entropy of the
-  populations.
+  on average), and 0 otherwise.
+* :math:`R_{\text{entropy}}` is ``entropy_bonus`` times the normalized Shannon entropy of
+  the populations.
 * :math:`P_{\text{trans}}` is set by the worst site, so one failing site cannot hide
   behind good ones: 40, 32 or 24 for :math:`T_{\min}` = 0, 1 or 2, then
   :math:`2 + 2(N_{\text{req}} - T_{\min})` up to :math:`N_{\text{req}}`, plus 4 per
   additional failing site.
-* :math:`P_{\text{conc}}`: for each site where one substituent holds more than 0.8 of the
-  population, :math:`5\gamma` × the excess.
+* :math:`P_{\text{conc}}` adds :math:`5\gamma` times the excess for each site where one
+  substituent holds more than 0.8 of the population.
 
 .. code-block:: yaml
 
@@ -649,23 +649,21 @@ substituent, scores below any run that samples:
      barrier_width: 1.29                     # kcal/mol
      skew_width: 0.78
      end_width: 0.58
-     no_transition_weight: 0.15
-     # accepted but unused: w_U, min_coverage_ratio
+     no_transition_weight: 0.2
 
 .. _Global Curriculum:
 
 Global Curriculum
 -----------------
 
-Without ``per_system``, all systems move through the curriculum stages together: every
-epoch draws from one stage, and the stage changes for everyone at once. This was the
-original mode and remains useful for REINFORCE training and for small single-system runs
-such as the 14benz example. Its weakness is that the stage length is set by the slowest
-system, so systems that are already predicted well keep spending simulations.
+Without ``per_system``, all systems move through the stages together: every epoch draws
+from one stage, and the stage changes for every system at once. This suits REINFORCE
+training and small single-system runs such as the 14benz example. Because the slowest
+system sets each stage's length, systems the model already predicts well keep spending
+simulations, which is why staged training uses per-system mode.
 
-Stages run from single-site pairs, through larger single-site combinations, to
-multi-site combinations, for the reason given in :ref:`Staged Online Training`: smaller
-combinations show their own errors more directly. For example:
+Stages typically run from single-site pairs, through larger single-site combinations, to
+multi-site combinations, since smaller combinations expose their own errors more directly:
 
 .. code-block:: yaml
 
@@ -684,32 +682,25 @@ combinations show their own errors more directly. For example:
 
 Each stage takes:
 
-* ``min_subs_per_site``, ``max_subs_per_site``: bounds on the substituents at any one
-  site of a combination (checked against the per-site counts, not the combination's
-  total)
-* ``min_sites``, ``max_sites``: number of sites represented
-* ``combo_whitelist``: an explicit list of combo names, bypassing the size filters
+* ``min_subs_per_site`` / ``max_subs_per_site``: bounds on the substituents at any one
+  site (checked per site, not against the combination's total)
+* ``min_sites`` / ``max_sites``: the number of sites represented
+* ``combo_whitelist``: explicit combo names, bypassing the size filters
 * ``min_transitions_for_stage`` / ``transition_filter_lookback``: on entering a later
   stage, keep only combos whose recent runs reached this many transitions per site
-* ``epochs``: epochs in the stage
-* ``max_train_combos``: per-stage override of ``max_train_combos_per_stage``
-* ``reward_override``: per-stage reward weights, e.g. a lower
+* ``epochs``, and ``max_train_combos`` to override ``max_train_combos_per_stage``
+* ``reward_override``: per-stage reward weights, e.g., a lower
   ``min_transitions_per_site`` while the policy is still learning pairs
 
-Each epoch draws up to ``max_train_combos_per_stage`` of the stage's combos: stratified
-across systems by default (``curriculum.stratified_sampling``,
-``curriculum.min_combos_per_system``), or by uncertainty with ``bandit.selection:
-uncertainty``. Draws are seeded by ``seed`` plus the epoch. The draw is uniform over the
-combos that pass the filter, so a stage allowing pairs and triplets draws mostly triplets,
-in proportion to how many of each exist.
+Each epoch draws up to ``max_train_combos_per_stage`` of the stage's combos, stratified
+across systems (``curriculum.min_combos_per_system``) or by uncertainty with
+``bandit.selection: uncertainty``, seeded by ``seed`` plus the epoch. The draw is uniform
+over the combos that pass the filter, so a stage allowing pairs and triplets draws mostly
+triplets, in proportion to how many of each exist.
 
-Progression
-~~~~~~~~~~~
-
-* ``type: epoch`` (default): advance after the stage's epochs.
-* ``type: reward``: advance only if the average reward over the last 5 epochs reaches
-  ``reward_threshold``.
-* ``type: both``: complete the epochs *and* meet the threshold.
+``progression.type`` sets when the stage changes: ``epoch`` (default) after the stage's
+epochs, ``reward`` once the average reward over the last 5 epochs reaches
+``reward_threshold``, and ``both`` when both hold.
 
 Checkpointing and Resume
 ------------------------
@@ -721,39 +712,38 @@ saves enough state to continue from the last completed epoch.
 
    output:
      base_dir: /path/to/training_output
-     save_checkpoints: true
-     checkpoint_freq: 5         # Save every N epochs
+     checkpoint_freq: 1         # every N epochs (default 5)
 
 ``base_dir`` then holds:
 
-* ``checkpoint_{epoch:03d}.pt``: the policy and optimizer state, the epoch, the global
-  curriculum stage index, and that epoch's statistics
-* ``bandit_state.json``: per-combo bookkeeping and the per-pair state (offset targets,
-  visits, outcomes, exploration factors, b and c brackets). This is the state the
-  per-pair corrections depend on, so a run resumed without it starts every pair over.
+* ``checkpoint_{epoch:03d}.pt``: the policy and optimizer state, the epoch and that
+  epoch's statistics
+* ``bandit_state.json``: the per-pair state (offset targets, visits, outcomes, exploration
+  factors, b and c brackets, group corrections) and per-combo failure counts. The per-pair
+  corrections depend on it, so a run resumed without it starts every pair over.
 * ``system_stages.json``: each system's stage, epochs spent and progress
-  (per-system mode)
 * ``validation_combos.json``: the held-out set, so a resumed run validates on the same
   pairs
+* ``regression_online_buffer.pt``: the recent hindsight targets the regression trains on
 * ``cost_ledger.json``: simulated time per run
-* ``final_model.pt``: written at the end, with the full per-epoch statistics
+* ``epoch_summary.log``: one block per epoch
+* ``best_model.pt``: the best validated model (with the validation gate)
+* ``final_model.pt``: written at the end, from the best validated model when the last
+  validation scored lower
 
 On restart, the driver loads the latest ``checkpoint_*.pt`` and continues from the next
-epoch. If that checkpoint cannot be loaded, it falls back to ``pretrain.model_path``
-(partial load, ``strict=False``).
-
-The Uni-Mol embeddings and graph tensors of each combo are saved to ``graph_data.pt`` in
-its run directory before the simulation is submitted. The update after the SLURM wait
-reloads them rather than recomputing the embeddings or holding every combo in memory
-during the wait.
+epoch, falling back to ``pretrain.model_path`` if that checkpoint cannot be loaded. Each
+combo's Uni-Mol embeddings and graph tensors are saved to ``graph_data.pt`` in its run
+directory before submission, so the update after the SLURM wait reloads them rather than
+recomputing them or holding every combo in memory.
 
 Archiving Combinations
 ----------------------
 
-The online training driver does not archive anything itself (an ``archive:`` block in
-its config is ignored), because the per-pair state and the cost ledger point back into
-the run directories. Archive a run's combination directories once its biases are exported
-and its costs summarized, with ``archive_combo_dirs(out_dir, pattern='comb_*', remove=False)``
+The training driver archives nothing itself, because the per-pair state and the cost
+ledger point into the run directories. Once a run's biases are exported and its costs
+summarized, its combination directories can be archived with
+``archive_combo_dirs(out_dir, pattern='comb_*', remove=False)``
 (``mllf.file_handling.generate_combinations``) or ``examples/14benz/archive_combos.sh``.
 
 .. _Example Configurations:
@@ -761,19 +751,18 @@ and its costs summarized, with ``archive_combo_dirs(out_dir, pattern='comb_*', r
 Example Configurations
 ----------------------
 
-* ``examples/workflow_14benz.yaml``: the smallest working config (one system, REINFORCE,
-  global curriculum, no pretrained model), walked through in :doc:`examples`.
-* ``training/online_*.yaml``: the staged setup used for production biases, with many
-  systems, per-system stages over ALF-derived combo sets, a pretrained Bayesian model,
-  hindsight targets with per-pair offsets, and full-network regression. Each header
-  explains which systems the run covers and why.
+* ``examples/workflow_14benz.yaml`` is the smallest working config (one system,
+  REINFORCE, global curriculum, no pretrained model), walked through in :doc:`examples`.
+* ``training/online_1.yaml`` through ``online_4_hne_pr3.yaml`` are the staged curriculum
+  for production biases: known systems in solvent and protein (stage 1), the hardest
+  systems (1b), vacuum legs (2), and deployment on chemistry and proteins the model was
+  not trained on (3 and 4). Each header states its systems and starting model.
 
 See Also
 --------
 
-* :doc:`file_handling` - file formats and parsers
-* :doc:`cb_setup` - policy architecture, hindsight targets and per-pair offsets
-* :doc:`unimol_representation` - Uni-Mol embeddings for node features
-* :doc:`cb_pretraining` - behavior cloning from completed simulations
-* :doc:`examples` - example workflows and usage
-* :doc:`api` - API reference
+* :doc:`cb_setup`: the policy, hindsight targets and per-pair offsets
+* :doc:`unimol_representation`: the Uni-Mol node features
+* :doc:`cb_pretraining`: behavior cloning from completed simulations
+* :doc:`file_handling`: file formats and parsers
+* :doc:`examples`: running the examples

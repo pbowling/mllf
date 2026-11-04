@@ -4,7 +4,7 @@ mllf API
 File Handling
 -------------
 
-For detailed documentation on file formats and usage examples, see :doc:`file_handling`.
+For file formats and usage, see :doc:`file_handling`.
 
 .. autosummary::
    :toctree: api
@@ -19,8 +19,7 @@ For detailed documentation on file formats and usage examples, see :doc:`file_ha
 Uni-Mol Representation
 -----------------------
 
-For detailed documentation on Uni-Mol embeddings and environment context, see
-:doc:`unimol_representation`.
+For Uni-Mol embeddings and environment context, see :doc:`unimol_representation`.
 
 .. autosummary::
    :toctree: api
@@ -29,10 +28,10 @@ For detailed documentation on Uni-Mol embeddings and environment context, see
    mllf.cb.environment_consensus
    mllf.cb.atom_vocab
 
-Graph and CB Modules
---------------------
+Policy Modules
+--------------
 
-For detailed documentation on CB architecture, see :doc:`cb_setup`.
+For the policy architecture, see :doc:`cb_setup`.
 
 .. autosummary::
    :toctree: api
@@ -46,7 +45,7 @@ For detailed documentation on CB architecture, see :doc:`cb_setup`.
 Pretraining (Behavior Cloning)
 -------------------------------
 
-For detailed documentation on behavior-cloning pretraining, see :doc:`cb_pretraining`.
+For behavior-cloning pretraining, see :doc:`cb_pretraining`.
 
 .. autosummary::
    :toctree: api
@@ -57,7 +56,7 @@ For detailed documentation on behavior-cloning pretraining, see :doc:`cb_pretrai
 Workflow Utilities
 ------------------
 
-For detailed documentation on the workflow system, see :doc:`workflow`.
+For the workflow system, see :doc:`workflow`.
 
 .. autosummary::
    :toctree: api
@@ -66,14 +65,18 @@ For detailed documentation on the workflow system, see :doc:`workflow`.
    mllf.cli.sim
    mllf.cb.workflow_utils
    mllf.cli.train_workflow
+   mllf.cb.bandit_config
    mllf.cb.reinforce_trainer
    mllf.cb.graph_build
    mllf.cb.hindsight
    mllf.cb.hindsight_regression
+   mllf.cb.replay_selection
+   mllf.cb.group_correction
    mllf.cb.curriculum
    mllf.cb.system_stages
    mllf.cb.export_biases
    mllf.cb.cost_ledger
+   mllf.cb.epoch_log
    mllf.cli.slurm
    mllf.file_handling.manifests
    mllf.file_handling.combo_sets

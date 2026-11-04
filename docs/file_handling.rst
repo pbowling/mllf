@@ -77,15 +77,15 @@ x and s, one row and column per substituent, in the order of the λ blocks:
 
 ``read_bias_coeff`` also returns the flat CHARMM scalars (``lams``, ``cs``, ``xs``, ``ss``,
 negated relative to the matrix convention) and, when it can find them, the substituents
-per site (``_nsubs_per_site``). Older ``.inp`` files are read as well. Each bias position
-is mapped to a substituent from what the run executed (:doc:`cb_pretraining`), not from
-file order.
+per site (``_nsubs_per_site``). CHARMM ``.inp`` bias files are read as well. Each bias
+position is mapped to a substituent from what the run executed (:doc:`cb_pretraining`),
+not from file order.
 
 Simulation Output
 -----------------
 
 ``mllf.file_handling.read_output`` reads the CHARMM/MSLD output. Block IDs start at 2
-(block 1 holds everything not perturbed: the core and environment), so node ``i`` is
+(block 1 holds everything not perturbed, the core and environment), so node ``i`` is
 block ``i + 2``.
 
 .. code-block:: python
@@ -112,8 +112,13 @@ block ``i + 2``.
   and :math:`G = -kT \ln` (density) gives the midpoint barrier, the skew and end
   asymmetries, and the pair's own transition count. A signal is ``None`` when the pair
   has too few frames or never reached an endpoint. These are the measurements behind the
-  per-edge reward and the hindsight targets (:doc:`cb_setup`); ``parse_pair_barriers``
+  per-edge reward and the hindsight targets (:doc:`cb_setup`), and ``parse_pair_barriers``
   returns only the barrier.
+* **Site hold-off** (``parse_site_holdoff``) reports, per site, the substituent that holds
+  the site's largest λ most often, the fraction of frames it dominates, the fraction of
+  those at λ ≥ 0.99, and the mean λ of each partner. A substituent that dominates yet
+  rarely reaches its endpoint, with the rest spread over several partners, is held off by
+  their combined end terms (:doc:`cb_setup`).
 
 See Also
 --------

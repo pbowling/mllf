@@ -56,30 +56,31 @@ Pretraining warm-starts the policy from completed simulations (:doc:`cb_pretrain
        --epochs 50
 
 Then set ``pretrain.model_path: models/14benz_pretrain/best_policy.pt`` in the workflow
-config. ``examples/pretrain_wUnimol.sh`` is the SLURM script for pretraining on many
-systems at once.
+config (``best_policy_bayesian.pt``, written with ``--bayesian-heads``, for
+``algorithm: hindsight``). ``examples/pretrain_with_filtering.sh`` is the SLURM launcher
+for pretraining on many systems at once.
 
 Staged Online Training
 ----------------------
 
-The configs in ``training/online_*.yaml`` use the production setup: per-system stages over
-ALF-derived combo sets, hindsight targets with per-pair offsets, and a pretrained Bayesian
-model. The driver runs as one long SLURM job that submits the simulations:
+The configs ``training/online_1.yaml`` through ``online_4_hne_pr3.yaml`` use the
+production setup, with per-system stages over ALF-derived combo sets, hindsight targets
+with per-pair offsets, and a pretrained Bayesian model. The driver runs as one long SLURM
+job that submits the simulations:
 
 .. code-block:: bash
 
    cd training
-   sbatch --time=4-00:00:00 --export=ALL,CONFIG=online_A_well_solv_vac.yaml \
-       start_test_training.sh
-   tail -f checkpoints_online_A/epoch_summary.log   # one block per epoch
+   sbatch --time=4-00:00:00 --export=ALL,CONFIG=online_1.yaml start_test_training.sh
+   tail -f checkpoints_online_1/epoch_summary.log   # one block per epoch
 
    # simulated time so far, against the iterative-flattening runs of the same systems
-   python -m mllf.cb.cost_ledger checkpoints_online_A --pretraining-root ../pretraining
+   python -m mllf.cb.cost_ledger checkpoints_online_1 --pretraining-root ../pretraining
 
-Each config's system list only illustrates the setup. Which systems go into a run should
-follow from what is prepared and from how well the pretrained model predicts each one.
-To test a trained model on systems it has not seen, use ``mode: deploy``
-(:ref:`Testing on New Systems`).
+Each stage starts from the previous stage's final model, and stages 3 and 4 test the
+trained model on systems it has not seen (``mode: deploy``, :ref:`Testing on New
+Systems`). The system lists illustrate the setup; which systems enter a run should follow
+from what is prepared and from how well the pretrained model predicts each one.
 
 Adding a System
 ---------------
@@ -89,4 +90,4 @@ Adding a System
    `msld-py-prep <https://github.com/Vilseck-Lab/msld-py-prep>`_ (:doc:`file_handling`).
 2. Add an entry to ``systems:`` with its ``input_dir``, ``out_dir`` and ``solvent_state``.
 3. Run the minimal configuration first. A single stage of single-site pairs tests the
-   whole pipeline before you widen it.
+   whole pipeline before it is widened.
