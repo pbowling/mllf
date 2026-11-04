@@ -502,6 +502,8 @@ def grow_directional_b_steps(state: Dict, system: str, labels: List[Tuple[int, i
       streak are cleared, the target is their midpoint (the best b guess)
       with the base step's variance, and ``barrier_trap`` is set on the
       pair so ``barrier_trapped_c_targets`` steps c up.
+    * A pair whose bracket closes (or inverts) is marked ``long_runs``, which
+      stays when the bracket is later cleared.
 
     Any non-directional run (both substituents sampled) clears both. Pairs
     flagged in ``skip`` ([E] bool; runs pinned at their start or stranded
@@ -540,6 +542,9 @@ def grow_directional_b_steps(state: Dict, system: str, labels: List[Tuple[int, i
         else:
             bracket['hi'] = db_c if bracket['hi'] is None else min(bracket['hi'], db_c)
 
+        if bracket['lo'] is not None and bracket['hi'] is not None:
+            # kept after the bracket clears (system_stages.pair_bracketed, sticky)
+            entry['long_runs'] = True
         if bracket['lo'] is not None and bracket['hi'] is not None and bracket['lo'] > bracket['hi']:
             # inverted: unlock (see docstring)
             target_c = 0.5 * (bracket['lo'] + bracket['hi'])
@@ -994,6 +999,26 @@ def apply_pair_offsets(actions: torch.Tensor, mean: torch.Tensor, state: Optiona
     return out, len(shifted)
 
 
+def cap_quadratic(actions: torch.Tensor, mean: torch.Tensor, cap: Optional[Dict[str, float]]) -> Tuple[torch.Tensor, int]:
+    """Keep each edge's c within the model's prediction +- max(floor,
+    fraction x |prediction|) (bandit key c_cap: {floor, fraction}), on a copy.
+    Pair offsets and barrier-trap steps (apply_pair_offsets) can otherwise
+    push c far from the model where crossings never come (luis_mcl1: c 30 ->
+    60-107, no good run); in stage 1, 99% of good runs stayed within
+    max(15, 0.5 x c) of the pair's first c. The offsets themselves are kept.
+    Returns (actions, number of edges clamped); no cap -> unchanged."""
+    if not cap:
+        return actions, 0
+    col = OFFSET_DIMS['quadratic']
+    m = mean[:, col]
+    band = torch.clamp(float(cap.get('fraction', 0.0)) * m.abs(), min=float(cap.get('floor', 0.0)))
+    c = actions[:, col]
+    capped = torch.minimum(torch.maximum(c, m - band), m + band)
+    out = actions.clone()
+    out[:, col] = capped
+    return out, int((capped != c).sum())
+
+
 def linear_edge_variance(state: Optional[Dict], system: str,
                          labels: Optional[List[Tuple[int, int]]], edge_index: torch.Tensor,
                          prior_sd: Optional[Dict[str, float]] = None) -> Optional[torch.Tensor]:
@@ -1102,7 +1127,8 @@ def record_pair_outcomes(state: Dict, system: str, labels: List[Tuple[int, int]]
                          combo: Optional[str] = None, stage: Optional[str] = None,
                          short: bool = False, short_min_transitions: int = 2,
                          short_min_fraction: float = SUCCESS_MIN_FRACTION,
-                         confirm: bool = True, epoch: Optional[int] = None) -> None:
+                         confirm: bool = True, epoch: Optional[int] = None,
+                         partial_min_transitions: int = 0, partial_runs: int = 0) -> None:
     """Store whether each pair's latest run failed (for pair_attention) and its
     consecutive failures, ``fail_streak`` (for update_exploration); count its
     training ``visits`` and ``successes`` and remember the ``combos`` (paths,
@@ -1120,6 +1146,14 @@ def record_pair_outcomes(state: Dict, system: str, labels: List[Tuple[int, int]]
     full-length run clears the flag either way. ``confirm=False``: no
     full-length confirmation; a short run passing the short test counts as a
     success itself.
+
+    ``partial_runs`` (stage keys partial_runs_to_resolve /
+    partial_min_transitions; 0: off): slow-crossing pairs. A short run with
+    at least ``partial_min_transitions`` crossings and the short test's
+    minority fraction (a run passing the short test included) adds to the
+    stage entry's ``partial_runs``; with ``partial_runs`` of them, in any
+    epochs, the pair has ``partial_resolved``, which ``pair_resolved``
+    accepts in place of its successes (the offset sd limits still apply).
 
     ``epoch``: the stage entry also counts the distinct epochs the pair ran
     in (``epochs``, ``last_epoch``), for retirement (two runs of a pair in
@@ -1160,6 +1194,12 @@ def record_pair_outcomes(state: Dict, system: str, labels: List[Tuple[int, int]]
                     st['epochs'] = int(st.get('epochs', 0)) + 1
                 if short:
                     st['short_promising'] = int(st.get('short_promising', 0)) + (0 if failed else 1)
+                if short and partial_runs > 0 and pair_succeeded(
+                        saved_data, i, j, site=sites.get(i), min_transitions=partial_min_transitions,
+                        min_fraction=short_min_fraction):
+                    st['partial_runs'] = int(st.get('partial_runs', 0)) + 1
+                    if st['partial_runs'] >= partial_runs:
+                        st['partial_resolved'] = True
             if combo:
                 combos = [c for c in entry.get('combos', []) if c != combo] + [combo]
                 entry['combos'] = combos[-REVISIT_COMBOS_KEPT:]

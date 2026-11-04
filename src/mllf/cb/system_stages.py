@@ -39,7 +39,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from mllf.cb.hindsight import (
     OFFSET_KEY,
@@ -128,12 +128,16 @@ def combo_pair_keys(system: str, combo_path) -> List[str]:
 def pair_resolved(entry: Optional[Dict], stage: str, successes: int = 2,
                   max_offset_sd: Optional[Dict[str, float]] = None,
                   prior_sd: Optional[Dict[str, float]] = None) -> bool:
-    """``successes`` successful runs in ``stage`` and, for each coefficient in
-    ``max_offset_sd``, an offset posterior sd at most that (a coefficient with
-    no observations has the prior sd)."""
+    """``successes`` successful runs in ``stage`` (or enough slow-crossing
+    runs, ``partial_resolved`` from hindsight.record_pair_outcomes) and, for
+    each coefficient in ``max_offset_sd``, an offset posterior sd at most that
+    (a coefficient with no observations has the prior sd); or resolved by its
+    scouting run (``apply_scouting``)."""
     entry = entry or {}
     st = (entry.get('stages') or {}).get(stage) or {}
-    if int(st.get('successes', 0)) < successes:
+    if st.get('scout_resolved'):
+        return True
+    if int(st.get('successes', 0)) < successes and not st.get('partial_resolved'):
         return False
     psd = {**OFFSET_PRIOR_SD, **(prior_sd or {})}
     for dim, limit in (max_offset_sd or {}).items():
@@ -144,34 +148,58 @@ def pair_resolved(entry: Optional[Dict], stage: str, successes: int = 2,
     return True
 
 
-def pair_retired(entry: Optional[Dict], stage: str, after_epochs: Optional[int]) -> bool:
+def pair_retired(entry: Optional[Dict], stage: str, after_epochs: Optional[int],
+                 min_successes: int = 0) -> bool:
     """The pair has run in ``after_epochs`` epochs of ``stage`` (``epochs``,
     see ``hindsight.record_pair_outcomes``) without resolving: it leaves the
     pool and no longer holds back its groups. None: never retired. (Callers
-    check ``pair_resolved`` first; a resolved pair is not 'retired'.)"""
+    check ``pair_resolved`` first; a resolved pair is not 'retired'.)
+    ``min_successes`` (``retire_terms``): only a pair with at least that many
+    good runs in the stage retires; one with fewer stays in the pool and
+    keeps holding back its groups."""
     if after_epochs is None:
         return False
     st = ((entry or {}).get('stages') or {}).get(stage) or {}
+    if int(st.get('successes', 0)) < int(min_successes):
+        return False
     return int(st.get('epochs', 0)) >= int(after_epochs)
+
+
+def retire_terms(key: str, retire_after: Optional[int], rule) -> Tuple[Optional[int], int]:
+    """(after_epochs, min_successes) for pair ``key`` under a stage's
+    retirement rule as callers resolve it: a bool / int (good runs every pair
+    needs; true = 1) with ``retire_after`` for every pair, or a dict for the
+    'reference' setting -- {'keys': the stage's reference pairs,
+    'after_epochs': their retirement epochs, 'min_successes': good runs they
+    need}; other pairs retire after ``retire_after`` with none."""
+    if isinstance(rule, dict):
+        if key in rule['keys']:
+            return rule.get('after_epochs', retire_after), int(rule.get('min_successes', 1))
+        return retire_after, 0
+    return retire_after, int(rule)
 
 
 def pair_settled(entry: Optional[Dict], stage: str, adv: Dict,
                  prior_sd: Optional[Dict[str, float]] = None,
-                 retire_after: Optional[int] = None) -> bool:
+                 retire_after: Optional[int] = None,
+                 min_successes: int = 0) -> bool:
     """Resolved (``pair_resolved``) or retired (``pair_retired``)."""
     return (pair_resolved(entry, stage, int(adv.get('successes', 2)), adv.get('max_offset_sd'), prior_sd)
-            or pair_retired(entry, stage, retire_after))
+            or pair_retired(entry, stage, retire_after, min_successes))
 
 
 def combo_resolved(bandit_state: Optional[Dict], system: str, combo, stage: str, adv: Dict,
                    prior_sd: Optional[Dict[str, float]] = None,
-                   retire_after: Optional[int] = None) -> bool:
+                   retire_after: Optional[int] = None,
+                   retire_requires_success=False) -> bool:
     """Every within-site pair of a combo is resolved (``pair_resolved``), or,
-    with ``retire_after``, resolved or retired (``pair_settled``)."""
+    with ``retire_after``, resolved or retired (``pair_settled``).
+    ``retire_requires_success``: the stage's retirement rule (``retire_terms``)."""
     store = (bandit_state or {}).get(OFFSET_KEY, {})
     keys = combo_pair_keys(system, combo)
     return bool(keys) and all(
-        pair_settled(store.get(k), stage, adv, prior_sd, retire_after) for k in keys)
+        pair_settled(store.get(k), stage, adv, prior_sd,
+                     *retire_terms(k, retire_after, retire_requires_success)) for k in keys)
 
 
 def combo_pair_flags(bandit_state: Optional[Dict], system: str, combo, stage: str) -> Tuple[bool, bool]:
@@ -185,42 +213,127 @@ def combo_pair_flags(bandit_state: Optional[Dict], system: str, combo, stage: st
     return awaiting, unvisited
 
 
+def pair_bracketed(entry: Optional[Dict], sticky: bool = False) -> bool:
+    """The pair's b has been seen pushing it both ways (closed ``b_bracket``
+    from hindsight.grow_directional_b_steps) or the bracket inverted
+    (``barrier_trap``): b is near its target, so a failed run is likely too
+    short to cross the barrier rather than wrongly biased. ``sticky`` (stage
+    key bracketed_runs_sticky): also once it ever was (``long_runs``); a run
+    sampling both substituents clears the bracket, which would otherwise send
+    a slow-crossing pair back to short runs."""
+    entry = entry or {}
+    br = entry.get('b_bracket') or {}
+    return (bool(entry.get('barrier_trap')) or (br.get('lo') is not None and br.get('hi') is not None)
+            or (sticky and bool(entry.get('long_runs'))))
+
+
+def combo_bracketed(bandit_state: Optional[Dict], system: str, combo, sticky: bool = False,
+                    settled: Optional[Callable[[str, Optional[Dict]], bool]] = None) -> bool:
+    """Any of the combo's pairs is bracketed (``pair_bracketed``).
+    ``settled(key, entry)``: pairs it holds for (resolved or retired) keep
+    long runs only while their bracket is closed, not by ``sticky``."""
+    store = (bandit_state or {}).get(OFFSET_KEY, {})
+    return any(pair_bracketed(store.get(k), sticky and not (settled and settled(k, store.get(k))))
+               for k in combo_pair_keys(system, combo))
+
+
+SCOUT_TIER_UNKNOWN = 1
+
+
+def combo_scout_tier(tiers: Dict[str, int], system: str, combo) -> int:
+    """A combo's scouting tier (stage key scout_priority; 0 = likely hardest):
+    the lowest tier of its pairs; a pair the scouting runs did not cover
+    counts as SCOUT_TIER_UNKNOWN (the middle)."""
+    keys = combo_pair_keys(system, combo)
+    return min((int(tiers.get(k, SCOUT_TIER_UNKNOWN)) for k in keys), default=SCOUT_TIER_UNKNOWN)
+
+
+def apply_scouting(sys_state: Dict, bandit_state: Dict, system: str, stage: str,
+                   summary: Dict, group_names: Iterable[str]) -> Tuple[Dict[str, str], List[str], List[str]]:
+    """Apply a scouting summary (training/scouting/scout_groups.py
+    --priorities, ``scout_summary.json``) to one system entering ``stage``,
+    once: each of its groups whose scouting run sampled every substituent has
+    passed (``groups_done``, exporting the scouting run; also kept in
+    ``scouted_groups``), and its pairs whose scouting run passed the full-run
+    test are resolved (``scout_resolved``). Returns (groups passed: name ->
+    run, pairs resolved, every scouting run of the system)."""
+    applied = sys_state.setdefault('scouting_applied', [])
+    groups = {k.split('/', 1)[1]: v for k, v in (summary.get('groups') or {}).items()
+              if k.split('/', 1)[0] == system}
+    if stage in applied:
+        return {}, [], []
+    applied.append(stage)
+    names = set(group_names)
+    passed = {g: v['run'] for g, v in groups.items() if g in names and v.get('all_sampled')}
+    for g, run in passed.items():
+        sys_state.setdefault('groups_done', {}).setdefault(g, run)
+        sys_state.setdefault('scouted_groups', {})[g] = run
+    store = bandit_state.setdefault(OFFSET_KEY, {})
+    resolved = [k for k in summary.get('pass_pairs') or [] if k.split('|')[0] == system]
+    for k in resolved:
+        store.setdefault(k, {}).setdefault('stages', {}).setdefault(stage, {'visits': 0, 'successes': 0})[
+            'scout_resolved'] = True
+    return passed, resolved, [v['run'] for g, v in groups.items() if g in names]
+
+
 def group_ready(bandit_state: Optional[Dict], system: str, group_combo, ref_keys: set,
                 stage: str, adv: Dict, prior_sd: Optional[Dict[str, float]] = None,
                 fraction: float = 1.0, retire_after: Optional[int] = None,
-                held: Optional[Iterable[str]] = None) -> bool:
+                held: Optional[Iterable[str]] = None,
+                retire_requires_success=False,
+                min_resolved_per_site: int = 0) -> bool:
     """At least ``fraction`` of a group's reference pairs (its within-site pairs
     in ``ref_keys``) are resolved (``pair_resolved``), so the group can run.
     With ``retire_after``, retired pairs (``pair_retired``) are left out of
     the count: the group test, not a pair that cannot be freed, decides.
     ``held``: pair keys the group waits on regardless of ``fraction`` (pairs
     reopened after the group failed, ``reopen_pairs``); each must be
-    resolved or retired."""
+    resolved or retired. ``min_resolved_per_site`` (stage key
+    group_min_resolved_per_site): a group spanning more than one site also
+    needs at least that many resolved reference pairs at every site, so it
+    never opens with a site that has no evidence."""
     store = (bandit_state or {}).get(OFFSET_KEY, {})
     for k in held or ():
-        if not pair_settled(store.get(k), stage, adv, prior_sd, retire_after):
+        if not pair_settled(store.get(k), stage, adv, prior_sd,
+                            *retire_terms(k, retire_after, retire_requires_success)):
             return False
-    keys = [k for k in combo_pair_keys(system, group_combo) if k in ref_keys]
-    keys = [k for k in keys
-            if pair_resolved(store.get(k), stage, int(adv.get('successes', 2)), adv.get('max_offset_sd'), prior_sd)
-            or not pair_retired(store.get(k), stage, retire_after)]
+
+    def _resolved(k):
+        return pair_resolved(store.get(k), stage, int(adv.get('successes', 2)), adv.get('max_offset_sd'), prior_sd)
+    ref = [k for k in combo_pair_keys(system, group_combo) if k in ref_keys]
+    if min_resolved_per_site > 0:
+        by_site: Dict[str, List[str]] = {}
+        for k in ref:
+            by_site.setdefault(k.split('|')[1], []).append(k)
+        if len(by_site) > 1 and any(sum(map(_resolved, ks)) < min_resolved_per_site
+                                    for ks in by_site.values()):
+            return False
+    keys = [k for k in ref
+            if _resolved(k) or not pair_retired(store.get(k), stage,
+                                                *retire_terms(k, retire_after, retire_requires_success))]
     if not keys:
         return True
-    n = sum(pair_resolved(store.get(k), stage, int(adv.get('successes', 2)),
-                          adv.get('max_offset_sd'), prior_sd) for k in keys)
-    return n >= fraction * len(keys)
+    return sum(map(_resolved, keys)) >= fraction * len(keys)
 
 
-def group_failed_pairs(system: str, group_combo, saved_data: Dict) -> List[str]:
-    """Pair keys of a failed group run to send back to the pair phase: the
-    group's within-site pairs that include a substituent with no population
-    (every one of the group's pairs if none is identifiable)."""
+def group_failed_pairs(system: str, group_combo, saved_data: Union[Dict, Sequence[Dict]]) -> List[str]:
+    """Pair keys of a failed group to send back to the pair phase: the
+    group's within-site pairs that include a substituent with no population.
+    ``saved_data``: one failed run, or the group's failed runs since it was
+    last reopened. Runs with no population at all (never at a physical
+    endpoint) are left out; over the rest, the substituents empty in every
+    run, else those empty in any. Every one of the group's pairs if none is
+    identifiable."""
     labels = combo_node_labels(group_combo) if Path(group_combo).is_dir() else None
-    pops = list(saved_data.get('populations') or [])
+    runs = [saved_data] if isinstance(saved_data, dict) else list(saved_data)
     keys = combo_pair_keys(system, group_combo)
     if not labels:
         return keys
-    empty = {labels[n] for n in range(len(labels)) if n >= len(pops) or pops[n] <= 0}
+    runs = [p for p in (list(r.get('populations') or []) for r in runs) if sum(p) > 0]
+    if not runs:
+        return keys
+    empty_in = [{labels[n] for n in range(len(labels)) if n >= len(p) or p[n] <= 0} for p in runs]
+    empty = set.intersection(*empty_in) or set.union(*empty_in)
     out = []
     for site, subs in combo_sites(group_combo):
         for a in range(len(subs)):
@@ -230,11 +343,31 @@ def group_failed_pairs(system: str, group_combo, saved_data: Dict) -> List[str]:
     return out or keys
 
 
+def held_off_sites(saved_data: Dict, cfg: Optional[Dict] = None) -> List[Dict]:
+    """Sites of a run whose dominant substituent's endpoint is held off by
+    several partners at once (``site_holdoff`` from
+    read_output.parse_site_holdoff): it holds the site's largest lambda in at
+    least ``dominant_min`` of the frames, reaches lambda >= 0.99 in under
+    ``at_max`` of those, and at least ``min_partners`` partners hold
+    ``partner_min`` or more of the rest. ``cfg``: bandit.group_holdoff."""
+    cfg = cfg or {}
+    dom_min = float(cfg.get('dominant_min', 0.7))
+    at_max = float(cfg.get('at_max', 0.05))
+    part_min = float(cfg.get('partner_min', 0.02))
+    n_min = int(cfg.get('min_partners', 2))
+    out = []
+    for site in saved_data.get('site_holdoff') or []:
+        partners = {b: v for b, v in (site.get('partners') or {}).items() if v >= part_min}
+        if site.get('dom_frac', 0) >= dom_min and site.get('at_frac', 1) < at_max and len(partners) >= n_min:
+            out.append({**site, 'partners': partners})
+    return out
+
+
 def reopen_pairs(bandit_state: Dict, keys: Iterable[str], stage: str) -> int:
     """Send pairs back to the pair phase of ``stage``: their stage successes
-    and epochs restart from 0 (so they must resolve again and get the full
-    retirement allowance) and their revisit retirement is cleared. Learned
-    offsets are kept. Returns the number reopened."""
+    (and partial runs) and epochs restart from 0 (so they must resolve again and get the full
+    retirement allowance), their revisit retirement and sticky long runs
+    are cleared. Learned offsets are kept. Returns the number reopened."""
     store = bandit_state.setdefault(OFFSET_KEY, {})
     n = 0
     for k in keys:
@@ -242,7 +375,11 @@ def reopen_pairs(bandit_state: Dict, keys: Iterable[str], stage: str) -> int:
         st = entry.setdefault('stages', {}).setdefault(stage, {'visits': 0, 'successes': 0})
         st['successes'] = 0
         st['epochs'] = 0
+        st.pop('scout_resolved', None)
+        st.pop('partial_runs', None)
+        st.pop('partial_resolved', None)
         st.pop('last_epoch', None)
+        entry.pop('long_runs', None)            # back to short runs unless b re-brackets
         entry['successes'] = 0
         entry['visits'] = 0
         entry.pop('retired', None)
@@ -288,6 +425,36 @@ def site_balanced(saved_data: Dict, nsubs_per_site: Sequence[int],
         if s >= len(trans) or trans[s] < min_site_transitions:
             return False
     return True
+
+
+def pooled_group_test(history: Sequence[Dict], nsubs_per_site: Sequence[int],
+                      min_population_ratio: float, min_site_transitions: int) -> Tuple[bool, Optional[str]]:
+    """Group test over a group's recent runs (stage key group_pass_window).
+
+    ``history``: the runs, oldest first, each {'run', 'populations',
+    'transitions'}. Populations and per-site transitions are summed over them
+    and ``site_balanced`` applied to the totals, so with both thresholds 0 the
+    group passes when every substituent was sampled in at least one run.
+    Returns (passes, run to export): the run that sampled the most
+    substituents, the most recent on ties.
+    """
+    if not history:
+        return False, None
+    n = max(len(h.get('populations') or []) for h in history)
+    pops = [0] * n
+    trans = [0] * len(nsubs_per_site)
+    for h in history:
+        for i, v in enumerate(h.get('populations') or []):
+            pops[i] += v
+        t = h.get('transitions') or []
+        t = [t[k] for k in sorted(t)] if isinstance(t, dict) else list(t)
+        for i, v in enumerate(t[:len(trans)]):
+            trans[i] += v
+    passes = site_balanced({'populations': pops, 'transitions': trans}, nsubs_per_site,
+                           min_population_ratio, min_site_transitions)
+    best = max(range(len(history)),
+               key=lambda i: (sum(1 for v in history[i].get('populations') or [] if v > 0), i))
+    return passes, history[best].get('run')
 
 
 def combos_progress(sys_state: Dict, adv: Dict,

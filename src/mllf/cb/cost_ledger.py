@@ -133,8 +133,9 @@ def _run_sort_key(p: Path):
 
 def alf_cost(dataset_dirs: Iterable[Path]) -> Dict[str, Dict]:
     """ALF's simulated time per dataset (group): {'runs', 'ns', 'missing'},
-    from each run's original output (``metadata.json`` -> source_run_dir /
-    output). ``missing`` counts runs whose output could not be read (e.g.
+    from each run's recorded ``simulated_ns`` (simulation_results.json), else
+    its original output (``metadata.json`` -> source_run_dir / output).
+    ``missing`` counts runs whose length could not be read (e.g.
     production replicas whose outputs were removed)."""
     out = {}
     for d in dataset_dirs:
@@ -147,8 +148,15 @@ def alf_cost(dataset_dirs: Iterable[Path]) -> Dict[str, Dict]:
                     src = json.loads(meta.read_text()).get('source_run_dir')
                 except Exception:
                     src = None
+            # simulation_results.json records the run length at collection
+            # (same simulated_ns of the output); reading the output is slow.
             ns = None
-            for cand in ([Path(src) / 'output'] if src else []) + [run / 'output', run / 'output.out']:
+            try:
+                ns = json.loads((run / 'simulation_results.json').read_text()).get('simulated_ns')
+            except Exception:
+                ns = None
+            for cand in ([] if ns is not None else
+                         ([Path(src) / 'output'] if src else []) + [run / 'output', run / 'output.out']):
                 ns = simulated_ns(cand)
                 if ns is not None:
                     break

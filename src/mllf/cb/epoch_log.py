@@ -8,6 +8,7 @@ stage progress and validation::
       Pair runs good: short 43/327 (13.1%), full-length 9/101 (8.9%)
       Groups: 6 run, 2 passed: 12fuzed_vac/group05, luis_bace_solvent/group03
       Groups back to pairs: 14benz_vac/group01 (12 pairs reopened)
+      Group corrections: indolizine_solv/group01 (site s1 ratio 0.75)
       Validation: 7/48 held-out pairs good (14.6%); model accepted
       Model update: loss online 2.943 -> 2.694, replay 4.888 -> 4.457
       Bias steps: median |step| b 2.31, c 4.33, skew 0.94, end 0.39; b grown 53, bisected 88, unlocked 4; c up 57, down 26, unlocked 2; pinned 13, stranded 34, held-off ends 33
@@ -45,6 +46,8 @@ def format_epoch_block(epoch: int, runs: Dict[str, int], failed: Sequence[str] =
                        pair_short: Optional[Dict] = None, pair_full: Optional[Dict] = None,
                        groups_run: int = 0, groups_passed: Sequence[str] = (),
                        groups_reopened: Sequence[Tuple[str, int]] = (),
+                       groups_holdoff: Sequence[str] = (),
+                       groups_corrected: Sequence[str] = (),
                        validation: Optional[Dict] = None, gate: Optional[str] = None,
                        regression: Optional[Dict] = None, hindsight: Optional[Dict] = None,
                        systems: Sequence[Dict] = (), stage_changes: Sequence[Dict] = (),
@@ -78,6 +81,10 @@ def format_epoch_block(epoch: int, runs: Dict[str, int], failed: Sequence[str] =
     if groups_reopened:
         lines.append("  Groups back to pairs: " + ', '.join(
             f"{g} ({n} pairs reopened)" for g, n in groups_reopened))
+    if groups_holdoff:
+        lines.append("  Groups with a held-off endpoint: " + ', '.join(groups_holdoff))
+    if groups_corrected:
+        lines.append("  Group corrections: " + ', '.join(groups_corrected))
     if validation and validation.get('total'):
         lines.append(f"  Validation: {_frac(int(validation.get('both', 0)), int(validation['total']))}"
                      f" held-out pairs good" + (f"; {gate}" if gate else ''))

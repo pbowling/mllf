@@ -10,7 +10,9 @@ from mllf.cb.hindsight import (
     KB_KCAL,
     LINEAR_STEP_CAP,
     OFFSET_KEY,
+    OFFSET_DIMS,
     apply_pair_offsets,
+    cap_quadratic,
     combo_node_labels,
     hindsight_targets,
     linear_hindsight,
@@ -172,3 +174,18 @@ def test_apply_pair_offsets_noop_without_state():
     a = torch.ones(2, 4)
     out, n = apply_pair_offsets(a, a, None, 'sys', [(1, 1), (1, 2)], EDGES)
     assert n == 0 and out is a
+
+
+def test_cap_quadratic_keeps_c_near_the_model():
+    c = OFFSET_DIMS['quadratic']
+    mean = torch.zeros(3, 4)
+    mean[:, c] = torch.tensor([10.0, 40.0, -40.0])
+    actions = mean.clone() + 1.0
+    actions[:, c] = torch.tensor([40.0, 75.0, -45.0])
+    out, n = cap_quadratic(actions, mean, {'floor': 15.0, 'fraction': 0.5})
+    # bands: max(15, 5) = 15, max(15, 20) = 20, 20
+    assert out[:, c].tolist() == [25.0, 60.0, -45.0] and n == 2
+    others = [d for d in range(4) if d != c]
+    assert torch.equal(out[:, others], actions[:, others])
+    same, n0 = cap_quadratic(actions, mean, None)
+    assert same is actions and n0 == 0

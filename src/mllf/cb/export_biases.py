@@ -35,16 +35,19 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from mllf.cb.bandit_config import with_hindsight_defaults
 from mllf.cb.graph_build import build_graph_and_data
 from mllf.cb.hindsight import (
     BIAS_DIMS,
     OFFSET_KEY,
     OFFSET_PRIOR_SD,
     apply_pair_offsets,
+    cap_quadratic,
     combo_node_labels,
     linear_edge_variance,
     pair_offset_posterior,
 )
+from mllf.cb.group_correction import apply_group_values, correction_config
 from mllf.cli.workflow import write_variables_from_actions
 
 
@@ -93,6 +96,11 @@ def export_final_biases(policy, system_cfg: Dict, config: Dict, bandit_state: Op
     actions, n_shifted = apply_pair_offsets(
         mean, mean, bandit_state, system, labels, data.edge_index,
         prior_sd=bandit_cfg.get('offset_prior_sd'), sample=False, dims=dims)
+    actions, _ = cap_quadratic(actions, mean, bandit_cfg.get('c_cap'))
+    if correction_config(bandit_cfg) is not None:
+        # the group's corrected x / s (bandit.group_correction), if any
+        actions, _ = apply_group_values(actions, bandit_state, system, combo_dir.name,
+                                        labels, data.edge_index)
     lin_var = linear_edge_variance(bandit_state, system, labels, data.edge_index,
                                    prior_sd=bandit_cfg.get('offset_prior_sd'))
     write_variables_from_actions(
@@ -226,7 +234,7 @@ def main() -> None:
                         '_unconverged names) and exit')
     args = p.parse_args()
 
-    config = yaml.safe_load(open(args.config))
+    config = with_hindsight_defaults(yaml.safe_load(open(args.config)))
     if args.label:
         n = label_final_biases(args.label, config, args.systems)
         print(f"labelled {n} exported group(s) under {Path(args.label) / 'final_biases'}")
@@ -236,6 +244,8 @@ def main() -> None:
     policy = UnimolPolicy(
         unimol_dim=pol_cfg.get('unimol_dim', 512), mlp_hidden=pol_cfg.get('mlp_hidden', 64),
         mlp_out_dim=4, use_dual_embeddings=True,
+        env_input=config.get('unimol', {}).get('env_input', 'dual'),
+        site_size_input=bool(config.get('unimol', {}).get('site_size_input', False)),
         use_bayesian_heads=pol_cfg.get('use_bayesian_heads', True),
         bayesian_prior_precision=config.get('bandit', {}).get('prior_precision', 1.0),
     ).to(device)

@@ -553,3 +553,93 @@ def test_reversed_pair_partner(tmp_path):
     assert ss.combo_pair_keys('s', p) == ss.combo_pair_keys('s', tmp_path / 'pair07_site1_subs_1_9')
     assert cs.reversed_pair(p) is None                                 # a partner has no partner
     assert cs.reversed_pair(tmp_path / 'group01_site1_subs_1_2_3') is None
+
+
+# ── Retirement rules, partial resolving, scouting, long runs, group window ──
+
+def test_retire_terms_reference_rule_applies_to_reference_pairs_only():
+    rule = {'keys': {'s|s1|1|2'}, 'after_epochs': 10, 'min_successes': 0}
+    assert ss.retire_terms('s|s1|1|2', 5, rule) == (10, 0)
+    assert ss.retire_terms('s|s1|2|3', 5, rule) == (5, 0)
+    assert ss.retire_terms('s|s1|2|3', 5, True) == (5, 1)
+    assert ss.retire_terms('s|s1|2|3', 5, False) == (5, 0)
+
+
+def test_pair_retired_needs_min_successes():
+    assert not ss.pair_retired(_st(epochs=10), 'p', 10, min_successes=1)
+    assert ss.pair_retired(_st(successes=1, epochs=10), 'p', 10, min_successes=1)
+    assert ss.pair_retired(_st(epochs=10), 'p', 10, min_successes=0)
+
+
+def test_partial_runs_resolve_a_slow_crossing_pair():
+    ei = torch.tensor([[0, 1], [1, 0]])
+    state = {}
+    slow = {'populations': [1000, 200], 'transition_pairs': {'2_3': 3}}   # 3 crossings: not a good short run
+    for epoch in range(3):
+        record_pair_outcomes(state, 's', [(1, 1), (1, 2)], ei, slow, stage='p', short=True,
+                             short_min_transitions=5, short_min_fraction=0.1, confirm=False,
+                             epoch=epoch, partial_min_transitions=3, partial_runs=3)
+        e = state[OFFSET_KEY]['s|s1|1|2']
+        assert e['stages']['p']['successes'] == 0
+        assert ss.pair_resolved(e, 'p', 2) == (epoch == 2)
+
+
+def test_scouting_passes_groups_and_resolves_pairs_once():
+    summary = {'groups': {'s/group01': {'run': 'r1', 'all_sampled': True},
+                          's/group02': {'run': 'r2', 'all_sampled': False},
+                          't/group01': {'run': 'r3', 'all_sampled': True}},
+               'pass_pairs': ['s|s1|1|2', 't|s1|1|2']}
+    st, bandit = {}, {}
+    passed, resolved, runs = ss.apply_scouting(st, bandit, 's', 'p', summary, ['group01', 'group02'])
+    assert passed == {'group01': 'r1'} and st['groups_done'] == {'group01': 'r1'}
+    assert resolved == ['s|s1|1|2'] and sorted(runs) == ['r1', 'r2']
+    assert ss.pair_resolved(bandit[OFFSET_KEY]['s|s1|1|2'], 'p', 2)
+    assert 't|s1|1|2' not in bandit[OFFSET_KEY]
+    assert ss.apply_scouting(st, bandit, 's', 'p', summary, ['group01', 'group02']) == ({}, [], [])
+
+
+def test_scout_tier_is_the_hardest_pair_unknown_in_the_middle():
+    tiers = {'s|s1|1|2': 2, 's|s1|1|3': 0}
+    assert ss.combo_scout_tier(tiers, 's', '/x/group01_site1_subs_1_2_3') == 0
+    assert ss.combo_scout_tier(tiers, 's', '/x/pair01_site1_subs_1_2') == 2
+    assert ss.combo_scout_tier(tiers, 's', '/x/pair02_site1_subs_2_3') == ss.SCOUT_TIER_UNKNOWN
+
+
+def test_bracketed_pairs_keep_long_runs_until_settled_when_sticky():
+    closed = {'b_bracket': {'lo': 1.0, 'hi': 3.0}}
+    was_long = {'b_bracket': {'lo': 1.0}, 'long_runs': True}           # bracket cleared since
+    assert ss.pair_bracketed(closed) and ss.pair_bracketed({'barrier_trap': True})
+    assert not ss.pair_bracketed(was_long) and ss.pair_bracketed(was_long, sticky=True)
+    state = {OFFSET_KEY: {'s|s1|1|2': was_long}}
+    combo = '/x/pair01_site1_subs_1_2'
+    assert ss.combo_bracketed(state, 's', combo, sticky=True)
+    assert not ss.combo_bracketed(state, 's', combo, sticky=True, settled=lambda k, e: True)
+
+
+def test_pooled_group_test_passes_when_every_sub_sampled_in_some_run():
+    hist = [{'run': 'a', 'populations': [500, 0, 300], 'transitions': [4]},
+            {'run': 'b', 'populations': [500, 20, 0], 'transitions': [3]},
+            {'run': 'c', 'populations': [600, 0, 100], 'transitions': [5]}]
+    assert ss.pooled_group_test(hist, [3], 0.0, 0) == (True, 'c')      # ties: the most recent
+    assert ss.pooled_group_test(hist[::2], [3], 0.0, 0)[0] is False     # sub 2 never sampled
+    assert ss.pooled_group_test([], [3], 0.0, 0) == (False, None)
+
+
+def test_held_off_sites_needs_dominance_and_several_partners():
+    site = {'blocks': [2, 3, 4], 'dom': 2, 'dom_frac': 0.9, 'at_frac': 0.01, 'partners': {3: 0.1, 4: 0.05}}
+    assert [h['dom'] for h in ss.held_off_sites({'site_holdoff': [site]})] == [2]
+    assert ss.held_off_sites({'site_holdoff': [{**site, 'at_frac': 0.2}]}) == []     # reaches its endpoint
+    assert ss.held_off_sites({'site_holdoff': [{**site, 'dom_frac': 0.5}]}) == []    # does not dominate
+    assert ss.held_off_sites({'site_holdoff': [{**site, 'partners': {3: 0.1, 4: 0.01}}]}) == []  # one partner
+
+
+def test_group_failed_pairs_pools_failed_runs(tmp_path):
+    import json
+    g = tmp_path / 'group01_site1_subs_1_5_9'
+    g.mkdir()
+    (g / 'mapping.json').write_text(json.dumps([
+        {'original_site': 1, 'original_sub': s, 'new_site': 1, 'new_sub': n, 'new_name': f'site1_sub{n}_pres.rtf'}
+        for n, s in ((1, 1), (2, 5), (3, 9))]))
+    runs = [{'populations': [800, 0, 300]}, {'populations': [800, 0, 0]}, {'populations': [0, 0, 0]}]
+    # sub 5 is empty in every run with any population; sub 9 only in one
+    assert sorted(ss.group_failed_pairs('s', g, runs)) == ['s|s1|1|5', 's|s1|5|9']

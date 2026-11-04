@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import yaml
 
-from mllf.cb import epoch_log, system_stages
+from mllf.cb import epoch_log, group_correction, system_stages
 from mllf.cb.cost_ledger import LEDGER_FILE, load_ledger, record_runs, summarize_ledger
 from mllf.cb.curriculum import (
     apply_stage_combo_filter,
@@ -41,6 +41,7 @@ from mllf.cb.export_biases import export_final_biases, label_final_biases
 from mllf.cb.graph_build import build_graph_and_data
 from mllf.cb.hindsight import combo_node_labels, merge_revisits, pair_attention, select_revisits
 from mllf.cb.policy import ContextBaseline, UnimolPolicy
+from mllf.cb.bandit_config import BANDIT_ALGORITHMS, bandit_algorithm, with_hindsight_defaults
 from mllf.cb.reinforce_trainer import append_summary, format_pair_success, train_epoch
 from mllf.cb.workflow_utils import (
     action_std_score,
@@ -75,7 +76,7 @@ def run_training(config_path: str) -> None:
     model and output paths come from the deploy configuration.
     """
     with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+        config = with_hindsight_defaults(yaml.safe_load(f))
     print(f"Loaded config from {config_path}")
 
     mode = config.get('mode', 'train')
@@ -87,9 +88,9 @@ def run_training(config_path: str) -> None:
         _bc = config.get('bandit') or {}
         if not (config.get('curriculum') or {}).get('enabled'):
             raise ValueError("mode: deploy needs curriculum stages (curriculum.enabled: true)")
-        if (_bc.get('algorithm') != 'neurallinear_ts' or _bc.get('update_target') != 'hindsight'
+        if (bandit_algorithm(_bc) != 'hindsight' or _bc.get('update_target') != 'hindsight'
                 or not _bc.get('pair_offsets', True)):
-            raise ValueError("mode: deploy needs bandit.algorithm: neurallinear_ts, "
+            raise ValueError("mode: deploy needs bandit.algorithm: hindsight, "
                              "update_target: hindsight and pair_offsets (per-pair learning)")
         _model = deploy_cfg.get('model_path')
         if not _model or not Path(_model).exists():
@@ -272,15 +273,17 @@ def run_training(config_path: str) -> None:
     mlp_hidden = policy_config.get('mlp_hidden', 64)
     num_bias_types = 4  # Linear, quadratic, skew, end
 
-    # NeuralLinear + Thompson Sampling: opt-in bandit config, sibling to
-    # curriculum:/reward:/unimol:. Default 'reinforce' reproduces today's
-    # behavior exactly when the `bandit:` block is absent from the config.
+    # bandit.algorithm: 'hindsight' (Bayesian heads, hindsight targets,
+    # per-pair offsets) or 'reinforce' (the default when `bandit:` is absent).
     bandit_cfg = config.get('bandit', {})
-    algorithm = bandit_cfg.get('algorithm', 'reinforce')
+    algorithm = bandit_algorithm(bandit_cfg)
+    if algorithm not in BANDIT_ALGORITHMS:
+        raise ValueError(f"bandit.algorithm must be one of {BANDIT_ALGORITHMS}, "
+                         f"got {bandit_cfg.get('algorithm')!r}")
     use_bayesian_heads = policy_config.get('use_bayesian_heads', False)
-    if use_bayesian_heads and algorithm != 'neurallinear_ts':
+    if use_bayesian_heads and algorithm != 'hindsight':
         print("  Warning: training.policy.use_bayesian_heads=True but "
-              "bandit.algorithm != 'neurallinear_ts' — the policy will have "
+              "bandit.algorithm != 'hindsight' — the policy will have "
               "Bayesian heads but nothing will train them online.")
 
     # Initialize policy with dual embeddings mode enabled
@@ -296,6 +299,8 @@ def run_training(config_path: str) -> None:
         use_dual_embeddings=True,  # Enable dual embedding mode for online training
         # unimol.env_input must match the pretrained model's (UnimolPolicy)
         env_input=config.get('unimol', {}).get('env_input', 'dual'),
+        # unimol.site_size_input must match too (pretrain_metadata.json, checked below)
+        site_size_input=bool(config.get('unimol', {}).get('site_size_input', False)),
         use_bayesian_heads=use_bayesian_heads,
         bayesian_prior_precision=bandit_cfg.get('prior_precision', 1.0),
     ).to(device)
@@ -345,7 +350,7 @@ def run_training(config_path: str) -> None:
     system_to_idx = build_system_index(systems_cfg)
     baseline_net = None
     baseline_optimizer = None
-    if context_baseline_cfg.get('enabled', False) and algorithm != 'neurallinear_ts':
+    if context_baseline_cfg.get('enabled', False) and algorithm != 'hindsight':
         baseline_net = ContextBaseline(
             # NOTE: 64, not mlp_hidden -- BiasHeadMLP.feat_dim (the trunk
             # output ContextBaseline consumes via forward_features) is
@@ -364,18 +369,18 @@ def run_training(config_path: str) -> None:
               f"params, {len(system_to_idx)} systems (incl. unknown fallback)")
     elif context_baseline_cfg.get('enabled', False):
         print("  Warning: training.context_baseline.enabled=True but "
-              "bandit.algorithm == 'neurallinear_ts' — context baseline is a "
-              "REINFORCE-only concept (NL+TS's closed-form update has no "
+              "bandit.algorithm == 'hindsight' — context baseline is a "
+              "REINFORCE-only concept (the hindsight update has no "
               "advantage/baseline step); ignoring.")
 
     # Replay-style AWR (opt-in, REINFORCE-mode only) -- see
     # _sample_replay_items / _compute_replay_awr_loss and train_epoch's
     # history_replay_cfg param.
     history_replay_cfg = config.get('replay', {})
-    if history_replay_cfg.get('enabled', False) and algorithm == 'neurallinear_ts':
+    if history_replay_cfg.get('enabled', False) and algorithm == 'hindsight':
         print("  Warning: replay.enabled=True but bandit.algorithm == "
-              "'neurallinear_ts' — history replay folds an extra REINFORCE-"
-              "style loss into the gradient step NL+TS doesn't take; ignoring.")
+              "'hindsight' — history replay folds an extra REINFORCE-"
+              "style loss into a gradient step hindsight doesn't take; ignoring.")
         history_replay_cfg = {}
 
     # ------------------------------------------------------------------
@@ -384,7 +389,7 @@ def run_training(config_path: str) -> None:
     output_config = config.get('output', {})
     checkpoint_dir = Path(output_config.get('base_dir', 'checkpoints'))
 
-    # NeuralLinear + TS per-combo failure/defer bookkeeping (see
+    # Hindsight bandit state: per-pair offsets and per-combo failure/defer (see
     # record_combo_failure / select_combos_by_uncertainty). Harmless to load
     # even in reinforce mode — it's simply never read or written then.
     bandit_state_path = checkpoint_dir / 'bandit_state.json'
@@ -394,6 +399,15 @@ def run_training(config_path: str) -> None:
     start_stage_idx = 0
 
     pretrain_path = config.get('pretrain', {}).get('model_path', None)
+    # The model's node inputs must be built the same way online
+    # (unimol.ligand_other_sites / site_size_input, recorded in pretrain_metadata.json)
+    if pretrain_path and (Path(pretrain_path).parent / 'pretrain_metadata.json').exists():
+        _meta = json.loads((Path(pretrain_path).parent / 'pretrain_metadata.json').read_text())
+        for _key in ('ligand_other_sites', 'site_size_input'):
+            _built = _meta.get(_key, False)
+            if bool(_built) != bool(config.get('unimol', {}).get(_key, False)):
+                raise ValueError(f"{pretrain_path} was pretrained with unimol.{_key}={_built}; "
+                                 f"set the same in this config")
     if checkpoint_dir.exists():
         checkpoints = sorted(checkpoint_dir.glob('checkpoint_*.pt'))
         if checkpoints:
@@ -609,7 +623,7 @@ def run_training(config_path: str) -> None:
         return {}
 
     def _epoch_log_block(epoch, epoch_combos, stats, val_ps, gate, passed, reopened, rows,
-                         changes, cost) -> str:
+                         changes, cost, holdoff=(), groupfix=()) -> str:
         """The epoch's epoch_summary.log block (mllf.cb.epoch_log)."""
         runs = {'groups': 0, 'reference': 0, 'reversed': 0, 'other': 0}
         for c in epoch_combos:
@@ -632,6 +646,7 @@ def run_training(config_path: str) -> None:
             epoch, runs, failed=stats.get('permanently_failed', []),
             pair_short=stats.get('pair_success_short'), pair_full=stats.get('pair_success_full'),
             groups_run=runs['groups'], groups_passed=passed, groups_reopened=reopened,
+            groups_holdoff=holdoff, groups_corrected=groupfix,
             validation=val_ps, gate=gate, regression=stats.get('regression'),
             hindsight=stats.get('hindsight'), systems=rows, stage_changes=changes,
             ns_train=sum(c['train']['ns'] for c in (cost or {}).values()) if cost else None,
@@ -662,8 +677,10 @@ def run_training(config_path: str) -> None:
             except Exception as _exp_err:
                 print(f"  [EXPORT] {sys_name}{'/' + _sub if _sub else ''}: export failed: {_exp_err}")
         # Confidence labels: CONFIDENCE.txt per group; groups that never passed
-        # are renamed <group>_unconverged.
+        # are renamed <group>_unconverged. The labels read system_stages.json,
+        # so save it first (scouting exports before the epoch's save).
         try:
+            system_stages.save_state(stage_state_path, stage_state)
             _n = label_final_biases(checkpoint_dir, config, [sys_name])
             if _n:
                 print(f"  [EXPORT] {sys_name}: confidence labels for {_n} group(s)")
@@ -814,6 +831,44 @@ def run_training(config_path: str) -> None:
     # Best validated model (shared_update: regression with the gate): saved as
     # best_model.pt, and what the run ends on if the last validation is worse.
     _best_state, _best_score, _best_epoch, _last_val_score = None, None, None, None
+    _scout_tier_cache: Dict[str, Dict[str, int]] = {}   # stage scout_priority files
+    _scout_summary_cache: Dict[str, Dict] = {}          # stage scouting dirs
+
+    def _apply_scouting(sn: str, epoch: int) -> Tuple[str, Dict]:
+        """Stage key ``scouting: <dir>`` (training/scouting/scout_groups.py):
+        before a system's first epoch in the stage, its groups whose scouting run
+        sampled every substituent have passed, its pairs whose scouting run
+        passed the full-run test are resolved (system_stages.apply_scouting),
+        and its scouting runs enter the cost ledger at epoch - 1. A system whose
+        group criterion already holds leaves the stage. Returns its log line and
+        counts."""
+        st = stage_state[sn]
+        stg = stages[st['stage']]
+        sdir = stg['scouting']
+        if sdir not in _scout_summary_cache:
+            _scout_summary_cache[sdir] = json.loads((Path(sdir) / 'scout_summary.json').read_text())
+        summary = _scout_summary_cache[sdir]
+        gnames = [Path(g).name for g in _system_group_pool(sn)]
+        passed, resolved, runs = system_stages.apply_scouting(
+            st, bandit_state if bandit_state is not None else {}, sn, stg['name'], summary, gnames)
+        record_runs(checkpoint_dir / LEDGER_FILE, [(sn, r, True) for r in runs], 'scout', epoch - 1,
+                    {sn: stg['name']})
+        ns = sum(float(v.get('ns') or 0.0) for k, v in (summary.get('groups') or {}).items()
+                 if k.split('/', 1)[0] == sn)
+        line = (f"  [SCOUT] {sn}: {len(passed)}/{len(gnames)} groups passed on their scouting run, "
+                f"{len(resolved)} pairs resolved, {ns:.1f} ns")
+        adv = stg.get('advance') or {}
+        n_done = sum(1 for g in gnames if g in (st.get('groups_done') or {}))
+        converged = False
+        if adv.get('type') == 'groups_done' and gnames and system_stages.criterion_met(adv, n_done, len(gnames)):
+            nxt = system_stages.advance(st, stages, sn, epoch - 1, 'criterion', (n_done, len(gnames)))
+            line += f" -> {'done' if nxt is None else stages[nxt]['name']} (criterion, by scouting)"
+            converged = True
+            if nxt is None:
+                _export_final(sn)
+        print(line)
+        return line, {'groups': len(gnames), 'passed': len(passed), 'pairs': len(resolved), 'ns': ns,
+                      'converged': converged, 'dir': sdir}
     for epoch in range(start_epoch, num_epochs):
         _active_systems: List[str] = []
         if per_system:
@@ -827,6 +882,26 @@ def run_training(config_path: str) -> None:
                     print(f"  [STAGE] {_sn}: no combos for stage {_skipped}; skipped")
                     if _nxt is None:
                         _export_final(_sn)
+            _scout_lines, _scout_counts = [], []
+            for _sn in sorted(stage_state):
+                _st = stage_state[_sn]
+                if (_st['done'] or not stages[_st['stage']].get('scouting')
+                        or stages[_st['stage']]['name'] in (_st.get('scouting_applied') or [])):
+                    continue
+                _l, _c = _apply_scouting(_sn, epoch)
+                _scout_lines.append(_l)
+                _scout_counts.append(_c)
+            if _scout_counts:
+                if algorithm == 'hindsight':
+                    save_bandit_state(bandit_state_path, bandit_state)
+                _conv = sum(c['converged'] for c in _scout_counts)
+                append_summary(summary_log_path, '\n'.join([
+                    f"\nScouting before epoch {epoch} ({', '.join(sorted({c['dir'] for c in _scout_counts}))}): "
+                    f"{sum(c['groups'] for c in _scout_counts)} groups scouted, "
+                    f"{sum(c['ns'] for c in _scout_counts):.1f} ns (cost ledger, epoch {epoch - 1}); "
+                    f"{sum(c['passed'] for c in _scout_counts)} groups passed on their scouting run; "
+                    f"{sum(c['pairs'] for c in _scout_counts)} pairs resolved; "
+                    f"{_conv}/{len(_scout_counts)} systems converged by scouting"] + _scout_lines))
             system_stages.save_state(stage_state_path, stage_state)
             _active_systems = sorted(s for s, st in stage_state.items() if not st['done'])
             if not _active_systems:
@@ -834,23 +909,6 @@ def run_training(config_path: str) -> None:
                 break
             active_train_combos = [c for s in _active_systems for c in _system_stage_pool(s)
                                    if c not in _val_set_ps]
-            # A pairs_resolved stage stops running pairs that are resolved,
-            # and, with retire_after_epochs, pairs run in that many of the
-            # stage's epochs without resolving (retired).
-            _n_before = len(active_train_combos)
-            _keep = []
-            for c in active_train_combos:
-                _sn = combo_system_map.get(c, {}).get('name')
-                _stg = stages[stage_state[_sn]['stage']]
-                _adv = _stg.get('advance') or {}
-                if _adv.get('type') in ('pairs_resolved', 'groups_done') and system_stages.combo_resolved(
-                        bandit_state, _sn, c, _stg['name'], _adv, bandit_cfg.get('offset_prior_sd'),
-                        retire_after=_stg.get('retire_after_epochs')):
-                    continue
-                _keep.append(c)
-            active_train_combos = _keep
-            if len(_keep) < _n_before:
-                print(f"  Resolved or retired pairs left the pool: {_n_before - len(_keep)} combo(s)")
             # Reference pairs per system: the stage's reference_set (e.g. each
             # ALF group's reference vs the others) when the pool holds more
             # pairs than those, else the pool itself.
@@ -861,6 +919,45 @@ def run_training(config_path: str) -> None:
                 _src = (combo_sets_by_system.get(_sn, {}).get(_rset, []) if _rset
                         else _system_stage_pool(_sn))
                 _ref_keys[_sn] = {k for c in _src for k in system_stages.combo_pair_keys(_sn, c)}
+
+            def _scout_tiers(path):
+                """{pair key: tier} from a stage's scout_priority file (cached)."""
+                if not path:
+                    return {}
+                if path not in _scout_tier_cache:
+                    _scout_tier_cache[path] = json.loads(Path(path).read_text())['tiers']
+                return _scout_tier_cache[path]
+
+            def _retire_rule(stg, sn):
+                """retire_requires_success as system_stages.retire_terms takes it:
+                true / false for every pair, or 'reference' for the stage's
+                reference pairs only -- they need retire_min_successes good runs
+                and retire after reference_retire_after_epochs."""
+                v = stg.get('retire_requires_success', False)
+                if v != 'reference':
+                    return bool(v)
+                return {'keys': _ref_keys.get(sn, set()),
+                        'after_epochs': stg.get('reference_retire_after_epochs', stg.get('retire_after_epochs')),
+                        'min_successes': int(stg.get('retire_min_successes', 1))}
+            # A pairs_resolved stage stops running pairs that are resolved,
+            # and, with retire_after_epochs, pairs run in that many of the
+            # stage's epochs without resolving (retired; with
+            # retire_requires_success, only pairs that had good runs).
+            _n_before = len(active_train_combos)
+            _keep = []
+            for c in active_train_combos:
+                _sn = combo_system_map.get(c, {}).get('name')
+                _stg = stages[stage_state[_sn]['stage']]
+                _adv = _stg.get('advance') or {}
+                if _adv.get('type') in ('pairs_resolved', 'groups_done') and system_stages.combo_resolved(
+                        bandit_state, _sn, c, _stg['name'], _adv, bandit_cfg.get('offset_prior_sd'),
+                        retire_after=_stg.get('retire_after_epochs'),
+                        retire_requires_success=_retire_rule(_stg, _sn)):
+                    continue
+                _keep.append(c)
+            active_train_combos = _keep
+            if len(_keep) < _n_before:
+                print(f"  Resolved or retired pairs left the pool: {_n_before - len(_keep)} combo(s)")
             # A stage with a group_set runs each group once group_ready_fraction
             # of its reference pairs are resolved (retired ones left out),
             # until the group passes the group test. A group sent back to the
@@ -878,7 +975,9 @@ def run_training(config_path: str) -> None:
                             bandit_cfg.get('offset_prior_sd'),
                             fraction=float(_stg.get('group_ready_fraction', 1.0)),
                             retire_after=_stg.get('retire_after_epochs'),
-                            held=_holds.get(Path(g).name)):
+                            held=_holds.get(Path(g).name),
+                            retire_requires_success=_retire_rule(_stg, _sn),
+                            min_resolved_per_site=int(_stg.get('group_min_resolved_per_site', 0))):
                         _ready_groups.append(g)
                         _holds.pop(Path(g).name, None)
             if _ready_groups:
@@ -987,7 +1086,7 @@ def run_training(config_path: str) -> None:
         #
         # Two scoring backends, chosen by `algorithm` (config knob is
         # `bandit.selection`, not tied to the training algorithm itself):
-        #   - neurallinear_ts: Bayesian posterior predictive variance
+        #   - hindsight: Bayesian posterior predictive variance
         #     (bayesian_variance_score) — true epistemic uncertainty, but
         #     requires the Bayesian heads that mode maintains. Defaults on.
         #   - reinforce: the policy's own action std, exp(log_std)
@@ -999,12 +1098,12 @@ def run_training(config_path: str) -> None:
         #     the curriculum toward noisy/high-variance heads), so this
         #     defaults off for REINFORCE and is opt-in via
         #     `bandit.selection: uncertainty`.
-        _default_selection = 'uncertainty' if algorithm == 'neurallinear_ts' else 'random'
+        _default_selection = 'uncertainty' if algorithm == 'hindsight' else 'random'
         use_uncertainty_selection = (
             bandit_cfg.get('selection', _default_selection) == 'uncertainty'
         )
         _uncertainty_score_fn = (
-            bayesian_variance_score if algorithm == 'neurallinear_ts' else action_std_score
+            bayesian_variance_score if algorithm == 'hindsight' else action_std_score
         )
         # shared_update: regression re-seeds each head's mean but never adds
         # posterior observations, so n_obs stays at the pretrained value (0)
@@ -1013,7 +1112,7 @@ def run_training(config_path: str) -> None:
         # selection scores against, so skip the gate there.
         _shared_regression = (bandit_cfg.get('update_target', 'awr') == 'hindsight'
                               and bandit_cfg.get('shared_update', 'posterior') == 'regression')
-        if use_uncertainty_selection and algorithm == 'neurallinear_ts' and not _shared_regression:
+        if use_uncertainty_selection and algorithm == 'hindsight' and not _shared_regression:
             _min_obs = bandit_cfg.get('min_observations_before_confident', 3)
             _n_obs_per_head = [mlp.bayesian_head.n_obs.item() for mlp in policy.edge_mlp.mlps]
             if min(_n_obs_per_head) < _min_obs:
@@ -1080,7 +1179,7 @@ def run_training(config_path: str) -> None:
                 attention_weight=float(bandit_cfg.get('selection_attention_weight', 0.0)),
                 system_quota=_system_quota,
             )
-            _score_label = 'posterior variance' if algorithm == 'neurallinear_ts' else 'action std'
+            _score_label = 'posterior variance' if algorithm == 'hindsight' else 'action std'
             print(f"  Epoch combo sample (uncertainty-driven, {_score_label}): "
                   f"{len(epoch_combos)}/{len(active_train_combos)} combos selected "
                   f"({len(_uncertainty_candidates)} candidates scored, "
@@ -1130,7 +1229,7 @@ def run_training(config_path: str) -> None:
         # system's minimum allocation; the selection above fills the rest.
         _revisit_cfg = bandit_cfg.get('revisit') or {}
         _revisit_detail_lines: List[str] = []
-        if (_revisit_cfg.get('enabled') and _update_policy and algorithm == 'neurallinear_ts'
+        if (_revisit_cfg.get('enabled') and _update_policy and algorithm == 'hindsight'
                 and _max_epoch_combos is not None):
             _rv_min = int(curriculum_config.get('min_combos_per_system', 5))
             _rv_frac = float(_revisit_cfg.get('fraction', 0.5))
@@ -1194,6 +1293,11 @@ def run_training(config_path: str) -> None:
                 _want = set(_ref_keys.get(_sn, ()))
                 for _ks in (stage_state[_sn].get('group_hold') or {}).values():
                     _want |= set(_ks)
+                # scout_priority: per-pair tiers from scouting group runs
+                # (training/scouting/scout_groups.py); within not-yet-run and
+                # run pairs, the lowest tier (likely hardest) goes first
+                _tiers = _scout_tiers(_stg_p.get('scout_priority') or (
+                    str(Path(_stg_p['scouting']) / 'pair_priority.json') if _stg_p.get('scouting') else None))
                 _refs = []
                 _new = []
                 for c in active_train_combos:
@@ -1204,6 +1308,7 @@ def run_training(config_path: str) -> None:
                         _keys = system_stages.combo_pair_keys(_sn, c)
                         if _keys and all(k in _want for k in _keys):
                             _refs.append((0 if _unvisited else 1,
+                                          system_stages.combo_scout_tier(_tiers, _sn, c),
                                           _rank.get((_sn, Path(c).name), len(_rank)), c, _keys))
                             continue
                     if _await and _short_stage:     # confirmations exist only with short runs
@@ -1211,10 +1316,12 @@ def run_training(config_path: str) -> None:
                         _n_conf += 1
                     elif _unvisited and _first_new:
                         _new.append(c)
+                if _tiers:
+                    _new.sort(key=lambda c: system_stages.combo_scout_tier(_tiers, _sn, c))
                 if _strict:
                     _share = (_system_quota or {}).get(_sn, _pmin)
                     _taken = 0
-                    for _, _, c, _keys in sorted(_refs, key=lambda t: t[:2]):
+                    for _, _, _, c, _keys in sorted(_refs, key=lambda t: t[:3]):
                         if _taken >= _share:
                             break
                         _priority.append(c)
@@ -1257,7 +1364,22 @@ def run_training(config_path: str) -> None:
                 return None
             _await, _ = system_stages.combo_pair_flags(bandit_state, sys_name, combo_name,
                                                        stages[st['stage']]['name'])
-            return None if _await else (int(rs['equil']), int(rs['prod']))
+            if _await:
+                return None
+            # bracketed pairs (b seen both sides) get longer runs: tests whether
+            # their failures are a crossing-time problem rather than a bias one;
+            # sticky long runs end once the pair is resolved or retired
+            _stg = stages[st['stage']]
+            brs = _stg.get('bracketed_run_steps')
+            if brs and system_stages.combo_bracketed(
+                    bandit_state, sys_name, combo_name,
+                    sticky=bool(_stg.get('bracketed_runs_sticky', False)),
+                    settled=lambda k, e: system_stages.pair_settled(
+                        e, _stg['name'], _stg.get('advance') or {}, bandit_cfg.get('offset_prior_sd'),
+                        *system_stages.retire_terms(k, _stg.get('retire_after_epochs'),
+                                                    _retire_rule(_stg, sys_name)))):
+                return int(brs['equil']), int(brs['prod'])
+            return int(rs['equil']), int(rs['prod'])
 
         # Sample a reserve pool for on-the-fly replacement of permanently failed combos.
         _reserve_size = config.get('max_failed_combos_per_epoch', 50)
@@ -1298,7 +1420,7 @@ def run_training(config_path: str) -> None:
                                  if per_system else None),
         )
         all_stats.append(stats)
-        if algorithm == 'neurallinear_ts':
+        if algorithm == 'hindsight':
             save_bandit_state(bandit_state_path, bandit_state)
         # Cost ledger (mllf.cb.cost_ledger): simulated ns per system and stage.
         _ledger_path = checkpoint_dir / LEDGER_FILE
@@ -1316,6 +1438,8 @@ def run_training(config_path: str) -> None:
         # for the epoch_summary.log block (mllf.cb.epoch_log)
         _log_passed: List[str] = []
         _log_reopened: List[Tuple[str, int]] = []
+        _log_holdoff: List[str] = []
+        _log_groupfix: List[str] = []
         _log_rows: List[Dict] = []
         _log_changes: List[Dict] = []
         if per_system:
@@ -1335,27 +1459,94 @@ def run_training(config_path: str) -> None:
                     continue
                 _cdir = Path(_rd).parent
                 _nsubs = [len(subs) for _, subs in system_stages.combo_sites(_cdir)]
-                _passes = system_stages.site_balanced(
-                    _sd, _nsubs, float(_adv.get('min_population_ratio', 0.5)),
-                    int(_adv.get('min_site_transitions', 10)))
+                # bandit.group_holdoff: a group run whose dominant substituent's
+                # endpoint is held off by several partners at once (no pair's
+                # profile sees it). Detected and logged; not yet corrected.
+                _ho_cfg = bandit_cfg.get('group_holdoff')
+                if _ho_cfg is not None and _adv.get('type') == 'groups_done':
+                    _held = system_stages.held_off_sites(_sd, _ho_cfg)
+                    if _held:
+                        _lab = combo_node_labels(_cdir) or []
+
+                        def _sub(b):
+                            n = int(b) - 2
+                            return f"s{_lab[n][0]}:{_lab[n][1]}" if 0 <= n < len(_lab) else f"block{b}"
+                        _gname = _cdir.name.split('_site')[0]
+                        _recs = _st.setdefault('group_holdoff', {}).setdefault(_cdir.name, [])
+                        for _h in _held:
+                            _recs.append({'epoch': epoch, 'run': Path(_rd).name, 'sub': _sub(_h['dom']),
+                                          'dom_frac': round(_h['dom_frac'], 3), 'at_frac': round(_h['at_frac'], 4),
+                                          'mean_dom': round(_h['mean_dom'], 3),
+                                          'partners': {_sub(b): round(v, 3) for b, v in _h['partners'].items()}})
+                            _hline = (f"  [HOLDOFF] {_sys}/{_cdir.name}: {_sub(_h['dom'])} dominates "
+                                      f"{_h['dom_frac']:.0%} of frames at mean lambda {_h['mean_dom']:.2f}, "
+                                      f"endpoint held {_h['at_frac']:.1%}; {len(_h['partners'])} partners")
+                            print(_hline)
+                            _stage_lines.append(_hline)
+                        del _recs[:-20]
+                        _log_holdoff.append(f"{_sys}/{_gname} ({', '.join(_sub(h['dom']) for h in _held)})")
+                # bandit.group_correction (applied in train_epoch): what this
+                # run's held-off endpoint / site did to the group's x / s. A
+                # run that stepped them is not counted toward group_max_failures.
+                _gc_rec = (group_correction.run_record(bandit_state, _sys, _cdir.name, _rd)
+                           if _adv.get('type') == 'groups_done' else None)
+                if _gc_rec:
+                    _what = ', '.join(f"{f['kind']} s{f['site']}" + (f" ({f['dom']})" if f.get('dom') else '')
+                                      + f" ratio {_gc_rec['ratio'].get(str(f['site']), 1.0):.2f}"
+                                      for f in _gc_rec.get('flagged') or [])
+                    _what += ''.join(f", s{s} overshot: stepped back" for s in _gc_rec.get('guarded') or [])
+                    _fline = (f"  [GROUPFIX] {_sys}/{_cdir.name}: {_what.lstrip(', ')}"
+                              + ("" if _gc_rec.get('stepped') else " (at the floor)"))
+                    print(_fline)
+                    _stage_lines.append(_fline)
+                    _log_groupfix.append(f"{_sys}/{_cdir.name.split('_site')[0]} ({_what.lstrip(', ')})")
+                _export_rd = str(_rd)
+                _window = int(stages[_st['stage']].get('group_pass_window', 1))
+                if _adv.get('type') == 'groups_done' and _window > 1:
+                    # group_pass_window: pool the group's last runs -- every
+                    # substituent sampled in at least one of them passes (with
+                    # the default thresholds); export the run that sampled most.
+                    _hist = _st.setdefault('group_window', {}).setdefault(_cdir.name, [])
+                    _tr = _sd.get('transitions') or []
+                    _hist.append({'run': str(_rd), 'populations': [float(v) for v in (_sd.get('populations') or [])],
+                                  'transitions': [float(v) for v in (list(_tr.values()) if isinstance(_tr, dict) else _tr)]})
+                    del _hist[:-_window]
+                    _passes, _export_rd = system_stages.pooled_group_test(
+                        _hist, _nsubs, float(_adv.get('min_population_ratio', 0.5)),
+                        int(_adv.get('min_site_transitions', 10)))
+                else:
+                    _passes = system_stages.site_balanced(
+                        _sd, _nsubs, float(_adv.get('min_population_ratio', 0.5)),
+                        int(_adv.get('min_site_transitions', 10)))
                 _st['combos'][_cdir.name] = _passes
                 if _passes and _adv.get('type') == 'groups_done':
-                    # first passing run: the group is retired (run kept for reference)
+                    # first passing run (or window): the group is retired; the
+                    # run kept is the one whose biases are exported
                     if _cdir.name not in (_st.get('groups_done') or {}):
                         _log_passed.append(f"{_sys}/{_cdir.name.split('_site')[0]}")
-                    _st.setdefault('groups_done', {}).setdefault(_cdir.name, str(_rd))
-                elif _adv.get('type') == 'groups_done' and _cdir.name not in (_st.get('groups_done') or {}):
+                    _st.setdefault('groups_done', {}).setdefault(_cdir.name, _export_rd)
+                elif (_adv.get('type') == 'groups_done' and _cdir.name not in (_st.get('groups_done') or {})
+                      and not (_gc_rec and _gc_rec.get('stepped'))):
                     # group_max_failures: a group failing that many runs goes
                     # back to the pair phase -- its pairs with an unsampled
-                    # substituent are reopened and it waits for them.
+                    # substituent are reopened and it waits for them. (A run
+                    # whose group correction stepped is not counted.)
                     _gmax = stages[_st['stage']].get('group_max_failures')
                     _fails = _st.setdefault('group_failures', {})
                     _fails[_cdir.name] = int(_fails.get(_cdir.name, 0)) + 1
+                    # populations of its failed runs since the last reopening:
+                    # the pairs reopened are those of substituents they left empty
+                    _fpops = _st.setdefault('group_failed_pops', {}).setdefault(_cdir.name, [])
+                    _fpops.append([float(v) for v in (_sd.get('populations') or [])])
                     if _gmax is not None and _fails[_cdir.name] >= int(_gmax):
-                        _keys = system_stages.group_failed_pairs(_sys, _cdir, _sd)
+                        _keys = system_stages.group_failed_pairs(
+                            _sys, _cdir, [{'populations': p} for p in _fpops])
                         system_stages.reopen_pairs(bandit_state, _keys, stages[_st['stage']]['name'])
                         _st.setdefault('group_hold', {})[_cdir.name] = _keys
                         _fails[_cdir.name] = 0
+                        _st['group_failed_pops'].pop(_cdir.name, None)
+                        # runs from before the pairs are re-corrected are not pooled with later ones
+                        (_st.get('group_window') or {}).pop(_cdir.name, None)
                         _st.setdefault('groups_reopened', {})[_cdir.name] = \
                             int((_st.get('groups_reopened') or {}).get(_cdir.name, 0)) + 1
                         _gline = (f"  [GROUP] {_sys}/{_cdir.name}: failed {_gmax} runs; back to the "
@@ -1363,7 +1554,7 @@ def run_training(config_path: str) -> None:
                         print(_gline)
                         _stage_lines.append(_gline)
                         _log_reopened.append((f"{_sys}/{_cdir.name.split('_site')[0]}", len(_keys)))
-                        if algorithm == 'neurallinear_ts':
+                        if algorithm == 'hindsight':
                             save_bandit_state(bandit_state_path, bandit_state)
             _val_set_ps = set(validation_combos)
             for _sys in _active_systems:
@@ -1391,7 +1582,8 @@ def run_training(config_path: str) -> None:
                         _adv.get('max_offset_sd'), bandit_cfg.get('offset_prior_sd'))}
                     _nres = len(_res)
                     _nret = sum(1 for k in _rk if k not in _res and system_stages.pair_retired(
-                        _store.get(k), _stage['name'], _stage.get('retire_after_epochs')))
+                        _store.get(k), _stage['name'], *system_stages.retire_terms(
+                            k, _stage.get('retire_after_epochs'), _retire_rule(_stage, _sys))))
                 elif _type == 'combos_balanced':
                     _prog = system_stages.combos_progress(
                         _st, _adv, [Path(c).name for c in _system_stage_pool(_sys)
@@ -1611,7 +1803,7 @@ def run_training(config_path: str) -> None:
                     # the full detail stays in the job's stdout.
                     append_summary(summary_log_path, '\n' + _epoch_log_block(
                         epoch, epoch_combos, stats, _log_val, _log_gate, _log_passed, _log_reopened,
-                        _log_rows, _log_changes, _cost))
+                        _log_rows, _log_changes, _cost, _log_holdoff, _log_groupfix))
                 else:
                     append_summary(summary_log_path, '\n'.join(_summary_lines))
                     _epoch_detail_lines = (_revisit_detail_lines + stats.get('detail_lines', [])
@@ -1627,10 +1819,10 @@ def run_training(config_path: str) -> None:
             traceback.print_exc()
             sys.stdout.flush()
 
-        # rl_optimizer only steps in REINFORCE and BC; NL+TS updates in closed
-        # form or, with regression, with its own optimizer at regression.lr.
+        # rl_optimizer only steps in REINFORCE and BC; hindsight updates in
+        # closed form or, with regression, with its own optimizer at regression.lr.
         if (not stats.get('bc_mode') and stats.get('update_policy', True)
-                and algorithm != 'neurallinear_ts'):
+                and algorithm != 'hindsight'):
             prev_lrs = [pg['lr'] for pg in rl_optimizer.param_groups]
             rl_scheduler.step(n_success_ep)
             new_lrs = [pg['lr'] for pg in rl_optimizer.param_groups]

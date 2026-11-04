@@ -1,17 +1,9 @@
-"""Per-epoch online training step for the UniMol CB policy.
+"""Run one online training epoch for the Uni-Mol bias policy.
 
-The core of the online-training driver: for a batch of combo directories,
-this builds (or reuses cached) Uni-Mol graph data, samples policy actions,
-submits/polls SLURM simulations, computes per-edge rewards, and updates the
-policy — either via REINFORCE (``bandit.algorithm: reinforce``, the default)
-or a closed-form NeuralLinear + Thompson Sampling posterior update
-(``bandit.algorithm: neurallinear_ts``). Also supports a behavioral-cloning
-mode and replay-style AWR (see ``train_epoch``'s docstring).
-
-Moved here from ``training/workflow.py`` as part of making the online CB
-training driver importable as a library (see ``mllf.cli.train_workflow``).
-The helper functions below (leading underscore) are implementation details
-of ``train_epoch`` and not a public API of this module.
+Builds combo graphs, samples actions, runs simulations, computes rewards, and
+updates the policy using REINFORCE or NeuralLinear + Thompson Sampling with
+posterior or hindsight-regression updates. ``train_epoch`` also supports
+behavioral-cloning and replay-AWR modes.
 """
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -30,6 +22,12 @@ import torch.nn.functional as F
 
 from mllf.cb.graph_build import build_graph_and_data
 from mllf.cb.graph_utils import build_directed_pairs
+from mllf.cb.group_correction import (
+    apply_group_values,
+    correction_config,
+    correction_targets,
+    update_group,
+)
 from mllf.cb.hindsight import (
     BARRIER_TRAP_WIDTH,
     BIAS_DIMS,
@@ -40,6 +38,7 @@ from mllf.cb.hindsight import (
     QUADRATIC_STEP_MAX,
     apply_pair_offsets,
     barrier_trapped_c_targets,
+    cap_quadratic,
     lambda_states,
     uncrossed_pairs,
     combo_node_labels,
@@ -66,6 +65,7 @@ from mllf.cb.hindsight_regression import (
 )
 from mllf.cb.policy import ContextBaseline, UnimolPolicy
 from mllf.cb.pretrain_policy import compute_pairwise_confidence_weights
+from mllf.cb.bandit_config import bandit_algorithm
 from mllf.cb.train_improved import compute_msld_reward_improved
 from mllf.cb.workflow_utils import (
     BARRIER_TARGET,
@@ -78,6 +78,8 @@ from mllf.cb.workflow_utils import (
     compute_pair_reward,
     compute_pair_success_stats,
     fix_msld_flat_for_single_site,
+    format_coverage_line,
+    format_crossing_line,
     parse_simulation_metrics,
     record_combo_failure,
     set_msld_steps,
@@ -91,7 +93,6 @@ from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_di
 
 # Replay sets for the hindsight regression, keyed by cache path (built once per process).
 _REPLAY_CACHE: Dict[str, list] = {}
-
 # Thread-safety lock for policy inference (policy forward passes are not thread-safe on CPU)
 _policy_inference_lock = threading.Lock()
 
@@ -151,18 +152,7 @@ class _CachedGraphData:
 
 
 def _save_graph_data_cache(epoch_dir: Path, data) -> None:
-    """Persist the graph tensors needed later for the REINFORCE update to a
-    small file in *epoch_dir*.
-
-    This lets the REINFORCE prep loop reuse the same Uni-Mol embeddings
-    computed during Phase 1 instead of recomputing them, WITHOUT keeping
-    every combo's data resident in RAM across the (potentially long) SLURM
-    wait in Phase 2 — an earlier in-memory-dict version of this cache caused
-    an OOM because it held all epoch combos' embeddings live for the entire
-    epoch. Persisting the (tiny — a few tens of KB) tensors to disk and
-    reloading them one at a time in Phase 3 keeps the memory profile the
-    same as before caching was introduced.
-    """
+    """Save CPU copies of graph tensors for reuse after simulation completes."""
     try:
         torch.save({
             'x': data.x.detach().cpu(),
@@ -462,17 +452,17 @@ def train_epoch(
     per-system config dict (needed for solvent_state and ensure_combo_dir_exists).
 
     Bandit algorithm: controlled by config['bandit']['algorithm']
-    ('reinforce', the default, or 'neurallinear_ts'). In 'neurallinear_ts'
-    mode, action sampling uses policy.get_actions_thompson instead of
-    policy.get_actions, and the epoch-batch update is a closed-form
-    Bayesian posterior update (policy.update_bayesian_posteriors) instead of
-    a REINFORCE backward()/optimizer.step() — see the branch on `algorithm`
-    below. bandit_state (mutated in place, same pattern as ema_baseline) is
-    the per-combo infra-failure/defer tracker used by uncertainty-driven
-    combo selection; harmless to omit in 'reinforce' mode.
+    ('reinforce', the default, or 'hindsight'; see bandit_algorithm). In
+    'hindsight' mode, action sampling uses policy.get_actions_thompson
+    instead of policy.get_actions, and the epoch-batch update regresses
+    toward each run's targets (bandit.update_target, bandit.shared_update)
+    instead of a REINFORCE backward()/optimizer.step() — see the branch on
+    `algorithm` below. bandit_state (mutated in place, same pattern as
+    ema_baseline) holds the per-pair offsets and the per-combo
+    infra-failure/defer tracker; harmless to omit in 'reinforce' mode.
 
     REINFORCE-only additions (both opt-in, default off, no effect on
-    'neurallinear_ts' mode):
+    'hindsight' mode):
 
     baseline_net / baseline_optimizer / system_to_idx: when baseline_net is
     given, REINFORCE's advantage uses ``ContextBaseline`` (features +
@@ -527,9 +517,14 @@ def train_epoch(
                     and bool(_bandit_cfg.get('pair_offsets', True)))
     _hs_dims = [d for d in _bandit_cfg.get('hindsight_dims', list(BIAS_DIMS)) if d in OFFSET_DIMS]
     _offset_sampling = _use_offsets and bool(_bandit_cfg.get('offset_sampling', False))
+    # bandit.group_correction (mllf.cb.group_correction): a group run whose
+    # end terms hold an endpoint (or a whole site) off shrinks those pairs'
+    # x / s for that group; its later runs use the corrected values.
+    _gc_cfg = correction_config(_bandit_cfg) if _use_offsets else None
 
     def _with_pair_offsets(actions, data, combo_path, sys_cfg):
-        """Shift a Thompson-sampled proposal by the pair's offsets, if any.
+        """Shift a Thompson-sampled proposal by the pair's offsets, if any,
+        then set the group's corrected x / s (bandit.group_correction).
 
         Returns (actions, linear_var): linear_var is each edge's b-difference
         variance after its pair's offset (``linear_edge_variance``), weighting
@@ -550,6 +545,10 @@ def train_epoch(
             sample=_offset_sampling and not deterministic_actions,
             base_sd=_bandit_cfg.get('offset_base_sd'),
             dims=_hs_dims)
+        shifted, _ = cap_quadratic(shifted, mean.detach(), _bandit_cfg.get('c_cap'))
+        if _gc_cfg is not None:
+            shifted, _ = apply_group_values(shifted, bandit_state, sys_name, Path(combo_path).name,
+                                            labels, data.edge_index)
         lin_var = (linear_edge_variance(bandit_state, sys_name, labels, data.edge_index,
                                         prior_sd=_bandit_cfg.get('offset_prior_sd'))
                    if 'linear' in _hs_dims else None)
@@ -919,6 +918,10 @@ def train_epoch(
 
         epoch_rewards.append(reward)
         raw_metrics = parse_simulation_metrics(output_file)
+        print(f"  {format_coverage_line(raw_metrics)}")
+        _crossing = format_crossing_line(raw_metrics)
+        if _crossing:
+            print(f"  {_crossing}")
         torch.save({
             'reward': reward,
             'actions': jactions.cpu(),
@@ -933,6 +936,7 @@ def train_epoch(
             'end_pairs': raw_metrics.get('end_pairs', {}),
             'transition_pairs': raw_metrics.get('transition_pairs', {}),
             'endpoint_pairs': raw_metrics.get('endpoint_pairs', {}),
+            'site_holdoff': raw_metrics.get('site_holdoff', []),
             'run_id': run_id,
         }, jepoch_dir / 'epoch_results.pt')
 
@@ -1039,6 +1043,7 @@ def train_epoch(
                     'end_pairs': _rec_metrics.get('end_pairs', {}),
                     'transition_pairs': _rec_metrics.get('transition_pairs', {}),
                     'endpoint_pairs': _rec_metrics.get('endpoint_pairs', {}),
+                    'site_holdoff': _rec_metrics.get('site_holdoff', []),
                     'run_id': run_id,
                 }, epoch_results_file)
                 if verbose:
@@ -1254,9 +1259,9 @@ def train_epoch(
         print(f"  WARNING: no successful simulations this pass ({_counts})")
 
     bandit_cfg = config.get('bandit', {})
-    algorithm = bandit_cfg.get('algorithm', 'reinforce')
+    algorithm = bandit_algorithm(bandit_cfg)
 
-    if algorithm == 'neurallinear_ts':
+    if algorithm == 'hindsight':
         # === Epoch-batch NeuralLinear + TS closed-form posterior update ===
         # Replaces the REINFORCE backward()/optimizer.step() below with a
         # closed-form Bayesian posterior update per bias head — no gradient
@@ -1333,6 +1338,7 @@ def train_epoch(
         _hs_n_edges = 0
         _hs_n_offsets = 0
         _hs_n_held_off = 0
+        _hs_n_gc_runs = _hs_n_gc_stepped = _hs_n_gc_guarded = 0
         _hs_widened = _hs_narrowed = 0
         for (combo_path_u, epoch_dir_u, reward_u) in deferred_updates:
             try:
@@ -1421,47 +1427,78 @@ def train_epoch(
                         if _pinned.any():
                             hs_v[_pinned, 0] = float('inf')
                             hs_dir[_pinned, 0] = False
+                        # bandit.group_correction: a group run whose end terms
+                        # hold an endpoint (or a whole site) off steps those
+                        # pairs' x / s down for the group (or a corrected site
+                        # that overshot is stepped back). The run then says
+                        # nothing per pair about that site: its edges skip
+                        # the per-pair rules below, and the shared model
+                        # learns the group's corrected x / s for them.
+                        _gc_t = _gc_v = _gc_mask = None
+                        if update_policy and _labels and _gc_cfg is not None:
+                            _gc_res = update_group(bandit_state, _sys_name, combo_path_u.name, saved_data,
+                                                   _labels, _applied, _gc_cfg, epoch, str(epoch_dir_u))
+                            if _gc_res['flagged'] or _gc_res['guarded']:
+                                _gc_t, _gc_v, _gc_mask = correction_targets(
+                                    vdata_u.edge_index, _gc_res, _gc_cfg)
+                                _hs_n_gc_runs += 1
+                                _hs_n_gc_stepped += int(_gc_res['stepped'])
+                                _hs_n_gc_guarded += len(_gc_res['guarded'])
+                        _sel = (None if _gc_mask is None or not _gc_mask.any()
+                                else (~_gc_mask).nonzero(as_tuple=True)[0])
+
+                        def _p(t):
+                            return t if _sel is None else t[_sel]
                         if update_policy and _labels:
                             # Per-pair offsets get grown directional b and
                             # (barrier-trapped) c steps; the shared model
                             # below keeps the base steps.
-                            hs_t_pair, hs_v_pair = hs_t.clone(), hs_v.clone()
-                            hs_dir_pair = hs_dir.clone()
+                            _ei_p = vdata_u.edge_index if _sel is None else vdata_u.edge_index[:, _sel]
+                            _pin_p, _str_p, _dir_p = _p(_pinned), _p(_stranded), _p(hs_dir)
+                            hs_t_pair, hs_v_pair = _p(hs_t).clone(), _p(hs_v).clone()
+                            hs_dir_pair = _dir_p.clone()
                             if 'linear' in _hs_dims and _hs_b_max >= _hs_b_base:
                                 _g, _br = grow_directional_b_steps(
-                                    bandit_state, _sys_name, _labels, vdata_u.edge_index,
-                                    hs_t_pair, hs_dir, _applied,
+                                    bandit_state, _sys_name, _labels, _ei_p,
+                                    hs_t_pair, _dir_p, _applied,
                                     base_step=_hs_b_base, max_step=_hs_b_max, var=hs_v_pair,
-                                    skip=_pinned | _stranded, counts=_hs_unlocks)
+                                    skip=_pin_p | _str_p, counts=_hs_unlocks)
                                 _hs_n_grown += _g
                                 _hs_n_bracketed += _br
+                                if _sel is not None:
+                                    hs_dir[_sel] = _dir_p
                             if 'quadratic' in _hs_dims:
                                 _up, _down = barrier_trapped_c_targets(
-                                    bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                    bandit_state, _sys_name, _labels, _ei_p,
                                     hs_t_pair, hs_v_pair, hs_dir_pair, _applied,
-                                    pinned=_pinned, stranded=_stranded, counts=_hs_unlocks,
+                                    pinned=_pin_p, stranded=_str_p, counts=_hs_unlocks,
                                     **_hs_c_trap)
                                 _hs_n_c_trapped += _up
                                 _hs_n_c_down += _down
                             _hs_n_offsets += record_pair_targets(
-                                bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                bandit_state, _sys_name, _labels, _ei_p,
                                 hs_t_pair, hs_v_pair, history=int(bandit_cfg.get('offset_history', 5)),
                                 dims=_hs_dims, directional=hs_dir_pair,
                             )
                             _short = _is_short_run(combo_path_u, epoch_dir_u)
                             _short_min, _short_frac = _short_test(_sys_name)
                             record_pair_outcomes(bandit_state, _sys_name, _labels,
-                                                 vdata_u.edge_index, saved_data,
+                                                 _ei_p, saved_data,
                                                  combo=str(combo_path_u),
                                                  stage=(stage_of_system or {}).get(_sys_name),
                                                  short=_short, short_min_transitions=_short_min,
                                                  short_min_fraction=_short_frac,
                                                  confirm=bool(((stage_cfg_of_system or {}).get(_sys_name) or {})
                                                               .get('confirm_full_length', True)),
-                                                 epoch=epoch)
+                                                 epoch=epoch,
+                                                 partial_min_transitions=int(
+                                                     ((stage_cfg_of_system or {}).get(_sys_name) or {})
+                                                     .get('partial_min_transitions', 3)),
+                                                 partial_runs=int(((stage_cfg_of_system or {}).get(_sys_name) or {})
+                                                                  .get('partial_runs_to_resolve', 0)))
                             if _offset_sampling:
                                 _wd, _nr = update_exploration(
-                                    bandit_state, _sys_name, _labels, vdata_u.edge_index,
+                                    bandit_state, _sys_name, _labels, _ei_p,
                                     hs_v_pair, saved_data, factor_max=_hs_factor_max, dims=_hs_dims,
                                     persistent_failures=_hs_persistent,
                                     min_transitions=_short_min if _short else SUCCESS_MIN_TRANSITIONS,
@@ -1474,6 +1511,12 @@ def train_epoch(
                                 hs_t, hs_v, hs_dir.clone(), _applied,
                                 pinned=_pinned, stranded=_stranded,
                                 **{**_hs_c_trap, 'grow': False})
+                        if _sel is not None:
+                            # flagged / guarded site: only the group's corrected x / s
+                            hs_v[_gc_mask] = float('inf')
+                            _fin = torch.isfinite(_gc_v)
+                            hs_t[_fin] = _gc_t[_fin]
+                            hs_v[_fin] = _gc_v[_fin]
                         hs_t_dev = hs_t.to(saved_actions.dtype).to(device)
                         finite = torch.isfinite(hs_v).to(device)
                         update_targets = saved_actions.clone()
@@ -1526,6 +1569,9 @@ def train_epoch(
             _detail_lines.append(_stats_msg)
         if update_policy and update_shared and _shared_regression:
             _reg_cfg = regression_config(bandit_cfg)
+            _reg_cfg['env_input'] = config.get('unimol', {}).get('env_input', 'dual')
+            _reg_cfg['ligand_other_sites'] = bool(config.get('unimol', {}).get('ligand_other_sites', False))
+            _reg_cfg['site_size_input'] = bool(config.get('unimol', {}).get('site_size_input', False))
             _ck = Path(config.get('output', {}).get('base_dir', 'checkpoints'))
             _buf_path = _ck / 'regression_online_buffer.pt'
             _buf = torch.load(_buf_path, weights_only=False) if _buf_path.exists() else []
@@ -1567,6 +1613,8 @@ def train_epoch(
                 + f"; pair-offset observations {_hs_n_offsets}"
                 + (f"; exploration widened {_hs_widened}, narrowed {_hs_narrowed}"
                    if _offset_sampling else "")
+                + (f"; group corrections {_hs_n_gc_runs} run(s), stepped {_hs_n_gc_stepped}, "
+                   f"guarded sites {_hs_n_gc_guarded}" if _gc_cfg is not None else "")
             )
             print(_hs_msg)
             _detail_lines.append(_hs_msg)
@@ -1575,7 +1623,8 @@ def train_epoch(
                 'held_off': _hs_n_held_off, 'b_grown': _hs_n_grown, 'b_bisected': _hs_n_bracketed,
                 'b_unlocked': _hs_unlocks.get('b_unlocked', 0), 'c_up': _hs_n_c_trapped,
                 'c_down': _hs_n_c_down, 'c_unlocked': _hs_unlocks.get('c_unlocked', 0),
-                'pinned': _hs_n_pinned, 'stranded': _hs_n_stranded}
+                'pinned': _hs_n_pinned, 'stranded': _hs_n_stranded,
+                'group_corrected': _hs_n_gc_runs}
 
     # === Epoch-batch REINFORCE update ===
     elif deferred_updates:
@@ -1685,8 +1734,6 @@ def train_epoch(
         ema_alpha = reward_config.get('ema_alpha', 0.2)
         ema_min_batch = int(reward_config.get('ema_min_batch', 5))
         success_floor = reward_config.get('success_advantage_floor', 0.0)
-        # reward.safety_lock_n is no longer read (see the note further down,
-        # where the fixed-constant fallback it used to trigger was removed).
         _gb_cfg = reward_config.get('global_baseline', [0.0, -1.0, -1.0, -1.0])
         global_baseline_t = torch.tensor(_gb_cfg, dtype=torch.float32, device=device)
         dim_names = ['linear', 'quadratic', 'skew', 'end']
@@ -1707,18 +1754,8 @@ def train_epoch(
                 f'{n}: {r_mean_batch[i]:.3f}±{r_std_batch[i]:.3f}'
                 for i, n in enumerate(dim_names)
             )
-            # No separate "safety lock" on top of this: ema_min_batch already
-            # gates whether a small batch gets folded INTO the running
-            # estimate (below), and seeding a brand-new EMA from a small-but-
-            # real batch is still strictly more informative than an arbitrary
-            # config constant unrelated to these systems. A prior version
-            # additionally forced r_mean/r_std to a fixed global constant
-            # whenever n_success < safety_lock_n (default 10) -- redundant
-            # with ema_min_batch where it mattered, and actively harmful for
-            # systems whose n_success chronically sits below that threshold:
-            # they never got to use their own accumulated EMA at all, every
-            # epoch reverting to a number with no relationship to what these
-            # systems actually look like.
+            # ema_min_batch gates small-batch EMA updates; no fixed safety
+            # threshold overrides the observed baseline.
             if ema_baseline is not None:
                 if len(ema_baseline) == 0:
                     ema_baseline['mean'] = r_mean_batch.detach().clone().cpu()
