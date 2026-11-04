@@ -1,49 +1,8 @@
-"""Policy pretraining on collected MSLD simulation data via Behavior Cloning.
+"""Pretrain a Uni-Mol bias policy by behavior cloning simulation data.
 
-This script trains the policy to directly predict bias coefficients from successful
-simulations using supervised learning (behavior cloning). This is fundamentally
-different from REINFORCE training:
-
-**Behavior Cloning Approach:**
-- Extract bias coefficients from successful runs as training targets
-- Train policy to predict these coefficients using MSE loss
-- Filter data to use only the best runs (highest rewards per system)
-- Requires 50-100 epochs for convergence
-
-**Data Requirements:**
-- Must have bias coefficient matrices (c, x, s, b) in variables.py
-- Must have simulation results to compute rewards for filtering
-- RTF files used to build graph structure
-
-**Multi-Structure Support:**
-- Minimized structures: MD-equilibrated, energy-minimized (pretraining data)
-- Unrelaxed structures: Crystallographic/experimental conformations from training data
-- Random selection: Per-run mixing of minimized and unrelaxed
-- Supports caching of Uni-Mol embeddings for fast reuse
-
-This allows the policy to learn good bias coefficient predictions from
-successful simulations before running expensive RL episodes, and supports
-training with diverse structural conformations.
-
-Usage (single structure type):
-    python -m mllf.cb.pretrain_policy \\
-        --pretraining-dir pretraining/14benz_solv \\
-        --output-dir models/pretrained_policy \\
-        --config examples/workflow_pretrain.yaml \\
-        --epochs 20
-
-Usage (with unrelaxed structures):
-    # Update workflow_pretrain.yaml:
-    # unimol:
-    #   structure_selection: random
-    #   unrelaxed_system_mappings:
-    #     14benz_solv: /path/to/training/systems/14benz_solv/prep
-    
-    python -m mllf.cb.pretrain_policy \\
-        --pretraining-dir pretraining/14benz_solv \\
-        --output-dir models/pretrained_policy \\
-        --config examples/workflow_pretrain.yaml \\
-        --epochs 20
+Successful runs provide bias-coefficient targets; optional reward filtering
+and structure selection control which examples are used. Run with
+``python -m mllf.cb.pretrain_policy --help`` for command-line options.
 """
 import argparse
 import collections
@@ -360,8 +319,22 @@ def _compute_unimol_embeddings_and_edges(
     env_cutoff: float = 8.0,
     use_environment_difference: bool = True,
     consensus_dict: Optional[Dict[str, Dict[str, Optional[set]]]] = None,
+    env_input: str = 'dual',
+    ligand_other_sites: bool = False,
+    ligand_minimized: bool = False,
+    site_size_input: bool = False,
 ) -> tuple:
     """Compute Uni-Mol embeddings for all substituents in a run.
+
+    env_input='phase' or 'phase_ligmean' keeps the [ligand, full] layout but puts
+    the phase flags (unimol_representation.phase_embedding) in the full half,
+    computing no environment embedding (see UnimolPolicy env_input).
+    ligand_other_sites: the ligand half also holds every other site's
+    reference substituent (unimol_representation.other_site_reference_subs).
+    site_size_input: the full half also holds the run's site size
+    (policy.fill_site_size; unimol.site_size_input).
+    ligand_minimized: for a 'minimized' run, the ligand half takes its
+    coordinates from the prep's minimized.pdb (unimol.ligand_from_minimized).
     
     Supports both minimized (pretraining) and unrelaxed (crystallographic) structures.
     Both representations are constructed from the same prep directory - the choice only
@@ -553,6 +526,9 @@ def _compute_unimol_embeddings_and_edges(
                     consensus_atoms=consensus_atoms,  # Filter by consensus if provided
                     cache_dir=cache_dir,
                     save_cache=(cache_dir is not None),
+                    env_input=env_input,
+                    ligand_other_sites=ligand_other_sites,
+                    ligand_minimized=ligand_minimized and structure_type == 'minimized',
                 )
                 # Concatenate for storage: UnimolPolicy._forward_edges() will split [ligand, full]
                 emb = np.concatenate([emb_ligand, emb_full])  # [1024]
@@ -581,7 +557,10 @@ def _compute_unimol_embeddings_and_edges(
     src_list = [p[0] for p in pairs]
     dst_list = [p[1] for p in pairs]
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    
+    if site_size_input:
+        from mllf.cb.policy import fill_site_size
+        fill_site_size(unimol_embeddings, nsubs_per_site)
+
     return unimol_embeddings, edge_index, nsubs_per_site, representation_source
 
 
@@ -2410,6 +2389,9 @@ def pretrain_epoch(
                     env_cutoff=env_cutoff,
                     use_environment_difference=use_environment_difference,
                     consensus_dict=consensus_dict,
+                    env_input=unimol_config.get('env_input', 'dual'),
+                    ligand_other_sites=bool(unimol_config.get('ligand_other_sites', False)),
+                    site_size_input=bool(unimol_config.get('site_size_input', False)),
                 )
                 from mllf.cb.graph_utils import build_directed_pairs
                 pairs = build_directed_pairs(nsubs_per_site)
@@ -2947,6 +2929,8 @@ def initialize_bayesian_heads_from_pretrained(
         unimol_dim=policy_det.unimol_dim,
         mlp_out_dim=policy_det.mlp_out_dim,
         use_dual_embeddings=policy_det.use_dual_embeddings,
+        env_input=getattr(policy_det, 'env_input', 'dual'),
+        site_size_input=getattr(policy_det, 'site_size_input', False),
         use_bayesian_heads=True,
         bayesian_prior_precision=bayesian_prior_precision,
     ).to(next(policy_det.parameters()).device)
@@ -3226,12 +3210,32 @@ def pretrain_with_runs(
     unimol_cfg = config.get('unimol', {})
     env_cutoff = unimol_cfg.get('environment_cutoff', 8.0)
     use_environment_difference = unimol_cfg.get('use_environment_difference', True)
+    # unimol.env_input: 'dual' (default, mean full Uni-Mol embedding), 'phase'
+    # (the 2 phase flags) or 'phase_ligmean' (mean ligand embedding + phase flags);
+    # see UnimolPolicy.
+    env_input = unimol_cfg.get('env_input', 'dual')
+    print(f"Environment input: {env_input}")
+    # unimol.ligand_other_sites: the ligand half is core + substituent + every
+    # other site's reference substituent (as each combo holds them fixed)
+    ligand_other_sites = bool(unimol_cfg.get('ligand_other_sites', False))
+    print(f"Ligand other-site reference substituents: {ligand_other_sites}")
+    # unimol.site_size_input: the edge input also carries 1 / (n - 1) for the n
+    # substituents at the edge's site in the run (policy.fill_site_size)
+    site_size_input = bool(unimol_cfg.get('site_size_input', False))
+    print(f"Site-size input: {site_size_input}")
+    # unimol.ligand_from_minimized: runs given the minimized structure
+    # (structure_selection minimized / random) embed the ligand in its
+    # minimized.pdb geometry, not the unrelaxed fragment files
+    ligand_from_minimized = bool(unimol_cfg.get('ligand_from_minimized', False))
+    print(f"Ligand geometry from minimized.pdb for minimized runs: {ligand_from_minimized}")
     
     policy = UnimolPolicy(
         unimol_dim=policy_config.get('unimol_dim', 512),
         mlp_hidden=policy_config.get('mlp_hidden', 64),
         mlp_out_dim=len(sample_extras['relation_names']) // 2,
         use_dual_embeddings=use_environment_difference,
+        env_input=env_input,
+        site_size_input=site_size_input,
     ).to(device)
     if init_checkpoint is not None:
         _init = torch.load(init_checkpoint, map_location=device, weights_only=False)
@@ -3518,6 +3522,10 @@ def pretrain_with_runs(
                     run_idx=0,
                     consensus_dict=consensus_dict,
                     cache_dir=embed_cache_dir,
+                    env_input=env_input,
+                    ligand_other_sites=ligand_other_sites,
+                    ligand_minimized=ligand_from_minimized,
+                    site_size_input=site_size_input,
                 )
                 
                 # Cache the system graph (shared across all runs)
@@ -3554,8 +3562,14 @@ def pretrain_with_runs(
                 if gi_path.exists():
                     with open(gi_path) as f:
                         gi = json.load(f)
-                    # Extract nsubs_per_site from graph_info
-                    nsubs_per_site = gi.get('nsubs_per_site', [])
+                    # Extract nsubs_per_site from graph_info (older runs
+                    # only list their sites: count substituents per site, as
+                    # _compute_unimol_embeddings_and_edges does)
+                    nsubs_per_site = gi.get('nsubs_per_site') or []
+                    if not nsubs_per_site:
+                        _per_site = collections.Counter(
+                            s.get('site') for s in (gi.get('sites') or {}).values() if s.get('site') is not None)
+                        nsubs_per_site = [_per_site[s] for s in sorted(_per_site)]
                     system_structure_cache[prep_dir_str] = nsubs_per_site
             except Exception:
                 pass  # Graceful degradation
@@ -3617,6 +3631,10 @@ def pretrain_with_runs(
                     run_idx=run_idx,
                     consensus_dict=consensus_dict,
                     cache_dir=embed_cache_dir,
+                    env_input=env_input,
+                    ligand_other_sites=ligand_other_sites,
+                    ligand_minimized=ligand_from_minimized,
+                    site_size_input=site_size_input,
                 )
                 
                 # Track representation choice
@@ -3630,6 +3648,9 @@ def pretrain_with_runs(
                     explicit_mapping=rep_source['explicit_mapping'],
                 )
                 source_info = rep_source['source']
+                # the structure the run's graph was built with sizes its
+                # pairwise weights (structure cache above may be empty)
+                system_structure_cache[prep_dir_str] = nsubs_per_site
             
             # Extract run-specific targets from variables.py
             from mllf.cb.graph_utils import build_directed_pairs
@@ -3833,7 +3854,9 @@ def pretrain_with_runs(
             reward_weighted=reward_weighted,
             awr_temperature=awr_temperature,
             pairwise_weights_cache=pairwise_weights_cache,
-            unimol_config={'environment_cutoff': env_cutoff, 'use_environment_difference': use_environment_difference},
+            unimol_config={'environment_cutoff': env_cutoff, 'use_environment_difference': use_environment_difference,
+                           'env_input': env_input, 'ligand_other_sites': ligand_other_sites,
+                           'site_size_input': site_size_input},
             consensus_dict=consensus_dict,  # Pass consensus for environment filtering
             pair_advantage_cache=pair_advantage_cache,
             system_emphasis=system_emphasis,
@@ -3919,6 +3942,8 @@ def pretrain_with_runs(
                     mlp_hidden=policy_config.get('mlp_hidden', 64),
                     mlp_out_dim=len(sample_extras['relation_names']) // 2,
                     use_dual_embeddings=use_environment_difference,
+                    env_input=env_input,
+                    site_size_input=site_size_input,
                 ).to(device)
                 policy_best_det.load_state_dict(_best_ckpt['policy_state'])
                 _save_bayesian_sibling(
@@ -3932,6 +3957,11 @@ def pretrain_with_runs(
         'policy_type': 'unimol',
         'unimol_dim': policy_config.get('unimol_dim', 512),
         'mlp_hidden': policy_config.get('mlp_hidden', 64),
+        'env_input': env_input,
+        'ligand_other_sites': ligand_other_sites,
+        'site_size_input': site_size_input,
+        'ligand_from_minimized': ligand_from_minimized,
+        'structure_selection': structure_selection,
         'num_relations': len(sample_extras['relation_names']),
         'num_pretraining_runs': len(runs),
         'num_runs_with_graphs': n_ok,

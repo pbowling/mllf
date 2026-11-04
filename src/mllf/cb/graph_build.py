@@ -16,6 +16,7 @@ import numpy as np
 import torch
 
 from mllf.cb.graph_utils import build_directed_pairs
+from mllf.cb.policy import fill_site_size
 from mllf.cb.unimol_representation import (
     build_environment_consensus,
     get_substituent_dual_embeddings,
@@ -136,8 +137,13 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     # swapping substituents). This matches pretrain_policy.py's approach and
     # ensures the environment half of the embedding is consistent across
     # subs at a site, exactly as during pretraining.
+    # In a phase mode (unimol.env_input) the full half is the phase flags: no
+    # environment embedding is computed; the consensus below then only enters
+    # the ligand embedding's cache key.
     combo_name = combo_path.name
-    print(f"  Computing dual Uni-Mol embeddings for {combo_name} (system: {system_config.get('name', 'unknown')}, solvent_state: {solvent_state})")
+    _env_input = global_config.get('unimol', {}).get('env_input', 'dual')
+    _kind = 'dual' if _env_input == 'dual' else f'ligand + {_env_input}'
+    print(f"  Computing Uni-Mol embeddings ({_kind}) for {combo_name} (system: {system_config.get('name', 'unknown')}, solvent_state: {solvent_state})")
     if custom_search_paths:
         print(f"    Custom environment PDB paths: {custom_search_paths}")
 
@@ -185,6 +191,10 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                     consensus_atoms=site_consensus_atoms,  # Filter by site consensus
                     cache_dir=embed_cache_dir,
                     save_cache=(embed_cache_dir is not None),
+                    # unimol.env_input 'phase': phase flags in the full half (UnimolPolicy)
+                    env_input=global_config.get('unimol', {}).get('env_input', 'dual'),
+                    # unimol.ligand_other_sites: other sites' reference subs in the ligand half
+                    ligand_other_sites=bool(global_config.get('unimol', {}).get('ligand_other_sites', False)),
                 )
                 # Concatenate dual embeddings: [512 ligand + 512 full] = 1024D
                 sub_emb = np.concatenate([emb_ligand, emb_full])  # [1024]
@@ -231,9 +241,14 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     
     # Prepare embedding as node features (now 1024D for dual embeddings)
     unimol_emb_t = torch.from_numpy(unimol_emb_array).float().to(device)  # [N, 1024]
+    # unimol.site_size_input: this combo's site sizes in the full half (UnimolPolicy)
+    if global_config.get('unimol', {}).get('site_size_input', False):
+        fill_site_size(unimol_emb_t, nsubs_per_site)
     
     # Create a simple data-like object with required attributes
     class UnimolData:
+        """Container for node features, directed edges, and site assignments."""
+
         def __init__(self, x, edge_index, edge_type, edge_attr, site_index):
             self.x = x
             self.edge_index = edge_index.to(device)

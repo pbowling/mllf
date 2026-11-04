@@ -1,23 +1,7 @@
-"""Uni-Mol 512-dimensional molecular representations with environment context.
+"""Build cached Uni-Mol embeddings for MSLD substituents.
 
-Constructs complete ligand systems (core + substituent(s) + environment) and computes
-Uni-Mol representations trained on 1.1B molecules from PubChem.
-
-Key Features:
-- Automatic ligand assembly: combine core + substituent(s) into unified 3D structure
-- Multi-site support: include reference subs (site#_sub1) from other sites
-- Environment context: add protein/solvent atoms within spatial cutoff (~5 Å)
-- Atom limit enforcement: Uni-Mol supports max 256 atoms; enforce via radial filtering
-- Format flexibility: handle PDB files and CHARMM CRD coordinates seamlessly
-- Embedding caching: save/load computed embeddings to disk for efficient reuse across runs
-
-Functions:
-- construct_full_ligand(): Build complete system with optional environment
-- get_unimol_representation(): Compute 512D molecular embedding
-- get_substituent_unimol_representation(): One-shot API for substituent + context
-- get_substituent_unimol_with_environment(): Full API with environment + optional caching
-- save_embedding(): Cache embedding to disk with metadata
-- load_embedding(): Load cached embedding if available
+Assembles core, substituent, reference-site, and optional environment atoms.
+The APIs support ligand-only/full dual embeddings and phase-feature inputs.
 """
 
 import numpy as np
@@ -26,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import warnings
 import json
 import hashlib
+import os
 import re
 
 from unimol_tools import UniMolRepr
@@ -371,6 +356,28 @@ def _environment_protein_candidates(prep_dir: Path) -> List[Path]:
     return _default_protein_pdb_candidates(prep_dir)
 
 
+# Phase flags (env_input='phase'): [condensed, protein] -- vacuum [0, 0],
+# solvent [1, 0], protein [1, 1] -- from the system name owning the prep dir.
+from mllf.cb.policy import ENV_INPUTS, PHASE_DIM, PHASE_NODE_INPUTS  # noqa: E402
+
+
+def phase_flags(prep_dir: Path) -> np.ndarray:
+    """[condensed, protein] for the system owning a prep dir (by its name)."""
+    name = _system_name_for_prep(prep_dir)
+    if {'vac', 'vacuum', 'gas'} & set(name.split('_')):
+        return np.zeros(PHASE_DIM, dtype=np.float32)
+    return np.array([1.0, 1.0 if 'prot' in name else 0.0], dtype=np.float32)
+
+
+def phase_embedding(prep_dir: Path, dim: int = 512) -> np.ndarray:
+    """The phase flags in the first PHASE_DIM slots of a ``dim`` vector of zeros:
+    the 'full' half of a substituent's [ligand, full] input when env_input='phase',
+    so its layout (and every cache built on it) keeps the dual shape."""
+    v = np.zeros(dim, dtype=np.float32)
+    v[:PHASE_DIM] = phase_flags(prep_dir)
+    return v
+
+
 def _solvent_leg_with_protein_file(prep_dir: Path) -> bool:
     """A solvent-leg prep that holds a protein file the environment now skips."""
     return _is_solvent_phase_prep(prep_dir) and any(
@@ -383,32 +390,19 @@ def build_environment_consensus(
     env_cutoff: float = 8.0,
     custom_search_paths: Optional[List[str]] = None,
 ) -> Optional[set]:
-    """Build environment atom set for the ligand core.
-    
-    Identifies all environment atoms within env_cutoff distance of the core scaffold.
-    This provides a consistent environment representation across pretraining, analysis,
-    and online training.
-    
-    **Strategy:**
-    1. Parse core scaffold to get its coordinates
-    2. Find environment file in prep_dir
-    3. Extract atoms within env_cutoff of the core
-    4. Return this set (capped at 256 atoms, keeping closest)
-    
-    Atoms are identified by (file_index, resnum, chain, atomname) tuples. The
-    file_index disambiguates atoms that share (resnum, chain, atomname) — e.g.
-    CHARMM's fixed-width PDB columns cause residue numbers to wrap for large
-    solvent boxes, so many distinct water molecules can otherwise collide.
-    
+    """Select nearby environment atoms around the ligand core.
+
+    The same core-based selection can be used for every substituent at a site.
+    Atom identifiers include a file index to distinguish duplicate PDB labels.
+
     Args:
-        core_pdb: Path to core scaffold PDB
-        prep_dir: Prep directory containing environment PDB files
-        env_cutoff: Distance cutoff (Å) for identifying relevant environment (default: 8.0)
-        custom_search_paths: Optional custom PDB search paths (from yaml config)
-        
+        core_pdb: Core scaffold PDB path.
+        prep_dir: Directory containing environment structures.
+        env_cutoff: Maximum core-to-environment distance in angstroms.
+        custom_search_paths: Additional environment paths to search first.
+
     Returns:
-        Set of (file_index, resnum, chain, atomname) tuples for environment atoms,
-        or None if no environment found
+        Selected environment atom identifiers, or None if no environment is found.
     """
     try:
         # Get core coordinates
@@ -718,8 +712,11 @@ def save_embedding(
         warnings.warn(f"Embedding cache already exists at {embedding_path}, skipping (use overwrite=True to replace)")
         return embedding_path
 
-    # Save embedding
-    np.save(embedding_path, embedding)
+    # Save embedding: write a temporary file and rename it into place, so a job
+    # sharing this cache never reads a half-written .npy
+    tmp_path = sub_cache_dir / f'.{cache_key}.{os.getpid()}.tmp.npy'
+    np.save(tmp_path, embedding)
+    os.replace(tmp_path, embedding_path)
 
     # Save metadata
     metadata = {
@@ -2049,6 +2046,60 @@ def get_substituent_unimol_with_environment(
         )
 
 
+def other_site_reference_subs(sub_pdb) -> List[str]:
+    """Every other site's reference substituent (``site<N>_sub1_frag.pdb``)
+    next to ``sub_pdb``, whatever its distance: the substituent the combo
+    holds fixed at that site (its own sub1, independent of ALF's numbering).
+    A single-site combo has none -- its core already carries the other
+    sites' sub1 (generate_combinations.augment_core_with_excluded_sub1)."""
+    site = extract_site_number(str(sub_pdb))
+    out = []
+    for ref in sorted(Path(sub_pdb).parent.glob('site*_sub1_frag.pdb')):
+        ref_site = extract_site_number(str(ref))
+        if site is not None and ref_site is not None and ref_site != site:
+            out.append(str(ref))
+    return out
+
+
+def minimized_ligand_copies(pdbs: List[str], prep_dir, out_dir) -> Optional[List[str]]:
+    """Copies of ligand PDBs (core, substituent, reference subs) with each
+    atom's coordinates from ``prep_dir/minimized.pdb`` (residue LIG, matched by
+    atom name), written to ``out_dir`` -- the minimized geometry of the same
+    atoms (unimol.ligand_from_minimized). None, so callers keep the unrelaxed
+    files, if there is no minimized.pdb, an atom is missing from its LIG
+    residue (e.g. a dataset prep whose fragments are named differently from
+    the run that was minimized), or the substituent is not bonded to the core
+    (nearest core atom > 2 A)."""
+    m = Path(prep_dir) / 'minimized.pdb'
+    if not m.exists():
+        return None
+    lig = {}
+    with open(m, errors='replace') as f:
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')) and line[17:21].strip() == 'LIG':
+                lig[line[12:16].strip().upper()] = line[30:54]
+    out, coords = [], []
+    for p in pdbs:
+        lines, xyz = [], []
+        with open(p) as f:
+            for line in f:
+                if line.startswith(('ATOM', 'HETATM')):
+                    new = lig.get(line[12:16].strip().upper())
+                    if new is None:
+                        return None
+                    line = line[:30] + new + line[54:]
+                    xyz.append([float(new[0:8]), float(new[8:16]), float(new[16:24])])
+                lines.append(line.rstrip('\n'))
+        q = Path(out_dir) / f'{len(out)}_{Path(p).name}'
+        q.write_text('\n'.join(lines) + '\n')
+        out.append(str(q))
+        coords.append(np.array(xyz))
+    core, sub = coords[0], coords[1]
+    if len(core) and len(sub) and np.linalg.norm(core[:, None] - sub[None], axis=2).min() > 2.0:
+        return None
+    return out
+
+
 def get_substituent_dual_embeddings(
     sub_pdb: str,
     core_pdb: str,
@@ -2064,52 +2115,46 @@ def get_substituent_dual_embeddings(
     consensus_atoms: Optional[set] = None,
     cache_dir: Optional[Path] = None,
     save_cache: bool = False,
+    env_input: str = 'dual',
+    ligand_other_sites: bool = False,
+    ligand_minimized: bool = False,
 ) -> tuple:
-    """Compute two Uni-Mol embeddings: ligand-only and ligand+environment.
-    
-    This function computes two separate representations:
-    1. **Ligand-only** [512]: core + sub (no environment, no ref_subs)
-       - Captures substituent-specific information
-    2. **Ligand+environment** [512]: core + sub + distance-filtered ref_subs + distance-filtered environment
-       - Captures combined ligand and environment information
-    
-    The policy learns from both embeddings, using:
-    - Difference of ligand-only (antisymmetric): captures substituent variation between nodes
-    - Mean of ligand+environment (symmetric): captures environment effects
-    
-    This dual-embedding approach allows MLPs to simultaneously learn substituent-dependent
-    and environment-dependent information.
-    
-    **Consensus Filtering:**
-    If consensus_atoms is provided (set of (resnum, chain, atomname) tuples), environment
-    atoms in the ligand+environment embedding are further filtered to only include atoms
-    that appear for ALL substituents at the site. This prevents odd environment noise in
-    the mean embedding used by the policy.
-    
+    """Compute ligand-only and context-aware (ligand+environment) Uni-Mol embeddings.
+
+    The first embedding contains the core and substituent (plus, with
+    ``ligand_other_sites``, the other sites' reference substituents). The
+    second adds reference substituents and environment, unless ``env_input``
+    is ``'phase'`` or ``'phase_ligmean'``, which return phase features instead.
+
     Args:
-        sub_pdb: Path to substituent fragment PDB (e.g., site1_sub2_frag.pdb)
-        core_pdb: Path to core scaffold PDB
-        prep_dir: Prep directory containing environment PDB files (minimized.pdb, etc.)
-        sub_rtf_data: Optional RTF metadata dict for substituent
-        core_rtf_data: Optional RTF metadata dict for core
-        include_other_sites: If True, include reference subs from other sites (default: False)
-        env_cutoff: Distance cutoff (Ångströms) for filtering environment/ref_sub atoms (default: 8.0)
-        atom_limit: Maximum atoms to include in representation (default: 256, Uni-Mol max)
-        use_cuda: Whether to use GPU (default: False for CPU)
-        custom_search_paths: Optional list of custom PDB paths to search before defaults
-        skip_minimized: If True, skip minimized.pdb (for unrelaxed structures)
-        consensus_atoms: Optional set of (resnum, chain, atomname) tuples for consensus filtering.
-            If provided, environment in ligand+environment embedding is filtered to only include
-            these atoms, preventing noise in the mean embedding.
-        cache_dir: Optional directory to cache both embeddings. If provided, each
-            half (ligand-only, full) is cached/loaded independently under its
-            own variant tag, so a cache hit on one doesn't require the other.
-        save_cache: If True and cache_dir provided, save newly computed
-            embeddings to cache (default: False).
+        sub_pdb: Substituent fragment PDB path.
+        core_pdb: Core scaffold PDB path.
+        prep_dir: Directory containing environment structures.
+        sub_rtf_data: Optional parsed substituent RTF metadata.
+        core_rtf_data: Optional parsed core RTF metadata.
+        include_other_sites: Include reference substituents from other sites.
+        env_cutoff: Distance cutoff in angstroms for environment atoms.
+        atom_limit: Maximum atoms in each Uni-Mol input.
+        use_cuda: Enable GPU inference.
+        custom_search_paths: Environment paths to search before defaults.
+        skip_minimized: Ignore minimized structures.
+        consensus_atoms: Optional atom identifiers used to filter the environment.
+        cache_dir: Optional embedding-cache directory.
+        save_cache: Save newly computed embeddings when caching is enabled.
+        env_input: ``'dual'`` for environment context, or ``'phase'`` /
+            ``'phase_ligmean'`` for phase flags in the second embedding.
+        ligand_other_sites: Build the ligand-only half as core + substituent
+            + every other site's reference substituent in full
+            (``other_site_reference_subs``; unimol.ligand_other_sites).
+        ligand_minimized: Take the ligand-only half's coordinates from
+            ``prep_dir/minimized.pdb`` (``minimized_ligand_copies``;
+            unimol.ligand_from_minimized), else the unrelaxed files.
 
     Returns:
-        (embedding_ligand_only [512], embedding_with_env [512])
+        A pair of 512-dimensional ligand-only and context embeddings.
     """
+    if env_input not in ENV_INPUTS:
+        raise ValueError(f"env_input must be one of {ENV_INPUTS}, got {env_input!r}")
     core_pdb_path = Path(core_pdb)
     prep_dir = Path(prep_dir)
     if not core_pdb_path.exists():
@@ -2119,6 +2164,20 @@ def get_substituent_dual_embeddings(
     # custom_search_paths/consensus_atoms don't actually affect this half's
     # value, but including them in the key is harmless and keeps a single
     # key-generation convention shared with the 'full' half below).
+    ligand_refs = other_site_reference_subs(sub_pdb) if ligand_other_sites else []
+    ligand_variant = 'ligand_refs' if ligand_other_sites else 'ligand'
+    lig_core, lig_sub, lig_refs = str(core_pdb), str(sub_pdb), ligand_refs
+    _min_dir = None
+    if ligand_minimized:
+        import tempfile
+        _min_dir = tempfile.TemporaryDirectory()
+        copies = minimized_ligand_copies([str(core_pdb), str(sub_pdb)] + ligand_refs, prep_dir, _min_dir.name)
+        if copies:
+            lig_core, lig_sub, lig_refs = copies[0], copies[1], copies[2:]
+            ligand_variant += '_min'
+        else:
+            print(f"      [MINIMIZED] {Path(sub_pdb).name}: no usable minimized ligand in {prep_dir}; "
+                  f"unrelaxed coordinates")
     embedding_ligand_only = None
     if cache_dir is not None:
         embedding_ligand_only = load_embedding(
@@ -2130,18 +2189,18 @@ def get_substituent_dual_embeddings(
             include_other_sites=include_other_sites,
             custom_search_paths=custom_search_paths,
             consensus_atoms=consensus_atoms,
-            variant='ligand',
+            variant=ligand_variant,
             verbose=True,
         )
 
     if embedding_ligand_only is None:
         # Construct ligand-only (no environment)
         ligand_only_dict = construct_full_ligand(
-            sub_pdb=sub_pdb,
-            core_pdb=core_pdb,
+            sub_pdb=lig_sub,
+            core_pdb=lig_core,
             sub_rtf_data=sub_rtf_data,
             core_rtf_data=core_rtf_data,
-            ref_sub_info=None,  # No ref_subs
+            ref_sub_info=[(p, None) for p in lig_refs] or None,
             protein_pdb=None,    # No environment
             solvent_coords=None,
             solvent_elements=None,
@@ -2159,8 +2218,11 @@ def get_substituent_dual_embeddings(
                 include_other_sites=include_other_sites,
                 custom_search_paths=custom_search_paths,
                 consensus_atoms=consensus_atoms,
-                variant='ligand',
+                variant=ligand_variant,
             )
+
+    if env_input in PHASE_NODE_INPUTS:
+        return embedding_ligand_only, phase_embedding(prep_dir, dim=len(embedding_ligand_only))
 
     # Ligand+environment half: get_substituent_unimol_with_environment handles
     # its own cache check/save internally (variant='full' keeps it distinct

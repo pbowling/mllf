@@ -3,8 +3,12 @@ import math
 
 import torch
 
-from mllf.cb.hindsight_regression import online_item, regression_config, regression_step
-from mllf.cb.policy import UnimolPolicy
+import pytest
+
+from mllf.cb.hindsight_regression import (
+    _check_replay_env_input, _check_replay_ligand, online_item, regression_config, regression_step,
+)
+from mllf.cb.policy import PHASE_DIM, UnimolPolicy, env_input_from_state
 
 
 def _policy():
@@ -112,3 +116,29 @@ def test_precision_and_sampling_spread_survive_checkpoint_load(tmp_path):
     assert torch.allclose(h.Lambda_mu, h.Lambda @ h.mu)
     after = spread(pol)
     assert (after < 3.0 * before + 1e-3).all()          # no blow-up of Thompson sampling
+
+
+@pytest.mark.parametrize('env_input', ['dual', 'phase', 'phase_ligmean'])
+def test_env_input_read_back_from_a_saved_policy(env_input):
+    pol = UnimolPolicy(unimol_dim=512, mlp_hidden=64, mlp_out_dim=4, use_dual_embeddings=True,
+                       env_input=env_input)
+    assert env_input_from_state(pol.state_dict()) == env_input
+
+
+def test_replay_cache_built_for_another_env_input_is_refused():
+    phase_graph = torch.zeros(2, 1024)
+    phase_graph[:, :512 + PHASE_DIM] = 1.0                 # zero past the phase flags
+    data = [(phase_graph, None)]
+    _check_replay_env_input(data, 'phase', 'cache.pt')
+    with pytest.raises(ValueError, match='env_input=phase'):
+        _check_replay_env_input(data, 'dual', 'cache.pt')
+    _check_replay_env_input([(torch.ones(2, 1024), None)], 'dual', 'cache.pt')
+
+
+def test_replay_cache_built_with_other_ligand_embeddings_is_refused(tmp_path):
+    cache = tmp_path / 'replay.pt'
+    _check_replay_ligand({'ligand_other_sites': False}, cache)          # no info file: built without
+    with pytest.raises(ValueError, match='ligand_other_sites'):
+        _check_replay_ligand({'ligand_other_sites': True}, cache)
+    (tmp_path / 'replay.pt.json').write_text('{"ligand_other_sites": true}')
+    _check_replay_ligand({'ligand_other_sites': True}, cache)

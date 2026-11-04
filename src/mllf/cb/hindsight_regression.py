@@ -1,20 +1,9 @@
-"""Full-network online update by regression on hindsight targets.
+"""Train the full policy on online hindsight targets and pretraining replay.
 
-The NeuralLinear+TS closed-form update (``UnimolPolicy.update_bayesian_posteriors``)
-only moves each bias head's last linear layer. This module instead takes
-gradient steps on the whole policy -- every head's trunk plus its output
-weights -- toward the hindsight targets of the epoch's runs
-(``mllf.cb.hindsight``): the biases each run measured it should have used,
-each weighted by its own variance. Pretraining runs are replayed in the same
-loss (with data hygiene) so that fitting the new pairs does not overwrite what
-the model already knows.
-
-After the steps, each Bayesian head's posterior mean is set to the trained
-output weights while its precision matrix is kept, so Thompson sampling and
-uncertainty-driven selection keep working with the same spread.
-
-Selected with ``bandit.shared_update: regression`` (default ``posterior``, the
-closed-form update); settings under ``bandit.regression``.
+With ``bandit.shared_update: regression``, gradient updates adjust each head's
+feature trunk and readout. The trained readout becomes the Bayesian posterior
+mean; its precision is retained for Thompson sampling and uncertainty-based
+selection.
 """
 import json
 import math
@@ -43,6 +32,15 @@ DEFAULTS = {
     # them with a collection_tag) are skipped, so a test doesn't replay earlier tests.
     'replay_pretraining_only': True,
     'structure_type': 'unrelaxed',
+    # The model's unimol.env_input; replay graphs are built the same way
+    # (set from the config's unimol section by the trainer).
+    'env_input': 'dual',
+    # The model's unimol.ligand_other_sites (recorded next to the replay cache
+    # in <cache>.json; a cache without it was built without)
+    'ligand_other_sites': False,
+    # The model's unimol.site_size_input (recorded in <cache>.json like
+    # ligand_other_sites)
+    'site_size_input': False,
     'grad_clip': 1.0,
     # 'random': one random run per combo directory, round-robin over datasets.
     # 'coverage': per system, the runs that best cover its pairs, replay_runs
@@ -56,6 +54,7 @@ DEFAULTS = {
 
 
 def regression_config(bandit_cfg: Dict) -> Dict:
+    """Return regression settings merged with their defaults."""
     cfg = dict(DEFAULTS)
     cfg.update(bandit_cfg.get('regression') or {})
     return cfg
@@ -168,6 +167,38 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
     return chosen
 
 
+def _check_replay_env_input(data, env_input: str, cache) -> None:
+    """A replay set built for the other env_input would feed the policy the
+    wrong environment half; phase-mode graphs are zero past the phase flags."""
+    from mllf.cb.policy import SITE_SIZE_SLOT
+    sample = [e for e, *_ in data[:50] if e.dim() == 2 and e.size(1) >= 1024]
+    if not sample:
+        return
+    # past the phase flags and the site-size slot
+    built_phase = all(float(e[:, SITE_SIZE_SLOT + 1:].abs().sum()) == 0.0 for e in sample)
+    from mllf.cb.policy import PHASE_NODE_INPUTS
+    if built_phase != (env_input in PHASE_NODE_INPUTS):
+        raise ValueError(f"replay cache {cache} was built with env_input="
+                         f"{'phase' if built_phase else 'dual'}, but the model uses {env_input!r}; "
+                         f"set regression.replay_cache to a new file")
+
+
+def _replay_info_path(cache) -> Path:
+    return Path(str(cache) + '.json')
+
+
+def _check_replay_ligand(cfg: Dict, cache) -> None:
+    """A replay set's node inputs must be built like the model's
+    (unimol.ligand_other_sites, unimol.site_size_input)."""
+    info = _replay_info_path(cache)
+    meta = json.loads(info.read_text()) if info.exists() else {}
+    for key in ('ligand_other_sites', 'site_size_input'):
+        built = meta.get(key, False)
+        if bool(built) != bool(cfg.get(key, False)):
+            raise ValueError(f"replay cache {cache} was built with {key}={built}, but the model "
+                             f"uses {cfg.get(key)}; set regression.replay_cache to a new file")
+
+
 def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tuple]:
     """Sample pretraining runs and build (x, edge_index, targets [E,4], weights [E,4]).
 
@@ -179,6 +210,8 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
     cache = cfg.get('replay_cache')
     if cache and Path(cache).exists():
         data = torch.load(cache, weights_only=False)
+        _check_replay_env_input(data, cfg.get('env_input', 'dual'), cache)
+        _check_replay_ligand(cfg, cache)
         if verbose:
             print(f"  [regression] replay set loaded from {cache}: {len(data)} runs")
         return data
@@ -263,7 +296,10 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
             emb, ei, ns2, _ = _compute_unimol_embeddings_and_edges(
                 run_dir, run_dir / 'graph_info.json',
                 structure_type=cfg['structure_type'], use_environment_difference=True,
-                consensus_dict=consensus, cache_dir=cfg.get('embedding_cache_dir'), run_idx=n)
+                consensus_dict=consensus, cache_dir=cfg.get('embedding_cache_dir'), run_idx=n,
+                env_input=cfg.get('env_input', 'dual'),
+                ligand_other_sites=bool(cfg.get('ligand_other_sites', False)),
+                site_size_input=bool(cfg.get('site_size_input', False)))
             targets = _extract_targets_from_variables(run_dir, ns2, build_directed_pairs(ns2))
             if not targets or len(targets) != ei.size(1) or len(weights) != ei.size(1):
                 continue
@@ -276,6 +312,10 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
     if cache:
         Path(cache).parent.mkdir(parents=True, exist_ok=True)
         torch.save(data, cache)
+        _replay_info_path(cache).write_text(json.dumps(
+            {'env_input': cfg.get('env_input', 'dual'),
+             'ligand_other_sites': bool(cfg.get('ligand_other_sites', False)),
+             'site_size_input': bool(cfg.get('site_size_input', False))}))
     if verbose:
         print(f"  [regression] replay set built: {len(data)} runs"
               + (f", saved to {cache}" if cache else ""))

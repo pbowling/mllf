@@ -81,3 +81,12 @@ def test_cache_key_changes_only_for_affected_solvent_legs(tmp_path):
     for prep in (clean, protein):
         k, k_unmarked = key(prep, False)
         assert k == k_unmarked                       # everything else keeps its old key
+
+
+@pytest.mark.parametrize('system, flags', [
+    ('luis_bace_solvent', [1.0, 0.0]), ('abl_water', [1.0, 0.0]), ('luis_bace_protein', [1.0, 1.0]),
+    ('indolizine_prot', [1.0, 1.0]), ('1benz_vac', [0.0, 0.0]), ('123benz_gas', [0.0, 0.0]),
+])
+def test_phase_flags_from_system_name(tmp_path, system, flags):
+    for prep in (tmp_path / system / 'prep', tmp_path / system / 'pair01_site1_subs_1_2' / 'prep'):
+        assert ur.phase_flags(prep).tolist() == flags

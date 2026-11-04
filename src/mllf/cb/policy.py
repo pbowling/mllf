@@ -1,13 +1,9 @@
-"""Edge value policy built on top of a node encoder.
+"""Policies that predict MSLD bias coefficients from molecular edge features.
 
-For each directed edge this policy produces a vector of means and a vector
-of log-standard-deviations (one per predicted coefficient). The MLP outputs
-concatenated [mu_1,...,mu_D, logsigma_1,...,logsigma_D] which are split
-and used to parameterize a per-edge independent Gaussian distribution.
-The agent samples continuous actions v_ij ~ N(mu_ij, sigma_ij^2) for every
-directed edge and returns sampled values plus per-edge log-probabilities.
+The deterministic policy predicts action means and standard deviations. The
+Uni-Mol policy can instead use Bayesian readouts for Thompson sampling.
 """
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -76,27 +72,21 @@ class BiasHeadMLP(nn.Module):
 
 
 class EdgeValueMLP(nn.Module):
+    """Independent edge-feature MLPs, one for each bias coefficient."""
+
     def __init__(self, in_dim: int, hidden: int = 64, num_bias_types: int = 4,
                  bias_embed_dim: int = 16, bayesian: bool = False,
                  prior_precision: float = 1.0):
-        """Four completely independent MLPs, one per MSLD bias type.
-
-        Replaces the previous shared-trunk + 4-heads design.  Each
-        :class:`BiasHeadMLP` owns its entire feature-extraction stack, so
-        the gradient from one bias type (e.g. the noisy signal)
-        cannot overwrite features learned by another type (e.g. linear).
-
-        The public API is identical to the old class — ``forward(x)`` returns
-        ``[E, 2*num_bias_types]`` — so no callers need to change.
+        """Initialize one independent MLP per bias coefficient.
 
         Args:
-            in_dim: Input dimension.
-            hidden: Unused; kept for API compatibility with old constructor.
-            num_bias_types: Number of bias types (default 4).
-            bias_embed_dim: Unused; kept for API compatibility.
-            bayesian: If True, each :class:`BiasHeadMLP` uses a
-                :class:`~mllf.cb.bayesian_head.BayesianLinearHead` last layer
-                instead of a deterministic ``Linear(64, 2)`` (NeuralLinear mode).
+            in_dim: Edge-feature dimension.
+            hidden: Unused compatibility parameter.
+            num_bias_types: Number of coefficient heads.
+            bias_embed_dim: Unused compatibility parameter.
+            bayesian: Use Bayesian linear readouts instead of deterministic
+                readouts.
+            prior_precision: Prior precision for each Bayesian readout.
         """
         super().__init__()
         self.num_bias_types = num_bias_types
@@ -184,6 +174,8 @@ class EdgeValueMLP(nn.Module):
 
 
 class EdgePolicy(nn.Module):
+    """Graph-encoder policy retained for workflows using learned node embeddings."""
+
     def __init__(self, encoder: nn.Module, emb_dim: int, edge_feat_dim: int = 0,
                  mlp_hidden: int = 64, mlp_out_dim: int = 4, p1_dim: int = 0):
         super().__init__()
@@ -210,10 +202,10 @@ class EdgePolicy(nn.Module):
     def edge_inputs(self, node_emb: torch.Tensor, edge_index: torch.LongTensor,
                     edge_feat: Optional[torch.Tensor] = None,
                     p1_emb: Optional[torch.Tensor] = None):
-        """Build per-edge input tensor.
+        """Concatenate source and destination node features for each edge.
 
-        When p1_emb is provided (skip connection), concatenates
-        [P1_src, P2_src, P1_dst, P2_dst, edge_feat]; otherwise [P2_src, P2_dst, edge_feat].
+        If ``p1_emb`` is provided, include those node features as skip
+        connections. Append ``edge_feat`` when present.
         """
         # edge_index: [2, E]
         src = edge_index[0]
@@ -337,14 +329,7 @@ class EdgePolicy(nn.Module):
     @classmethod
     def from_pyg_data(cls, encoder: nn.Module, emb_dim: int, data, mlp_hidden: int = 64,
                       mlp_out_dim: int = 1, p1_dim: int = 0):
-        """Construct an EdgePolicy using a PyG ``data`` object to infer edge_feat_dim.
-
-        Reads ``data.edge_attr`` (if present) for per-edge feature size.
-        Pass ``p1_dim=data.x.size(1)`` to enable the skip-connection path where
-        pre-RGCN node embeddings are concatenated alongside RGCN embeddings.
-
-        Input dimension: 2*(emb_dim + p1_dim) + edge_feat_dim.
-        """
+        """Build a policy and infer edge-feature width from PyG ``data``."""
         edge_feat_dim = 0
         if hasattr(data, 'edge_attr') and data.edge_attr is not None:
             try:
@@ -352,6 +337,59 @@ class EdgePolicy(nn.Module):
             except Exception:
                 edge_feat_dim = 0
         return cls(encoder, emb_dim, edge_feat_dim, mlp_hidden, mlp_out_dim, p1_dim)
+
+
+# UnimolPolicy env_input options; 'phase' feeds PHASE_DIM flags [condensed,
+# protein] (unimol_representation.phase_flags) in place of the mean full
+# embedding; 'phase_ligmean' adds the pair's mean ligand-only embedding to that.
+ENV_INPUTS = ('dual', 'phase', 'phase_ligmean')
+# Inputs whose node 'full' half holds the phase flags (no environment embedding).
+PHASE_NODE_INPUTS = ('phase', 'phase_ligmean')
+PHASE_DIM = 2
+# unimol.site_size_input: the node's 'full' half carries 1 / (n - 1) for the n
+# substituents at its site in this run in the slot after the phase flags (pair
+# 1, 3 subs 0.5, 8 subs 0.14), and the edge input gains it after the phase
+# flags. Same-site partners' end terms stack at a shared endpoint, so a pair's
+# x / s in a pair run and in a group differ; without this the model sees both
+# as the same edge. Set per run by fill_site_size (not cached with the embedding).
+SITE_SIZE_SLOT = 512 + PHASE_DIM
+
+
+def site_size_values(nsubs_per_site) -> List[float]:
+    """Per-node 1 / (n - 1) for the n substituents at the node's site."""
+    return [1.0 / max(int(n) - 1, 1) for n in nsubs_per_site for _ in range(int(n))]
+
+
+def fill_site_size(node_emb: torch.Tensor, nsubs_per_site) -> torch.Tensor:
+    """Write site_size_values into SITE_SIZE_SLOT of a [N, 1024] phase-mode node
+    tensor (nodes ordered site by site, as every graph builder orders them)."""
+    vals = site_size_values(nsubs_per_site)
+    if len(vals) != node_emb.size(0):
+        raise ValueError(f"nsubs_per_site {list(nsubs_per_site)} gives {len(vals)} nodes, "
+                         f"embeddings have {node_emb.size(0)}")
+    node_emb[:, SITE_SIZE_SLOT] = torch.tensor(vals, dtype=node_emb.dtype, device=node_emb.device)
+    return node_emb
+
+
+def env_input_from_state(state_dict: Dict) -> str:
+    """Which env_input a saved UnimolPolicy was built with, from the input width
+    of its first layer: 514 / 515 'phase', 1026 / 1027 'phase_ligmean' (the +1
+    is site_size_input), otherwise 'dual'."""
+    widths = {512 + PHASE_DIM: 'phase', 1024 + PHASE_DIM: 'phase_ligmean',
+              513 + PHASE_DIM: 'phase', 1025 + PHASE_DIM: 'phase_ligmean'}
+    for k, v in state_dict.items():
+        if k.endswith('trunk.0.weight') or k.endswith('net.0.weight'):
+            return widths.get(v.shape[1], 'dual')
+    return 'dual'
+
+
+def site_size_from_state(state_dict: Dict) -> bool:
+    """Whether a saved UnimolPolicy was built with site_size_input (input width
+    515 or 1027)."""
+    for k, v in state_dict.items():
+        if k.endswith('trunk.0.weight') or k.endswith('net.0.weight'):
+            return v.shape[1] in (513 + PHASE_DIM, 1025 + PHASE_DIM)
+    return False
 
 
 class UnimolPolicy(nn.Module):
@@ -372,6 +410,18 @@ class UnimolPolicy(nn.Module):
       - diff_ligand captures how substituents differ (antisymmetric, sub-dependent)
       - mean_full captures environmental context (symmetric, environment-dependent)
     - Allows MLPs to simultaneously learn substituent-dependent and environment-dependent information
+
+    **Phase input** (use_dual_embeddings=True, env_input='phase'):
+    - Same [N, 1024] node layout, but the 'full' half holds the phase flags
+      [condensed, protein] padded with zeros (unimol_representation.phase_embedding)
+    - Edge input: [diff_ligand(512), phase(2)] = 514D -- the environment enters
+      only as vacuum / solvent / protein, not as a 512D embedding
+
+    **Phase + ligand mean** (use_dual_embeddings=True, env_input='phase_ligmean'):
+    - Node layout as for 'phase'
+    - Edge input: [diff_ligand(512), mean_ligand(512), phase(2)] = 1026D -- adds
+      the pair's mean ligand-only embedding, symmetric pair context with no
+      environment (what the full half gave vacuum pairs in 'dual' mode)
     
     Each edge is passed as 1024D directly to EdgeValueMLP, which contains four
     independent BiasHeadMLPs (one per bias type). Each BiasHeadMLP learns its
@@ -394,17 +444,36 @@ class UnimolPolicy(nn.Module):
             original REINFORCE-compatible architecture exactly as before.
         bayesian_prior_precision: Prior precision (ridge strength) for each
             ``BayesianLinearHead`` when ``use_bayesian_heads=True``. Unused otherwise.
+        env_input: 'dual' (default): the symmetric half is the mean of the full
+            embeddings; 'phase': it is the 2 phase flags; 'phase_ligmean': the mean
+            ligand-only embedding plus the 2 phase flags. The phase inputs need
+            use_dual_embeddings=True and node inputs built with the same env_input.
+        site_size_input: append the site-size value (SITE_SIZE_SLOT, filled by
+            fill_site_size) after the phase flags: 515D for 'phase', 1027D for
+            'phase_ligmean'. Needs a phase env_input.
     """
 
     def __init__(self, unimol_dim: int = 512, mlp_hidden: int = 64,
                  mlp_out_dim: int = 4, use_dual_embeddings: bool = False,
                  use_bayesian_heads: bool = False,
-                 bayesian_prior_precision: float = 1.0):
+                 bayesian_prior_precision: float = 1.0,
+                 env_input: str = 'dual',
+                 site_size_input: bool = False):
         super().__init__()
+        if env_input not in ENV_INPUTS:
+            raise ValueError(f"env_input must be one of {ENV_INPUTS}, got {env_input!r}")
+        if env_input in PHASE_NODE_INPUTS and not use_dual_embeddings:
+            raise ValueError(f"env_input={env_input!r} needs use_dual_embeddings=True")
+        if site_size_input and env_input not in PHASE_NODE_INPUTS:
+            raise ValueError(f"site_size_input needs a phase env_input {PHASE_NODE_INPUTS}, got {env_input!r}")
         self.unimol_dim = unimol_dim
         self.mlp_out_dim = int(mlp_out_dim)
         self.use_dual_embeddings = use_dual_embeddings
         self.use_bayesian_heads = bool(use_bayesian_heads)
+        self.env_input = env_input
+        self.site_size_input = bool(site_size_input)
+        # leading slots of the 'full' half fed to the edge: phase flags (+ site size)
+        self._phase_dim = PHASE_DIM + int(self.site_size_input)
         
         # When using dual embeddings:
         # - Input format: [N, 1024] where first 512 = ligand-only, last 512 = full system with environment
@@ -413,6 +482,10 @@ class UnimolPolicy(nn.Module):
         # - Input format: [N, 512] ligand+environment
         # - Edge input: [diff, mean] = 1024D
         in_dim = 2 * unimol_dim if not use_dual_embeddings else 1024
+        if env_input == 'phase':
+            in_dim = unimol_dim + self._phase_dim      # [diff_ligand, phase(, site size)]
+        elif env_input == 'phase_ligmean':
+            in_dim = 2 * unimol_dim + self._phase_dim  # [diff_ligand, mean_ligand, phase(, site size)]
         self.edge_mlp = EdgeValueMLP(in_dim, hidden=mlp_hidden, num_bias_types=mlp_out_dim,
                                       bayesian=self.use_bayesian_heads,
                                       prior_precision=bayesian_prior_precision)
@@ -483,6 +556,14 @@ class UnimolPolicy(nn.Module):
             # - Symmetric component from full (captures environment effects)
             diff_ligand = src_ligand - dst_ligand     # [E, 512] - antisymmetric (sub-dependent)
             mean_full = (src_full + dst_full) / 2.0   # [E, 512] - symmetric (environment-dependent)
+            if self.env_input == 'phase':
+                # 'full' half = phase flags (+ site size, the same for both nodes of
+                # an edge) + zero padding
+                return torch.cat([diff_ligand, mean_full[:, :self._phase_dim]], dim=-1)  # [E, 514 / 515]
+            if self.env_input == 'phase_ligmean':
+                mean_ligand = (src_ligand + dst_ligand) / 2.0   # [E, 512] - symmetric pair context
+                return torch.cat([diff_ligand, mean_ligand, mean_full[:, :self._phase_dim]],
+                                 dim=-1)  # [E, 1026 / 1027]
             return torch.cat([diff_ligand, mean_full], dim=-1)  # [E, 1024]
         else:
             # Standard mode: ligand+environment
