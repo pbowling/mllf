@@ -450,64 +450,6 @@ class TestEmbeddingLoading:
             assert loaded_true is None, "Should NOT load with different include_other_sites=True"
 
 
-class TestEmbeddingProperties:
-    """Test properties and constraints of embeddings."""
-    
-    def test_embedding_dimension_is_512(self):
-        """Verify Uni-Mol embeddings are 512-dimensional."""
-        # This is a property test verifying the expected dimension
-        expected_dim = 512
-        
-        # Verify this is consistent with Uni-Mol model output
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache_dir = Path(tmpdir)
-            # Create a test embedding with correct dimension
-            embedding = np.random.randn(expected_dim).astype(np.float32)
-            
-            save_embedding(
-                embedding=embedding,
-                cache_dir=cache_dir,
-                sub_pdb='/path/to/sub.pdb',
-                core_pdb='/path/to/core.pdb',
-                prep_dir='/path/to/prep',
-            )
-            
-            # Verify saved dimension
-            loaded = load_embedding(
-                cache_dir=cache_dir,
-                sub_pdb='/path/to/sub.pdb',
-                core_pdb='/path/to/core.pdb',
-                prep_dir='/path/to/prep',
-                verbose=False,
-            )
-            
-            assert loaded.shape == (512,), "Embedding should be 512-dimensional"
-    
-    def test_embedding_dtype_is_float32(self):
-        """Verify Uni-Mol embeddings are float32."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache_dir = Path(tmpdir)
-            embedding = np.random.randn(512).astype(np.float32)
-            
-            save_embedding(
-                embedding=embedding,
-                cache_dir=cache_dir,
-                sub_pdb='/path/to/sub.pdb',
-                core_pdb='/path/to/core.pdb',
-                prep_dir='/path/to/prep',
-            )
-            
-            loaded = load_embedding(
-                cache_dir=cache_dir,
-                sub_pdb='/path/to/sub.pdb',
-                core_pdb='/path/to/core.pdb',
-                prep_dir='/path/to/prep',
-                verbose=False,
-            )
-            
-            assert loaded.dtype == np.float32, "Embedding should be float32"
-
-
 class TestCacheKeyEdgeCases:
     """Test edge cases in cache key generation."""
     

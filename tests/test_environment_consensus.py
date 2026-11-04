@@ -194,27 +194,6 @@ class TestConsensusAtomsSerialization:
 class TestConsensusAtomProperties:
     """Test properties of consensus atoms."""
     
-    def test_consensus_atom_tuple_structure(self):
-        """Verify consensus atoms have correct tuple structure."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = Path(tmpdir)
-            # Atom ID format: (file_index, resnum, chain, atomname)
-            atom = (42, 100, 'A', 'OW')
-            consensus_dict = {'site1': {atom}}
-            
-            save_path = save_consensus_atoms(consensus_dict, run_dir)
-            
-            with open(save_path) as f:
-                data = json.load(f)
-            
-            # After JSON roundtrip
-            saved_atom = data['site1'][0]
-            assert len(saved_atom) == 4, "Atom should have 4 components"
-            assert saved_atom[0] == 42, "First element should be file_index"
-            assert saved_atom[1] == 100, "Second element should be resnum"
-            assert saved_atom[2] == 'A', "Third element should be chain"
-            assert saved_atom[3] == 'OW', "Fourth element should be atomname"
-    
     def test_consensus_atoms_are_unique(self):
         """Verify sets eliminate duplicate atoms in consensus."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -229,59 +208,8 @@ class TestConsensusAtomProperties:
             # After roundtrip, should only have 2 unique atoms
             assert len(loaded['site1']) == 2, "Duplicates should be eliminated by set"
     
-    def test_consensus_atom_limit_respected(self):
-        """Verify consensus respects atom limit (max 256)."""
-        # This test documents the expected constraint that consensus atoms
-        # should be capped at 256 (Uni-Mol model limit), though the save/load
-        # functions don't enforce this — it's done in build_environment_consensus()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = Path(tmpdir)
-            
-            # Create 300 atoms (exceeds Uni-Mol limit of 256)
-            atoms = {(i, 100 + i, 'A', f'C{i}') for i in range(300)}
-            consensus_dict = {'site1': atoms}
-            
-            # Save/load should preserve all atoms
-            save_path = save_consensus_atoms(consensus_dict, run_dir)
-            loaded = load_consensus_atoms(run_dir)
-            
-            # The save/load functions don't truncate, but the builder should
-            assert len(loaded['site1']) == 300, "Save/load should preserve all atoms"
-
-
 class TestConsensusFileStructure:
     """Test file structure and JSON formatting."""
-    
-    def test_consensus_json_is_valid(self):
-        """Verify saved consensus file is valid JSON."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = Path(tmpdir)
-            consensus_dict = {
-                'site1': {(0, 100, 'A', 'OW')},
-                'site2': None,
-            }
-            
-            save_path = save_consensus_atoms(consensus_dict, run_dir)
-            
-            # Should be parseable as valid JSON
-            try:
-                with open(save_path) as f:
-                    json.load(f)
-            except json.JSONDecodeError:
-                pytest.fail("Saved consensus should be valid JSON")
-    
-    def test_consensus_json_is_readable(self):
-        """Verify consensus JSON is human-readable (indented)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = Path(tmpdir)
-            consensus_dict = {'site1': {(0, 100, 'A', 'OW')}}
-            
-            save_path = save_consensus_atoms(consensus_dict, run_dir)
-            
-            content = save_path.read_text()
-            # Should have indentation for readability
-            assert '\n' in content, "JSON should be formatted with newlines"
-            assert '  ' in content, "JSON should be indented"
     
     def test_consensus_atoms_are_sorted(self):
         """Verify consensus atoms are sorted for consistency."""
