@@ -344,6 +344,9 @@ def parse_lambda_trajectory(text: str) -> Tuple[Optional[int], List[List[float]]
         LAMBDA.......TIME(ps).. .BLOCKS   2   THRU BLOCK    5
         LAMBDA>       0.0200  0.0001  0.0002  0.7249  0.2748
 
+    CHARMM wraps a frame after 10 lambdas onto further ``LAMBDA>`` lines
+    holding values only; with the header's block range these are joined.
+
     Returns:
         (first_block, frames) -- ``first_block`` is the block ID of the first
         lambda column (2 in practice; None if no header was found, in which
@@ -352,17 +355,31 @@ def parse_lambda_trajectory(text: str) -> Tuple[Optional[int], List[List[float]]
         was printed.
     """
     first_block: Optional[int] = None
+    n_blocks: Optional[int] = None
     hdr = re.search(r"LAMBDA\.+TIME.*?BLOCKS\s+(\d+)\s+THRU\s+BLOCK\s+(\d+)", text)
     if hdr:
         first_block = int(hdr.group(1))
+        n_blocks = int(hdr.group(2)) - first_block + 1
     frames: List[List[float]] = []
+    partial: Optional[List[float]] = None    # a wrapped frame still short of n_blocks
     for m in re.finditer(r"^\s*LAMBDA>\s+([^\n]+)", text, re.MULTILINE):
         try:
             vals = [float(v) for v in m.group(1).split()]
         except ValueError:
+            partial = None
             continue
-        if len(vals) >= 2:
-            frames.append(vals[1:])
+        if partial is not None:
+            partial.extend(vals)
+            if len(partial) >= n_blocks:
+                frames.append(partial[:n_blocks])
+                partial = None
+            continue
+        if len(vals) < 2:
+            continue
+        if n_blocks is not None and len(vals) - 1 < n_blocks:
+            partial = vals[1:]
+            continue
+        frames.append(vals[1:])
     return first_block, frames
 
 
@@ -595,6 +612,74 @@ def parse_pair_barriers(
     return {k: v["barrier"] for k, v in parse_pair_profile(text, pairs, temperature).items()}
 
 
+# Shares below this are not counted as partners holding lambda off the endpoint.
+HOLDOFF_PARTNER_MIN = 0.02
+
+
+def parse_site_holdoff(text: str, pairs: Optional[List[Tuple[int, int]]] = None) -> List[Dict]:
+    """Per site, where the absolute lambda trajectory sits around its dominant substituent.
+
+    Sites are the connected blocks of the same-site ``pairs`` (default: the
+    SINGLE DDG table's). In each site the dominant block is the one holding
+    the site's largest lambda in the most frames; over those frames:
+
+    * ``dom_frac``: the fraction of all frames it dominates;
+    * ``at_frac``: the fraction with its lambda >= 0.99 (its endpoint held);
+    * ``mean_dom``: its mean lambda;
+    * ``partners``: {block: mean lambda} of the other blocks, for those with
+      at least HOLDOFF_PARTNER_MIN.
+
+    A substituent that dominates yet almost never reaches 0.99, with the
+    remainder spread over several partners, has its endpoint held off by the
+    partners' end terms acting there together; the pair profiles miss it,
+    since such frames are on no pair's edge.
+
+    Returns a list of {'blocks', 'dom', 'dom_frac', 'at_frac', 'mean_dom',
+    'partners'} (block IDs as in the output), empty without a trajectory.
+    """
+    first_block, frames = parse_lambda_trajectory(text)
+    if not frames:
+        return []
+    if first_block is None:
+        first_block = 2
+    if pairs is None:
+        pairs = sorted(parse_single_ddg(text).keys())
+    sites: List[set] = []
+    for a, b in pairs:
+        hit = [s for s in sites if a in s or b in s]
+        merged = set().union({a, b}, *hit)
+        sites = [s for s in sites if s not in hit] + [merged]
+    n_cols = min(len(f) for f in frames)
+    lam = [f[:n_cols] for f in frames]
+    out: List[Dict] = []
+    for blocks in sorted(sorted(s) for s in sites):
+        cols = [b - first_block for b in blocks]
+        if not cols or min(cols) < 0 or max(cols) >= n_cols:
+            continue
+        counts = [0] * len(cols)
+        tops = []
+        for f in lam:
+            vals = [f[c] for c in cols]
+            k = max(range(len(cols)), key=vals.__getitem__)
+            counts[k] += 1
+            tops.append(k)
+        d = max(range(len(cols)), key=counts.__getitem__)
+        on = [f for f, k in zip(lam, tops) if k == d]
+        n = len(on)
+        partners = {}
+        for k, c in enumerate(cols):
+            if k == d:
+                continue
+            share = sum(f[c] for f in on) / n if n else 0.0
+            if share >= HOLDOFF_PARTNER_MIN:
+                partners[blocks[k]] = share
+        out.append({'blocks': blocks, 'dom': blocks[d], 'dom_frac': n / len(lam),
+                    'at_frac': sum(1 for f in on if f[cols[d]] >= 0.99) / n if n else 0.0,
+                    'mean_dom': sum(f[cols[d]] for f in on) / n if n else 0.0,
+                    'partners': partners})
+    return out
+
+
 __all__ = [
     "terminated_normally",
     "resolve_output_file",
@@ -605,4 +690,5 @@ __all__ = [
     "parse_lambda_trajectory",
     "parse_pair_profile",
     "parse_pair_barriers",
+    "parse_site_holdoff",
 ]

@@ -305,14 +305,6 @@ def compute_msld_reward_improved(
     # proportional partial credit below (e.g. 2/3 → 0.44×, 1/3 → 0.11×).
     coverage_factor = (nonzero_count / total_subs) ** 2 if total_subs > 0 else 0.0
     R = coverage_factor * (R_P + R_T + R_entropy) + penalties
-
-    # Debug output
-    print(f"  Reward breakdown: R_P={R_P:.2f}, R_T={R_T:.2f}, R_entropy={R_entropy:.2f}, "
-          f"coverage_factor={coverage_factor:.2f}, penalties={penalties:.2f}, total={R:.2f}")
-    print(f"  Coverage: {nonzero_count}/{total_subs} ({coverage_ratio:.2%}), "
-          f"Transitions: {list(site_transitions.values())}, "
-          f"Confidence: {confidence_factor:.2f}")
-
     return R
 
 

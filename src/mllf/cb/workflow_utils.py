@@ -173,6 +173,8 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
     Returns:
         Dict with:
           'populations': list of population counts per block at highest lambda
+          'population_sites': site index of each entry in 'populations' (None
+                       where the output's SINGLE DDG listing doesn't place it)
           'transitions': list of transition counts per site at highest lambda
           'ddg_pairs': dict mapping "blk_i_blk_j" → float|None at highest lambda
                        (None = NaN = no crossings between that pair)
@@ -192,6 +194,8 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
                        just short of each endpoint ({'edge', 'at_lo',
                        'near_lo', 'near_hi', 'at_hi'}, or None); see
                        ``parse_pair_profile``
+          'site_holdoff': per site, where lambda sits around the dominant
+                       substituent (see ``parse_site_holdoff``)
     """
     from mllf.file_handling.read_output import (
         parse_single_population,
@@ -199,11 +203,13 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         parse_single_ddg,
         parse_fraction_physical_ligand,
         parse_pair_profile,
+        parse_site_holdoff,
     )
 
-    raw_metrics = {'populations': [], 'transitions': [], 'ddg_pairs': {}, 'fraction_physical': None,
+    raw_metrics = {'populations': [], 'population_sites': [], 'transitions': [], 'ddg_pairs': {},
+                   'fraction_physical': None,
                    'barrier_pairs': {}, 'skew_pairs': {}, 'end_pairs': {}, 'transition_pairs': {},
-                   'endpoint_pairs': {}}
+                   'endpoint_pairs': {}, 'site_holdoff': []}
 
     try:
         with open(output_file, 'r') as f:
@@ -223,6 +229,10 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
                 raw_metrics[field] = {f"{lo}_{hi}": vals[key] for (lo, hi), vals in profile.items()}
         except Exception:
             pass
+        try:
+            raw_metrics['site_holdoff'] = parse_site_holdoff(output_text, pairs=list(ddg_data.keys()))
+        except Exception:
+            pass
         
         # Extract populations per block - use only HIGHEST lambda value (0.990)
         for block_id, block_info in population_data.items():
@@ -233,6 +243,7 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
                 raw_metrics['populations'].append(counts_dict[max_lambda])
             else:
                 raw_metrics['populations'].append(0)
+            raw_metrics['population_sites'].append(block_info.get('site'))
         
         # Extract transitions per site - use only HIGHEST lambda value (0.990)
         for site_id, trans_dict in transitions_data.items():
@@ -251,6 +262,52 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         pass
     
     return raw_metrics
+
+
+def format_coverage_line(raw_metrics: Dict) -> str:
+    """One-line run summary: substituents visited (per site) and transitions per site.
+
+    Single site: ``Coverage: 2/2 (100.0%), Transitions: [2]``.
+    Multiple sites: ``Coverage: [3/4, 1/4] (50.0%), Transitions: [4, 2]``; the
+    percentage is over all substituents. Blocks with no site in the output are
+    counted as one site.
+    """
+    pops = raw_metrics.get('populations', [])
+    sites = raw_metrics.get('population_sites', [])
+    trans = raw_metrics.get('transitions', [])
+    if len(sites) != len(pops) or any(s is None for s in sites):
+        sites = [0] * len(pops)
+    per_site: Dict = {}
+    for pop, site in zip(pops, sites):
+        visited, total = per_site.get(site, (0, 0))
+        per_site[site] = (visited + (pop > 0), total + 1)
+    n_visited = sum(v for v, _ in per_site.values())
+    pct = n_visited / len(pops) if pops else 0.0
+    parts = [f"{v}/{t}" for _, (v, t) in sorted(per_site.items())]
+    cov = parts[0] if len(parts) == 1 else f"[{', '.join(parts)}]"
+    return f"Coverage: {cov} ({pct:.1%}), Transitions: {list(trans)}"
+
+
+def format_crossing_line(raw_metrics: Dict) -> str:
+    """Second summary line: same-site pairs never crossed, and per-site dominance.
+
+    ``Uncrossed pairs: 3/10, Dominant: [0.92, 0.61]``. A pair is uncrossed when
+    its SINGLE DDG is NaN/inf (no transitions between the two substituents);
+    Dominant is the fraction of frames each site spends on its most-held
+    substituent (from the lambda trajectory). Either part is left out when its
+    data isn't in the output; returns '' when both are.
+    """
+    parts = []
+    ddg = raw_metrics.get('ddg_pairs') or {}
+    if ddg:
+        n_unc = sum(1 for v in ddg.values()
+                    if v is None or (isinstance(v, float) and not math.isfinite(v)))
+        parts.append(f"Uncrossed pairs: {n_unc}/{len(ddg)}")
+    holdoff = raw_metrics.get('site_holdoff') or []
+    if holdoff:
+        doms = ', '.join(f"{s.get('dom_frac', 0.0):.2f}" for s in holdoff)
+        parts.append(f"Dominant: [{doms}]")
+    return ', '.join(parts)
 
 
 def build_edge_weights(

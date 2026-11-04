@@ -3,7 +3,7 @@ import math
 import pytest
 
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
-from mllf.file_handling.read_output import parse_lambda_trajectory, parse_pair_barriers
+from mllf.file_handling.read_output import parse_lambda_trajectory, parse_pair_barriers, parse_site_holdoff
 from mllf.file_handling.read_rtf import parse_rtf_file, parse_rtf_dir
 
 
@@ -281,3 +281,16 @@ def test_pair_transitions_ignore_other_sites():
     prof = parse_pair_profile(text)
     assert set(prof) == {(2, 3), (4, 5)}
     assert prof[(2, 3)]["transitions"] == 0 and prof[(4, 5)]["transitions"] == 2
+
+
+def test_site_holdoff_dominant_sub_short_of_its_endpoint():
+    rows = [[0.80, 0.12, 0.08]] * 8 + [[1.0, 0.0, 0.0]] * 1 + [[0.1, 0.85, 0.05]]
+    (site,) = parse_site_holdoff(_lambda_output(rows))
+    assert site['blocks'] == [2, 3, 4] and site['dom'] == 2
+    assert site['dom_frac'] == pytest.approx(0.9)
+    assert site['at_frac'] == pytest.approx(1 / 9)              # one of its 9 frames at lambda >= 0.99
+    assert site['partners'] == pytest.approx({3: 0.96 / 9, 4: 0.64 / 9})
+
+
+def test_site_holdoff_empty_without_trajectory():
+    assert parse_site_holdoff("no lambda here") == []
