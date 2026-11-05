@@ -9,7 +9,13 @@ from mllf.cb.replay_selection import (
     system_of_dataset,
 )
 
-KNOWN = ['12benz_solvent', '123benz_vac', '14benz_solv', 'thrombin_solvent', 'luis_p38_protein', '1benz_vac']
+KNOWN = [
+    '12benz_solvent',
+    '123benz_vac',
+    '14benz_solv',
+    'thrombin_solvent',
+    'luis_p38_protein',
+    '1benz_vac']
 
 
 @pytest.mark.parametrize('name,system', [

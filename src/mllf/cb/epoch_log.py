@@ -11,7 +11,8 @@ stage progress and validation::
       Group corrections: indolizine_solv/group01 (site s1 ratio 0.75)
       Validation: 7/48 held-out pairs good (14.6%); model accepted
       Model update: loss online 2.943 -> 2.694, replay 4.888 -> 4.457
-      Bias steps: median |step| b 2.31, c 4.33, skew 0.94, end 0.39; b grown 53, bisected 88, unlocked 4; c up 57, down 26, unlocked 2; pinned 13, stranded 34, held-off ends 33
+      Bias steps: median |step| b 2.31, c 4.33, skew 0.94, end 0.39; b grown 53, bisected 88,
+        unlocked 4; c up 57, down 26, unlocked 2; pinned 13, stranded 34, held-off ends 33
       System               Stage          Epoch  Progress     Ref pairs  Retired  Train ns
       12benz_solvent       pairs_groups   13/20  0/3 groups   4/9        0           24.8
       ...
@@ -46,12 +47,12 @@ def format_epoch_block(epoch: int, runs: Dict[str, int], failed: Sequence[str] =
                        pair_short: Optional[Dict] = None, pair_full: Optional[Dict] = None,
                        groups_run: int = 0, groups_passed: Sequence[str] = (),
                        groups_reopened: Sequence[Tuple[str, int]] = (),
-                       groups_holdoff: Sequence[str] = (),
-                       groups_corrected: Sequence[str] = (),
+                       groups_holdoff: Sequence[str] = (), groups_corrected: Sequence[str] = (),
                        validation: Optional[Dict] = None, gate: Optional[str] = None,
                        regression: Optional[Dict] = None, hindsight: Optional[Dict] = None,
                        systems: Sequence[Dict] = (), stage_changes: Sequence[Dict] = (),
-                       ns_train: Optional[float] = None, ns_validation: Optional[float] = None) -> str:
+                       ns_train: Optional[float] = None,
+                       ns_validation: Optional[float] = None) -> str:
     """The epoch's block (see the module docstring).
 
     runs: {'groups', 'reference', 'reversed', 'other'} combos run this epoch
@@ -86,25 +87,29 @@ def format_epoch_block(epoch: int, runs: Dict[str, int], failed: Sequence[str] =
     if groups_corrected:
         lines.append("  Group corrections: " + ', '.join(groups_corrected))
     if validation and validation.get('total'):
-        lines.append(f"  Validation: {_frac(int(validation.get('both', 0)), int(validation['total']))}"
-                     f" held-out pairs good" + (f"; {gate}" if gate else ''))
+        lines.append("  Validation: "
+                     f"{_frac(int(validation.get('both', 0)), int(validation['total']))}"
+                     " held-out pairs good" + (f"; {gate}" if gate else ''))
     if regression:
-        lines.append(f"  Model update: loss online {_num(regression.get('online_before'), '{:.3f}')} -> "
+        lines.append("  Model update: loss online "
+                     f"{_num(regression.get('online_before'), '{:.3f}')} -> "
                      f"{_num(regression.get('online_after'), '{:.3f}')}, replay "
                      f"{_num(regression.get('replay_before'), '{:.3f}')} -> "
                      f"{_num(regression.get('replay_after'), '{:.3f}')}")
     if hindsight:
         med = hindsight.get('median_step') or {}
         names = (('linear', 'b'), ('quadratic', 'c'), ('skew', 'skew'), ('end', 'end'))
-        lines.append(
-            "  Bias steps: median |step| "
-            + ', '.join(f"{lab} {_num(med.get(d))}" for d, lab in names if d in med)
-            + f"; b grown {hindsight.get('b_grown', 0)}, bisected {hindsight.get('b_bisected', 0)}, "
-              f"unlocked {hindsight.get('b_unlocked', 0)}"
-            + f"; c up {hindsight.get('c_up', 0)}, down {hindsight.get('c_down', 0)}, "
-              f"unlocked {hindsight.get('c_unlocked', 0)}"
-            + f"; pinned {hindsight.get('pinned', 0)}, stranded {hindsight.get('stranded', 0)}, "
-              f"held-off ends {hindsight.get('held_off', 0)}")
+        lines.append("  Bias steps: median |step| "
+                     + ', '.join(f"{lab} {_num(med.get(d))}" for d, lab in names if d in med)
+                     + f"; b grown {hindsight.get('b_grown', 0)}, "
+                     f"bisected {hindsight.get('b_bisected', 0)}, "
+                     f"unlocked {hindsight.get('b_unlocked', 0)}"
+                     + f"; c up {hindsight.get('c_up', 0)}, "
+                     f"down {hindsight.get('c_down', 0)}, "
+                     f"unlocked {hindsight.get('c_unlocked', 0)}"
+                     + f"; pinned {hindsight.get('pinned', 0)}, "
+                     f"stranded {hindsight.get('stranded', 0)}, "
+                     f"held-off ends {hindsight.get('held_off', 0)}")
     if systems:
         w = max(20, max(len(r['system']) for r in systems) + 1)
         sw = max(14, max(len(str(r['stage'])) for r in systems) + 1)
@@ -118,14 +123,15 @@ def format_epoch_block(epoch: int, runs: Dict[str, int], failed: Sequence[str] =
             ret = r.get('retired')
             lines.append(f"  {r['system']:{w}s} {str(r['stage']):{sw}s} "
                          f"{str(r['stage_epoch']) + '/' + str(r['stage_max']):6s} {prog_s:12s} "
-                         f"{ref_s:10s} {('-' if ret is None else str(ret)):8s} {r.get('ns') or 0.0:8.1f}")
+                         f"{ref_s:10s} {('-' if ret is None else str(ret)):8s} "
+                         f"{r.get('ns') or 0.0:8.1f}")
     if stage_changes:
         lines.append("  Stage changes: " + '; '.join(
             f"{c['system']} {c['stage']} -> {c['next'] or 'done'} "
             f"({REASON_WORDS.get(c['reason'], c['reason'])})" for c in stage_changes))
     if ns_train is not None:
-        lines.append(f"  Simulated ns: training {ns_train:.1f}"
-                     + (f", validation {ns_validation:.1f} (not counted)" if ns_validation else ''))
+        lines.append(f"  Simulated ns: training {ns_train:.1f}" + (
+            f", validation {ns_validation:.1f} (not counted)" if ns_validation else ''))
     return '\n'.join(lines)
 
 

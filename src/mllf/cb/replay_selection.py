@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from mllf.cb.hindsight import pair_key
-from mllf.file_handling.combo_sets import _rtf_signature
+from mllf.file_handling.combo_sets import rtf_signature
 
 FULL_RUN_CROSSINGS = 10     # full-length pair test (hindsight.SUCCESS_MIN_TRANSITIONS)
 SHORT_RUN_CROSSINGS = 3     # short-run test (stage explore_min_transitions)
@@ -53,7 +53,7 @@ class FragmentIndex:
         for f in sorted(Path(prep_dir).glob('site*_sub*_pres.rtf')) if prep_dir else []:
             m = re.match(r'site(\d+)_sub(\d+)_', f.name)
             if m:
-                self._add(_rtf_signature(f), (int(m.group(1)), int(m.group(2))))
+                self._add(rtf_signature(f), (int(m.group(1)), int(m.group(2))))
 
     def _add(self, sig, label):
         self.by_sig.setdefault(sig, []).append(label)
@@ -71,7 +71,7 @@ class FragmentIndex:
                 m = re.match(r'site(\d+)_sub\d+_', f.name)
                 if not m:
                     continue
-                site, sig = int(m.group(1)), _rtf_signature(f)
+                site, sig = int(m.group(1)), rtf_signature(f)
                 if any(h[0] == site for h in idx.by_sig.get(sig, [])):
                     continue
                 next_sub[site] = next_sub.get(site, 0) + 1
@@ -79,7 +79,7 @@ class FragmentIndex:
         return idx
 
     def match(self, rtf, site: int) -> Optional[Tuple[int, int]]:
-        sig = _rtf_signature(rtf)
+        sig = rtf_signature(rtf)
         for hits in (self.by_sig.get(sig), self.by_atoms.get(sig[1])):
             if not hits:
                 continue
@@ -116,7 +116,10 @@ def node_labels(run_dir, index: Optional[FragmentIndex],
             if index is None:
                 labels.append((site, sub))
                 continue
-            fname = (node['master'] + '_pres.rtf') if node.get('master') else (node.get('filename') or '')
+            fname = (
+                node['master'] +
+                '_pres.rtf') if node.get('master') else (
+                node.get('filename') or '')
             rtf = Path(run_dir).parent / 'prep' / fname
             if not rtf.exists():
                 rtf = Path(node.get('filepath') or '')
@@ -261,7 +264,8 @@ def owners(candidates: Dict[str, Dict[str, float]], chosen: Sequence[str]) -> Di
 def system_budgets(n_subs: Dict[str, int], total: int, min_per_system: int = 3) -> Dict[str, int]:
     """Each system's share of ``total``, proportional to its substituents."""
     s = sum(n_subs.values())
-    return {k: max(int(min_per_system), int(round(total * v / s)) if s else 0) for k, v in n_subs.items()}
+    return {k: max(int(min_per_system), int(round(total * v / s)) if s else 0)
+            for k, v in n_subs.items()}
 
 
 def uncovered(candidates: Dict[str, Dict[str, float]], chosen: Sequence[str],
@@ -275,8 +279,9 @@ def uncovered(candidates: Dict[str, Dict[str, float]], chosen: Sequence[str],
     return sum(1 for p in pairs if best.get(p, 0.0) < cover_quality)
 
 
-def select_runs(cand: Dict[str, Dict[str, Dict[str, float]]], budgets: Dict[str, int], total: int,
-                min_graphs: int = 3, rounds: int = 5) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+def select_runs(cand: Dict[str, Dict[str, Dict[str, float]]], budgets: Dict[str, int],
+                total: int, min_graphs: int = 3, rounds: int = 5
+                ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     """Per system ({system: {run: {pair: score}}}): (coverage picks, extra
     picks for the minimum).
 
@@ -311,9 +316,10 @@ def select_runs(cand: Dict[str, Dict[str, Dict[str, float]]], budgets: Dict[str,
         if len(chosen[s]) >= min_graphs:
             continue
         more = greedy_cover(cand[s], min_graphs, chosen=chosen[s], level=2)
-        if len(more) < min_graphs:   # no second measurement left to add: any run with sampled pairs
-            rest = sorted((c for c in cand[s] if c not in more),
-                          key=lambda c: (-sum(min(1.0, q / COVER_QUALITY) for q in cand[s][c].values()), c))
+        # no second measurement left to add: any run with sampled pairs
+        if len(more) < min_graphs:
+            rest = sorted((c for c in cand[s] if c not in more), key=lambda c: (
+                -sum(min(1.0, q / COVER_QUALITY) for q in cand[s][c].values()), c))
             more += rest[:min_graphs - len(more)]
         extra[s] = more[len(chosen[s]):]
     return chosen, extra
@@ -400,7 +406,8 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
         if prep.is_dir():
             indexes[sysn] = FragmentIndex(prep)
         else:
-            indexes[sysn] = FragmentIndex.from_preps([p / 'prep' for p in paths if (p / 'prep').is_dir()])
+            indexes[sysn] = FragmentIndex.from_preps(
+                [p / 'prep' for p in paths if (p / 'prep').is_dir()])
             if verbose:
                 print(f"  [replay] {sysn}: no {prep}; substituents numbered from its datasets' "
                       f"fragments ({indexes[sysn].n_subs})")
@@ -408,7 +415,8 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
     tasks = []
     for sysn, paths in by_system.items():
         for p in paths:
-            if any(c.is_dir() and c.name.startswith('run') for c in p.iterdir()) and not (p / 'metadata.json').exists():
+            if any(c.is_dir() and c.name.startswith('run')
+                   for c in p.iterdir()) and not (p / 'metadata.json').exists():
                 tasks.append((sysn, p, indexes[sysn], include_tagged))
     cand: Dict[str, Dict[str, Dict[str, float]]] = {}
     nodes_of: Dict[str, Dict[str, Tuple[int, int]]] = {}
@@ -421,8 +429,8 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
                 nodes_of[run_dir] = {p: (s[1], s[2]) for p, s in scores.items()}
                 source_of[run_dir] = source
                 labels_seen.setdefault(sysn, set()).update(labels)
-    n_subs = {s: (indexes[s].n_subs if indexes.get(s) and indexes[s].n_subs else len(labels_seen.get(s, ())))
-              for s in cand}
+    n_subs = {s: (indexes[s].n_subs if indexes.get(
+        s) and indexes[s].n_subs else len(labels_seen.get(s, ()))) for s in cand}
     budgets = system_budgets(n_subs, total, min_per_system)
     chosen, extra = select_runs(cand, budgets, total, min_graphs=min_per_system)
     plan, report = [], []
@@ -442,7 +450,8 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
         runs = [c for c in chosen[sysn] + extra.get(sysn, []) if c in weighted]
         for c in runs:
             plan.append({'system': sysn, 'run_dir': c, 'source': source_of[c],
-                         'role': weighted[c][0][1], 'owned': [nodes_of[c][p] for p, _ in weighted[c]]})
+                         'role': weighted[c][0][1],
+                         'owned': [nodes_of[c][p] for p, _ in weighted[c]]})
             for p, role in weighted[c]:
                 report.append({'system': sysn, 'pair': p, 'run_dir': c, 'source': source_of[c],
                                'role': role, 'quality': round(cand[sysn][c][p], 4),
@@ -453,7 +462,8 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
                   f"{len(cand[sysn])} candidate runs, {len(runs)} chosen"
                   + (f" ({n_ext} for the minimum)" if n_ext else '')
                   + f", {len(own)}/{len(n_cand)} sampled pairs covered "
-                  f"({len(n_cand) - uncovered(cand[sysn], chosen[sysn])} at quality >= {COVER_QUALITY})")
+                  f"({len(n_cand) - uncovered(cand[sysn], chosen[sysn])} at quality >= "
+                  f"{COVER_QUALITY})")
     if verbose:
         print(f"  [replay] total: {len(plan)} graphs over {len(cand)} systems (target {total})")
     return plan, report

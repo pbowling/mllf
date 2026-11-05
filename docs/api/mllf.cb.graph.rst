@@ -1,4 +1,4 @@
-﻿mllf.cb.graph
+mllf.cb.graph
 =============
 
 .. automodule:: mllf.cb.graph

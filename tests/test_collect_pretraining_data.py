@@ -312,7 +312,9 @@ class TestFixInpNonlinearSigns:
         assert self._bias(run)['c'][0][1] == pytest.approx(19.5)
 
     def test_py_sourced_run_untouched(self, tmp_path):
-        run = self._make_run(tmp_path, 'py_run', ['variablesflat.py', 'variables3.inp'], 19.5, -0.5, 1.6, 1.1)
+        run = self._make_run(
+            tmp_path, 'py_run', [
+                'variablesflat.py', 'variables3.inp'], 19.5, -0.5, 1.6, 1.1)
         before = (run / 'variables.py').read_text()
         assert fix_inp_nonlinear_signs(tmp_path / 'pretraining') == (0, 1, 0)
         assert (run / 'variables.py').read_text() == before
@@ -343,8 +345,10 @@ class TestBackfillLambdaProfile:
         rows = ([[1.0, 0.0]] * 400 + [[0.97, 0.03]] * 40 + [[0.7, 0.3]] * 20 + [[0.5, 0.5]] * 30
                 + [[0.3, 0.7]] * 20 + [[0.03, 0.97]] * 40 + [[0.0, 1.0]] * 400)
         lines = [" LAMBDA.......TIME(ps).. .BLOCKS   2   THRU BLOCK    3"]
-        lines += [f"LAMBDA>  {0.02 * (i + 1):10.4f}  {a:.4f}  {b:.4f}" for i, (a, b) in enumerate(rows)]
-        lines += ["Temperature is:  298.150 K", "Site:     1", "SINGLE DDG>  2  3   0.0  0.0  -1.0  -1.0"]
+        lines += [f"LAMBDA>  {0.02 * (i + 1):10.4f}  {a:.4f}  {b:.4f}" for i,
+                  (a, b) in enumerate(rows)]
+        lines += ["Temperature is:  298.150 K", "Site:     1",
+                  "SINGLE DDG>  2  3   0.0  0.0  -1.0  -1.0"]
         return "\n".join(lines)
 
     def _make(self, root):
@@ -571,7 +575,7 @@ class TestFilterBestRunsPerSystem:
         # Use a neutral grandparent name that doesn't contain 'best' or 'combo'
         # (those keywords trigger special legacy-combo grouping in the function).
         base = tmp_path / 'pretraining'
-        low  = _make_pretraining_run(base, ('14benz_solv',), 'run_001', n_transitions=0)
+        low = _make_pretraining_run(base, ('14benz_solv',), 'run_001', n_transitions=0)
         high = _make_pretraining_run(base, ('14benz_solv',), 'run_002', n_transitions=100)
         result = filter_best_runs_per_system([low, high])
         assert len(result) == 1
@@ -583,8 +587,8 @@ class TestFilterBestRunsPerSystem:
                                        n_transitions=0)
         run_a2 = _make_pretraining_run(tmp_path, ('dataset', 'comb_001'), 'run_002',
                                        n_transitions=100)
-        run_b  = _make_pretraining_run(tmp_path, ('dataset', 'comb_002'), 'run_001',
-                                       n_transitions=50)
+        run_b = _make_pretraining_run(tmp_path, ('dataset', 'comb_002'), 'run_001',
+                                      n_transitions=50)
         result = filter_best_runs_per_system([run_a1, run_a2, run_b])
         # 2 distinct combos → 2 runs selected (best from comb_001 + only from comb_002)
         assert len(result) == 2
@@ -810,11 +814,9 @@ class TestBackfillDdgPairs:
         assert n_skipped == 1
 
 
-
 # ---------------------------------------------------------------------------
 # Active-substituent mapping (which master sub carries each bias position)
 # ---------------------------------------------------------------------------
-
 from mllf.cli.collect_pretraining_data import (  # noqa: E402
     parse_active_subs_from_inp,
     parse_active_subs_from_output,
@@ -858,20 +860,29 @@ def _script(blocks, reads, echo=False):
 
 # p38 group2-like: blocks site1 = (1, 7, 8), site2 = (1, 6); a second .inp
 # reads every sub, and the selections are defined out of label order.
-_BLOCKS = [('site1_sub1', 'site1_sub1'), ('site1_sub2', 'site1_sub7'), ('site1_sub3', 'site1_sub8'),
-           ('site2_sub1', 'site2_sub1'), ('site2_sub2', 'site2_sub6')]
-_EXPECTED = {'site1': ['site1_sub1', 'site1_sub7', 'site1_sub8'], 'site2': ['site2_sub1', 'site2_sub6']}
+_BLOCKS = [('site1_sub1', 'site1_sub1'), ('site1_sub2', 'site1_sub7'),
+           ('site1_sub3', 'site1_sub8'), ('site2_sub1', 'site2_sub1'),
+           ('site2_sub2', 'site2_sub6')]
+_EXPECTED = {
+    'site1': [
+        'site1_sub1',
+        'site1_sub7',
+        'site1_sub8'],
+    'site2': [
+        'site2_sub1',
+        'site2_sub6']}
 
 
 def test_active_subs_from_output_follow_block_calls(tmp_path):
     prep = _prep(tmp_path)
     out = tmp_path / 'output'
     shuffled = [_BLOCKS[2], _BLOCKS[0], _BLOCKS[4], _BLOCKS[1], _BLOCKS[3]]
-    text = _script(shuffled, reads=['site1_sub8', 'site1_sub1', 'site1_sub7', 'site2_sub6', 'site2_sub1'],
-                   echo=True)
+    text = _script(shuffled, reads=['site1_sub8', 'site1_sub1', 'site1_sub7', 'site2_sub6',
+                                    'site2_sub1'], echo=True)
     # calls are in label order regardless of define order
-    text = re.sub(r'(BLOCK>\s+Call \d+ sele \S+ show end\n)+', lambda m: ''.join(
-        f'  BLOCK>       Call {k + 2} sele {lab} show end\n' for k, (lab, _) in enumerate(_BLOCKS)), text)
+    text = re.sub(r'(BLOCK>\s+Call \d+ sele \S+ show end\n)+',
+                  lambda m: ''.join(f'  BLOCK>       Call {k + 2} sele {lab} show end\n'
+                                    for k, (lab, _) in enumerate(_BLOCKS)), text)
     out.write_text(text)
     assert parse_active_subs_from_output(out, prep, [3, 2]) == _EXPECTED
 
@@ -908,10 +919,17 @@ def test_active_subs_from_inp_reads_when_no_block_setup(tmp_path):
 def test_rekey_uses_msld_site_and_records_master():
     from mllf.cli.collect_pretraining_data import rekey_graph_info
     gi = {'solvent_state': 'solvent', 'sites': {
-        'site2_sub21': {'site': 2, 'sub': 21, 'atom_types': ['CT00'], 'filename': 'site2_sub21_pres.rtf'},
-        'site2_sub1': {'site': 2, 'sub': 1, 'atom_types': ['CT00'], 'filename': 'site2_sub1_pres.rtf'},
-        'site2_sub2': {'site': 2, 'sub': 2, 'atom_types': ['NG00'], 'filename': 'site2_sub2_pres.rtf'}}}
-    out = rekey_graph_info(gi, {'site1': ['site2_sub21'], 'site2': ['site2_sub2', 'site2_sub1']}, [1, 2])
+        'site2_sub21': {'site': 2, 'sub': 21, 'atom_types': ['CT00'],
+                        'filename': 'site2_sub21_pres.rtf'},
+        'site2_sub1': {'site': 2, 'sub': 1, 'atom_types': ['CT00'],
+                       'filename': 'site2_sub1_pres.rtf'},
+        'site2_sub2': {'site': 2, 'sub': 2, 'atom_types': ['NG00'],
+                       'filename': 'site2_sub2_pres.rtf'}}}
+    out = rekey_graph_info(
+        gi, {
+            'site1': ['site2_sub21'], 'site2': [
+                'site2_sub2', 'site2_sub1']}, [
+            1, 2])
     assert {k: (v['site'], v['sub'], v['master']) for k, v in out['sites'].items()} == {
         'site1_sub1': (1, 1, 'site2_sub21'), 'site2_sub1': (2, 1, 'site2_sub2'),
         'site2_sub2': (2, 2, 'site2_sub1')}

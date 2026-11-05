@@ -114,7 +114,7 @@ class BayesianLinearHead(nn.Module):
         """
         D = self._D
         cov = self.Lambda_inv + self.jitter * torch.eye(D, device=self.Lambda_inv.device,
-                                                          dtype=self.Lambda_inv.dtype)
+                                                        dtype=self.Lambda_inv.dtype)
         try:
             L = torch.linalg.cholesky(cov)
         except RuntimeError:
@@ -237,7 +237,7 @@ class BayesianLinearHead(nn.Module):
             self._prior_precision = prior_precision  # keeps reset() consistent with this seed
 
         mu0 = torch.cat([weight, torch.tensor([float(bias)], dtype=self.mu.dtype,
-                                                device=self.mu.device)])
+                                              device=self.mu.device)])
         self.mu = mu0
         self.Lambda_mu = self.Lambda @ mu0
 

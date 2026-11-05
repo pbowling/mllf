@@ -14,25 +14,19 @@ import json
 
 import numpy as np
 
-from mllf.cli.workflow import load_manifest
 from mllf.file_handling.generate_combinations import (
     create_single_combination_dir,
     find_site_sub_files,
     list_possible_combinations,
 )
-
-# Combos defined outside a system's manifest (e.g. ALF's substituent groups,
-# mllf.file_handling.combo_sets): combo path -> combo_info, consulted before
-# combo_metadata.json when a combo directory has to be created.
-EXPLICIT_COMBOS: Dict[str, Dict] = {}
+from math import comb as _comb
+from itertools import combinations as _icombinations
 
 
-def register_explicit_combos(infos: List[Dict]) -> None:
-    """Make combos that are not in any manifest creatable on demand
-    (``ensure_combo_dir_exists``); each info needs 'path' plus the fields
-    ``create_single_combination_dir`` reads."""
-    for info in infos:
-        EXPLICIT_COMBOS[str(info['path'])] = info
+def load_manifest(manifest_path: str) -> List[str]:
+    """Combo directory paths listed in a manifest file (one per line)."""
+    with open(manifest_path, 'r', encoding='utf-8') as fh:
+        return [ln.strip() for ln in fh if ln.strip()]
 
 
 def count_combinations_fast(sys_entry: Dict, max_subs_per_site: int = 10) -> int:
@@ -42,8 +36,6 @@ def count_combinations_fast(sys_entry: Dict, max_subs_per_site: int = 10) -> int
     without ever building the combination list.  Used to classify systems as
     'small' (safe to run in parallel) vs 'large' (run alone).
     """
-    from math import comb as _comb
-    from itertools import combinations as _icombinations
 
     input_dir = Path(sys_entry['input_dir'])
     # Per-system override takes precedence over the global config value.
@@ -80,7 +72,7 @@ def count_combinations_fast(sys_entry: Dict, max_subs_per_site: int = 10) -> int
 
 
 def build_system_manifest(sys_entry: Dict, max_combos: Optional[int] = None,
-                           seed: int = 42) -> Dict:
+                          seed: int = 42) -> Dict:
     """Create or load the manifest for one system.
 
     Creating a manifest calls list_possible_combinations which can build a very
@@ -107,7 +99,7 @@ def build_system_manifest(sys_entry: Dict, max_combos: Optional[int] = None,
     if not manifest_path.exists():
         raise FileNotFoundError(
             f"Manifest not found at {manifest_path}. "
-            f"Call create_and_load_system_manifest for systems needing creation."
+            "Call create_and_load_system_manifest for systems needing creation."
         )
     log.append(f"  Manifest already exists at {manifest_path}")
     sys_combos = load_manifest(str(manifest_path))
@@ -123,8 +115,8 @@ def build_system_manifest(sys_entry: Dict, max_combos: Optional[int] = None,
 
 
 def create_and_load_system_manifest(sys_entry: Dict, max_subs_per_site: int = 10,
-                                      max_combos: Optional[int] = None,
-                                      seed: int = 42) -> Dict:
+                                    max_combos: Optional[int] = None,
+                                    seed: int = 42) -> Dict:
     """Generate combinations, write manifest + metadata to input_dir, then load.
 
     This is the memory-intensive path (list_possible_combinations builds all
@@ -225,8 +217,13 @@ def iter_json_array_streaming(path, chunk_size: int = 1 << 20):
 def build_combo_dir_lookup(
     combos: List[str],
     combo_system_map: Dict[str, Dict],
+    explicit: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, Any]:
     """Pre-scan combo_metadata.json for combos whose directories don't exist.
+
+    *explicit* maps combo paths that are in no manifest (e.g. ALF's
+    substituent groups, ``mllf.file_handling.combo_sets``) to their combo
+    info; those entries are taken from it instead of the metadata files.
 
     Streams each affected system's metadata file via
     iter_json_array_streaming (never loading the full array into memory),
@@ -243,10 +240,11 @@ def build_combo_dir_lookup(
     """
     # Group missing combos by their system's input_dir.
     missing_by_system: Dict[str, Set[str]] = {}
-    explicit: Dict[str, Any] = {}
+    found: Dict[str, Any] = {}
+    explicit = explicit or {}
     for c in combos:
-        if c in EXPLICIT_COMBOS:
-            explicit[c] = EXPLICIT_COMBOS[c]
+        if c in explicit:
+            found[c] = explicit[c]
             continue
         if not Path(c).exists():
             sys_cfg = combo_system_map.get(c, {})
@@ -255,7 +253,7 @@ def build_combo_dir_lookup(
                 missing_by_system.setdefault(idir, set()).add(c)
 
     if not missing_by_system:
-        return explicit
+        return found
 
     n_systems = len(missing_by_system)
     n_missing = sum(len(v) for v in missing_by_system.values())
@@ -276,19 +274,20 @@ def build_combo_dir_lookup(
                     break
 
     print(f"  [dir lookup] found {len(lookup)}/{n_missing} entries")
-    lookup.update(explicit)
+    lookup.update(found)
     return lookup
 
 
 def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
-                             global_config: Dict, verbose: bool = False,
-                             _lookup: Optional[Dict] = None) -> Path:
+                            global_config: Dict, verbose: bool = False,
+                            _lookup: Optional[Dict] = None) -> Path:
     """Ensure a combination directory exists, creating it lazily if needed.
 
     *_lookup* is an optional {combo_path_str: combo_info} dict pre-built by
-    build_combo_dir_lookup for the current epoch.  When provided it avoids
-    re-reading combo_metadata.json; when absent the function falls back to a
-    full JSON scan (correct but slow for large systems).
+    build_combo_dir_lookup for the current epoch (or the explicit combo sets
+    themselves).  When provided it avoids re-reading combo_metadata.json;
+    when absent the function falls back to a full JSON scan (correct but slow
+    for large systems, and it cannot find combos that are in no manifest).
 
     The manifest lives in input_dir and is shared by every run of the system,
     so its paths point at whichever out_dir first built it. The combo dir is
@@ -302,7 +301,7 @@ def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
     elif combo_path.exists():
         return combo_path
 
-    combo_info = (_lookup or {}).get(str(combo_path)) or EXPLICIT_COMBOS.get(str(combo_path))
+    combo_info = (_lookup or {}).get(str(combo_path))
 
     if combo_info is None:
         # Fallback: full JSON scan.  Should only be reached if the pre-scan
@@ -330,4 +329,3 @@ def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
         verbose=verbose,
     )
     return created_path
-

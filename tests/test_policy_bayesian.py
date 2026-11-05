@@ -16,7 +16,7 @@ def _toy_graph(n_nodes=6, unimol_dim=512, dual=True, seed=0):
     # spans all 8 relation slots (2 per bias type) so bias_type = edge_type//2
     # covers all 4 bias types across a handful of edges.
     edge_index = torch.tensor([[0, 1, 2, 3, 4, 5],
-                                [1, 0, 3, 2, 5, 4]], dtype=torch.long)
+                               [1, 0, 3, 2, 5, 4]], dtype=torch.long)
     edge_type = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.long)
     return emb, edge_index, edge_type
 
@@ -24,14 +24,14 @@ def _toy_graph(n_nodes=6, unimol_dim=512, dual=True, seed=0):
 class TestBayesianPolicyShapes:
     def test_forward_features_shape(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         z = policy.forward_features(emb, edge_index, edge_type)
         assert z.shape == (edge_index.shape[1], 64)
 
     def test_predict_uncertainty_shapes_and_positive_var(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         mean, var = policy.predict_uncertainty(emb, edge_index, edge_type)
         E = edge_index.shape[1]
@@ -41,7 +41,7 @@ class TestBayesianPolicyShapes:
 
     def test_get_actions_thompson_shape_and_clip(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         actions, mean, var = policy.get_actions_thompson(emb, edge_index, edge_type)
         E = edge_index.shape[1]
@@ -56,7 +56,7 @@ class TestBayesianPolicyShapes:
         """Non-routed dims stay exactly 0 (same convention as get_actions'
         routed path — only the edge's own bias-type column is meaningful)."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         actions, _, _ = policy.get_actions_thompson(emb, edge_index, edge_type)
         bias_type = edge_type // 2
@@ -69,7 +69,7 @@ class TestBayesianPolicyShapes:
         """deterministic=True should reproduce the posterior mean exactly
         (no sampling noise) across repeated calls."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         a1, _, _ = policy.get_actions_thompson(emb, edge_index, edge_type, deterministic=True)
         a2, _, _ = policy.get_actions_thompson(emb, edge_index, edge_type, deterministic=True)
@@ -79,7 +79,7 @@ class TestBayesianPolicyShapes:
         """Non-deterministic calls should (almost surely) differ across draws
         when the posterior still has real uncertainty (untrained prior)."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         torch.manual_seed(1)
         a1, _, _ = policy.get_actions_thompson(emb, edge_index, edge_type)
@@ -90,7 +90,7 @@ class TestBayesianPolicyShapes:
 class TestBayesianPolicyLearning:
     def test_update_reduces_uncertainty(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         _, var_before = policy.predict_uncertainty(emb, edge_index, edge_type)
 
@@ -103,7 +103,7 @@ class TestBayesianPolicyLearning:
 
     def test_update_increments_n_obs_only_for_active_heads(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()  # bias_type covers dims 0,1,2 only
         targets = torch.randn(edge_index.shape[1])
         policy.update_bayesian_posteriors(emb, edge_index, edge_type, targets)
@@ -116,7 +116,7 @@ class TestBayesianPolicyLearning:
         """After many updates on a fixed (z, target) pair, the predicted mean
         for that same edge should move toward the observed target."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()
         target_value = 50.0
         targets = torch.full((edge_index.shape[1],), target_value)
@@ -162,12 +162,12 @@ class TestBayesianPolicyUnroutedEdgeType:
         torch.manual_seed(seed)
         emb = torch.randn(n_nodes, 1024)
         edge_index = torch.tensor([[0, 1, 2, 3, 4, 5],
-                                    [1, 0, 3, 2, 5, 4]], dtype=torch.long)
+                                   [1, 0, 3, 2, 5, 4]], dtype=torch.long)
         return emb, edge_index, None
 
     def test_forward_features_shape(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = self._toy_graph_unrouted()
         z = policy.forward_features(emb, edge_index, edge_type)
         E = edge_index.shape[1]
@@ -175,7 +175,7 @@ class TestBayesianPolicyUnroutedEdgeType:
 
     def test_predict_uncertainty_shape(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = self._toy_graph_unrouted()
         mean, var = policy.predict_uncertainty(emb, edge_index, edge_type)
         E = edge_index.shape[1]
@@ -187,7 +187,7 @@ class TestBayesianPolicyUnroutedEdgeType:
         """Unlike the routed path, no column should be a zero-filled
         placeholder -- every bias type predicts for every edge."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = self._toy_graph_unrouted()
         actions, mean, var = policy.get_actions_thompson(emb, edge_index, edge_type)
         E = edge_index.shape[1]
@@ -200,7 +200,7 @@ class TestBayesianPolicyUnroutedEdgeType:
 
     def test_update_bayesian_posteriors_updates_every_head_with_every_edge(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = self._toy_graph_unrouted()
         E = edge_index.shape[1]
         targets = torch.randn(E, 4)
@@ -214,7 +214,7 @@ class TestBayesianPolicyUnroutedEdgeType:
 
     def test_deterministic_reproducible_when_unrouted(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = self._toy_graph_unrouted()
         a1, _, _ = policy.get_actions_thompson(emb, edge_index, edge_type, deterministic=True)
         a2, _, _ = policy.get_actions_thompson(emb, edge_index, edge_type, deterministic=True)
@@ -242,7 +242,7 @@ class TestPreactivationScaling:
 
     def test_preact_action_roundtrip(self):
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         for d in range(4):
             x = torch.linspace(-8.0, 8.0, 50)
             y = policy._preact_to_action(x, d)
@@ -254,13 +254,14 @@ class TestPreactivationScaling:
         strictly within (-scale_factors[d], scale_factors[d]) -- this is
         exactly the failure mode the missing transform allowed."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = self._toy_graph()
 
         for d, mlp in enumerate(policy.edge_mlp.mlps):
             mlp.bayesian_head.mu.data.fill_(50.0)  # deliberately huge pre-activation weights
 
-        actions, mean, _ = policy.get_actions_thompson(emb, edge_index, edge_type, deterministic=True)
+        actions, mean, _ = policy.get_actions_thompson(
+            emb, edge_index, edge_type, deterministic=True)
         for d in range(4):
             limit = policy.scale_factors[d].item()
             assert (actions[:, d].abs() < limit).all(), f"dim {d} exceeded physical scale"
@@ -272,7 +273,7 @@ class TestPreactivationScaling:
         converge close to the target -- in physical units, not raw
         pre-activation units."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
-                               use_dual_embeddings=True, use_bayesian_heads=True)
+                              use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = self._toy_graph()
         # Must be comfortably within the *smallest* scale_factor (end: 30) --
         # softsign asymptotes toward but never reaches +/-scale_factor, so a
@@ -300,7 +301,8 @@ class TestPreactivationScaling:
         targets = [[1000.0, 0.0, 0.0, 0.0]] * 6
         graph_cache = [(emb, edge_index, targets)]
 
-        noise_vars = estimate_reward_noise_variance(policy_det, graph_cache, device=torch.device('cpu'))
+        noise_vars = estimate_reward_noise_variance(
+            policy_det, graph_cache, device=torch.device('cpu'))
         scale_linear = policy_det.scale_factors[0].item()
         # A residual of order `scale_linear` in physical space should become
         # order ~1 in pre-activation space (division by scale^2), not stay
@@ -325,7 +327,7 @@ class TestPriorPrecisionCalibration:
 
         torch.manual_seed(0)
         det = UnimolPolicy(unimol_dim=512, mlp_out_dim=4, use_dual_embeddings=True,
-                            use_bayesian_heads=False)
+                           use_bayesian_heads=False)
         bayes = initialize_bayesian_heads_from_pretrained(det, bayesian_prior_precision=1.0)
 
         emb = torch.randn(20, 1024)
@@ -365,7 +367,7 @@ class TestPriorPrecisionCalibration:
 
         torch.manual_seed(0)
         det = UnimolPolicy(unimol_dim=512, mlp_out_dim=4, use_dual_embeddings=True,
-                            use_bayesian_heads=False)
+                           use_bayesian_heads=False)
         # Force small readout weights, matching real BC-trained scale (an
         # untrained/random-init readout is typically already this small, but
         # be explicit so the test doesn't depend on init RNG behavior).
@@ -410,7 +412,7 @@ class TestPriorPrecisionCalibration:
             assert mean_diff < 3 * budget, (
                 f"dim {name}: sampled actions deviate from the mean by "
                 f"{mean_diff:.2f} on average, expected < {3 * budget} "
-                f"(3x the calibration's own physical noise budget)"
+                "(3x the calibration's own physical noise budget)"
             )
 
     def test_prior_precision_scales_inversely_with_weight_magnitude(self):
@@ -420,7 +422,7 @@ class TestPriorPrecisionCalibration:
 
         torch.manual_seed(0)
         det = UnimolPolicy(unimol_dim=512, mlp_out_dim=4, use_dual_embeddings=True,
-                            use_bayesian_heads=False)
+                           use_bayesian_heads=False)
         with torch.no_grad():
             det.edge_mlp.mlps[0].readout.weight.data[0] = torch.randn(64) * 1.0
             det.edge_mlp.mlps[0].readout.bias.data[0] = 0.1

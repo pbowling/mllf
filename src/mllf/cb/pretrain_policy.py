@@ -14,19 +14,44 @@ import re
 import sys
 import threading
 import warnings
+from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
-import yaml
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
+import yaml
 from torch_geometric.data import Data
 
-from mllf.cb.policy import UnimolPolicy
-from mllf.file_handling.read_pdb import parse_pdb_file
+from mllf.cb import graph_utils
+from mllf.cb.environment_consensus import build_site_consensus
+from mllf.cb.graph import Graph
+from mllf.cb.graph_utils import build_directed_pairs
+from mllf.cb.hindsight import (
+    SUCCESS_MIN_FRACTION,
+    SUCCESS_MIN_TRANSITIONS,
+    pair_succeeded,
+    site_nodes,
+)
+from mllf.cb.pair_weights import (
+    compute_pairwise_confidence_weights,
+    compute_pairwise_measured_mask,
+)
+from mllf.cb.policy import UnimolPolicy, fill_site_size
+from mllf.cb.unimol_representation import (
+    get_substituent_dual_embeddings,
+    get_substituent_unimol_with_environment,
+)
+from mllf.cb.workflow_utils import (
+    BARRIER_TARGET,
+    BARRIER_WIDTH,
+    END_WIDTH,
+    SKEW_WIDTH,
+    compute_pair_reward,
+)
 from mllf.file_handling.generate_combinations import is_combo_dir_name
 
 
@@ -34,27 +59,27 @@ from mllf.file_handling.generate_combinations import is_combo_dir_name
 
 def initialize_representation_tracker(output_dir: Path) -> Path:
     """Initialize CSV file for tracking which representations are used.
-    
+
     Args:
         output_dir: Output directory for pretraining
-        
+
     Returns:
         Path to tracking CSV file
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     tracking_file = output_dir / 'pretraining_representations_used.csv'
-    
+
     # Create header if file doesn't exist
     if not tracking_file.exists():
         with open(tracking_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=[
-                'system', 'run_idx', 'structure_type', 'source', 
+                'system', 'run_idx', 'structure_type', 'source',
                 'prep_dir_used', 'explicit_mapping', 'timestamp'
             ])
             writer.writeheader()
-    
+
     return tracking_file
 
 
@@ -68,7 +93,7 @@ def track_representation_choice(
     explicit_mapping: bool = False
 ) -> None:
     """Log which representation (minimized/unrelaxed) was used for a run.
-    
+
     Args:
         tracking_file: Path to tracking CSV file
         system_name: System name (e.g., 'indolizine_prot')
@@ -79,7 +104,7 @@ def track_representation_choice(
         explicit_mapping: Whether an explicit mapping was used
     """
     tracking_file = Path(tracking_file)
-    
+
     with open(tracking_file, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
             'system', 'run_idx', 'structure_type', 'source',
@@ -98,21 +123,21 @@ def track_representation_choice(
 
 def read_representation_tracking(tracking_file: Path) -> List[Dict]:
     """Read and parse representation tracking CSV.
-    
+
     Args:
         tracking_file: Path to tracking CSV file
-        
+
     Returns:
         List of tracking records (dicts)
     """
     tracking_file = Path(tracking_file)
     records = []
-    
+
     if tracking_file.exists():
         with open(tracking_file, 'r') as f:
             reader = csv.DictReader(f)
             records = list(reader)
-    
+
     return records
 
 
@@ -122,23 +147,23 @@ def read_representation_tracking(tracking_file: Path) -> List[Dict]:
 
 
 def _select_structure_type_for_run(
-    run_idx: int, 
-    strategy: str, 
+    run_idx: int,
+    strategy: str,
     system_name: Optional[str] = None,
     skip_patterns: Optional[List[str]] = None,
     seed: int = 42
 ) -> str:
     """Determine which structure type to use for a given run.
-    
+
     **Strategies:**
     - 'minimized': Always use minimized (pretraining) structures
-    - 'unrelaxed': Always use unrelaxed (crystallographic) structures  
+    - 'unrelaxed': Always use unrelaxed (crystallographic) structures
     - 'random': Randomly alternate between minimized and unrelaxed per run
-    
+
     **System-Specific Skipping:**
     If skip_patterns is provided and the system_name matches any pattern,
     unrelaxed structures are skipped regardless of strategy (falls back to minimized).
-    
+
     Args:
         run_idx: Index of the run (used for random seeding if needed)
         strategy: Strategy to use ('minimized', 'unrelaxed', 'random')
@@ -146,12 +171,12 @@ def _select_structure_type_for_run(
         skip_patterns: List of patterns to match against system_name (case-insensitive)
                       Uses 'if pattern.lower() in system_name.lower()'
         seed: Random seed for reproducibility in 'random' mode
-        
+
     Returns:
         str: 'minimized' or 'unrelaxed'
     """
     strategy = strategy.lower()
-    
+
     # Check if this system should skip unrelaxed
     should_skip_unrelaxed = False
     if system_name is not None and skip_patterns:
@@ -160,7 +185,7 @@ def _select_structure_type_for_run(
             if pattern.lower() in system_name_lower:
                 should_skip_unrelaxed = True
                 break
-    
+
     if strategy == 'minimized' or should_skip_unrelaxed:
         return 'minimized'
     elif strategy == 'unrelaxed':
@@ -169,7 +194,9 @@ def _select_structure_type_for_run(
         rng = np.random.RandomState(seed + run_idx)  # Deterministic per run
         return 'minimized' if rng.rand() < 0.5 else 'unrelaxed'
     else:
-        raise ValueError(f"Unknown structure selection strategy: {strategy}. Use 'minimized', 'unrelaxed', or 'random'.")
+        raise ValueError(
+            f"Unknown structure selection strategy: {strategy}. Use 'minimized', 'unrelaxed', or "
+            "'random'.")
 
 
 def build_unrelaxed_system_mappings(
@@ -178,59 +205,61 @@ def build_unrelaxed_system_mappings(
     config_mappings: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Path]:
     """Build mapping from pretraining system directories to unrelaxed (training) directories.
-    
+
     Supports three modes:
     1. Config-provided mappings: Use explicitly provided paths from config
     2. Automatic detection: Match pretraining system names to training/systems/
     3. Hybrid: Config mappings override automatic detection
-    
+
     **Example:**
     If pretraining has:
         - pretraining/indolizine_prot/prep
         - pretraining/indolizine_solv/prep
-    
+
     This function returns:
         {
             'indolizine_prot': Path('/mllf/training/systems/indolizine_prot/prep'),
             'indolizine_solv': Path('/mllf/training/systems/indolizine_solv/prep'),
         }
-    
+
     Args:
         pretraining_base_dir: Base pretraining directory containing system subdirs
         training_systems_base: Base training/systems directory (auto-detected if None)
         config_mappings: Dict of explicit system_name -> unrelaxed_path mappings from config
-        
+
     Returns:
         Dict mapping system names to online prep directories
     """
     pretraining_base_dir = Path(pretraining_base_dir)
-    
+
     # Auto-detect training base if not provided
     if training_systems_base is None:
         training_systems_base = pretraining_base_dir.parent / 'training' / 'systems'
     else:
         training_systems_base = Path(training_systems_base)
-    
+
     mappings = {}
-    
+
     # First, scan pretraining directory for systems
     if pretraining_base_dir.exists():
         for sys_dir in pretraining_base_dir.iterdir():
             if sys_dir.is_dir() and (sys_dir / 'prep').exists():
                 sys_name = sys_dir.name
-                
+
                 # Check config mappings first
                 if config_mappings and sys_name in config_mappings:
                     unrelaxed_path = Path(config_mappings[sys_name])
                 else:
                     # Try automatic detection
                     unrelaxed_path = Path(training_systems_base) / sys_name / 'prep'
-                
+
                 if unrelaxed_path.exists():
                     mappings[sys_name] = unrelaxed_path
                 else:
-                    print(f"    Warning: Could not find unrelaxed path for {sys_name}: {unrelaxed_path}")
-    
+                    print(
+                        f"    Warning: Could not find unrelaxed path for {sys_name}: "
+                        f"{unrelaxed_path}")
+
     return mappings
 
 
@@ -240,33 +269,33 @@ def prepare_pretraining_config(
     training_systems_base: Optional[Path] = None,
 ) -> Dict:
     """Prepare and validate pretraining configuration for multi-structure support.
-    
+
     Processes config to:
     - Build unrelaxed system mappings if needed
     - Validate structure selection strategy
     - Set up cache directory if requested
-    
+
     Args:
         config: Loaded workflow_pretrain.yaml configuration dict
         pretraining_base_dir: Base pretraining directory
         training_systems_base: Base training/systems directory
-        
+
     Returns:
         Updated config dict with resolved mappings and paths
     """
     config = config.copy()
-    
+
     # Extract Uni-Mol configuration
     unimol_cfg = config.get('unimol', {})
     structure_selection = unimol_cfg.get('structure_selection', 'minimized').lower()
-    
+
     # Validate strategy
     if structure_selection not in ['minimized', 'unrelaxed', 'random']:
         raise ValueError(
             f"Invalid structure_selection: {structure_selection}. "
-            f"Must be 'minimized', 'unrelaxed', or 'random'."
+            "Must be 'minimized', 'unrelaxed', or 'random'."
         )
-    
+
     # Build unrelaxed mappings if needed
     if structure_selection in ['unrelaxed', 'random']:
         config_mappings = unimol_cfg.get('unrelaxed_system_mappings')
@@ -276,17 +305,17 @@ def prepare_pretraining_config(
             config_mappings=config_mappings,
         )
         config['_unrelaxed_system_mappings'] = unrelaxed_mappings  # Store resolved mappings
-        
+
         if not unrelaxed_mappings:
-            print(f"    Warning: No unrelaxed system mappings found. Check paths!")
-    
+            print("    Warning: No unrelaxed system mappings found. Check paths!")
+
     # Setup cache directory
     if unimol_cfg.get('cache_embeddings', False):
         cache_dir = unimol_cfg.get('cache_dir')
         if cache_dir is None:
             cache_dir = Path(pretraining_base_dir) / 'embeddings_cache'
         config['_cache_dir'] = Path(cache_dir)
-    
+
     return config
 
 
@@ -308,7 +337,7 @@ def _node_master_sub(site_info: Dict, site_id: int, sub_id: int) -> str:
     return m.group(1) if m else f"site{site_id}_sub{sub_id}"
 
 
-def _compute_unimol_embeddings_and_edges(
+def compute_unimol_embeddings_and_edges(
     run_dir: Path,
     graph_info_path: Path,
     structure_type: str = 'minimized',
@@ -335,48 +364,51 @@ def _compute_unimol_embeddings_and_edges(
     (policy.fill_site_size; unimol.site_size_input).
     ligand_minimized: for a 'minimized' run, the ligand half takes its
     coordinates from the prep's minimized.pdb (unimol.ligand_from_minimized).
-    
+
     Supports both minimized (pretraining) and unrelaxed (crystallographic) structures.
     Both representations are constructed from the same prep directory - the choice only
     affects semantic interpretation (e.g., which PDB files represent the initial vs relaxed state).
-    
+
     **Embedding Modes:**
     - **Standard mode** (use_environment_difference=False): Single 512D embedding per node
       - Input to policy: [ligand+environment diff, ligand+environment mean]
       - Backward compatible with original UnimolPolicy design
-    - **Dual embedding mode** (use_environment_difference=True): Two separate 512D embeddings per node
+    - **Dual embedding mode** (use_environment_difference=True): Two separate 512D
+      embeddings per node
       - Ligand-only: core + sub (captures substituent-specific information)
       - Full: core + sub + environment + ref_subs (captures ligand+environment context)
       - Edge input to policy: [diff_ligand (antisymmetric), mean_full (symmetric)]
       - This allows MLPs to learn substituent-dependent and environment-dependent info in parallel
-    
+
     **Structure Types:**
     - 'minimized': Use minimized (relaxed, MD-equilibrated) representation
     - 'unrelaxed': Use unrelaxed (crystallographic/experimental) representation
-    
+
     Both use the same prep directory files; the selection is logged for tracking.
-    
+
     **Consensus Filtering:**
     If consensus_dict is provided, environment atoms are filtered to only atoms present in
     ALL substituents at a site. Each system has its own consensus built from its substituents.
-    
+
     Args:
         run_dir: Directory containing variables.py and graph_info.json
         graph_info_path: Path to graph_info.json
         structure_type: 'minimized' or 'unrelaxed' (default: 'minimized')
-        unrelaxed_system_mappings: Dict mapping system names to alternate prep paths (optional override)
+        unrelaxed_system_mappings: Dict mapping system names to alternate prep paths
+            (optional override)
         custom_search_paths: Dict mapping system solvent_state to custom PDB search paths
                            e.g., {'protein': ['pdb/protein.pdb'], 'solv': ['solvent.pdb']}
         cache_dir: Optional directory to cache/load embeddings
         run_idx: Run index (for reference in tracking)
         env_cutoff: Environment distance cutoff in Ångströms (default: 8.0)
-        use_environment_difference: If True, compute dual embeddings: [ligand-only(512), full(512)] = 1024D per node.
-                                   If False, use standard embedding: ligand+environment(512) per node.
+        use_environment_difference: If True, compute dual embeddings:
+            [ligand-only(512), full(512)] = 1024D per node.
+            If False, use standard embedding: ligand+environment(512) per node.
         consensus_dict: Optional nested dict mapping systems to site consensus atoms.
-                       Structure: {prep_dir_str: {site_key: {(resnum, chain, atomname), ...}, ...}, ...}
-                       If provided, environment atoms are filtered to consensus atoms for each site.
-                       Use None for sites with no consensus (environment not filtered for that site).
-    
+            Structure: {prep_dir_str: {site_key: {(resnum, chain, atomname), ...}, ...}, ...}
+            If provided, environment atoms are filtered to consensus atoms for each site.
+            Use None for sites with no consensus (environment not filtered for that site).
+
     Returns:
         (unimol_embeddings [N, emb_dim], edge_index [2, E], nsubs_per_site, representation_source)
         where:
@@ -384,31 +416,22 @@ def _compute_unimol_embeddings_and_edges(
         - E = directed pairs within sites
         - emb_dim = 1024 when use_environment_difference=True (dual embeddings)
         - emb_dim = 512 when use_environment_difference=False (standard embeddings)
-        - representation_source = dict with 'structure_type', 'prep_dir_used', 'source', 'explicit_mapping'
+        - representation_source = dict with 'structure_type', 'prep_dir_used', 'source',
+          'explicit_mapping'
     """
-    import json
-    from mllf.cb.unimol_representation import (
-        get_substituent_unimol_with_environment,
-        get_substituent_dual_embeddings,
-        construct_full_ligand,
-        get_unimol_representation,
-    )
-    from mllf.cb.graph_utils import build_directed_pairs
-    from mllf.file_handling.read_pdb import parse_pdb_file
-    
+
     # Load graph_info to get site structure
     with open(graph_info_path) as f:
         graph_info = json.load(f)
-    
+
     sites = graph_info.get("sites", {})
-    
+
     # Get nsubs_per_site from graph_info if available (preferred)
     nsubs_per_site = graph_info.get('nsubs_per_site', None)
-    
+
     if nsubs_per_site is None:
         # Reconstruct from sites structure: count subs per site
         # Sites can be keyed as "site1_sub1" or as "1" with "subs" list
-        from collections import defaultdict
         site_sub_counts = defaultdict(int)
         for site_key, site_info in sites.items():
             site_id = site_info.get("site")
@@ -418,9 +441,9 @@ def _compute_unimol_embeddings_and_edges(
             nsubs_per_site = [site_sub_counts[s] for s in sorted(site_sub_counts.keys())]
         else:
             raise ValueError(f"Could not determine nsubs_per_site from {graph_info_path}")
-    
+
     n_nodes = sum(nsubs_per_site)
-    
+
     # Build mapping from (site_id, sub_id) to global node index
     # Iterate through sites and map each (site, sub) to its position
     sub_to_global_idx = {}
@@ -434,12 +457,12 @@ def _compute_unimol_embeddings_and_edges(
         for local_idx, sub_id in enumerate(subs_for_site):
             sub_to_global_idx[(site_id, sub_id)] = global_idx
             global_idx += 1
-    
+
     # Compute Uni-Mol embeddings for each substituent
     prep_dir = run_dir.parent / "prep"
     if not prep_dir.is_dir():
         raise FileNotFoundError(f"Prep dir not found: {prep_dir}")
-    
+
     # Determine which prep directory to use
     # Both minimized and unrelaxed use the same prep_dir; only the choice is tracked
     # Handle nested combos: need to look TWO levels up if in comb_* directory
@@ -449,15 +472,16 @@ def _compute_unimol_embeddings_and_edges(
     active_prep_dir = prep_dir
     explicit_mapping = False
     source = 'pretraining/prep'
-    
+
     # Check if explicit mapping provided for unrelaxed
-    if structure_type == 'unrelaxed' and unrelaxed_system_mappings and sys_name in unrelaxed_system_mappings:
+    if (structure_type == 'unrelaxed' and unrelaxed_system_mappings
+            and sys_name in unrelaxed_system_mappings):
         active_prep_dir = Path(unrelaxed_system_mappings[sys_name])
         explicit_mapping = True
         source = 'training/systems'
         if not active_prep_dir.exists():
             raise FileNotFoundError(f"Mapped prep dir not found: {active_prep_dir}")
-    
+
     # Initialize representation source tracking
     representation_source = {
         'structure_type': structure_type,
@@ -465,41 +489,41 @@ def _compute_unimol_embeddings_and_edges(
         'source': source,
         'explicit_mapping': explicit_mapping,
     }
-    
+
     # Determine embedding dimension based on representation type
     # Dual embeddings (ligand-only + full) = 1024D, standard = 512D
     emb_dim = 1024 if use_environment_difference else 512
     unimol_embeddings = torch.zeros((n_nodes, emb_dim), dtype=torch.float32)
-    
+
     # Read core PDB once (needed for environment loading)
     core_pdb = active_prep_dir / "core.pdb"
     if not core_pdb.exists():
         raise FileNotFoundError(f"Core PDB not found: {core_pdb}")
-    
+
     # Get solvent state from graph_info if available (for environment path selection)
     solvent_state = graph_info.get('solvent_state', 'solv')
-    
+
     # Determine custom search paths for this system
     sub_custom_paths = None
     if custom_search_paths is not None:
         sub_custom_paths = custom_search_paths.get(solvent_state)
-    
+
     # Compute embedding for each substituent with environment context
     prep_dir_str = str(prep_dir)  # Key for consensus lookup
-    
+
     for site_key, site_info in sites.items():
         site_id = site_info.get("site")
         sub_id = site_info.get("sub")
-        
+
         if site_id is None or sub_id is None:
             continue
-        
+
         try:
             sub_pdb = active_prep_dir / f"{_node_master_sub(site_info, site_id, sub_id)}_frag.pdb"
             if not sub_pdb.exists():
                 print(f"  Warning: Sub PDB not found: {sub_pdb}, using zeros")
                 continue
-            
+
             # Get consensus atoms for this site if available.
             # consensus_dict is keyed by [prep_dir_str][site_name] where
             # site_name is per-SITE (e.g. "site1"), NOT per-node like
@@ -510,7 +534,7 @@ def _compute_unimol_embeddings_and_edges(
                 system_consensus = consensus_dict.get(prep_dir_str)
                 if system_consensus is not None:
                     consensus_atoms = system_consensus.get(f"site{site_id}")
-            
+
             # Compute Uni-Mol embeddings
             if use_environment_difference:
                 # Compute dual embeddings: ligand-only and full
@@ -548,52 +572,25 @@ def _compute_unimol_embeddings_and_edges(
                 )
             global_idx = sub_to_global_idx[(site_id, sub_id)]
             unimol_embeddings[global_idx] = torch.from_numpy(emb).float()
-            
+
         except Exception as e:
             print(f"  Warning: Could not compute embedding for site{site_id}_sub{sub_id}: {e}")
-    
+
     # Build edge_index for all directed pairs within each site
     pairs = build_directed_pairs(nsubs_per_site)
     src_list = [p[0] for p in pairs]
     dst_list = [p[1] for p in pairs]
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     if site_size_input:
-        from mllf.cb.policy import fill_site_size
         fill_site_size(unimol_embeddings, nsubs_per_site)
 
     return unimol_embeddings, edge_index, nsubs_per_site, representation_source
 
 
-# ── Pretraining representation tracking ──────────────────────────────────────
-
-def read_representation_tracking(tracking_file: Path) -> List[Dict]:
-    """Read pretraining representation tracking CSV.
-    
-    Args:
-        tracking_file: Path to pretraining_representations_used.csv
-    
-    Returns:
-        List of dicts with tracking information
-    """
-    import csv
-    
-    tracking_file = Path(tracking_file)
-    if not tracking_file.exists():
-        return []
-    
-    results = []
-    with open(tracking_file, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            results.append(row)
-    
-    return results
-
-
 # ── per-system graph cache helpers ──────────────────────────────────────────
 
 
-def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
+def extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
     """Extract bias-coefficient targets from a single run's variables.py.
 
     This is cheap (pure Python, no AEV computation).  Call once per run after
@@ -606,7 +603,6 @@ def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
     edge), or None if the variables file cannot be parsed, is missing, or the
     bias matrix size does not match nsubs_per_site.
     """
-    import yaml
     try:
         variables_path = Path(run_dir) / 'variables.py'
         if not variables_path.exists():
@@ -617,9 +613,9 @@ def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         yaml_start = -1
         close_delim = None
         for open_d, close_d in (('bias_string = """', '"""'),
-                                 ('bias_string="""',   '"""'),
-                                 ("bias_string = '''", "'''"),
-                                 ("bias_string='''",   "'''")):
+                                ('bias_string="""', '"""'),
+                                ("bias_string = '''", "'''"),
+                                ("bias_string='''", "'''")):
             pos = content.find(open_d)
             if pos != -1:
                 yaml_start = pos + len(open_d)
@@ -641,13 +637,13 @@ def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         c_matrix = np.array(bias_data['c'], dtype=float)
         x_matrix = np.array(bias_data['x'], dtype=float)
         s_matrix = np.array(bias_data['s'], dtype=float)
-        
+
         targets = []
         for (i, j) in pairs:
-            linear    = float(b_vector[j] - b_vector[i])
+            linear = float(b_vector[j] - b_vector[i])
             quadratic = float(c_matrix[i, j]) if i < j else float(c_matrix[j, i])
-            skew      = float(x_matrix[i, j])
-            end       = float(s_matrix[i, j])
+            skew = float(x_matrix[i, j])
+            end = float(s_matrix[i, j])
             # One row per edge with all 4 bias types (matches UnimolPolicy output)
             targets.append([linear, quadratic, skew, end])
         return targets
@@ -655,221 +651,60 @@ def _extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         return None
 
 
-def compute_pairwise_confidence_weights(
-    sim_results: Dict,
-    nsubs_per_site: List[int],
-    pairs: List[tuple],
-) -> Optional[List[float]]:
-    """Compute per-edge confidence weights from pairwise population balance and DDG data.
-    
-    For each directed edge (i, j), extracts populations and DDG values from simulation results
-    to compute a confidence weight. This weight reflects how well-sampled and reliable the
-    pairwise interaction is.
-    
-    **Confidence Computation:**
-    - If either population is 0 or missing: weight = 0 (no data)
-    - If DDG value is NaN or infinite: weight = 0 (unreliable)
-    - Otherwise: weight = min(pop_i, pop_j) / max(pop_i, pop_j)
-      (population balance, ranges 0-1, perfect when populations are equal)
-    
-    **Node to Block Mapping:**
-    MSLD block numbering starts at 1 (reference), with block 2 being the first real block.
-    In the graph, nodes are 0-indexed (node 0 = block 2, node 1 = block 3, etc.).
-    
-    Args:
-        sim_results: Dict with 'populations' and 'ddg_pairs' from simulation_results.json
-        nsubs_per_site: List of number of substituents per site (for validation)
-        pairs: List of (i, j) directed edge tuples from build_directed_pairs()
-    
-    Returns:
-        List of per-edge confidence weights [0.0, 1.0], or None if cannot extract populations
-    """
-    populations = sim_results.get("populations", {})
-    ddg_pairs = sim_results.get("ddg_pairs", {})
-    
-    if not populations:
-        return None
-    
-    # Extract population counts (use only HIGHEST lambda value, matching reward logic)
-    pop_dict = {}  # node_idx (0-based) -> population count
-    for block_id_str in populations.keys():
-        try:
-            block_id = int(block_id_str)
-        except ValueError:
-            continue
-        
-        # Convert block ID to node index: node_idx = block_id - 2
-        # (block 2 = node 0, block 3 = node 1, etc.)
-        node_idx = block_id - 2
-        if node_idx < 0:
-            continue
-        
-        block_data = populations[block_id_str]
-        counts = block_data.get("counts", {})
-        if counts:
-            # Use only the highest lambda value (same as reward computation)
-            max_lambda = max(counts.keys(), key=lambda x: float(x))
-            pop_dict[node_idx] = counts[max_lambda]
-    
-    if not pop_dict:
-        return None
-    
-    # Compute confidence weight for each edge
-    weights = []
-    for (i, j) in pairs:
-        pop_i = pop_dict.get(i, 0)
-        pop_j = pop_dict.get(j, 0)
-        
-        # Zero weight if either population is missing or zero
-        if pop_i <= 0 or pop_j <= 0:
-            weights.append(0.0)
-            continue
-        
-        # Check DDG value for this pair
-        # DDG key format: "{i+2}_{j+2}" (convert node indices back to block IDs)
-        # For reverse pairs: ΔG(j→i) = -ΔG(i→j), so if forward key missing,
-        # look for reverse key and negate its value
-        ddg_key_fwd = f"{i+2}_{j+2}"
-        ddg_key_rev = f"{j+2}_{i+2}"
-        
-        ddg_value = None
-        if ddg_key_fwd in ddg_pairs:
-            ddg_value = ddg_pairs[ddg_key_fwd]
-        elif ddg_key_rev in ddg_pairs:
-            # Use negation of reverse pair (antisymmetric property)
-            reverse_val = ddg_pairs[ddg_key_rev]
-            try:
-                ddg_value = -float(reverse_val)
-            except (ValueError, TypeError):
-                ddg_value = None
-        
-        # Zero weight if DDG is missing, NaN, or infinite
-        if ddg_value is None:
-            weights.append(0.0)
-            continue
-        
-        try:
-            ddg_val = float(ddg_value)
-            if not (np.isfinite(ddg_val)):  # catches NaN and inf
-                weights.append(0.0)
-                continue
-        except (ValueError, TypeError):
-            weights.append(0.0)
-            continue
-        
-        # Population balance weight: min / max (symmetric around 0.5 for equal pops)
-        balance = min(pop_i, pop_j) / max(pop_i, pop_j)
-        weights.append(float(balance))
-
-    return weights
-
-
-# Signal that has to have been measured for each bias type's target to count
-# (order matches the policy's [linear, quadratic, skew, end] outputs; None =
-# the linear rule in compute_pairwise_confidence_weights).
-MEASURED_SIGNAL = (None, 'barrier_pairs', 'skew_pairs', 'end_pairs')
-
-
-def compute_pairwise_measured_mask(
-    sim_results: Dict,
-    pairs: List[tuple],
-    linear_weights: Optional[List[float]],
-) -> List[List[float]]:
-    """Per-edge, per-bias-type mask: 1 where the run measured what sets that target.
-
-    A run's biases are only evidence for a coefficient when the simulation
-    actually sampled the part of lambda space that coefficient shapes; a
-    trapped or diverging run leaves the others wherever the optimizer that
-    produced them happened to stop (e.g. end biases of 10-18 in flattening
-    runs that never reached their endpoints). So each target counts only if:
-
-    * linear: both substituents were sampled and the pair's DDG is finite
-      (``linear_weights`` > 0, from ``compute_pairwise_confidence_weights``);
-    * quadratic: the pair's midpoint barrier was measured;
-    * skew / end: the pair's skew / end asymmetry was measured (these need
-      frames at both endpoint cores; see read_output.parse_pair_profile).
-
-    Runs without the profile fields (collected before they were parsed) get 0
-    for quadratic/skew/end: there is no evidence those targets were sampled.
-
-    Returns:
-        [E][4] list of 0.0 / 1.0.
-    """
-    def _finite(v) -> bool:
-        try:
-            return v is not None and math.isfinite(float(v))
-        except (TypeError, ValueError):
-            return False
-
-    mask = []
-    for k, (i, j) in enumerate(pairs):
-        lo, hi = min(i, j) + 2, max(i, j) + 2
-        row = [1.0 if (linear_weights is not None and linear_weights[k] > 0) else 0.0]
-        for field in MEASURED_SIGNAL[1:]:
-            values = sim_results.get(field) or {}
-            v = values.get(f"{lo}_{hi}", values.get(f"{hi}_{lo}"))
-            row.append(1.0 if _finite(v) else 0.0)
-        mask.append(row)
-    return mask
-
-
 def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None,
-                                                 warn_missing_types=True,
-                                                 pdb_dir=None, prep_dir=None, solvent_state=None,
-                                                 pdb_pattern='site{site}_sub{sub}_frag.pdb'):
+                                                warn_missing_types=True,
+                                                pdb_dir=None, prep_dir=None, solvent_state=None,
+                                                pdb_pattern='site{site}_sub{sub}_frag.pdb'):
     """Build fully-connected PyG graph for pretraining from saved variables.py.
-    
+
     Unlike the standard graph builder which only creates edges for non-zero coefficients,
     this function creates edges for ALL pairs within each site. This provides richer
     training data for pretraining, especially for linear biases which can be estimated
     for all pairs.
-    
+
     **Key differences from standard graph builder:**
     1. Creates ALL directed pairs within each site (O(N²) edges per site)
     2. Computes linear coefficients correctly: linear_ij = b[j] - b[i]
     3. Reads nonlinear coefficients from matrices (may be 0.0 for many pairs)
-    
+
     **Why this helps pretraining:**
     - More training data: ~10x more edges for typical systems
     - Proper linear bias encoding: antisymmetric by construction
     - Better gradient signal: model learns from all pairwise relationships
     - Matches pairwise MLP approach: same data representation
-    
+
     Args:
         run_dir: Directory containing variables.py and graph_info.json
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include
         warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
-        pdb_dir: Directory containing _frag.pdb files (required to construct Uni-Mol representations).
+        pdb_dir: Directory containing _frag.pdb files (required to construct Uni-Mol
+            representations).
         prep_dir: Prep directory for MIC/context-aware AEV computation (usually same as pdb_dir).
         solvent_state: Environment type ('gas'/'vacuum', 'protein', 'solvent'/'water').
-        pdb_pattern: Filename pattern for substituent PDB files (default: site{site}_sub{sub}_frag.pdb).
-    
+        pdb_pattern: Filename pattern for substituent PDB files
+            (default: site{site}_sub{sub}_frag.pdb).
+
     Returns:
         Tuple of (data, targets, extras) where:
         - data: PyG Data with fully-connected edges within each site
         - targets: List of [linear, quadratic, skew, end] for each directed edge
         - extras: Dict with relation_names, base_relation_map, etc.
     """
-    import json
-    import yaml
-    from torch_geometric.data import Data
-    from mllf.cb import graph_utils
-    
+
     run_dir = Path(run_dir)
-    
+
     # Load graph_info.json to get node features and site structure
     graph_info_path = run_dir / "graph_info.json"
     if not graph_info_path.exists():
         raise FileNotFoundError(f"graph_info.json not found in {run_dir}")
-    
+
     with open(graph_info_path, 'r') as f:
         graph_info = json.load(f)
-    
+
     # Load node features using existing graph_utils
-    from mllf.cb.graph import Graph
     g = Graph.from_graph_info(graph_info)
-    
+
     data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
         g, toppar_dir=toppar_dir, toppar_files=toppar_files,
         warn_missing_types=warn_missing_types,
@@ -878,12 +713,11 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         prep_dir=prep_dir,
         solvent_state=solvent_state,
     )
-    
+
     # Extract site structure
     nsubs_per_site = graph_info.get('nsubs_per_site', [])
     if not nsubs_per_site:
         # Compute from sites data (backward compatibility for old graph_info.json files)
-        from collections import defaultdict
         site_counts = defaultdict(int)
         sites_info = graph_info.get('sites', {})
         for key, node_info in sites_info.items():
@@ -893,16 +727,17 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         if site_counts:
             nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
         else:
-            raise ValueError(f"Could not determine nsubs_per_site from graph_info.json in {run_dir}")
-    
+            raise ValueError(
+                f"Could not determine nsubs_per_site from graph_info.json in {run_dir}")
+
     # Load bias coefficients from variables.py
     variables_path = run_dir / "variables.py"
     if not variables_path.exists():
         raise FileNotFoundError(f"variables.py not found in {run_dir}")
-    
+
     with open(variables_path, 'r') as f:
         content = f.read()
-    
+
     # Extract YAML string
     yaml_start = content.find('bias_string = """') + len('bias_string = """')
     if yaml_start < len('bias_string = """'):
@@ -911,21 +746,21 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         yaml_start = content.find("bias_string = '''") + len("bias_string = '''")
     if yaml_start < len("bias_string = '''"):
         yaml_start = content.find("bias_string='''") + len("bias_string='''")
-    
+
     yaml_end = content.find('"""', yaml_start)
     if yaml_end == -1:
         yaml_end = content.find("'''", yaml_start)
-    
+
     yaml_str = content[yaml_start:yaml_end]
     bias_data = yaml.safe_load(yaml_str)
-    
+
     # Extract bias matrices
     b_list = bias_data['b']
     if isinstance(b_list[0], list):
         b_vector = np.array(b_list[0], dtype=float)
     else:
         b_vector = np.array(b_list, dtype=float)
-    
+
     c_matrix = np.array(bias_data['c'], dtype=float)
     x_matrix = np.array(bias_data['x'], dtype=float)
     s_matrix = np.array(bias_data['s'], dtype=float)
@@ -940,55 +775,56 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         raise ValueError(
             f"Bias matrix size ({len(b_vector)}) does not match node count "
             f"from nsubs_per_site ({n_nodes} = {nsubs_per_site}). "
-            f"Run has inconsistent graph_info / variables data."
+            "Run has inconsistent graph_info / variables data."
         )
 
     # Build directed pairs for ALL substituents within each site
-    from mllf.cb.graph_utils import build_directed_pairs
     pairs = build_directed_pairs(nsubs_per_site)
-    
+
     # Get relation names from extras
     relation_names = extras['relation_names']
     base_relation_map = extras['base_relation_map']
     rel_to_idx = extras['relation_map']
-    
+
     # Build edge_index, edge_type, and edge_attr for all pairs
     src_list = []
     dst_list = []
     edge_type_list = []
     edge_attr_list = []
-    
+
     # For each directed pair, create edges for all 4 bias types
     pairs_to_process = pairs
 
     for (i, j) in pairs_to_process:
         for bias in ['linear', 'quadratic', 'skew', 'end']:
             fwd_name, bwd_name = base_relation_map[bias]
-            
+
             # Determine which relation (fwd or bwd) this edge represents
             # For i<j: use forward relation; for i>j: use backward relation
             if i < j:
                 rel_name = fwd_name
             else:
                 rel_name = bwd_name
-            
+
             rel_idx = rel_to_idx[rel_name]
-            
+
             src_list.append(i)
             dst_list.append(j)
             edge_type_list.append(rel_idx)
-            
+
             # One-hot edge attribute
             k = len(relation_names)
             one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
             one_hot[rel_idx] = 1.0
             edge_attr_list.append(one_hot)
-    
+
     # Create PyG Data object
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     edge_type = torch.tensor(edge_type_list, dtype=torch.long)
-    edge_attr = torch.stack(edge_attr_list, dim=0) if edge_attr_list else torch.zeros((0, len(relation_names)), dtype=torch.get_default_dtype())
-    
+    edge_attr = torch.stack(
+        edge_attr_list, dim=0) if edge_attr_list else torch.zeros(
+        (0, len(relation_names)), dtype=torch.get_default_dtype())
+
     data = Data(
         x=data_sparse.x,  # Use node features from sparse graph
         edge_index=edge_index,
@@ -996,19 +832,18 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         edge_attr=edge_attr,
         site_index=data_sparse.site_index,
     )
-    
+
     # Build targets for each edge: [linear, quadratic, skew, end]
     # Each edge should only predict its specific coefficient type
-    base_order = list(base_relation_map.keys())  # ['linear', 'quadratic', 'skew', 'end']
-    
+
     targets = []
-    
+
     # Process original pairs
     for (i, j) in pairs:
         # Linear: b[j] - b[i] (proper antisymmetric conversion)
         # This naturally gives antisymmetric values: linear_ji = b[i] - b[j] = -linear_ij
         linear = float(b_vector[j] - b_vector[i])
-        
+
         # Quadratic: Symmetric, only upper triangle stored
         # If i < j: use c[i,j] directly
         # If i > j: use c[j,i] (use the opposite direction)
@@ -1016,11 +851,11 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
             quadratic = float(c_matrix[i, j])
         else:
             quadratic = float(c_matrix[j, i])
-        
+
         # Skew and End: NOT antisymmetric, both directions stored independently
         skew = float(x_matrix[i, j])
         end = float(s_matrix[i, j])
-        
+
         # Create 4 edges per pair, each with ONLY its target coefficient
         # Edge 0 (linear type): predict [linear, 0, 0, 0]
         # Edge 1 (quadratic type): predict [0, quadratic, 0, 0]
@@ -1030,46 +865,46 @@ def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, 
         targets.append([0.0, quadratic, 0.0, 0.0])
         targets.append([0.0, 0.0, skew, 0.0])
         targets.append([0.0, 0.0, 0.0, end])
-    
+
     return data, targets, extras
 
 
-def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] = None) -> List[Dict]:
+def filter_best_runs_per_system(
+        runs: List[Dict], reward_config: Optional[Dict] = None) -> List[Dict]:
     """Filter runs to keep only the best run per unique system.
-    
+
     Groups runs by their dataset (pretraining parent directory) and keeps only the
     run with the highest reward for each dataset. This ensures we get one representative
     run from each system (e.g., one from 14benz_solv, one from indole_prot, etc.)
     rather than training on all runs.
-    
+
     For 14benz_combos_best, which contains different combinations, we group by the
     combination name (e.g., comb_0001_site1_1__site1_2) to get one run per combination.
-    
+
     Args:
         runs: List of run dicts with 'run_dir', 'source_dir', 'metadata', 'sim_results'
         reward_config: Optional reward configuration dict from config file
-    
+
     Returns:
         Filtered list containing only best run per system/combination
     """
     if reward_config is None:
         reward_config = {}
-    
-    from collections import defaultdict
-    
+
     # Group runs by system identifier
     systems = defaultdict(list)
     for run in runs:
         run_dir = run.get('run_dir')
-        
+
         # Extract system identifier from the run directory path
         # Supports both flat and nested structures:
         # - Flat: pretraining/14benz_solv/run_001 → "14benz_solv"
         # - Nested: pretraining/14benz_good_runs/comb_XXXX/run_001 → "14benz_good_runs/comb_XXXX"
         if run_dir:
             parent_dir = run_dir.parent.name  # e.g., "14benz_solv" or "comb_0063_site2_5__site2_3"
-            grandparent_dir = run_dir.parent.parent.name  # e.g., "pretraining" or "14benz_good_runs"
-            
+            # e.g., "pretraining" or "14benz_good_runs"
+            grandparent_dir = run_dir.parent.parent.name
+
             # Check if parent looks like a combo directory (starts with "comb_")
             if is_combo_dir_name(parent_dir):
                 # Nested structure: use grandparent/combo as system ID
@@ -1090,22 +925,22 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
             # Fallback to source_dir if run_dir not available
             source = run.get('source_dir', 'unknown')
             system_id = source
-        
+
         systems[system_id].append(run)
-    
+
     # Compute rewards and keep best per system
     best_runs = []
     for system_name, system_runs in sorted(systems.items()):
         if not system_runs:
             continue
-        
+
         # Compute reward for each run
         run_rewards = []
         for run in system_runs:
             metadata = run.get('metadata', {})
             num_sites = metadata.get('num_sites', 2)
             num_substituents = metadata.get('num_substituents', 0)
-            
+
             # Extract actual nsubs_per_site from graph_info.json if available
             run_dir = run.get('run_dir')
             nsubs_per_site = None
@@ -1113,12 +948,10 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
                 graph_info_path = run_dir / 'graph_info.json'
                 if graph_info_path.exists():
                     try:
-                        import json
                         with open(graph_info_path, 'r') as f:
                             graph_info = json.load(f)
                         if 'sites' in graph_info:
                             # Count substituents per site from graph_info
-                            from collections import defaultdict
                             site_counts = defaultdict(int)
                             for site_key in graph_info['sites']:
                                 # Parse "site1_sub2" -> site number
@@ -1128,7 +961,7 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
                             nsubs_per_site = [site_counts[i] for i in sorted(site_counts.keys())]
                     except Exception as e:
                         print(f"  Warning: Could not parse graph_info.json: {e}")
-            
+
             # Fallback: estimate from total (asymmetric-safe distribution)
             if nsubs_per_site is None:
                 if num_substituents > 0 and num_sites > 0:
@@ -1137,10 +970,10 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
                         nsubs_per_site[i] += 1
                 else:
                     nsubs_per_site = [3] * num_sites
-            
+
             # Compute reward using config parameters (filter out legacy/unknown parameters)
             filtered_config = _reward_kwargs(reward_config)
-            
+
             reward = compute_reward_from_sim_results(
                 run['sim_results'],
                 num_sites=num_sites,
@@ -1148,67 +981,67 @@ def filter_best_runs_per_system(runs: List[Dict], reward_config: Optional[Dict] 
                 **filtered_config  # Use filtered reward config from workflow yaml
             )
             run_rewards.append((run, reward))
-        
+
         # Keep only the best run
         if run_rewards:
             best_run, best_reward = max(run_rewards, key=lambda x: x[1])
             best_runs.append(best_run)
             print(f"  {system_name}: selected run with reward {best_reward:.2f}")
-    
+
     return best_runs
 
 
 def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
     """Load all collected pretraining runs.
-    
+
     Supports both flat and nested directory structures:
     - Flat: pretraining_dir/run_001/, pretraining_dir/run_002/, ...
     - Nested: pretraining_dir/combo_XXX/run_001/, pretraining_dir/combo_XXX/run_002/, ...
-    
+
     Args:
         pretraining_dir: Directory with collected run data
-    
+
     Returns:
         List of dicts with run_dir, metadata, sim_results for each run
     """
     runs = []
-    
+
     def _load_run(run_dir: Path):
         """Helper to load a single run directory."""
         # Load metadata
         metadata_file = run_dir / "metadata.json"
         if not metadata_file.exists():
             return None
-        
+
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
-        
+
         # Skip if simulation didn't terminate normally
         if not metadata.get("terminated_normally", False):
             print(f"  Skipping {run_dir.name}: did not terminate normally")
             return None
-        
+
         # Load simulation results
         results_file = run_dir / "simulation_results.json"
         if not results_file.exists():
             print(f"  Skipping {run_dir.name}: no simulation_results.json")
             return None
-        
+
         with open(results_file, 'r') as f:
             sim_results = json.load(f)
-        
+
         return {
             "run_dir": run_dir,
             "source_dir": metadata.get("source_run_dir"),
             "metadata": metadata,
             "sim_results": sim_results,
         }
-    
+
     # Iterate through top-level directories
     for entry in sorted(pretraining_dir.iterdir()):
         if not entry.is_dir():
             continue
-        
+
         # Check if this is a run directory (has metadata.json)
         if (entry / "metadata.json").exists():
             # Flat structure: entry is a run directory
@@ -1223,7 +1056,7 @@ def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
                     run_data = _load_run(subentry)
                     if run_data:
                         runs.append(run_data)
-    
+
     return runs
 
 
@@ -1287,23 +1120,23 @@ def compute_reward_from_sim_results(
     explore_min_transitions: int = EXPLORE_MIN_TRANSITIONS,
 ) -> float:
     """Compute reward from simulation results dict using improved reward logic.
-    
+
     This implements the same logic as train_improved.py but works with cached
     simulation results instead of reading from output files.
-    
+
     **Confidence Factor (C_F)**: Scales population reward by data reliability
-    
+
     Uses a **graduated transition penalty system** to provide continuous feedback:
     - **0 transitions**: -40.0 penalty (death floor - zero activity)
     - **1 transition**: -32.0 penalty (very low activity)
     - **2 transitions**: -24.0 penalty (very low activity)
     - **3-9 transitions**: -2.0 - (2.0 × deficit) penalty (climbing ramp, ranges -16 to -4)
     - **≥10 transitions**: 0.0 penalty, unlocks R_T reward (success zone)
-    
+
     Default parameters match the updated reward configuration which achieved
     improved gradient signal for low-transition runs (graduated penalties help
     1-2 transition runs compared to uniform -40 penalty).
-    
+
     Args:
         sim_results: Dict with 'populations' and 'transitions' keys
         num_sites: Number of sites in the system
@@ -1323,7 +1156,7 @@ def compute_reward_from_sim_results(
             P_baseline and T_baseline scale with the run's length; a short run
             needs only explore_min_transitions per site (online's short-run
             test) where a full one needs min_transitions_per_site.
-    
+
     Returns:
         Scalar reward value
     """
@@ -1335,7 +1168,7 @@ def compute_reward_from_sim_results(
 
     populations = sim_results.get("populations", {})
     transitions = sim_results.get("transitions", {})
-    
+
     # Extract population counts (use only HIGHEST lambda value)
     pop_list = []
     for block_id in sorted([int(k) for k in populations.keys()]):
@@ -1345,16 +1178,16 @@ def compute_reward_from_sim_results(
             # Use only the highest lambda value
             max_lambda = max(counts.keys(), key=lambda x: float(x))
             pop_list.append(counts[max_lambda])
-    
+
     if not pop_list:
         return -50.0  # No population data (capped at penalty limit)
-    
+
     pop_array = np.array(pop_list, dtype=float)
     total_pop = pop_array.sum()
-    
+
     if total_pop == 0:
         return -50.0  # No sampling occurred (capped at penalty limit)
-    
+
     # Extract transition counts per site (use only HIGHEST lambda value)
     trans_per_site = []
     for site_id in sorted([int(k) for k in transitions.keys()]):
@@ -1366,31 +1199,31 @@ def compute_reward_from_sim_results(
             trans_per_site.append(total_trans)
         else:
             trans_per_site.append(0)
-    
+
     # Ensure we have transition data for all sites
     while len(trans_per_site) < num_sites:
         trans_per_site.append(0)
-    
+
     trans_array = np.array(trans_per_site[:num_sites], dtype=float)
     total_trans = trans_array.sum()
-    
+
     # Track minimum transitions across all sites for Confidence Factor
     min_transitions_across_sites = int(trans_array.min())
-    
+
     # === STRICT REQUIREMENTS (penalties) ===
     # Match train_improved.py penalty calculation
     penalties = 0.0
-    
+
     # 1. Multi-site aware transition penalty system
     # Apply base penalty once based on worst site, then add scaling for additional bad sites
     # This prevents unfair accumulation when multiple sites are degenerate
     sites_below_threshold = 0
-    
+
     # Count sites below threshold
     for trans_count in trans_array:
         if trans_count < min_transitions_per_site:
             sites_below_threshold += 1
-    
+
     # Determine base penalty based on worst site (minimum transitions)
     if min_transitions_across_sites == 0:
         base_penalty = 40.0
@@ -1405,7 +1238,7 @@ def compute_reward_from_sim_results(
         base_penalty = 2.0 + 2.0 * deficit
     else:
         base_penalty = 0.0
-    
+
     # Add multi-site degradation penalty if multiple sites are bad
     # Each additional bad site beyond the first adds a smaller incremental penalty
     if sites_below_threshold > 1:
@@ -1414,41 +1247,42 @@ def compute_reward_from_sim_results(
         penalties -= total_transition_penalty
     elif sites_below_threshold == 1:
         penalties -= base_penalty
-    
+
     # 2. Coverage requirement
     # NOTE: adaptive coverage penalty removed — replaced by coverage_factor below
     num_populated = np.count_nonzero(pop_array)
     total_subs = sum(nsubs_per_site)
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
-    
+
     # 3. Concentration penalty (per-site check)
     pop_idx = 0
     for site_idx, nsubs in enumerate(nsubs_per_site):
         site_pops = pop_array[pop_idx:pop_idx + nsubs]
         site_total = site_pops.sum()
-        
+
         if site_total > 0:
             concentration_ratio = site_pops.max() / site_total
             if concentration_ratio > concentration_penalty_threshold:
-                # Reduced coefficient (2.0 instead of 5.0) to prevent excessive accumulation in multi-site systems
+                # Reduced coefficient (2.0 instead of 5.0) to prevent excessive
+                # accumulation in multi-site systems
                 penalties -= gamma * 2.0 * (concentration_ratio - concentration_penalty_threshold)
-        
+
         pop_idx += nsubs
-    
+
     # === REWARD COMPONENTS ===
-    
+
     # Confidence Factor (C_F): Scale population reward by data reliability
     # Low-transition runs have unreliable population distributions
     confidence_factor = min(1.0, min_transitions_across_sites / (2.0 * min_transitions_per_site))
-    
+
     # R_P: Population balance
     pop_probs = pop_array / total_pop  # needed for entropy below
     nonzero_pops = pop_array[pop_array > 0]
-    
+
     R_P = 0.0
     if len(nonzero_pops) > 1:
         min_meaningful_coverage = max(2, num_sites * 1.5)
-        
+
         if len(nonzero_pops) >= min_meaningful_coverage:
             # balance_factor removed: R_entropy captures within-visited uniformity
             total_pop_normalized = sum(p / P_baseline for p in nonzero_pops)
@@ -1456,7 +1290,7 @@ def compute_reward_from_sim_results(
         else:
             # Insufficient coverage: minimal reward proportional to coverage
             R_P = w_P * 0.01 * coverage_ratio * confidence_factor
-    
+
     # R_T: Transitions (Tier 3: "Success Zone" - only if all sites >= min_transitions_per_site)
     if sites_below_threshold == 0:
         R_T = w_T * (total_trans / T_baseline)
@@ -1465,18 +1299,18 @@ def compute_reward_from_sim_results(
             R_T *= 1.5  # 50% bonus for very active sampling
     else:
         R_T = 0.0  # No transition reward if some sites below threshold (Tier 1 or 2)
-    
+
     # R_entropy: Shannon entropy bonus for uniform distributions
     entropy = -np.sum(pop_probs * np.log(pop_probs + 1e-10))
     max_entropy = np.log(len(pop_probs))
     normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
     R_entropy = entropy_bonus * normalized_entropy
-    
+
     # ========== PENALTY CLAMPING ==========
     max_penalty = 60.0
     if penalties < -max_penalty:
         penalties = -max_penalty
-    
+
     # coverage_factor: smooth quadratic multiplier replacing hard completeness gate
     coverage_factor = (num_populated / total_subs) ** 2 if total_subs > 0 else 0.0
     reward = coverage_factor * (R_P + R_T + R_entropy) + penalties
@@ -1486,10 +1320,10 @@ def compute_reward_from_sim_results(
 
 def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, float]]:
     """Compute mean and std dev for each bias coefficient type across all runs.
-    
+
     Args:
         runs: List of run dictionaries with run_dir paths
-    
+
     Returns:
         Dict with statistics per bias type:
         {
@@ -1499,8 +1333,7 @@ def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, floa
             'end': {'mean': float, 'std': float, 'values': [...]}
         }
     """
-    from collections import defaultdict
-    
+
     # Collect all coefficient values by type
     coeff_values = {
         'linear': [],
@@ -1508,21 +1341,21 @@ def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, floa
         'skew': [],
         'end': []
     }
-    
+
     print(f"Computing coefficient statistics across {len(runs)} runs...")
-    
+
     for run in runs:
         run_dir = run["run_dir"]
         variables_path = run_dir / "variables.py"
-        
+
         if not variables_path.exists():
             continue
-        
+
         try:
             # Load bias coefficients
             with open(variables_path, 'r') as f:
                 content = f.read()
-            
+
             # Extract YAML
             yaml_start = content.find('bias_string = """') + len('bias_string = """')
             if yaml_start < len('bias_string = """'):
@@ -1530,10 +1363,10 @@ def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, floa
             yaml_end = content.find('"""', yaml_start)
             if yaml_end == -1:
                 continue
-            
+
             yaml_content = content[yaml_start:yaml_end]
             bias_data = yaml.safe_load(yaml_content)
-            
+
             # Extract linear biases (b vector)
             b = bias_data.get('b', [])
             if isinstance(b, list):
@@ -1544,21 +1377,21 @@ def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, floa
                         val = float(row)
                         if val != 0.0:
                             coeff_values['linear'].append(abs(val))
-            
+
             # Extract matrix coefficients
             c_matrix = bias_data.get('c', [])
             x_matrix = bias_data.get('x', [])
             s_matrix = bias_data.get('s', [])
-            
+
             for matrix, key in [(c_matrix, 'quadratic'), (x_matrix, 'skew'), (s_matrix, 'end')]:
                 if isinstance(matrix, list):
                     for row in matrix:
                         if isinstance(row, list):
                             coeff_values[key].extend([abs(float(x)) for x in row if x != 0.0])
-        
-        except Exception as e:
+
+        except Exception:
             continue
-    
+
     # Compute statistics
     stats = {}
     for bias_type, values in coeff_values.items():
@@ -1581,16 +1414,16 @@ def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, floa
                 'max': 0.0,
                 'count': 0
             }
-    
+
     # Print statistics
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("Coefficient Statistics Across All Runs")
-    print("="*80)
+    print("=" * 80)
     for bias_type, stat in stats.items():
         print(f"{bias_type:12s}: mean={stat['mean']:7.2f}, std={stat['std']:7.2f}, "
               f"p95={stat['p95']:7.2f}, max={stat['max']:7.2f}, n={stat['count']}")
-    print("="*80 + "\n")
-    
+    print("=" * 80 + "\n")
+
     return stats
 
 
@@ -1600,25 +1433,25 @@ def filter_runs_by_coefficient_range(
     min_runs_to_compute_stats: int = 10
 ) -> List[Dict]:
     """Filter runs to exclude those with coefficients outside statistical range.
-    
+
     Removes runs where ANY coefficient exceeds mean ± n_std for its type.
     This filters out outlier runs that would dominate the loss during training.
-    
+
     Args:
         runs: List of run dictionaries
         n_std: Number of standard deviations for threshold (default: 3.0)
         min_runs_to_compute_stats: Minimum runs needed to compute statistics
-    
+
     Returns:
         Filtered list of runs
     """
     if len(runs) < min_runs_to_compute_stats:
         print(f"Warning: Only {len(runs)} runs available, skipping statistical filtering")
         return runs
-    
+
     # Compute statistics across all runs
     stats = compute_coefficient_statistics(runs)
-    
+
     # Compute thresholds
     thresholds = {}
     print(f"Filtering thresholds (mean ± {n_std}σ):")
@@ -1627,38 +1460,38 @@ def filter_runs_by_coefficient_range(
         thresholds[bias_type] = threshold
         print(f"  {bias_type:12s}: ≤ {threshold:.2f}")
     print()
-    
+
     # Filter runs
     filtered_runs = []
     excluded_runs = []
-    
+
     for run in runs:
         run_dir = run["run_dir"]
         variables_path = run_dir / "variables.py"
-        
+
         if not variables_path.exists():
             continue
-        
+
         try:
             # Load and parse coefficients
             with open(variables_path, 'r') as f:
                 content = f.read()
-            
+
             yaml_start = content.find('bias_string = """') + len('bias_string = """')
             if yaml_start < len('bias_string = """'):
                 yaml_start = content.find('bias_string="""') + len('bias_string="""')
             yaml_end = content.find('"""', yaml_start)
             if yaml_end == -1:
                 continue
-            
+
             yaml_content = content[yaml_start:yaml_end]
             bias_data = yaml.safe_load(yaml_content)
-            
+
             # Check all coefficients against thresholds
             exceeds_threshold = False
             violated_type = None
             max_violation = 0.0
-            
+
             # Check linear (b vector)
             b = bias_data.get('b', [])
             for row in (b if isinstance(b, list) else [b]):
@@ -1671,7 +1504,7 @@ def filter_runs_by_coefficient_range(
                         break
                 if exceeds_threshold:
                     break
-            
+
             # Check matrices
             if not exceeds_threshold:
                 for matrix_key, bias_type in [('c', 'quadratic'), ('x', 'skew'), ('s', 'end')]:
@@ -1689,32 +1522,33 @@ def filter_runs_by_coefficient_range(
                                 break
                         if exceeds_threshold:
                             break
-            
+
             if exceeds_threshold:
-                excluded_runs.append((run_dir.parent.name, run_dir.name, violated_type, max_violation))
+                excluded_runs.append(
+                    (run_dir.parent.name, run_dir.name, violated_type, max_violation))
             else:
                 filtered_runs.append(run)
-        
-        except Exception as e:
+
+        except Exception:
             # On error, include the run (conservative approach)
             filtered_runs.append(run)
-    
+
     # Report results
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"Statistical Filtering Results (±{n_std}σ threshold)")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     print(f"  Total runs: {len(runs)}")
-    print(f"  Kept: {len(filtered_runs)} ({100*len(filtered_runs)/len(runs):.1f}%)")
-    print(f"  Excluded: {len(excluded_runs)} ({100*len(excluded_runs)/len(runs):.1f}%)")
-    
+    print(f"  Kept: {len(filtered_runs)} ({100 * len(filtered_runs) / len(runs):.1f}%)")
+    print(f"  Excluded: {len(excluded_runs)} ({100 * len(excluded_runs) / len(runs):.1f}%)")
+
     if excluded_runs:
-        print(f"\n  Top 10 excluded runs:")
+        print("\n  Top 10 excluded runs:")
         excluded_runs.sort(key=lambda x: x[3], reverse=True)
         for system, run, bias_type, max_val in excluded_runs[:10]:
             print(f"    {system:30s} {run:15s} ({bias_type:10s}: {max_val:.2f})")
-    
-    print(f"{'='*80}\n")
-    
+
+    print(f"{'=' * 80}\n")
+
     return filtered_runs
 
 
@@ -1724,34 +1558,32 @@ def filter_runs_by_reward(
     reward_config: Optional[Dict] = None,
 ) -> List[Dict]:
     """Filter runs by minimum reward threshold.
-    
+
     Computes reward for each run using compute_reward_from_sim_results() and
     excludes runs below the threshold.
-    
+
     Args:
         runs: List of run dicts from load_pretraining_runs
         min_reward: Minimum reward threshold (default: 0.0)
         reward_config: Optional config ``reward`` section (reward weights and
             run-length handling; defaults otherwise)
-    
+
     Returns:
         Filtered list of runs meeting reward threshold
     """
-    from pathlib import Path
-    import json
-    
-    print(f"\n{'='*80}")
+
+    print(f"\n{'=' * 80}")
     print(f"Reward Filtering (threshold: >= {min_reward})")
-    print(f"{'='*80}")
-    
+    print(f"{'=' * 80}")
+
     filtered_runs = []
     excluded_runs = []
     error_counts = {}
-    
+
     for run in runs:
         try:
             run_dir = Path(run['run_dir'])
-            
+
             # Load simulation_results.json (note: not sim_results.json)
             sim_results_path = run_dir / "simulation_results.json"
             if not sim_results_path.exists():
@@ -1760,10 +1592,10 @@ def filter_runs_by_reward(
                 error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
                 excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
                 continue
-            
+
             with open(sim_results_path, 'r') as f:
                 sim_results = json.load(f)
-            
+
             # Load graph_info.json to get nsubs_per_site
             graph_info_path = run_dir / "graph_info.json"
             if not graph_info_path.exists():
@@ -1771,10 +1603,10 @@ def filter_runs_by_reward(
                 error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
                 excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
                 continue
-            
+
             with open(graph_info_path, 'r') as f:
                 graph_info = json.load(f)
-            
+
             # Extract nsubs_per_site from sites data (sites is a dict with block names as keys)
             sites = graph_info.get('sites', {})
             if not sites:
@@ -1782,61 +1614,62 @@ def filter_runs_by_reward(
                 error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
                 excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
                 continue
-            
+
             # Count substitutions per site
             site_counts = {}
             for block_name, block_data in sites.items():
                 site_num = extract_site_number(block_name, block_data)
                 site_counts[site_num] = site_counts.get(site_num, 0) + 1
-            
+
             num_sites = len(site_counts)
             nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
-            
+
             # Compute reward
             reward = compute_reward_from_sim_results(sim_results, num_sites, nsubs_per_site,
                                                      **_reward_kwargs(reward_config))
-            
+
             # Filter by threshold
             if reward >= min_reward:
                 filtered_runs.append(run)
             else:
-                excluded_runs.append((run_dir.parent.name, run_dir.name, reward, "Below threshold"))
-        
+                excluded_runs.append(
+                    (run_dir.parent.name, run_dir.name, reward, "Below threshold"))
+
         except Exception as e:
             # On error, exclude the run (conservative approach for reward filtering)
             error_reason = f"Error: {str(e)}"
             error_counts[error_reason] = error_counts.get(error_reason, 0) + 1
             excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
-    
+
     # Report results
     print(f"  Total runs: {len(runs)}")
-    print(f"  Kept: {len(filtered_runs)} ({100*len(filtered_runs)/len(runs):.1f}%)")
-    print(f"  Excluded: {len(excluded_runs)} ({100*len(excluded_runs)/len(runs):.1f}%)")
-    
+    print(f"  Kept: {len(filtered_runs)} ({100 * len(filtered_runs) / len(runs):.1f}%)")
+    print(f"  Excluded: {len(excluded_runs)} ({100 * len(excluded_runs) / len(runs):.1f}%)")
+
     # Show error breakdown
     if error_counts:
-        print(f"\n  Error breakdown:")
+        print("\n  Error breakdown:")
         for error_reason, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
             print(f"    {error_reason}: {count} runs")
-    
+
     if excluded_runs:
         # Show distribution of excluded runs
         reward_excluded = [x for x in excluded_runs if isinstance(x[2], (int, float))]
         if reward_excluded:
-            print(f"\n  Reward statistics for excluded runs:")
+            print("\n  Reward statistics for excluded runs:")
             rewards = [x[2] for x in reward_excluded]
-            print(f"    Mean: {sum(rewards)/len(rewards):.2f}")
+            print(f"    Mean: {sum(rewards) / len(rewards):.2f}")
             print(f"    Min: {min(rewards):.2f}")
             print(f"    Max: {max(rewards):.2f}")
-        
-        print(f"\n  Top 10 excluded runs (by reward):")
+
+        print("\n  Top 10 excluded runs (by reward):")
         # Sort by reward (descending) - show the "best" of the excluded runs
         reward_excluded_sorted = sorted(reward_excluded, key=lambda x: x[2], reverse=True)
         for system, run, reward, reason in reward_excluded_sorted[:10]:
             print(f"    {system:30s} {run:15s} reward={reward:7.2f}")
-    
-    print(f"{'='*80}\n")
-    
+
+    print(f"{'=' * 80}\n")
+
     return filtered_runs
 
 
@@ -1861,11 +1694,10 @@ def filter_runs_by_min_transitions(
     Returns:
         Filtered list of runs where all sites meet the threshold
     """
-    import json
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"Transition Filtering (min transitions per site: >= {min_transitions})")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
     filtered_runs = []
     excluded_runs = []   # (system, run, min_t, reason)
@@ -1909,39 +1741,40 @@ def filter_runs_by_min_transitions(
             excluded_runs.append((run_dir.parent.name, run_dir.name, None, f"error: {exc}"))
 
     print(f"  Total runs : {len(runs)}")
-    print(f"  Kept       : {len(filtered_runs)} ({100*len(filtered_runs)/max(len(runs),1):.1f}%)")
-    print(f"  Excluded   : {len(excluded_runs)} ({100*len(excluded_runs)/max(len(runs),1):.1f}%)")
+    print(f"  Kept       : {len(filtered_runs)} "
+          f"({100 * len(filtered_runs) / max(len(runs), 1):.1f}%)")
+    print(f"  Excluded   : {len(excluded_runs)} "
+          f"({100 * len(excluded_runs) / max(len(runs), 1):.1f}%)")
     if n_errors:
         print(f"  Errors     : {n_errors}")
 
     # Histogram of worst-site transition counts in excluded runs
     excl_counts = [t for _, _, t, _ in excluded_runs if isinstance(t, int)]
     if excl_counts:
-        from collections import Counter
         hist = Counter(excl_counts)
-        print(f"  Excluded by worst-site transition count:")
+        print("  Excluded by worst-site transition count:")
         for k in sorted(hist):
             print(f"    {k:3d} transitions: {hist[k]} runs")
 
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
     return filtered_runs
 
 
 def extract_site_number(block_id: str, block_data: Dict) -> int:
     """Extract site number from block data, handling missing 'site' key.
-    
+
     Some multi-site systems have graph_info.json blocks without the 'site' key.
     This function handles both cases:
     1. If 'site' key exists, return it
     2. If missing, extract from block_id format (e.g., "site1_sub2" → 1)
-    
+
     Args:
         block_id: Block identifier (e.g., "site1_sub1", "site2_sub3")
         block_data: Block data dict (may or may not have 'site' key)
-    
+
     Returns:
         Site number as integer
-    
+
     Raises:
         KeyError: If 'site' key exists and is required but missing
         ValueError: If extraction from block_id fails
@@ -1949,7 +1782,7 @@ def extract_site_number(block_id: str, block_data: Dict) -> int:
     # Try to use 'site' key if it exists
     if 'site' in block_data:
         return block_data['site']
-    
+
     # Otherwise, extract from block_id format: "siteN_subM" → N
     try:
         # Split on underscore: ["siteN", "subM"]
@@ -1960,9 +1793,10 @@ def extract_site_number(block_id: str, block_data: Dict) -> int:
             return int(site_str)
     except (IndexError, ValueError):
         pass
-    
+
     # If we get here, we couldn't extract the site number
-    raise ValueError(f"Cannot extract site number from block_id '{block_id}' and block_data has no 'site' key")
+    raise ValueError(
+        f"Cannot extract site number from block_id '{block_id}' and block_data has no 'site' key")
 
 
 def sample_runs_stratified_negative(
@@ -2000,15 +1834,16 @@ def sample_runs_stratified_negative(
     # whose upper bound satisfies r <= upper_bound.
     BUCKET_UPPER_BOUNDS = [-50, -40, -30, -20, -10, 0]
 
-    print(f"\n{'='*80}")
-    print(f"Stratified Negative Sampling  (max_fraction={fraction_per_bucket:.0%}, quadratic ramp)")
-    print(f"{'='*80}")
+    print(f"\n{'=' * 80}")
+    print(f"Stratified Negative Sampling  (max_fraction={fraction_per_bucket:.0%}, quadratic "
+          "ramp)")
+    print(f"{'=' * 80}")
 
     # Compute reward for every run -----------------------------------------
     scored: List[tuple] = []  # (reward, run_dict)
     n_error = 0
     error_log = []  # Track errors for detailed reporting
-    
+
     for run in runs:
         try:
             run_dir = Path(run['run_dir'])
@@ -2060,16 +1895,16 @@ def sample_runs_stratified_negative(
             else:
                 error_type = error_msg
             error_types[error_type] = error_types.get(error_type, 0) + 1
-        
-        print(f"\n  Error Type Breakdown:")
+
+        print("\n  Error Type Breakdown:")
         for error_type in sorted(error_types.keys(), key=lambda x: error_types[x], reverse=True):
             count = error_types[error_type]
             print(f"    {error_type:<40} {count:>6,}")
-        
+
         # Log to file for detailed analysis
         error_log_path = Path("scoring_errors.log")
         with open(error_log_path, 'w') as f:
-            f.write(f"Scoring Errors Log\n")
+            f.write("Scoring Errors Log\n")
             f.write(f"Total errors: {n_error}\n\n")
             for run_path, error_msg in error_log[:20]:  # Log first 20
                 f.write(f"{run_path}\n  {error_msg}\n")
@@ -2101,13 +1936,14 @@ def sample_runs_stratified_negative(
     rng = random.Random(seed)
     sampled_negative: List[Dict] = []
     print(f"\n  {'Bucket':<18} {'Fraction':>8} {'Available':>10} {'Sampled':>9}")
-    print(f"  {'-'*18} {'-'*8} {'-'*10} {'-'*9}")
+    print(f"  {'-' * 18} {'-' * 8} {'-' * 10} {'-' * 9}")
     for i, label in enumerate(bucket_labels):
         available = buckets[i]
         n_avail = len(available)
         # Quadratic ramp: bucket 0 → 0%, bucket (n_buckets-1) → fraction_per_bucket
         bucket_frac = fraction_per_bucket * (i / max(n_buckets - 1, 1)) ** 2
-        n_sample = max(1, int(math.ceil(n_avail * bucket_frac))) if (n_avail > 0 and bucket_frac > 0) else 0
+        n_sample = max(1, int(math.ceil(n_avail * bucket_frac))
+                       ) if (n_avail > 0 and bucket_frac > 0) else 0
         if n_avail <= n_sample:
             selected = available
         else:
@@ -2138,13 +1974,13 @@ def sample_runs_stratified_negative(
 
     print(f"\n  Positive (kept all):   {len(positive_runs):>7,}")
     print(f"  {'Bucket':<18} {'Count':>10}")
-    print(f"  {'-'*18} {'-'*10}")
+    print(f"  {'-' * 18} {'-' * 10}")
     for i, label in enumerate(pos_labels):
         print(f"  {label:<18} {pos_buckets[i]:>10,}")
 
     print(f"\n  Negative (sampled):    {len(sampled_negative):>7,}")
     print(f"  Total after sampling:  {len(result):>7,}")
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
     return result
 
 
@@ -2202,7 +2038,7 @@ def pretrain_epoch(
     data_hygiene: bool = False,
 ) -> Dict[str, float]:
     """Run one behavior cloning AWR epoch for UnimolPolicy with optional pairwise weighting.
-    
+
     Args:
         policy: UnimolPolicy model
         optimizer: Optimizer
@@ -2235,13 +2071,13 @@ def pretrain_epoch(
                         specific (typically under-represented) systems' runs, matched
                         case-insensitively against each run's 'system_label'. See
                         ``pretrain_with_runs`` for how this combines with reward_weighted.
-    
+
     Returns:
         Dict with 'loss', 'num_runs', 'num_updates' keys
     """
     if unimol_config is None:
         unimol_config = {}
-    
+
     env_cutoff = unimol_config.get('environment_cutoff', 8.0)
     use_environment_difference = unimol_config.get('use_environment_difference', True)
     policy.train()
@@ -2300,22 +2136,22 @@ def pretrain_epoch(
             n_valid = len(valid)
             optimizer.zero_grad()
             group_loss = 0.0
-            
+
             for run_idx, rw in valid:
                 unimol_emb, edge_idx, targets_list = graph_cache[run_idx]
                 targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
-                
+
                 # Move embeddings and edge_index to device
                 unimol_emb = unimol_emb.to(device)
                 edge_idx = edge_idx.to(device)
-                
+
                 # Forward pass through UnimolPolicy
                 mean, log_std = policy._forward_edges(unimol_emb, edge_idx)
-                
+
                 active_mask = targets.abs() > 1e-8
                 if not active_mask.any():
                     continue
-                
+
                 # AWR loss: -exp(A/β) · log π(a | s) over active elements.
                 std = torch.exp(log_std)
                 logp_per = torch.distributions.Normal(mean, std).log_prob(targets)  # [E, D]
@@ -2326,14 +2162,19 @@ def pretrain_epoch(
                 if edge_conf is None:
                     continue
 
-                advantage = pair_advantage_cache[run_idx] if pair_advantage_cache is not None else None
+                advantage = (pair_advantage_cache[run_idx] if pair_advantage_cache is not None
+                             else None)
                 if advantage is not None and advantage.shape[0] == logp_per.shape[0]:
                     # Per-edge, per-dimension AWR advantage (pair_advantages):
                     # pairs with better bias coefficients within an
                     # otherwise-successful run get emphasised more than pairs
                     # that were poorly resolved, instead of every pair in the
                     # run sharing one scalar weight.
-                    awr_w = torch.clamp(torch.exp(advantage.to(device) / awr_temperature), max=20.0)  # [E, D]
+                    awr_w = torch.clamp(
+                        torch.exp(
+                            advantage.to(device) /
+                            awr_temperature),
+                        max=20.0)  # [E, D]
                 else:
                     # Fall back to the whole-run scalar reward when per-pair
                     # data is unavailable for this run (e.g. older collected
@@ -2343,18 +2184,19 @@ def pretrain_epoch(
 
                 w = awr_w * edge_conf  # [E, D]
                 combined_mask = active_mask & (edge_conf > 1e-8)
-                w_sum = w[combined_mask].sum() if combined_mask.any() else torch.tensor(0.0, device=device)
+                w_sum = w[combined_mask].sum() if combined_mask.any(
+                ) else torch.tensor(0.0, device=device)
                 if combined_mask.any() and w_sum > 1e-8:
                     run_loss = rw * _awr_run_loss(w, logp_per, combined_mask, active_mask,
                                                   w_sum, data_hygiene) / n_valid
                 else:
                     continue
-                
+
                 if torch.isnan(run_loss) or torch.isinf(run_loss):
                     continue
                 run_loss.backward()
                 group_loss += run_loss.item()
-            
+
             if group_loss > 0.0:
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
                 optimizer.step()
@@ -2363,7 +2205,7 @@ def pretrain_epoch(
                 total_runs += n_valid
             else:
                 optimizer.zero_grad()
-        
+
         avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
         return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates}
 
@@ -2384,7 +2226,7 @@ def pretrain_epoch(
             run_dir = Path(run["run_dir"])
             gi_path = run_dir / "graph_info.json"
             try:
-                unimol_emb, edge_idx, nsubs_per_site, _ = _compute_unimol_embeddings_and_edges(
+                unimol_emb, edge_idx, nsubs_per_site, _ = compute_unimol_embeddings_and_edges(
                     run_dir, gi_path,
                     env_cutoff=env_cutoff,
                     use_environment_difference=use_environment_difference,
@@ -2393,9 +2235,8 @@ def pretrain_epoch(
                     ligand_other_sites=bool(unimol_config.get('ligand_other_sites', False)),
                     site_size_input=bool(unimol_config.get('site_size_input', False)),
                 )
-                from mllf.cb.graph_utils import build_directed_pairs
                 pairs = build_directed_pairs(nsubs_per_site)
-                targets_list = _extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
+                targets_list = extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
                 if not targets_list:
                     continue
                 targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
@@ -2406,27 +2247,32 @@ def pretrain_epoch(
         # Move to device
         unimol_emb = unimol_emb.to(device)
         edge_idx = edge_idx.to(device)
-        
+
         # Forward pass
         mean, log_std = policy._forward_edges(unimol_emb, edge_idx)
-        
+
         active_mask = targets.abs() > 1e-8
         if not active_mask.any():
             continue
-        
+
         # Compute AWR loss
         optimizer.zero_grad()
         std = torch.exp(log_std)
         logp_per = torch.distributions.Normal(mean, std).log_prob(targets)
 
         # Per-edge confidence weight (population balance + DDG validity).
-        edge_conf = _edge_confidence(pairwise_weights_cache, run_idx, logp_per, device, data_hygiene)
+        edge_conf = _edge_confidence(pairwise_weights_cache, run_idx,
+                                     logp_per, device, data_hygiene)
         if edge_conf is None:
             continue
 
         advantage = pair_advantage_cache[run_idx] if pair_advantage_cache is not None else None
         if advantage is not None and advantage.shape[0] == logp_per.shape[0]:
-            awr_w = torch.clamp(torch.exp(advantage.to(device) / awr_temperature), max=20.0)  # [E, D]
+            awr_w = torch.clamp(
+                torch.exp(
+                    advantage.to(device) /
+                    awr_temperature),
+                max=20.0)  # [E, D]
         else:
             raw_r = run.get("_bc_reward", 0.0)
             awr_w = torch.full_like(logp_per, min(math.exp(raw_r / awr_temperature), 20.0))
@@ -2438,7 +2284,7 @@ def pretrain_epoch(
             loss = rw * _awr_run_loss(w, logp_per, combined_mask, active_mask, w_sum, data_hygiene)
         else:
             continue
-        
+
         if not (torch.isnan(loss) or torch.isinf(loss)):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
@@ -2564,11 +2410,11 @@ def _compute_run_pair_reward(
     try:
         populations = _extract_highest_lambda_counts(populations_raw)
         total_transitions = _extract_total_transitions(sim_results.get("transitions", {}))
-        length_ratio, _ = run_length(sim_results, reward_config.get("full_length_ns", FULL_LENGTH_NS))
+        length_ratio, _ = run_length(
+            sim_results, reward_config.get(
+                "full_length_ns", FULL_LENGTH_NS))
         t_baseline = reward_config.get("T_baseline", 50.0) * length_ratio
         fraction_physical = sim_results.get("fraction_physical")
-        from mllf.cb.workflow_utils import (BARRIER_TARGET, BARRIER_WIDTH, END_WIDTH, SKEW_WIDTH,
-                                            compute_pair_reward)
         return compute_pair_reward(
             edge_index.detach().cpu(), ddg_pairs, populations,
             total_transitions=total_transitions,
@@ -2601,8 +2447,6 @@ def _run_pair_success(run: Dict, edge_index: torch.Tensor,
     Returns a [E] bool tensor, or None when the run lacks per-pair transitions
     ('transition_pairs'; ``collect_pretraining_data --backfill-barrier``).
     """
-    from mllf.cb.hindsight import (SUCCESS_MIN_FRACTION, SUCCESS_MIN_TRANSITIONS,
-                                   pair_succeeded, site_nodes)
     sim_results = run.get("sim_results", {})
     pair_trans = sim_results.get("transition_pairs")
     if not pair_trans:
@@ -2674,7 +2518,7 @@ def pretrain(
     device: Optional[str] = None,
 ):
     """Run policy pretraining (legacy single-directory interface).
-    
+
     Args:
         pretraining_dir: Directory with collected pretraining data
         output_dir: Directory to save pretrained policy
@@ -2687,7 +2531,7 @@ def pretrain(
     print(f"\nLoading pretraining data from {pretraining_dir}...")
     runs = load_pretraining_runs(pretraining_dir)
     print(f"Loaded {len(runs)} runs with successful simulations")
-    
+
     # Call the main pretraining function
     pretrain_with_runs(runs, output_dir, config, epochs, learning_rate, device)
 
@@ -2852,7 +2696,7 @@ def estimate_reward_noise_variance(
             noise_var_physical = 1.0  # too little data — fall back to a neutral hyperparameter
         noise_vars.append(noise_var_physical / float(scale_factors[d]) ** 2)
     dim_names = ['linear', 'quadratic', 'skew', 'end']
-    print(f"  Estimated reward noise variance (sigma^2, pre-activation space) "
+    print("  Estimated reward noise variance (sigma^2, pre-activation space) "
           f"from {n_used} sampled runs: "
           + ', '.join(f'{n}={v:.6f}' for n, v in zip(dim_names, noise_vars)))
     return noise_vars
@@ -2923,7 +2767,6 @@ def initialize_bayesian_heads_from_pretrained(
         A new UnimolPolicy with use_bayesian_heads=True, same architecture/
         dims as policy_det, trunks copied, posterior means seeded.
     """
-    from mllf.cb.policy import UnimolPolicy
 
     policy_bayes = UnimolPolicy(
         unimol_dim=policy_det.unimol_dim,
@@ -2946,7 +2789,7 @@ def initialize_bayesian_heads_from_pretrained(
             max(float(np.var(residuals[d])), 1e-6) if len(residuals[d]) >= 5 else None
             for d in range(4)
         ]
-        print(f"  Data-driven prior-precision calibration: E[||z||^2]="
+        print("  Data-driven prior-precision calibration: E[||z||^2]="
               + ', '.join(f'{v:.2f}' for v in typical_z_norm_sq)
               + ", physical residual var="
               + ', '.join(f'{v:.4f}' if v is not None else 'n/a' for v in residual_vars_physical))
@@ -2973,7 +2816,8 @@ def initialize_bayesian_heads_from_pretrained(
             adaptive_precision = typical_z_norm_sq[d] / max(target_preact_var, 1e-8)
         else:
             # Fallback: weight-magnitude-only heuristic (see docstring).
-            combined = torch.cat([weight, torch.tensor([bias], dtype=weight.dtype, device=weight.device)])
+            combined = torch.cat([weight, torch.tensor(
+                [bias], dtype=weight.dtype, device=weight.device)])
             typical_scale_sq = float(combined.pow(2).mean().clamp(min=1e-6))
             adaptive_precision = bayesian_prior_precision / typical_scale_sq
 
@@ -3013,7 +2857,7 @@ def pretrain_with_runs(
     resume_checkpoint: Optional[Path] = None,
 ):
     """Run policy pretraining with provided runs.
-    
+
     Args:
         runs: List of run dicts (from load_pretraining_runs)
         output_dir: Directory to save pretrained policy
@@ -3025,7 +2869,8 @@ def pretrain_with_runs(
         use_fully_connected: If True (default), build fully-connected graphs with all pairs
                             within sites for richer training data and proper linear bias encoding.
                             If False, use sparse graphs with only non-zero coefficient edges.
-        filter_outliers: If True (default), exclude runs with coefficients outside statistical range
+        filter_outliers: If True (default), exclude runs with coefficients outside
+            statistical range
         outlier_std_threshold: Number of standard deviations for outlier threshold (default: 3.0)
         min_reward_threshold: If set, exclude runs with reward below this threshold (e.g., 5.0)
         stratified_negative_fraction: If set, keep all positive-reward runs and randomly
@@ -3095,21 +2940,20 @@ def pretrain_with_runs(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Setup device
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(device)
-    
+
     print(f"Using device: {device}")
-    
+
     if len(runs) == 0:
         print("Error: No valid runs found")
         return
 
     # Snapshot the full run pool before any BC-specific selection.
-    all_runs_unfiltered = list(runs)
 
     # Optionally filter to keep only best run per system for behavior cloning
     if use_best_only:
@@ -3119,16 +2963,16 @@ def pretrain_with_runs(
         print(f"Using reward config: {reward_config}")
         best_runs = filter_best_runs_per_system(runs, reward_config=reward_config)
         print(f"Filtered to {len(best_runs)} best runs for training\n")
-        
+
         if len(best_runs) == 0:
             print("Error: No valid runs after filtering")
             return
-        
+
         # Update runs to use filtered best runs
         runs = best_runs
     else:
         print(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
-    
+
     # Transition-count filter takes highest precedence — direct data quality criterion
     if min_transitions is not None:
         print(f"\nApplying transition filtering (min per site: >= {min_transitions})...")
@@ -3141,45 +2985,48 @@ def pretrain_with_runs(
 
     # Stratified negative sampling (takes precedence over min_reward_threshold)
     elif stratified_negative_fraction is not None:
-        print(f"\nApplying stratified negative sampling (max_fraction={stratified_negative_fraction:.0%}, quadratic ramp)...")
-        runs = sample_runs_stratified_negative(runs, fraction_per_bucket=stratified_negative_fraction,
-                                               reward_config=config.get('reward', {}))
+        print("\nApplying stratified negative sampling "
+              f"(max_fraction={stratified_negative_fraction:.0%}, quadratic ramp)...")
+        runs = sample_runs_stratified_negative(
+            runs, fraction_per_bucket=stratified_negative_fraction,
+            reward_config=config.get('reward', {}))
 
         if len(runs) == 0:
             print("Error: No runs remaining after stratified negative sampling")
             return
 
-    # Optionally filter runs by minimum reward threshold (applied when stratified sampling not used)
+    # Optionally filter runs by minimum reward threshold (applied when
+    # stratified sampling not used)
     elif min_reward_threshold is not None:
         print(f"\nApplying reward filtering (threshold: >= {min_reward_threshold})...")
         runs = filter_runs_by_reward(runs, min_reward=min_reward_threshold,
                                      reward_config=config.get('reward', {}))
-        
+
         if len(runs) == 0:
             print("Error: No runs remaining after reward filtering")
             print("Try lowering min_reward_threshold or disable reward filtering")
             return
-    
+
     # Optionally filter outlier runs based on coefficient statistics (applied second)
     if filter_outliers:
         print(f"\nApplying statistical filtering (±{outlier_std_threshold}σ threshold)...")
         runs = filter_runs_by_coefficient_range(runs, n_std=outlier_std_threshold)
-        
+
         if len(runs) == 0:
             print("Error: No runs remaining after statistical filtering")
             print("Try increasing outlier_std_threshold or set filter_outliers=False")
             return
-    
+
     # Extract toppar configuration
     vocab_config = config.get('vocabulary', {})
     toppar_dir = vocab_config.get('toppar_dir')
     toppar_files = vocab_config.get('toppar_files')
     warn_missing_types = vocab_config.get('warn_missing_types', True)
-    
+
     # For Uni-Mol pretraining, schema is fixed: 4 bias types (linear, quadratic, skew, end)
     # with 2 directions each = 8 relations. We don't need to build a sample graph.
     # (Unlike the old approach which required toppar files and node features.)
-    
+
     relation_names = [
         'linear_ij', 'linear_ji',
         'quadratic_ij', 'quadratic_ji',
@@ -3189,23 +3036,22 @@ def pretrain_with_runs(
     base_relation_map = {
         'linear': 0, 'quadratic': 1, 'skew': 2, 'end': 3
     }
-    
+
     sample_extras = {
         'relation_names': relation_names,
         'base_relation_map': base_relation_map,
     }
-    
-    print(f"\nSchema for Uni-Mol pretraining:")
-    print(f"  Bias types: 4 (linear, quadratic, skew, end)")
+
+    print("\nSchema for Uni-Mol pretraining:")
+    print("  Bias types: 4 (linear, quadratic, skew, end)")
     print(f"  Relations: {len(relation_names)} (2 directions per type)")
     print(f"  Relation names: {relation_names}")
-    
+
     # Create policy using Uni-Mol representations only
-    from mllf.cb.policy import UnimolPolicy
-    
+
     train_config = config.get('training', {})
     policy_config = train_config.get('unimol', {})
-    
+
     # Extract Uni-Mol settings from top-level unimol config
     unimol_cfg = config.get('unimol', {})
     env_cutoff = unimol_cfg.get('environment_cutoff', 8.0)
@@ -3228,7 +3074,7 @@ def pretrain_with_runs(
     # minimized.pdb geometry, not the unrelaxed fragment files
     ligand_from_minimized = bool(unimol_cfg.get('ligand_from_minimized', False))
     print(f"Ligand geometry from minimized.pdb for minimized runs: {ligand_from_minimized}")
-    
+
     policy = UnimolPolicy(
         unimol_dim=policy_config.get('unimol_dim', 512),
         mlp_hidden=policy_config.get('mlp_hidden', 64),
@@ -3242,18 +3088,18 @@ def pretrain_with_runs(
         policy.load_state_dict(_init['policy_state'])
         print(f"\nInitialized policy from {init_checkpoint} "
               f"(epoch {_init.get('epoch')}, loss {_init.get('loss')})")
-    
-    print(f"\nModel architecture:")
+
+    print("\nModel architecture:")
     if use_environment_difference:
-        print(f"  Policy: UnimolPolicy (dual embeddings: ligand-only + full)")
-        print(f"  Input: [diff_ligand(512D), mean_full(512D)] = 1024D edge features")
-        print(f"  diff_ligand captures substituent variation (sub-dependent)")
-        print(f"  mean_full captures environment effects (environment-dependent)")
+        print("  Policy: UnimolPolicy (dual embeddings: ligand-only + full)")
+        print("  Input: [diff_ligand(512D), mean_full(512D)] = 1024D edge features")
+        print("  diff_ligand captures substituent variation (sub-dependent)")
+        print("  mean_full captures environment effects (environment-dependent)")
     else:
-        print(f"  Policy: UnimolPolicy (ligand+environment)")
-        print(f"  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
+        print("  Policy: UnimolPolicy (ligand+environment)")
+        print("  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
     print(f"  Total parameters: {sum(p.numel() for p in policy.parameters())}")
-    
+
     # Optimizer: cosine-annealed Adam over all policy parameters.
     optimizer = optim.Adam(
         policy.parameters(),
@@ -3266,7 +3112,7 @@ def pretrain_with_runs(
     active_opt = optimizer
     active_sched = scheduler
 
-    print(f"  Learning rate: {learning_rate} (cosine annealed to {learning_rate/100:.6f})")
+    print(f"  Learning rate: {learning_rate} (cosine annealed to {learning_rate / 100:.6f})")
     print(f"  Early stopping patience: {patience} epochs")
     print(f"  Graph caching: all {len(runs)} graphs pre-built once, reused across all epochs")
 
@@ -3287,7 +3133,8 @@ def pretrain_with_runs(
             best_loss = float(_best['loss'])
             epochs_without_improvement = start_epoch - int(_best['epoch'])
         print(f"\nResuming from {resume_checkpoint}: epoch {start_epoch} done; "
-              f"best loss {best_loss:.4f}, {epochs_without_improvement} epoch(s) without improvement")
+              f"best loss {best_loss:.4f}, {epochs_without_improvement} epoch(s) without "
+              "improvement")
 
     # ------------------------------------------------------------------
     # Suppress per-occurrence warnings during training and collect them
@@ -3296,19 +3143,19 @@ def pretrain_with_runs(
     # so "Element mismatch in /long/path/foo.pdb" and the same mismatch in
     # every other run appear as a single entry with a total count.
     # ------------------------------------------------------------------
-    _warning_counts  = collections.Counter()   # (category, template) -> count
+    _warning_counts = collections.Counter()   # (category, template) -> count
     _warning_example = {}                       # (category, template) -> full message
-    _warning_lock    = threading.Lock()          # thread-safe updates during parallel build
+    _warning_lock = threading.Lock()          # thread-safe updates during parallel build
     _path_re = re.compile(r'/[^\s:*?"<>|]+')
 
     _orig_showwarning = warnings.showwarning
 
     def _collect_warning(message, category, filename, lineno, file=None, line=None):
-        text     = str(message)
+        text = str(message)
         template = _path_re.sub('<path>', text)
-        key      = (category.__name__, template)
+        key = (category.__name__, template)
         with _warning_lock:
-            _warning_counts[key]  += 1
+            _warning_counts[key] += 1
             if key not in _warning_example:
                 _warning_example[key] = (text, filename, lineno)
 
@@ -3319,21 +3166,25 @@ def pretrain_with_runs(
     # All runs from the same system (prep directory) have identical substitutent
     # coordinates, so Uni-Mol embeddings and edge indices are identical.
     # Only the targets differ per run (different variables.py).
-    # 
+    #
     # NOTE: When using 'random' structure selection, this cache is skipped
     # and representations are computed per-run instead, allowing different structure types
     # to be selected for each run. For 'minimized' and 'unrelaxed', per-system caching
     # is used since the structure type is deterministic per system.
     # ------------------------------------------------------------------
-    
+
     # Check structure selection strategy
     unimol_cfg = config.get('unimol', {})
     structure_selection = unimol_cfg.get('structure_selection', 'minimized').lower()
-    use_system_cache = (structure_selection in ['minimized', 'unrelaxed'])  # Use cache for deterministic structure types
+    # Use cache for deterministic structure types
+    use_system_cache = (structure_selection in ['minimized', 'unrelaxed'])
     unrelaxed_mappings = config.get('_unrelaxed_system_mappings', {})
     skip_unrelaxed_for_systems = unimol_cfg.get('skip_unrelaxed_for_systems', [])
-    env_cutoff = unimol_cfg.get('environment_cutoff', 8.0)  # Distance cutoff for environment filtering
-    use_environment_difference = unimol_cfg.get('use_environment_difference', True)  # Use (env+lig)-(lig) representation
+    # Distance cutoff for environment filtering
+    env_cutoff = unimol_cfg.get('environment_cutoff', 8.0)
+    use_environment_difference = unimol_cfg.get(
+        'use_environment_difference',
+        True)  # Use (env+lig)-(lig) representation
     tracking_file = initialize_representation_tracker(output_dir)
 
     # Persistent Uni-Mol embedding cache (unimol.cache_embeddings / unimol.cache_dir
@@ -3344,63 +3195,64 @@ def pretrain_with_runs(
     embed_cache_dir: Optional[Path] = None
     if unimol_cfg.get('cache_embeddings', False):
         embed_cache_dir = unimol_cfg.get('cache_dir')
-        embed_cache_dir = Path(embed_cache_dir) if embed_cache_dir else Path(output_dir) / 'embeddings_cache'
+        embed_cache_dir = Path(embed_cache_dir) if embed_cache_dir else Path(
+            output_dir) / 'embeddings_cache'
         embed_cache_dir.mkdir(parents=True, exist_ok=True)
         print(f"  Uni-Mol embedding cache: ENABLED ({embed_cache_dir})")
     else:
-        print(f"  Uni-Mol embedding cache: disabled (set unimol.cache_embeddings: true to enable)")
-    
+        print("  Uni-Mol embedding cache: disabled (set unimol.cache_embeddings: true to enable)")
+
     # Initialize consensus_dict - will be populated if consensus building is enabled
     consensus_dict = None
-    
+
     if structure_selection != 'minimized':
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Structure selection: {structure_selection}")
-        print(f"Computing representations per-run (system cache disabled)")
+        print("Computing representations per-run (system cache disabled)")
         print(f"Tracking: {tracking_file}")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
     else:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Grouping {len(runs)} runs by system and building per-system graphs...")
-        print(f"{'='*60}")
-    
+        print(f"{'=' * 60}")
+
     # Group runs by prep directory (system)
     system_to_runs = {}  # prep_dir -> list of run indices
     system_graph_cache = {}  # prep_dir -> (unimol_emb, edge_idx, nsubs_per_site)
-    system_structure_cache = {}  # prep_dir -> nsubs_per_site (always populated, for pairwise weights)
-    
+    # prep_dir -> nsubs_per_site (always populated, for pairwise weights)
+    system_structure_cache = {}
+
     for run_idx, run in enumerate(runs):
         run_dir = Path(run["run_dir"])
         prep_dir = run_dir.parent / "prep"
         prep_dir_str = str(prep_dir)
-        
+
         if prep_dir_str not in system_to_runs:
             system_to_runs[prep_dir_str] = []
         system_to_runs[prep_dir_str].append(run_idx)
-    
+
     print(f"Found {len(system_to_runs)} unique systems")
-    
+
     # Build environment consensus atoms if configured
     # Structure: consensus_dict[prep_dir_str][site_name] = set of consensus atoms
     use_consensus = unimol_cfg.get('use_environment_consensus', True)
     consensus_dict = {}  # Will be populated per-system
-    
+
     if use_consensus:
         print("\nBuilding environment consensus atoms per system/site...")
-        from mllf.cb.environment_consensus import build_site_consensus
-        
+
         # Build consensus for each unique system (prep_dir)
         for prep_dir_str in sorted(system_to_runs.keys()):
             prep_dir = Path(prep_dir_str)
-            
+
             # Skip if prep directory doesn't exist
             if not prep_dir.is_dir():
                 continue
-            
+
             # Find all site_* PDB files in this system's prep directory
             # Handle both regular files and combo subdirectories
             site_to_subs = {}
-            
+
             # Search for PDB files directly in prep_dir
             for sub_pdb in sorted(prep_dir.glob('site*_sub*_frag.pdb')):
                 site_num = sub_pdb.stem.split('_')[0]  # e.g., "site1"
@@ -3408,7 +3260,7 @@ def pretrain_with_runs(
                     site_to_subs[site_num] = []
                 if sub_pdb not in site_to_subs[site_num]:
                     site_to_subs[site_num].append(sub_pdb)
-            
+
             # Also search in combo subdirectories (for combo structures)
             for comb_dir in sorted(d for d in prep_dir.iterdir()
                                    if d.is_dir() and is_combo_dir_name(d.name)):
@@ -3418,11 +3270,11 @@ def pretrain_with_runs(
                         site_to_subs[site_num] = []
                     if sub_pdb not in site_to_subs[site_num]:
                         site_to_subs[site_num].append(sub_pdb)
-            
+
             # Build consensus for each site in this system
             if site_to_subs:
                 consensus_dict[prep_dir_str] = {}
-                
+
                 # Find core.pdb for this system (try direct path first, then combo)
                 core_pdb = None
                 if (prep_dir / 'core.pdb').exists():
@@ -3434,7 +3286,7 @@ def pretrain_with_runs(
                         if (comb_dir / 'core.pdb').exists():
                             core_pdb = str(comb_dir / 'core.pdb')
                             break
-                
+
                 if core_pdb:
                     # Extract system name for logging
                     # Handle nested combos: system/comb_ID/prep or system/prep
@@ -3445,10 +3297,12 @@ def pretrain_with_runs(
                     else:
                         # Regular: .../system/prep
                         system_label = system_path.parent.name
-                    
+
                     # SKIP consensus building for vacuum systems (no environment to define)
                     if 'vac' in system_label.lower() or 'vacuum' in system_label.lower():
-                        print(f"\n[CONSENSUS] Skipping consensus for vacuum system: {system_label} (no environment)")
+                        print(
+                            f"\n[CONSENSUS] Skipping consensus for vacuum system: {system_label} "
+                            "(no environment)")
                         # Set all sites to None for this system
                         for site_name in sorted(site_to_subs.keys()):
                             consensus_dict[prep_dir_str][site_name] = None
@@ -3467,12 +3321,13 @@ def pretrain_with_runs(
                                 )
                                 consensus_dict[prep_dir_str][site_name] = consensus
                             except Exception as e:
-                                print(f"  Warning: Failed to build consensus for {prep_dir_str}/{site_name}: {e}")
+                                print(
+                                    "  Warning: Failed to build consensus for "
+                                    f"{prep_dir_str}/{site_name}: {e}")
                                 consensus_dict[prep_dir_str][site_name] = None
-        
+
         # Save consensus atoms for reference/debugging
         if consensus_dict:
-            import json
             consensus_json = {}
             for prep_dir_str, sites in consensus_dict.items():
                 if sites:
@@ -3480,10 +3335,11 @@ def pretrain_with_runs(
                     for site_key, atoms in sites.items():
                         if atoms is not None:
                             # Convert set of tuples to list of lists for JSON serialization
-                            consensus_json[prep_dir_str][site_key] = sorted([list(atom) for atom in atoms])
+                            consensus_json[prep_dir_str][site_key] = sorted(
+                                [list(atom) for atom in atoms])
                         else:
                             consensus_json[prep_dir_str][site_key] = None
-            
+
             if consensus_json:
                 consensus_file = output_dir / 'environment_consensus.json'
                 with open(consensus_file, 'w') as f:
@@ -3491,29 +3347,30 @@ def pretrain_with_runs(
                 print(f"  Saved consensus to {consensus_file.name}\n")
         else:
             print()
-    
+
     # Build graph cache per system (only if using minimized mode)
     n_systems_ok = 0
     n_systems_fail = 0
-    
+
     if use_system_cache:
         print(f"\nBuilding per-system graphs ({len(system_to_runs)} systems)...")
         for system_idx, (prep_dir_str, run_indices) in enumerate(sorted(system_to_runs.items())):
             try:
                 prep_dir = Path(prep_dir_str)
-                
-                # Use first run in system to get graph_info (all runs from same system have identical structure)
+
+                # Use first run in system to get graph_info (all runs from same system
+                # have identical structure)
                 first_run_idx = run_indices[0]
                 first_run = runs[first_run_idx]
                 run_dir = Path(first_run["run_dir"])
                 gi_path = run_dir / "graph_info.json"
-                
+
                 if not gi_path.exists():
                     n_systems_fail += 1
                     continue
-                
+
                 # Compute Uni-Mol embeddings using configured structure selection
-                unimol_emb, edge_idx, nsubs_per_site, _ = _compute_unimol_embeddings_and_edges(
+                unimol_emb, edge_idx, nsubs_per_site, _ = compute_unimol_embeddings_and_edges(
                     run_dir, gi_path,
                     structure_type=structure_selection,
                     unrelaxed_system_mappings=unrelaxed_mappings,
@@ -3527,88 +3384,91 @@ def pretrain_with_runs(
                     ligand_minimized=ligand_from_minimized,
                     site_size_input=site_size_input,
                 )
-                
+
                 # Cache the system graph (shared across all runs)
                 system_graph_cache[prep_dir_str] = (unimol_emb, edge_idx, nsubs_per_site)
                 system_structure_cache[prep_dir_str] = nsubs_per_site
                 n_systems_ok += 1
-                
+
                 # Handle nested combos: look TWO levels up if in comb_* directory
                 display_name = prep_dir.parent.name
                 if is_combo_dir_name(display_name):
                     display_name = prep_dir.parent.parent.name + '/' + display_name
                 print(f"  [{system_idx + 1}/{len(system_to_runs)}] {display_name}: "
-                      f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, {edge_idx.size(1)} edges")
-            
+                      f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, {edge_idx.size(1)} "
+                      "edges")
+
             except Exception as e:
                 print(f"  System {prep_dir_str}: {e}")
                 n_systems_fail += 1
-        
-        print(f"\nPer-system graph cache ready: {n_systems_ok} systems built, {n_systems_fail} failed")
+
+        print(
+            f"\nPer-system graph cache ready: {n_systems_ok} systems built, {n_systems_fail} "
+            "failed")
     else:
-        print(f"Skipping system cache (using per-run structure selection)")
+        print("Skipping system cache (using per-run structure selection)")
         n_systems_ok = 0
         for prep_dir_str in system_to_runs.keys():
             n_systems_ok += 1
         # Still build structure cache for pairwise weights calculation
-        print(f"Building per-system structure cache (for pairwise weights)...")
+        print("Building per-system structure cache (for pairwise weights)...")
         for prep_dir_str, run_indices in sorted(system_to_runs.items()):
             try:
                 first_run_idx = run_indices[0]
                 first_run = runs[first_run_idx]
                 run_dir = Path(first_run["run_dir"])
                 gi_path = run_dir / "graph_info.json"
-                
+
                 if gi_path.exists():
                     with open(gi_path) as f:
                         gi = json.load(f)
                     # Extract nsubs_per_site from graph_info (older runs
                     # only list their sites: count substituents per site, as
-                    # _compute_unimol_embeddings_and_edges does)
+                    # compute_unimol_embeddings_and_edges does)
                     nsubs_per_site = gi.get('nsubs_per_site') or []
                     if not nsubs_per_site:
                         _per_site = collections.Counter(
-                            s.get('site') for s in (gi.get('sites') or {}).values() if s.get('site') is not None)
+                            s.get('site') for s in (gi.get('sites') or {}).values()
+                            if s.get('site') is not None)
                         nsubs_per_site = [_per_site[s] for s in sorted(_per_site)]
                     system_structure_cache[prep_dir_str] = nsubs_per_site
             except Exception:
                 pass  # Graceful degradation
-    
+
     # Now build per-run targets cache
     graph_cache = [None] * len(runs)
     n_ok = 0
     n_fail = 0
-    
-    print(f"\n{'='*60}")
+
+    print(f"\n{'=' * 60}")
     if use_system_cache:
-        print(f"Pre-building per-run targets (using system cache)...")
+        print("Pre-building per-run targets (using system cache)...")
     else:
-        print(f"Pre-building per-run embeddings and targets...")
+        print("Pre-building per-run embeddings and targets...")
         print(f"(structure selection: {structure_selection})")
-    print(f"{'='*60}")
-    
+    print(f"{'=' * 60}")
+
     for run_idx, run in enumerate(runs):
         try:
             run_dir = Path(run["run_dir"])
             prep_dir = run_dir.parent / "prep"
             prep_dir_str = str(prep_dir)
             gi_path = run_dir / "graph_info.json"
-            
+
             if not gi_path.exists():
                 n_fail += 1
                 continue
-            
+
             # Determine structure type for this run
             if use_system_cache:
                 # Minimized mode: use cached system embeddings
                 if prep_dir_str not in system_graph_cache:
                     n_fail += 1
                     continue
-                
+
                 unimol_emb, edge_idx, nsubs_per_site = system_graph_cache[prep_dir_str]
                 struct_type_used = 'minimized'
-                source_info = 'system_cache'
-                
+
             else:
                 # Random or unrelaxed mode: compute per-run with selected structure
                 # Handle nested combos: look TWO levels up if in comb_* directory
@@ -3616,13 +3476,14 @@ def pretrain_with_runs(
                 if is_combo_dir_name(system_name):
                     system_name = prep_dir.parent.parent.name
                 struct_type_used = _select_structure_type_for_run(
-                    run_idx, 
+                    run_idx,
                     structure_selection,
                     system_name=system_name,
                     skip_patterns=skip_unrelaxed_for_systems
                 )
-                
-                unimol_emb, edge_idx, nsubs_per_site, rep_source = _compute_unimol_embeddings_and_edges(
+
+                (unimol_emb, edge_idx, nsubs_per_site,
+                 rep_source) = compute_unimol_embeddings_and_edges(
                     run_dir, gi_path,
                     structure_type=struct_type_used,
                     unrelaxed_system_mappings=unrelaxed_mappings,
@@ -3636,7 +3497,7 @@ def pretrain_with_runs(
                     ligand_minimized=ligand_from_minimized,
                     site_size_input=site_size_input,
                 )
-                
+
                 # Track representation choice
                 track_representation_choice(
                     tracking_file,
@@ -3647,40 +3508,40 @@ def pretrain_with_runs(
                     prep_dir_used=Path(rep_source['prep_dir_used']),
                     explicit_mapping=rep_source['explicit_mapping'],
                 )
-                source_info = rep_source['source']
                 # the structure the run's graph was built with sizes its
                 # pairwise weights (structure cache above may be empty)
                 system_structure_cache[prep_dir_str] = nsubs_per_site
-            
+
             # Extract run-specific targets from variables.py
-            from mllf.cb.graph_utils import build_directed_pairs
             pairs = build_directed_pairs(nsubs_per_site)
-            targets = _extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
-            
+            targets = extract_targets_from_variables(run_dir, nsubs_per_site, pairs)
+
             if targets and edge_idx.size(1) > 0:
                 # Cache: (unimol_embeddings [N, 512], edge_index [2, E], targets [E, 4])
                 graph_cache[run_idx] = (unimol_emb, edge_idx, targets)
                 n_ok += 1
             else:
                 n_fail += 1
-            
+
             if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
                 pct = 100 * n_ok / (run_idx + 1) if (run_idx + 1) > 0 else 0
-                print(f"  {run_idx + 1}/{len(runs)} runs ({n_ok} cached, {n_fail} failed, {pct:.0f}%)...")
-        
+                print(f"  {run_idx + 1}/{len(runs)} runs ({n_ok} cached, {n_fail} failed, "
+                      f"{pct:.0f}%)...")
+
         except Exception as e:
             print(f"  Run {run_idx}: {e}")
             n_fail += 1
-    
+
     print(f"\nRun cache ready: {n_ok} runs cached, {n_fail} failed")
     if not use_system_cache:
         print(f"Representation tracking: {tracking_file}")
-    
-    # Build per-run pairwise confidence weights cache (based on population balance and DDG reliability)
-    print(f"\n{'='*60}")
-    print(f"Building per-run pairwise confidence weights...")
-    print(f"{'='*60}")
-    
+
+    # Build per-run pairwise confidence weights cache (based on population
+    # balance and DDG reliability)
+    print(f"\n{'=' * 60}")
+    print("Building per-run pairwise confidence weights...")
+    print(f"{'=' * 60}")
+
     pairwise_weights_cache = [None] * len(runs)
     n_weights_ok = 0
     # Data hygiene bookkeeping: per bias type, edges whose target counts.
@@ -3692,17 +3553,16 @@ def pretrain_with_runs(
             run_dir = Path(run["run_dir"])
             prep_dir = run_dir.parent / "prep"
             prep_dir_str = str(prep_dir)
-            
+
             # Get system structure info (always available)
             if prep_dir_str not in system_structure_cache:
                 continue
-            
+
             nsubs_per_site = system_structure_cache[prep_dir_str]
-            
+
             # Build pairs for this system
-            from mllf.cb.graph_utils import build_directed_pairs
             pairs = build_directed_pairs(nsubs_per_site)
-            
+
             # Compute pairwise confidence weights from simulation results
             if "sim_results" in run:
                 weights = compute_pairwise_confidence_weights(
@@ -3719,7 +3579,7 @@ def pretrain_with_runs(
                     pairwise_weights_cache[run_idx] = weights
                     n_weights_ok += 1
 
-        except Exception as e:
+        except Exception:
             # If pairwise weighting fails, just skip for this run (graceful degradation)
             pass
 
@@ -3728,15 +3588,16 @@ def pretrain_with_runs(
 
     print(f"\nPairwise confidence weights ready: {n_weights_ok} runs with weights")
     if n_weights_ok > 0:
-        print(f"  Pairwise AWR weighting: ENABLED")
+        print("  Pairwise AWR weighting: ENABLED")
     if data_hygiene:
         _frac = _kept / max(_edges_total, 1)
         print(f"  Data hygiene: targets kept only where measured (of {_edges_total} edges): "
               f"linear {_frac[0]:.1%}, quadratic {_frac[1]:.1%}, skew {_frac[2]:.1%}, "
               f"end {_frac[3]:.1%}; {len(runs) - n_weights_ok} runs without usable "
-              f"populations contribute nothing")
-    
-    # Build per-pair advantage cache if requested (enables per-edge, per-dimension AWR in pretrain_epoch)
+              "populations contribute nothing")
+
+    # Build per-pair advantage cache if requested (enables per-edge,
+    # per-dimension AWR in pretrain_epoch)
     pair_reward_cache = [None] * len(runs)
     pair_success_cache = [None] * len(runs)
     pair_advantage_cache = None
@@ -3745,45 +3606,46 @@ def pretrain_with_runs(
     success_gate = bool(reward_config.get("success_gate", True))
 
     if use_per_pair_awr:
-        print(f"\n{'='*60}")
-        print(f"Building per-pair reward cache for per-edge, per-dimension AWR...")
-        print(f"{'='*60}")
-        
+        print(f"\n{'=' * 60}")
+        print("Building per-pair reward cache for per-edge, per-dimension AWR...")
+        print(f"{'=' * 60}")
+
         n_pair_ok = 0
-        
+
         for run_idx, run in enumerate(runs):
             try:
                 run_dir = Path(run["run_dir"])
                 prep_dir = run_dir.parent / "prep"
                 prep_dir_str = str(prep_dir)
-                
+
                 # Get the edge_index for this run from graph_cache
                 if graph_cache[run_idx] is None:
                     continue
                 unimol_emb, edge_idx, targets_list = graph_cache[run_idx]
-                
+
                 # Compute per-edge, per-dimension reward
                 r_pair = _compute_run_pair_reward(run, edge_idx, reward_config)
                 if r_pair is not None:
                     pair_reward_cache[run_idx] = r_pair
                     if success_gate:
-                        pair_success_cache[run_idx] = _run_pair_success(run, edge_idx, reward_config)
+                        pair_success_cache[run_idx] = _run_pair_success(
+                            run, edge_idx, reward_config)
                     n_pair_ok += 1
-            
-            except Exception as e:
+
+            except Exception:
                 # Graceful degradation: run will fall back to scalar reward
                 pass
-            
+
             if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
                 print(f"  {run_idx + 1}/{len(runs)} runs ({n_pair_ok} with pair rewards)...")
-        
+
         if n_pair_ok:
             success_floor = reward_config.get("success_advantage_floor", -2.0)
             pair_advantage_cache, baseline_mean, baseline_std = pair_advantages(
                 pair_reward_cache,
                 pair_success=pair_success_cache if success_gate else None,
                 success_floor=success_floor)
-            print(f"\nPer-pair reward baseline computed:")
+            print("\nPer-pair reward baseline computed:")
             print(f"  Runs with per-pair rewards: {n_pair_ok}/{len(runs)}")
             print(f"  Baseline mean [lin, quad, skew, end]: {baseline_mean.numpy()}")
             print(f"  Baseline  std [lin, quad, skew, end]: {baseline_std.numpy()}")
@@ -3794,10 +3656,10 @@ def pretrain_with_runs(
                              if ok is not None and sh == short]
                     n_edges = sum(int(f.numel()) for f in flags)
                     n_passed = sum(int(f.sum()) for f in flags)
-                    print(f"  Success gate, {name} runs (short = under {0.5 * full_length_ns:g} ns): "
-                          f"{n_passed}/{n_edges} edges passed the online "
-                          f"{'short-run' if short else 'full-run'} test")
-    
+                    print(f"  Success gate, {name} runs (short = under "
+                          f"{0.5 * full_length_ns:g} ns): {n_passed}/{n_edges} edges passed "
+                          f"the online {'short-run' if short else 'full-run'} test")
+
     # For compatibility with pretrain_epoch, use a simple grouping (one run per group)
     # This allows us to reuse the per-graph gradient accumulation logic if needed
     epoch_groups = {f"run_{i}": [i] for i in range(len(runs)) if graph_cache[i] is not None}
@@ -3834,15 +3696,15 @@ def pretrain_with_runs(
         print("  Warning: all rewards zero or negative — disabling reward weighting.")
         reward_weighted = False
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Starting behavior cloning for {epochs} epochs")
     print(f"Training on {len(runs)} runs ({n_ok} with valid graphs)")
     if reward_weighted:
         print("Reward-weighted loss: ENABLED")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     for epoch in range(start_epoch, epochs):
-        print(f"Epoch {epoch+1}/{epochs}")
+        print(f"Epoch {epoch + 1}/{epochs}")
 
         stats = pretrain_epoch(
             policy, active_opt, runs, reward_config, device,
@@ -3854,7 +3716,8 @@ def pretrain_with_runs(
             reward_weighted=reward_weighted,
             awr_temperature=awr_temperature,
             pairwise_weights_cache=pairwise_weights_cache,
-            unimol_config={'environment_cutoff': env_cutoff, 'use_environment_difference': use_environment_difference,
+            unimol_config={'environment_cutoff': env_cutoff,
+                           'use_environment_difference': use_environment_difference,
                            'env_input': env_input, 'ligand_other_sites': ligand_other_sites,
                            'site_size_input': site_size_input},
             consensus_dict=consensus_dict,  # Pass consensus for environment filtering
@@ -3864,7 +3727,8 @@ def pretrain_with_runs(
         )
 
         print(f"  AWR Loss: {stats['loss']:.4f}")
-        print(f"  Runs processed: {stats['num_runs']} ({stats.get('num_updates', stats['num_runs'])} grad steps)")
+        print(f"  Runs processed: {stats['num_runs']} "
+              f"({stats.get('num_updates', stats['num_runs'])} grad steps)")
         print(f"  LR: {active_sched.get_last_lr()[0]:.6f}")
 
         # Step LR scheduler after each epoch
@@ -3876,14 +3740,17 @@ def pretrain_with_runs(
             epochs_without_improvement = 0
 
             best_path = output_dir / "best_policy.pt"
-            _ckpt = {'policy_state': policy.state_dict(), 'epoch': epoch + 1, 'loss': stats['loss']}
+            _ckpt = {
+                'policy_state': policy.state_dict(),
+                'epoch': epoch + 1,
+                'loss': stats['loss']}
             torch.save(_ckpt, best_path)
             print(f"  Saved best model (loss: {best_loss:.4f})")
         else:
             epochs_without_improvement += 1
 
         # Save checkpoint
-        checkpoint_path = output_dir / f"checkpoint_epoch_{epoch+1:03d}.pt"
+        checkpoint_path = output_dir / f"checkpoint_epoch_{epoch + 1:03d}.pt"
         _epoch_ckpt = {
             'policy_state': policy.state_dict(),
             'optimizer_state': active_opt.state_dict(),
@@ -3895,9 +3762,10 @@ def pretrain_with_runs(
 
         # Early stopping
         if epochs_without_improvement >= patience:
-            print(f"\nEarly stopping: no improvement for {patience} epochs (best loss: {best_loss:.4f})")
+            print(f"\nEarly stopping: no improvement for {patience} epochs (best loss: "
+                  f"{best_loss:.4f})")
             break
-    
+
     # Save final model
     final_path = output_dir / "final_policy.pt"
     _final_ckpt = {'policy_state': policy.state_dict(), 'epoch': epochs}
@@ -3910,9 +3778,9 @@ def pretrain_with_runs(
     # BayesianLinearHead's posterior mean warm-started from the deterministic
     # readout (see initialize_bayesian_heads_from_pretrained).
     if bayesian_heads:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("NeuralLinear + TS: building Bayesian-head sibling checkpoint(s)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         try:
             _hygiene_weights = pairwise_weights_cache if data_hygiene else None
             noise_vars = estimate_reward_noise_variance(
@@ -3970,32 +3838,32 @@ def pretrain_with_runs(
         'training_method': 'behavior_cloning',
         'device': str(device),
     }
-    
+
     with open(output_dir / "pretrain_metadata.json", 'w') as f:
         json.dump(metadata, f, indent=2)
-    
-    print(f"\n{'='*60}")
-    print(f"Behavior cloning complete!")
+
+    print(f"\n{'=' * 60}")
+    print("Behavior cloning complete!")
     print(f"Best MSE loss: {best_loss:.4f}")
     print(f"Saved to: {output_dir}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # Restore original warning handler
     warnings.showwarning = _orig_showwarning
 
     # Print deduplicated warning summary
     if _warning_counts:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Warning Summary ({sum(_warning_counts.values())} total occurrences, "
               f"{len(_warning_counts)} unique types)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         for (cat, template), count in sorted(_warning_counts.items(),
-                                              key=lambda kv: -kv[1]):
+                                             key=lambda kv: -kv[1]):
             example_text, ex_file, ex_line = _warning_example[(cat, template)]
             short_file = Path(ex_file).name if ex_file else '?'
             print(f"  [{count:5d}x] {cat} ({short_file}:{ex_line})")
             print(f"           {template[:120]}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
 
 def main():
@@ -4007,13 +3875,17 @@ def main():
         type=str,
         action='append',
         default=None,
-        help="Directory containing collected pretraining data (can specify multiple times). Mutually exclusive with --manifest-file.",
+        help="Directory containing collected pretraining data (can specify multiple times). "
+             "Mutually exclusive with --manifest-file.",
     )
     parser.add_argument(
         "--manifest-file",
         type=str,
         default=None,
-        help="Path to a JSON manifest file containing a list of pretraining directories. One directory path per line, or a JSON object with 'directories' key. Use this instead of --pretraining-dir when you have too many directories (avoids 'Argument list too long' error).",
+        help="Path to a JSON manifest file containing a list of pretraining directories. One "
+             "directory path per line, or a JSON object with 'directories' key. Use this instead "
+             "of --pretraining-dir when you have too many directories (avoids 'Argument list too "
+             "long' error).",
     )
     parser.add_argument(
         "--output-dir",
@@ -4049,23 +3921,27 @@ def main():
     parser.add_argument(
         "--use-best-only",
         action="store_true",
-        help="If set, filter to best run per system. Otherwise use all valid runs (default: use all)",
+        help="If set, filter to best run per system. Otherwise use all valid runs (default: use "
+             "all)",
     )
     parser.add_argument(
         "--use-sparse-graphs",
         action="store_true",
-        help="If set, use sparse graphs (only non-zero coefficient edges). By default, uses fully-connected graphs with all pairs within sites for richer training data.",
+        help="If set, use sparse graphs (only non-zero coefficient edges). By default, uses "
+             "fully-connected graphs with all pairs within sites for richer training data.",
     )
     parser.add_argument(
         "--no-filter-outliers",
         action="store_true",
-        help="If set, disable statistical filtering of outlier runs. By default, runs with coefficients outside ±N standard deviations are excluded.",
+        help="If set, disable statistical filtering of outlier runs. By default, runs with "
+             "coefficients outside ±N standard deviations are excluded.",
     )
     parser.add_argument(
         "--outlier-std-threshold",
         type=float,
         default=3.0,
-        help="Number of standard deviations for outlier threshold (default: 3.0). Runs with any coefficient exceeding mean ± N*std are excluded.",
+        help="Number of standard deviations for outlier threshold (default: 3.0). Runs with any "
+             "coefficient exceeding mean ± N*std are excluded.",
     )
     parser.add_argument(
         "--min-transitions",
@@ -4081,7 +3957,9 @@ def main():
         "--min-reward-threshold",
         type=float,
         default=None,
-        help="Minimum reward threshold for filtering runs (e.g., 5.0). If set, only runs with reward >= threshold are used for pretraining. Ignored when --stratified-negative-fraction is set.",
+        help="Minimum reward threshold for filtering runs (e.g., 5.0). If set, only runs with "
+             "reward >= threshold are used for pretraining. Ignored when "
+             "--stratified-negative-fraction is set.",
     )
     parser.add_argument(
         "--stratified-negative-fraction",
@@ -4089,7 +3967,8 @@ def main():
         default=None,
         metavar="F",
         help="If set, keep all positive-reward runs and sample negative-reward buckets with a "
-             "quadratic ramp: worst bucket (-inf,-50] keeps 0%%, best bucket (-10,0) keeps this fraction. "
+             "quadratic ramp: worst bucket (-inf,-50] keeps 0%%, best bucket (-10,0) keeps this "
+             "fraction. "
              "E.g. 0.55 ramps from 0%% to 55%% (quadratic schedule). "
              "When specified, --min-reward-threshold is ignored. Default: disabled.",
     )
@@ -4211,11 +4090,11 @@ def main():
              "basename. Repeat the flag to emphasize multiple systems.",
     )
     args = parser.parse_args()
-    
+
     # Load config
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    
+
     # Determine which directories to load from: manifest file or command-line args
     pretraining_dirs = []
     if args.manifest_file:
@@ -4226,7 +4105,7 @@ def main():
         try:
             with open(args.manifest_file, 'r') as f:
                 content = f.read().strip()
-            
+
             # Try to parse as JSON first
             try:
                 manifest_data = json.loads(content)
@@ -4235,12 +4114,13 @@ def main():
                 elif isinstance(manifest_data, list):
                     pretraining_dirs = manifest_data
                 else:
-                    print(f"Error: Manifest file must contain a 'directories' key or be a JSON array")
+                    print("Error: Manifest file must contain a 'directories' key or be a JSON "
+                          "array")
                     sys.exit(1)
             except json.JSONDecodeError:
                 # Fall back to line-separated format
                 pretraining_dirs = [line.strip() for line in content.split('\n') if line.strip()]
-            
+
             print(f"  Found {len(pretraining_dirs)} directories in manifest")
         except FileNotFoundError:
             print(f"Error: Manifest file not found: {args.manifest_file}")
@@ -4253,7 +4133,7 @@ def main():
     else:
         print("Error: Must specify either --pretraining-dir or --manifest-file")
         sys.exit(1)
-    
+
     # Combine runs from all pretraining directories
     all_runs = []
     for pretrain_dir_str in pretraining_dirs:
@@ -4270,7 +4150,7 @@ def main():
         for run in runs:
             run['system_label'] = system_label
         all_runs.extend(runs)
-    
+
     print(f"\nTotal runs from all directories: {len(all_runs)}")
     if args.max_runs is not None and len(all_runs) > args.max_runs:
         all_runs = random.Random(0).sample(all_runs, args.max_runs)
@@ -4281,15 +4161,18 @@ def main():
         for entry in args.emphasize_systems:
             name, sep, weight_str = entry.rpartition(':')
             if not sep:
-                print(f"  Warning: --emphasize-systems entry '{entry}' missing ':WEIGHT' — skipping")
+                print(
+                    f"  Warning: --emphasize-systems entry '{entry}' missing ':WEIGHT' — skipping")
                 continue
             try:
                 system_emphasis[name] = float(weight_str)
             except ValueError:
-                print(f"  Warning: --emphasize-systems entry '{entry}' has non-numeric weight — skipping")
+                print(
+                    f"  Warning: --emphasize-systems entry '{entry}' has non-numeric weight — "
+                    "skipping")
         if system_emphasis:
             print(f"System emphasis weights: {system_emphasis}")
-    
+
     # Run pretraining with combined runs
     pretrain_with_runs(
         runs=all_runs,

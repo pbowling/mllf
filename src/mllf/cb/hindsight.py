@@ -63,6 +63,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from mllf.cb.pair_weights import is_finite
+import yaml
+
 KB_KCAL = 0.0019872041
 DEFAULT_TEMPERATURE = 298.15
 
@@ -71,7 +74,7 @@ DEFAULT_TEMPERATURE = 298.15
 BARRIER_C_SLOPE = -0.233
 SKEW_X_SLOPE = 0.19      # skew: -0.19 per unit x[lo][hi], +0.19 per unit x[hi][lo]
 END_S_SLOPE_HI = 0.44    # end (K_hi - K_lo): -0.44 per unit s[lo][hi]
-END_S_SLOPE_LO = 0.46    #                     +0.46 per unit s[hi][lo]
+END_S_SLOPE_LO = 0.46  # +0.46 per unit s[hi][lo]
 
 # Trust-region caps on one correction (bandit.hindsight_*_step_cap). The b and
 # c values follow the step limits of ALF's flattening (1.5 x its cutoffs); x and
@@ -155,7 +158,6 @@ OFFSET_DIMS = {name: d for d, name in enumerate(BIAS_DIMS)}
 
 def read_applied_biases(run_dir) -> Optional[Dict[str, List]]:
     """The b/c/x/s matrices a run actually used, from its ``variables.py``."""
-    import yaml
     path = Path(run_dir) / 'variables.py'
     if not path.exists():
         return None
@@ -170,10 +172,6 @@ def read_applied_biases(run_dir) -> Optional[Dict[str, List]]:
     if b and isinstance(b[0], list):
         b = b[0]
     return {'b': b, 'c': data.get('c'), 'x': data.get('x'), 's': data.get('s')}
-
-
-def _finite(v) -> bool:
-    return v is not None and isinstance(v, (int, float)) and math.isfinite(v)
 
 
 def _capped(delta: float, cap: float, base_var: float) -> Tuple[float, float]:
@@ -228,7 +226,7 @@ def quadratic_hindsight(c: float, barrier: Optional[float], barrier_target: floa
                         slope: float = BARRIER_C_SLOPE,
                         step_cap: float = QUADRATIC_STEP_CAP) -> Tuple[float, float]:
     """Target and variance for c from the pair's midpoint barrier."""
-    if not _finite(barrier):
+    if not is_finite(barrier):
         return c, math.inf
     clipped, var = _capped((barrier - barrier_target) / abs(slope), step_cap,
                            (BARRIER_SD / slope) ** 2)
@@ -242,7 +240,7 @@ def skew_hindsight(x_lh: float, x_hl: float, skew: Optional[float],
     Removing the asymmetry needs -0.19 dx_lh + 0.19 dx_hl = -skew; the step is
     split equally: dx_lh = skew / (2 * 0.19), dx_hl = -dx_lh.
     """
-    if not _finite(skew):
+    if not is_finite(skew):
         return (x_lh, math.inf), (x_hl, math.inf)
     step, var = _capped(skew / (2.0 * SKEW_X_SLOPE), step_cap,
                         (SKEW_SD / (2.0 * SKEW_X_SLOPE)) ** 2)
@@ -256,7 +254,7 @@ def end_hindsight(s_lh: float, s_hl: float, end: Optional[float],
     Removing it needs -0.44 ds_lh + 0.46 ds_hl = -end; split equally:
     ds_lh = end / (2 * 0.44), ds_hl = -end / (2 * 0.46).
     """
-    if not _finite(end):
+    if not is_finite(end):
         return (s_lh, math.inf), (s_hl, math.inf)
     d_lh, v_lh = _capped(end / (2.0 * END_S_SLOPE_HI), step_cap,
                          (END_SD / (2.0 * END_S_SLOPE_HI)) ** 2)
@@ -337,7 +335,8 @@ def node_transition_counts(saved_data: Dict, nodes: Sequence[int],
     return counts
 
 
-def _site_transitions(saved_data: Dict, nodes: Sequence[int], block_offset: int = 2) -> Optional[int]:
+def _site_transitions(
+        saved_data: Dict, nodes: Sequence[int], block_offset: int = 2) -> Optional[int]:
     """Total transitions between the site's substituents (None if unknown)."""
     counts = node_transition_counts(saved_data, nodes, block_offset)
     return None if counts is None else sum(counts.values()) // 2
@@ -545,7 +544,8 @@ def grow_directional_b_steps(state: Dict, system: str, labels: List[Tuple[int, i
         if bracket['lo'] is not None and bracket['hi'] is not None:
             # kept after the bracket clears (system_stages.pair_bracketed, sticky)
             entry['long_runs'] = True
-        if bracket['lo'] is not None and bracket['hi'] is not None and bracket['lo'] > bracket['hi']:
+        if (bracket['lo'] is not None and bracket['hi'] is not None
+                and bracket['lo'] > bracket['hi']):
             # inverted: unlock (see docstring)
             target_c = 0.5 * (bracket['lo'] + bracket['hi'])
             entry.pop('b_bracket', None)
@@ -939,7 +939,8 @@ def apply_pair_offsets(actions: torch.Tensor, mean: torch.Tensor, state: Optiona
     sd = base_sd x explore factor, capped by the offset posterior sd once the
     slot has observations. Slots without observations are left to the model's
     own Thompson sample until the pair's exploration has widened (factor > 1,
-    after an unexplained failure); then a draw around 0 is added to it. Slots WITH observations replace
+    after an unexplained failure); then a draw around 0 is added to it. Slots WITH
+    observations replace
     it: proposal = model mean + offset draw, so once a pair has measured a
     coefficient its own posterior, not the shared model's noise, sets how far
     the next proposal explores.
@@ -999,7 +1000,8 @@ def apply_pair_offsets(actions: torch.Tensor, mean: torch.Tensor, state: Optiona
     return out, len(shifted)
 
 
-def cap_quadratic(actions: torch.Tensor, mean: torch.Tensor, cap: Optional[Dict[str, float]]) -> Tuple[torch.Tensor, int]:
+def cap_quadratic(actions: torch.Tensor, mean: torch.Tensor,
+                  cap: Optional[Dict[str, float]]) -> Tuple[torch.Tensor, int]:
     """Keep each edge's c within the model's prediction +- max(floor,
     fraction x |prediction|) (bandit key c_cap: {floor, fraction}), on a copy.
     Pair offsets and barrier-trap steps (apply_pair_offsets) can otherwise
@@ -1186,17 +1188,21 @@ def record_pair_outcomes(state: Dict, system: str, labels: List[Tuple[int, int]]
             if bool(stuck[k]):
                 entry['run_both'] = True
             if stage:
-                st = entry.setdefault('stages', {}).setdefault(stage, {'visits': 0, 'successes': 0})
+                st = entry.setdefault(
+                    'stages', {}).setdefault(
+                    stage, {
+                        'visits': 0, 'successes': 0})
                 st['visits'] += 1
                 st['successes'] += 1 if success else 0
                 if epoch is not None and st.get('last_epoch') != int(epoch):
                     st['last_epoch'] = int(epoch)
                     st['epochs'] = int(st.get('epochs', 0)) + 1
                 if short:
-                    st['short_promising'] = int(st.get('short_promising', 0)) + (0 if failed else 1)
+                    st['short_promising'] = int(
+                        st.get('short_promising', 0)) + (0 if failed else 1)
                 if short and partial_runs > 0 and pair_succeeded(
-                        saved_data, i, j, site=sites.get(i), min_transitions=partial_min_transitions,
-                        min_fraction=short_min_fraction):
+                        saved_data, i, j, site=sites.get(i),
+                        min_transitions=partial_min_transitions, min_fraction=short_min_fraction):
                     st['partial_runs'] = int(st.get('partial_runs', 0)) + 1
                     if st['partial_runs'] >= partial_runs:
                         st['partial_resolved'] = True

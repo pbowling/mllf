@@ -3,55 +3,42 @@
 Assembles core, substituent, reference-site, and optional environment atoms.
 The APIs support ligand-only/full dual embeddings and phase-feature inputs.
 """
-
-import numpy as np
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import warnings
-import json
+import functools
 import hashlib
+import json
 import os
 import re
+import tempfile
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 
 from unimol_tools import UniMolRepr
 
+from mllf.cb.policy import ENV_INPUTS, PHASE_DIM, PHASE_NODE_INPUTS
 from mllf.file_handling.generate_combinations import is_combo_dir_name
-# Import existing infrastructure for coordinate extraction
 from mllf.file_handling.read_pdb import (
     parse_pdb_file,
     find_reference_subs_from_other_sites,
     extract_site_number,
-    calculate_min_distance,
 )
 
 
-# Global Uni-Mol representation model (initialized once for efficiency)
-_unimol_model = None
-
-
+@functools.lru_cache(maxsize=None)
 def _get_unimol_model(use_cuda: bool = False) -> UniMolRepr:
-    """Initialize or retrieve the global Uni-Mol model instance.
-    
-    The model is initialized once and cached to avoid repeated downloads/loading.
-    The Uni-Mol v1 84M model is pretrained on 1.1B molecules from PubChem.
-    
-    Args:
-        use_cuda: Whether to use GPU (default: False for CPU inference)
-        
-    Returns:
-        UniMolRepr: Initialized Uni-Mol representation model
-    """
-    global _unimol_model
-    if _unimol_model is None:
-        _unimol_model = UniMolRepr(
-            remove_hs=False,  # Keep hydrogen atoms for accurate 3D geometry
-            use_cuda=use_cuda,
-            batch_size=32,
-            model_name='unimolv1',
-            model_size='84m',
-            max_atoms=256,  # Uni-Mol max atom capacity
-        )
-    return _unimol_model
+    """The Uni-Mol v1 84M representation model (pretrained on 1.1B PubChem
+    molecules), loaded once per process for each ``use_cuda`` setting.
+    ``_get_unimol_model.cache_clear()`` releases it."""
+    return UniMolRepr(
+        remove_hs=False,  # Keep hydrogen atoms for accurate 3D geometry
+        use_cuda=use_cuda,
+        batch_size=32,
+        model_name='unimolv1',
+        model_size='84m',
+        max_atoms=256,  # Uni-Mol max atom capacity
+    )
 
 
 def _read_atom_names_from_pdb(pdb_path: Path) -> List[str]:
@@ -62,10 +49,10 @@ def _read_atom_names_from_pdb(pdb_path: Path) -> List[str]:
     uppercase so that mixed-case frag.pdb names (e.g., ``Br0B``) match the
     all-uppercase names written by CHARMM into minimized.pdb (``BR0B``).
     Returns an empty list on any error so callers can fall back gracefully.
-    
+
     Args:
         pdb_path: Path to PDB file
-        
+
     Returns:
         List of atom names (uppercase) in order from ATOM/HETATM records
     """
@@ -89,10 +76,10 @@ def _read_box_from_prep_script(prep_dir: Path) -> Optional[float]:
     Searches for a ``box = <number>`` assignment in the main prep ``.py`` file
     (any ``.py`` other than ``alf_info.py``) in prep_dir. Returns None
     if no such file or line is found, so the caller can skip MIC gracefully.
-    
+
     Args:
         prep_dir: Path to prep directory
-        
+
     Returns:
         Cubic box length as float, or None if not found
     """
@@ -137,8 +124,7 @@ def _convert_crd_to_tmp_pdb(crd_path: Path) -> Path:
     Raises:
         ValueError: If no atoms were successfully parsed from the file.
     """
-    import tempfile
-    
+
     atoms = []
     with open(crd_path, 'r') as fh:
         for raw in fh:
@@ -157,16 +143,16 @@ def _convert_crd_to_tmp_pdb(crd_path: Path) -> Path:
             if len(line) < 100:
                 continue
             try:
-                atom_no  = int(line[0:10])
-                res_no   = int(line[10:20])
-                resname  = line[22:30].strip()
+                atom_no = int(line[0:10])
+                res_no = int(line[10:20])
+                resname = line[22:30].strip()
                 atomname = line[32:40].strip()
-                x        = float(line[40:60])
-                y        = float(line[60:80])
-                z        = float(line[80:100])
-                segid    = line[102:110].strip() if len(line) > 110 else ''
+                x = float(line[40:60])
+                y = float(line[60:80])
+                z = float(line[80:100])
+                segid = line[102:110].strip() if len(line) > 110 else ''
                 # Derive single-char PDB chain from segid (PROA→A, PROB→B …)
-                chain    = segid[-1] if segid and segid[-1].isalpha() else 'A'
+                chain = segid[-1] if segid and segid[-1].isalpha() else 'A'
                 atoms.append((atom_no, res_no, resname, atomname, x, y, z, chain))
             except (ValueError, IndexError):
                 continue
@@ -178,7 +164,19 @@ def _convert_crd_to_tmp_pdb(crd_path: Path) -> Path:
         mode='w', suffix='.pdb', prefix='minimized_crd_', delete=False
     )
     try:
-        _TWO_CHAR_ELEMENTS = {'CL', 'BR', 'FE', 'MG', 'ZN', 'MN', 'NA', 'CU', 'CO', 'NI', 'SE', 'SI'}
+        _TWO_CHAR_ELEMENTS = {
+            'CL',
+            'BR',
+            'FE',
+            'MG',
+            'ZN',
+            'MN',
+            'NA',
+            'CU',
+            'CO',
+            'NI',
+            'SE',
+            'SI'}
         for atom_no, res_no, resname, atomname, x, y, z, chain in atoms:
             # PDB atom name: 4-char names fill cols 13-16; shorter get a leading space
             aname_col = atomname[:4] if len(atomname) >= 4 else f' {atomname:<3}'
@@ -188,8 +186,8 @@ def _convert_crd_to_tmp_pdb(crd_path: Path) -> Path:
                 elem = alpha[:2].capitalize()
             else:
                 elem = alpha[:1] if alpha else 'X'
-            serial  = atom_no % 100000
-            res_seq = res_no  % 10000
+            serial = atom_no % 100000
+            res_seq = res_no % 10000
             tmp.write(
                 f"ATOM  {serial:5d} {aname_col} {resname[:3]:3s} {chain}{res_seq:4d}    "
                 f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem:>2s}\n"
@@ -208,7 +206,7 @@ def _extract_atom_identifiers_from_pdb(
     return_distances: bool = False,
 ) -> set:
     """Extract unique atom identifiers from PDB file, optionally filtered by distance.
-    
+
     Each atom is identified by its (file_index, residue_number, chain_id, atom_name)
     tuple, where file_index is the atom's 0-based position among ATOM/HETATM records
     in the file. The file_index is required for uniqueness: (resnum, chain, atomname)
@@ -217,21 +215,22 @@ def _extract_atom_identifiers_from_pdb(
     share the same (resnum, chain, atomname). Since consensus atoms are always built
     from and matched against the SAME physical environment file, the file index is a
     safe, unambiguous identifier.
-    
+
     Args:
         pdb_path: Path to PDB file
         ligand_coords: Optional [N_ligand, 3] coordinates. If provided, only returns
             identifiers for atoms within ligand_cutoff distance.
         ligand_cutoff: Distance cutoff (Å) for filtering atoms (only if ligand_coords provided)
-        return_distances: If True and ligand_coords provided, return dict mapping atom_ids to min distances
-        
+        return_distances: If True and ligand_coords provided, return dict mapping atom_ids
+            to min distances
+
     Returns:
         Set of (file_index, resnum, chain, atomname) tuples for atoms in the PDB
         If return_distances=True: Dict of {atom_id: min_distance_to_ligand}
     """
     atom_ids = set()
     atom_distances = {}  # atom_id -> min distance to ligand
-    
+
     try:
         with open(pdb_path, 'r') as f:
             coords_list = []
@@ -245,24 +244,24 @@ def _extract_atom_identifiers_from_pdb(
                     x = float(line[30:38])
                     y = float(line[38:46])
                     z = float(line[46:54])
-                    
+
                     atom_id = (file_idx, resnum, chain, atomname)
                     atom_ids.add(atom_id)
                     coords_list.append([x, y, z])
                     atom_lines.append(atom_id)
                     file_idx += 1
-            
+
             # If ligand coordinates provided, filter by distance and track distances
             if ligand_coords is not None and len(coords_list) > 0:
                 coords_arr = np.array(coords_list, dtype=np.float32)
                 ligand_arr = np.array(ligand_coords, dtype=np.float32)
-                
+
                 # Calculate minimum distance to any ligand atom
                 distances = np.min(
                     np.linalg.norm(coords_arr[:, None, :] - ligand_arr[None, :, :], axis=2),
                     axis=1
                 )
-                
+
                 # Build filtered set and distances dict
                 atom_ids_filtered = set()
                 for idx, atom_id in enumerate(atom_lines):
@@ -270,15 +269,15 @@ def _extract_atom_identifiers_from_pdb(
                         atom_ids_filtered.add(atom_id)
                         if return_distances:
                             atom_distances[atom_id] = float(distances[idx])
-                
+
                 if return_distances:
                     return atom_distances
                 else:
                     return atom_ids_filtered
-    
+
     except Exception as e:
         warnings.warn(f"Could not extract atom identifiers from {pdb_path}: {e}")
-    
+
     if return_distances:
         return {}
     return atom_ids
@@ -358,9 +357,6 @@ def _environment_protein_candidates(prep_dir: Path) -> List[Path]:
 
 # Phase flags (env_input='phase'): [condensed, protein] -- vacuum [0, 0],
 # solvent [1, 0], protein [1, 1] -- from the system name owning the prep dir.
-from mllf.cb.policy import ENV_INPUTS, PHASE_DIM, PHASE_NODE_INPUTS  # noqa: E402
-
-
 def phase_flags(prep_dir: Path) -> np.ndarray:
     """[condensed, protein] for the system owning a prep dir (by its name)."""
     name = _system_name_for_prep(prep_dir)
@@ -410,9 +406,9 @@ def build_environment_consensus(
         if not core_coords:
             print(f"      [CONSENSUS] No coordinates found in core: {Path(core_pdb).name}")
             return None
-        
+
         core_coords = np.array(core_coords, dtype=np.float32)
-        
+
         # Try to find environment file (custom paths first, then defaults)
         env_pdb_path = None
         if custom_search_paths:
@@ -421,7 +417,7 @@ def build_environment_consensus(
                 if test_path.exists():
                     env_pdb_path = test_path
                     break
-        
+
         if env_pdb_path is None:
             # Try default locations in prep_dir first
             # Priority: protein variants → solvent variants → minimized (fallback)
@@ -437,22 +433,25 @@ def build_environment_consensus(
             core_parent = Path(core_pdb).parent
             if core_parent != prep_dir:
                 env_candidates.extend(
-                    ([] if _is_solvent_phase_prep(prep_dir) else _default_protein_pdb_candidates(core_parent))
+                    ([] if _is_solvent_phase_prep(prep_dir)
+                     else _default_protein_pdb_candidates(core_parent))
                     + _default_solvent_pdb_candidates(core_parent)
                     + [core_parent / "pre_min.pdb", core_parent / "minimized.pdb"]
                 )
-            
+
             for candidate in env_candidates:
                 if candidate.exists():
                     env_pdb_path = candidate
                     break
-        
+
         if env_pdb_path is None:
             # Debug: print available files in prep_dir
             available = list(prep_dir.glob("*.pdb"))
-            print(f"      [CONSENSUS] No environment file found in {prep_dir.name} (available: {[p.name for p in available[:3]]}...)")
+            print(
+                f"      [CONSENSUS] No environment file found in {prep_dir.name} (available: "
+                f"{[p.name for p in available[:3]]}...)")
             return None
-        
+
         # Extract atoms within env_cutoff of the core, tracking distances
         atom_dist_dict = _extract_atom_identifiers_from_pdb(
             str(env_pdb_path),
@@ -460,25 +459,27 @@ def build_environment_consensus(
             ligand_cutoff=env_cutoff,
             return_distances=True,
         )
-        
+
         if not atom_dist_dict:
-            print(f"      [CONSENSUS] No atoms within {env_cutoff}Å of core in {env_pdb_path.name}")
+            print(f"      [CONSENSUS] No atoms within {env_cutoff}Å of core in "
+                  f"{env_pdb_path.name}")
             return None
-        
+
         # Convert dict to set of atom identifiers
         consensus_atoms = set(atom_dist_dict.keys())
-        
+
         # Cap at 256 atoms - keep closest ones
         if len(consensus_atoms) > 256:
             # Sort by distance and keep 256 closest
             sorted_atoms = sorted(consensus_atoms, key=lambda a: atom_dist_dict[a])
             consensus_atoms = set(sorted_atoms[:256])
-            print(f"      [CONSENSUS] Built core consensus: {len(consensus_atoms)} atoms (capped at 256)")
+            print(f"      [CONSENSUS] Built core consensus: {len(consensus_atoms)} atoms (capped "
+                  "at 256)")
         else:
             print(f"      [CONSENSUS] Built core consensus: {len(consensus_atoms)} atoms")
-        
+
         return consensus_atoms
-    
+
     except Exception as e:
         print(f"      [CONSENSUS] Exception building core consensus: {e}")
         return None
@@ -491,20 +492,20 @@ def _filter_environment_by_consensus(
     consensus_atoms: set,
 ) -> Optional[tuple]:
     """Filter environment atoms to only include those in consensus set.
-    
+
     Args:
         coords: List of [x,y,z] coordinates from parsed PDB
         elements: List of element symbols matching coords
         pdb_path: Path to original PDB file (to extract atom identifiers)
         consensus_atoms: Set of (file_index, resnum, chain, atomname) tuples to keep
             (see _extract_atom_identifiers_from_pdb for why file_index is required)
-        
+
     Returns:
         (filtered_coords, filtered_elements) tuple, or None if no atoms match consensus
     """
     filtered_coords = []
     filtered_elements = []
-    
+
     try:
         idx = 0
         with open(pdb_path, 'r') as f:
@@ -514,23 +515,23 @@ def _filter_environment_by_consensus(
                         resnum = int(line[22:26].strip())
                         chain = line[21].strip() or 'A'
                         atomname = line[12:16].strip().upper()
-                        
+
                         # Check if this atom is in consensus (file_index disambiguates
                         # atoms that share (resnum, chain, atomname), e.g. wrapped
                         # water residue numbers in large solvent boxes)
                         if (idx, resnum, chain, atomname) in consensus_atoms:
                             filtered_coords.append(coords[idx])
                             filtered_elements.append(elements[idx])
-                    
+
                     idx += 1
-    
+
     except Exception as e:
         warnings.warn(f"Could not filter by consensus: {e}")
         return None
-    
+
     if filtered_coords:
         return (filtered_coords, filtered_elements)
-    
+
     return None
 
 
@@ -709,7 +710,9 @@ def save_embedding(
 
     # Check if already exists
     if embedding_path.exists() and not overwrite:
-        warnings.warn(f"Embedding cache already exists at {embedding_path}, skipping (use overwrite=True to replace)")
+        warnings.warn(
+            f"Embedding cache already exists at {embedding_path}, skipping (use overwrite=True to "
+            "replace)")
         return embedding_path
 
     # Save embedding: write a temporary file and rename it into place, so a job
@@ -811,87 +814,18 @@ def load_embedding(
     return None
 
 
-def _extract_ligand_from_pdb(
-    pdb_path: str,
-    core_pdb: str,
-    sub_pdb: str,
-    ref_sub_pdbs: Optional[List[str]] = None,
-) -> Optional[np.ndarray]:
-    """Extract ligand atom coordinates from minimized.pdb using atom name matching.
-    
-    This is critical for systems like cmet_solvent_group1 where minimized.pdb contains
-    the FULL system (core + all substituents from all sites + ref_subs + solvent). 
-    We need to extract only the atoms corresponding to the specific core + sub + ref_subs.
-    
-    Strategy:
-    1. Read atom names from core.pdb, sub_pdb, and all ref_sub PDBs
-    2. Build a name -> coordinate map from minimized.pdb
-    3. Extract only those atoms whose names match core + sub + ref_subs
-    4. Return their coordinates in the minimized frame
-    
-    This is robust to coordinate frame differences and PBC wrapping.
-    
-    Args:
-        pdb_path: Path to minimized.pdb (full system)
-        core_pdb: Path to core.pdb (for getting core atom names)
-        sub_pdb: Path to sub_pdb (for getting sub atom names)
-        ref_sub_pdbs: Optional list of ref_sub PDB paths (for getting their atom names)
-        
-    Returns:
-        [N_lig, 3] numpy array of ligand atom coordinates from minimized.pdb,
-        matched by atom name, or None if not found
-    """
-    try:
-        # Read atom names from core, sub, and ref_subs using shared utility
-        ligand_names = set()
-        ligand_names.update(_read_atom_names_from_pdb(Path(core_pdb)))
-        ligand_names.update(_read_atom_names_from_pdb(Path(sub_pdb)))
-        
-        # Add ref_sub atom names
-        if ref_sub_pdbs:
-            for ref_pdb in ref_sub_pdbs:
-                ligand_names.update(_read_atom_names_from_pdb(Path(ref_pdb)))
-        
-        if not ligand_names:
-            return None
-        
-        # Build name -> coordinate map from minimized.pdb
-        name_to_coord = {}
-        with open(pdb_path, 'r') as f:
-            for line in f:
-                if line.startswith('ATOM') or line.startswith('HETATM'):
-                    atom_name = line[12:16].strip().upper()
-                    x = float(line[30:38])
-                    y = float(line[38:46])
-                    z = float(line[46:54])
-                    name_to_coord[atom_name] = [x, y, z]
-        
-        # Extract ligand coordinates by matching names
-        ligand_coords = []
-        for name in ligand_names:
-            if name in name_to_coord:
-                ligand_coords.append(name_to_coord[name])
-        
-        if ligand_coords:
-            return np.array(ligand_coords, dtype=np.float32)
-    except Exception:
-        pass
-    
-    return None
-
-
 def _get_all_ligand_atom_names(
     core_pdb: str,
     sub_pdb: str,
     ref_sub_pdbs: Optional[List[str]] = None,
 ) -> set:
     """Get all ligand atom names (core + sub + ref_subs) for excluding from environment.
-    
+
     Args:
         core_pdb: Path to core PDB
         sub_pdb: Path to sub PDB
         ref_sub_pdbs: Optional list of ref_sub PDB paths
-        
+
     Returns:
         Set of atom names (uppercase) to exclude from environment
     """
@@ -901,7 +835,7 @@ def _get_all_ligand_atom_names(
     if ref_sub_pdbs:
         for ref_pdb in ref_sub_pdbs:
             atom_names.update(_read_atom_names_from_pdb(Path(ref_pdb)))
-    
+
     return atom_names
 
 
@@ -911,47 +845,48 @@ def _filter_ref_sub_by_distance(
     cutoff: float = 5.0,
 ) -> Optional[tuple]:
     """Filter a reference substituent PDB by distance to main substituent.
-    
+
     Loads a ref_sub PDB and keeps only atoms within cutoff distance of the
     main substituent. If no atoms pass the filter, returns None.
-    
+
     Args:
         ref_sub_pdb: Path to ref_sub PDB file
         sub_coords: [N_sub, 3] array of main substituent coordinates
         cutoff: Distance cutoff in Ångströms
-        
+
     Returns:
         (coords, elements) tuple for filtered ref_sub atoms, or None if no atoms pass filter
     """
     try:
         if not Path(ref_sub_pdb).exists():
             return None
-        
+
         # Load ref_sub coordinates
         ref_coords, ref_elements = parse_pdb_file(str(ref_sub_pdb))
-        
+
         if not ref_coords or len(ref_coords) == 0:
             return None
-        
+
         ref_coords = np.array(ref_coords, dtype=np.float32)
         sub_coords = np.array(sub_coords, dtype=np.float32)
-        
+
         # Calculate distances from each ref atom to closest sub atom
         # Shape: [N_ref] - minimum distance from each ref atom to any sub atom
-        distances = np.min(np.linalg.norm(ref_coords[:, None, :] - sub_coords[None, :, :], axis=2), axis=1)
-        
+        distances = np.min(np.linalg.norm(
+            ref_coords[:, None, :] - sub_coords[None, :, :], axis=2), axis=1)
+
         # Keep only atoms within cutoff
         mask = distances <= cutoff
-        
+
         if not np.any(mask):
             # No atoms within cutoff
             return None
-        
+
         # Filter atoms and sort by distance (closest first)
         filtered_indices = np.argsort(distances[mask])
         filtered_coords = ref_coords[mask][filtered_indices]
         filtered_elements = [ref_elements[i] for i in np.where(mask)[0][filtered_indices]]
-        
+
         return (filtered_coords.tolist(), filtered_elements)
     except Exception as e:
         warnings.warn(f"Could not filter ref_sub {Path(ref_sub_pdb).name}: {e}")
@@ -960,15 +895,15 @@ def _filter_ref_sub_by_distance(
 
 def _parse_crystal_box_from_pdb(pdb_path: str) -> Optional[np.ndarray]:
     """Parse CRYST1 record from PDB to get box dimensions.
-    
+
     Reads the CRYST1 line to extract lattice parameters (A, B, C) and angles.
     For cubic systems (A=B=C, THETA=90), returns isotropic box vector.
-    
+
     CRYST1 format: columns 7-15 (A), 16-24 (B), 25-33 (C), 34-40 (α), 41-47 (β), 48-54 (γ)
-    
+
     Args:
         pdb_path: Path to PDB file containing CRYST1 record
-        
+
     Returns:
         [3] numpy array [box_x, box_y, box_z] in Ångströms, or None if not found
     """
@@ -980,16 +915,16 @@ def _parse_crystal_box_from_pdb(pdb_path: str) -> Optional[np.ndarray]:
                     a = float(line[6:15])   # A
                     b = float(line[15:24])  # B
                     c = float(line[24:33])  # C
-                    
+
                     # Verify cubic system (A=B=C with 90° angles)
                     if abs(a - b) < 0.01 and abs(b - c) < 0.01:
                         return np.array([a, b, c], dtype=np.float32)
                     else:
                         # Non-cubic; return as-is
                         return np.array([a, b, c], dtype=np.float32)
-    except Exception as e:
+    except Exception:
         pass
-    
+
     return None
 
 
@@ -999,34 +934,34 @@ def _minimum_image_convention(
     box_lengths: np.ndarray
 ) -> np.ndarray:
     """Compute minimum-image distances for cubic/orthorhombic PBC.
-    
+
     For a cubic or orthorhombic cell, applies the minimum image convention:
     for each environment atom, computes displacement vectors to all ligand atoms,
     applies periodic wrapping, and returns the minimum distance to any ligand atom.
-    
+
     Vectorized implementation (no Python loops).
-    
+
     Args:
         coords_env: [N_env, 3] environment atom coordinates
         coords_lig: [N_lig, 3] ligand atom coordinates
         box_lengths: [3] box dimensions [Lx, Ly, Lz]
-        
+
     Returns:
         [N_env] array of minimum distances to any ligand atom
     """
     # Displacement vectors: [N_env, N_lig, 3]
     delta = coords_env[:, None, :] - coords_lig[None, :, :]
-    
+
     # Apply minimum image convention
     # For each component, wrap to [-L/2, L/2]
     delta = delta - box_lengths[None, None, :] * np.round(delta / box_lengths[None, None, :])
-    
+
     # Compute distances: [N_env, N_lig]
     distances = np.linalg.norm(delta, axis=2)
-    
+
     # Minimum distance to any ligand atom: [N_env]
     min_distances = np.min(distances, axis=1)
-    
+
     return min_distances
 
 
@@ -1036,31 +971,31 @@ def _wrap_coords_to_nearest_image(
     box_lengths: np.ndarray
 ) -> np.ndarray:
     """Wrap coordinates to nearest periodic image relative to ligand centroid.
-    
+
     Translates coordinates so they're in the nearest periodic image of the
     ligand centroid. Useful after PBC distance calculations to ensure returned
     coordinates are in the correct periodic image.
-    
+
     Args:
         coords: [N, 3] coordinates to wrap
         ligand_coords: [N_lig, 3] ligand atom coordinates
         box_lengths: [3] box dimensions [Lx, Ly, Lz]
-        
+
     Returns:
         [N, 3] wrapped coordinates in nearest image
     """
     # Ligand centroid
     ligand_centroid = np.mean(ligand_coords, axis=0)
-    
+
     # Displacement from centroid
     delta = coords - ligand_centroid[None, :]
-    
+
     # Apply minimum image convention
     delta = delta - box_lengths[None, :] * np.round(delta / box_lengths[None, :])
-    
+
     # Wrap back to nearest image
     wrapped = ligand_centroid[None, :] + delta
-    
+
     return wrapped
 
 
@@ -1073,10 +1008,10 @@ def _filter_and_truncate_environment_atoms(
     source_name: str = "environment",
 ) -> Optional[tuple]:
     """Filter environment atoms by distance to ligand and truncate to atom limit.
-    
+
     Applied consistently to all environment sources (minimized.pdb, protein.pdb, etc.)
     to ensure uniform behavior whether using minimized or unrelaxed structures.
-    
+
     Args:
         coords: List of [x,y,z] coordinates from parsed PDB
         elements: List of element symbols matching coords
@@ -1084,7 +1019,7 @@ def _filter_and_truncate_environment_atoms(
         ligand_cutoff: Distance cutoff (Å) for filtering atoms
         atom_limit: Maximum atoms to keep (256 for Uni-Mol)
         source_name: Name of source PDB for logging (e.g., "minimized.pdb", "protein.pdb")
-    
+
     Returns:
         (coords, elements) tuple with filtered/truncated atoms, or None if no atoms within cutoff
     """
@@ -1093,26 +1028,28 @@ def _filter_and_truncate_environment_atoms(
         if len(coords) > atom_limit:
             return (coords[:atom_limit], elements[:atom_limit])
         return (coords, elements)
-    
+
     coords_arr = np.array(coords)
     ligand_arr = np.array(ligand_coords)
-    
+
     # Calculate distances from each environment atom to nearest ligand atom
     distances = np.min(
         np.linalg.norm(coords_arr[:, None, :] - ligand_arr[None, :, :], axis=2),
         axis=1
     )
-    
+
     # Keep atoms within the ligand cutoff (environment context)
     env_mask = distances <= ligand_cutoff
     initial_atoms = np.sum(env_mask) if env_mask.any() else 0
-    
+
     # Try PBC wrapping if not enough atoms found (heuristic: < 10 suggests ligand near box edge)
     if not env_mask.any() or np.sum(env_mask) < 10:
         # If exactly 0 atoms initially, this is suspicious - print diagnostic
         if not env_mask.any():
-            print(f"        [ENV] {source_name}: 0 atoms within {ligand_cutoff} Å (ligand may be outside box), attempting PBC wrapping...")
-        
+            print(
+                f"        [ENV] {source_name}: 0 atoms within {ligand_cutoff} Å (ligand may be "
+                "outside box), attempting PBC wrapping...")
+
         try:
             # Try to estimate box from coordinates (cubic approximation)
             all_coords = np.vstack([coords_arr, ligand_arr])
@@ -1121,50 +1058,58 @@ def _filter_and_truncate_environment_atoms(
             estimated_box = max_coords - min_coords
             box_length = np.max(estimated_box)
             box_lengths = np.array([box_length, box_length, box_length], dtype=np.float32)
-            
+
             pbc_distances = _minimum_image_convention(coords_arr, ligand_arr, box_lengths)
             env_mask = pbc_distances <= ligand_cutoff
             distances = pbc_distances
-            
+
             if env_mask.any():
                 pbc_atoms = np.sum(env_mask)
                 if initial_atoms == 0:
-                    print(f"        [ENV] PBC wrapping recovered {pbc_atoms} atoms within {ligand_cutoff} Å")
+                    print(
+                        f"        [ENV] PBC wrapping recovered {pbc_atoms} atoms within "
+                        f"{ligand_cutoff} Å")
                 else:
-                    print(f"        [ENV] PBC (estimated cubic) found {pbc_atoms} atoms within {ligand_cutoff} Å")
+                    print(
+                        f"        [ENV] PBC (estimated cubic) found {pbc_atoms} atoms within "
+                        f"{ligand_cutoff} Å")
         except Exception as e:
             print(f"        [ENV] PBC wrapping failed: {e}, using direct distance filtering")
-    
+
     if not env_mask.any():
         # 0 atoms even after PBC - this is a structural issue
         if initial_atoms == 0:
-            print(f"        [ENV] ERROR: {source_name} has 0 atoms within {ligand_cutoff} Å even after PBC wrapping")
-            print(f"        [ENV]   This suggests a structure preparation issue (ligand/box mismatch)")
+            print(
+                f"        [ENV] ERROR: {source_name} has 0 atoms within {ligand_cutoff} Å even "
+                "after PBC wrapping")
+            print("        [ENV]   This suggests a structure preparation issue (ligand/box "
+                  "mismatch)")
             return None
         else:
             print(f"        [ENV] {source_name}: no atoms within {ligand_cutoff} Å of ligand")
             return None
-    
+
     # Filter by distance mask
     env_indices = np.where(env_mask)[0]
     env_distances = distances[env_indices]
-    
+
     # Sort by distance (closest first) for proper truncation priority
     sorted_order = np.argsort(env_distances)
     env_indices = env_indices[sorted_order]
-    
+
     # Apply atom limit
     if len(env_indices) > atom_limit:
         env_indices = env_indices[:atom_limit]
-    
+
     # Get filtered coordinates and elements
     filtered_coords = [coords[i] for i in env_indices]
     filtered_elements = [elements[i] for i in env_indices]
-    
+
     n_total = len(coords_arr)
     n_kept = len(filtered_coords)
-    print(f"        [ENV] {source_name}: filtered to {n_kept}/{n_total} atoms (distance <= {ligand_cutoff} Å, sorted closest-first, capped at {atom_limit})")
-    
+    print(f"        [ENV] {source_name}: filtered to {n_kept}/{n_total} atoms (distance <= "
+          f"{ligand_cutoff} Å, sorted closest-first, capped at {atom_limit})")
+
     return (filtered_coords, filtered_elements)
 
 
@@ -1200,16 +1145,19 @@ def _select_environment_atoms(
         (coords, elements) tuple, or None if no atoms were selected.
     """
     if consensus_atoms is not None:
-        filtered = _filter_environment_by_consensus(coords, elements, pdb_file_path, consensus_atoms)
+        filtered = _filter_environment_by_consensus(
+            coords, elements, pdb_file_path, consensus_atoms)
         if filtered is None:
             print(f"        [CONSENSUS] {source_name}: no atoms matched consensus set")
             return None
         filtered_coords, filtered_elements = filtered
-        print(f"        [CONSENSUS] {source_name}: selected {len(filtered_coords)} consensus atoms")
+        print(f"        [CONSENSUS] {source_name}: selected {len(filtered_coords)} consensus "
+              "atoms")
         return (filtered_coords, filtered_elements)
 
-    print(f"        [CONSENSUS] {source_name}: NOT using core consensus (none built/provided for this site) — "
-          f"falling back to distance-to-substituent filtering")
+    print(f"        [CONSENSUS] {source_name}: NOT using core consensus (none built/provided for "
+          "this site) — "
+          "falling back to distance-to-substituent filtering")
     return _filter_and_truncate_environment_atoms(
         coords=coords,
         elements=elements,
@@ -1232,28 +1180,28 @@ def _load_environment_pdb(
     consensus_atoms: Optional[set] = None,
 ) -> Optional[tuple]:
     """Load environment PDB with intelligent fallback chain and consensus filtering.
-    
+
     **Filtering:** Environment atoms are filtered by distance to SUBSTITUENT only,
     not the full ligand (core+sub+ref_subs). This focuses the environment context
     on the site of substitution.
-    
+
     **Consensus:** If consensus_atoms is provided (set of (resnum, chain, atomname) tuples),
     environment atoms are further filtered to only include atoms in the consensus set.
     This prevents odd environment noise by only including atoms that appear for all
     substituents at the site.
-    
+
     Priority order (when skip_minimized=False):
     1. Custom paths (if provided via yaml config)
     2. minimized.pdb (full system; extract core+sub+ref_subs, rest is environment)
     3. minimized.crd (CHARMM extended format; auto-converted to PDB)
     4. protein.pdb / proa.pdb / nested pdb/protein.pdb (auto-detect variants)
     5. solvent.pdb / waterbox.pdb / environment.pdb (auto-detect variants)
-    
+
     When skip_minimized=True (for unrelaxed structures), minimized.pdb and .crd are skipped:
     1. Custom paths (if provided via yaml config)
     2. protein.pdb / proa.pdb / nested pdb/protein.pdb (auto-detect variants)
     3. solvent.pdb / waterbox.pdb / environment.pdb (auto-detect variants)
-    
+
     Args:
         prep_dir: Path to prep directory containing PDB files
         sub_coords: [N_sub, 3] numpy array of substituent atom coordinates.
@@ -1264,34 +1212,39 @@ def _load_environment_pdb(
             e.g., ['pdb/protein.pdb', 'proa.pdb', 'prob.pdb']. Checked before defaults.
         core_pdb: Path to core.pdb (for extracting core atoms from minimized.pdb)
         sub_pdb: Path to sub_pdb (for extracting sub atoms from minimized.pdb)
-        ref_sub_pdbs: Optional list of paths to ref_sub PDB files (for extracting from minimized.pdb)
+        ref_sub_pdbs: Optional list of paths to ref_sub PDB files (for extracting from
+            minimized.pdb)
         skip_minimized: If True, skip minimized.pdb and minimized.crd (for unrelaxed structures)
         consensus_atoms: Optional set of (resnum, chain, atomname) tuples for consensus filtering.
             If provided, environment is further filtered to only include these atoms.
-        
+
     Returns:
         (coords [M, 3], elements [M]) tuple if environment found, else None
     """
     prep_dir = Path(prep_dir)
-    
+
     def _apply_consensus_if_needed(coords_result, elements_result, pdb_file_path):
         """Apply consensus filtering to environment if consensus_atoms provided."""
-        if consensus_atoms is not None and coords_result is not None and elements_result is not None:
+        if (consensus_atoms is not None and coords_result is not None
+                and elements_result is not None):
             filtered = _filter_environment_by_consensus(
                 coords_result, elements_result, pdb_file_path, consensus_atoms
             )
             if filtered is not None:
                 filtered_coords, filtered_elements = filtered
-                print(f"        [CONSENSUS] Filtered to {len(filtered_coords)}/{len(coords_result)} atoms by consensus")
+                print(
+                    f"        [CONSENSUS] Filtered to {len(filtered_coords)}/{len(coords_result)} "
+                    "atoms by consensus")
                 return (filtered_coords, filtered_elements)
             else:
                 # No atoms pass consensus filter
-                print(f"        [CONSENSUS] No atoms matched consensus set, skipping this source")
+                print("        [CONSENSUS] No atoms matched consensus set, skipping this source")
                 return None
-        print(f"        [CONSENSUS] {Path(pdb_file_path).name}: NOT using core consensus (none built/provided "
-              f"for this site) — using unfiltered atoms from this source")
+        print(f"        [CONSENSUS] {Path(pdb_file_path).name}: NOT using core consensus (none "
+              "built/provided "
+              "for this site) — using unfiltered atoms from this source")
         return (coords_result, elements_result)
-    
+
     # Try custom search paths first (from yaml config)
     if custom_search_paths:
         for pdb_name in custom_search_paths:
@@ -1299,29 +1252,23 @@ def _load_environment_pdb(
             if pdb_path.exists():
                 try:
                     coords, elements = parse_pdb_file(str(pdb_path))
-                    print(f"        [ENV] {pdb_path.relative_to(prep_dir)}: loaded {len(coords)} atoms (custom/configured)")
-                    return _apply_consensus_if_needed(coords, elements, str(pdb_path)) or (coords, elements)
+                    print(f"        [ENV] {pdb_path.relative_to(prep_dir)}: loaded {len(coords)} "
+                          "atoms (custom/configured)")
+                    return _apply_consensus_if_needed(
+                        coords, elements, str(pdb_path)) or (coords, elements)
                 except Exception as e:
                     warnings.warn(f"Could not load custom PDB {pdb_path}: {e}, trying next source")
-    
+
     # Try minimized.pdb first (usually contains ligand + protein + water)
     # Skip if skip_minimized=True (for unrelaxed structures)
     minimized_pdb = prep_dir / "minimized.pdb"
     if minimized_pdb.exists() and not skip_minimized:
         try:
             coords, elements = parse_pdb_file(str(minimized_pdb))
-            
-            # Extract core + sub + ref_subs from minimized.pdb using atom name matching
-            # These are NOT part of the environment (they're the ligand itself)
-            ligand_from_min = None
-            if core_pdb is not None and sub_pdb is not None:
-                ligand_from_min = _extract_ligand_from_pdb(
-                    str(minimized_pdb), core_pdb, sub_pdb, ref_sub_pdbs
-                )
-            
+
             # Get all ligand atom names to exclude from environment
             ligand_atom_names = _get_all_ligand_atom_names(core_pdb, sub_pdb, ref_sub_pdbs)
-            
+
             # Extract environment atoms (everything in minimized.pdb NOT in the ligand)
             env_coords = []
             env_elements = []
@@ -1338,7 +1285,7 @@ def _load_environment_pdb(
                             # Try to get element from atom name (last 1-2 chars)
                             element = ''.join([c for c in atom_name if c.isalpha()])[:2]
                             env_elements.append(element if element else 'X')
-            
+
             # Select environment atoms: consensus membership if available,
             # else fall back to distance-to-substituent filtering.
             if sub_coords is not None and len(sub_coords) > 0:
@@ -1353,13 +1300,15 @@ def _load_environment_pdb(
                 if len(env_coords) > 256:
                     env_coords = env_coords[:256]
                     env_elements = env_elements[:256]
-                print(f"        [ENV] minimized.pdb (environment): loaded {len(env_coords)} atoms (no distance filtering, capped at 256)")
+                print(f"        [ENV] minimized.pdb (environment): loaded {len(env_coords)} atoms "
+                      "(no distance filtering, capped at 256)")
                 result = _apply_consensus_if_needed(env_coords, env_elements, str(minimized_pdb))
                 return result if result[0] is not None else None
         except Exception as e:
             warnings.warn(f"Could not load minimized.pdb: {e}, falling back to other sources")
-    
-    # Fallback: Try to convert minimized.crd (CHARMM extended CRD format) if minimized.pdb doesn't exist
+
+    # Fallback: Try to convert minimized.crd (CHARMM extended CRD format) if minimized.pdb doesn't
+    # exist
     # This handles cases like luis_p38_protein_group1 where we have CRD but not PDB
     # Skip if skip_minimized=True (for unrelaxed structures)
     minimized_crd = prep_dir / "minimized.crd"
@@ -1368,17 +1317,10 @@ def _load_environment_pdb(
             # Convert CRD to temporary PDB for consistent coordinate handling
             crd_pdb = _convert_crd_to_tmp_pdb(minimized_crd)
             coords, elements = parse_pdb_file(str(crd_pdb))
-            
-            # Extract core + sub + ref_subs from converted PDB using atom name matching
-            ligand_from_crd = None
-            if core_pdb is not None and sub_pdb is not None:
-                ligand_from_crd = _extract_ligand_from_pdb(
-                    str(crd_pdb), core_pdb, sub_pdb, ref_sub_pdbs
-                )
-            
+
             # Get all ligand atom names to exclude from environment
             ligand_atom_names = _get_all_ligand_atom_names(core_pdb, sub_pdb, ref_sub_pdbs)
-            
+
             # Extract environment atoms (everything NOT in the ligand)
             env_coords = []
             env_elements = []
@@ -1393,7 +1335,7 @@ def _load_environment_pdb(
                             env_coords.append([x, y, z])
                             element = ''.join([c for c in atom_name if c.isalpha()])[:2]
                             env_elements.append(element if element else 'X')
-            
+
             # Select environment atoms: consensus membership if available,
             # else fall back to distance-to-substituent filtering.
             if sub_coords is not None and len(sub_coords) > 0:
@@ -1408,24 +1350,26 @@ def _load_environment_pdb(
                 if len(env_coords) > 256:
                     env_coords = env_coords[:256]
                     env_elements = env_elements[:256]
-                print(f"        [ENV] minimized.crd (environment): loaded {len(env_coords)} atoms (no distance filtering, capped at 256)")
+                print(f"        [ENV] minimized.crd (environment): loaded {len(env_coords)} atoms "
+                      "(no distance filtering, capped at 256)")
                 result = _apply_consensus_if_needed(env_coords, env_elements, str(crd_pdb))
                 return result if result[0] is not None else None
         except Exception as e:
-            warnings.warn(f"Could not load/convert minimized.crd: {e}, falling back to other sources")
-    
+            warnings.warn(
+                f"Could not load/convert minimized.crd: {e}, falling back to other sources")
+
     # Fallback: Try individual protein PDB files (for unrelaxed structures)
     # Uses the same candidate list as build_environment_consensus() to ensure
     # both resolve to the identical file (see _default_protein_pdb_candidates).
     # A solvent leg skips protein files left in its prep (_environment_protein_candidates).
     protein_candidates = _environment_protein_candidates(prep_dir)
-    
+
     for protein_pdb in protein_candidates:
         if protein_pdb.exists():
             try:
                 coords, elements = parse_pdb_file(str(protein_pdb))
                 rel_path = protein_pdb.relative_to(prep_dir)
-                
+
                 # Select environment atoms: consensus membership if available,
                 # else fall back to distance-to-substituent filtering.
                 if sub_coords is not None and len(sub_coords) > 0:
@@ -1442,23 +1386,24 @@ def _load_environment_pdb(
                     if len(coords) > 256:
                         coords = coords[:256]
                         elements = elements[:256]
-                    print(f"        [ENV] {rel_path}: loaded {len(coords)} atoms (no distance filtering, capped at 256)")
+                    print(f"        [ENV] {rel_path}: loaded {len(coords)} atoms (no distance "
+                          "filtering, capped at 256)")
                     return (coords, elements)
             except Exception as e:
                 warnings.warn(f"Could not load {protein_pdb.name}: {e}, trying next source")
-    
+
     # Fallback: Try solvent/water PDB files (for unrelaxed structures)
     # Uses the same candidate list as build_environment_consensus() to ensure
     # both resolve to the identical file (see _default_solvent_pdb_candidates).
     solvent_candidates = _default_solvent_pdb_candidates(prep_dir)
-    
+
     solvent_files_found = False
     for solvent_pdb in solvent_candidates:
         if solvent_pdb.exists():
             solvent_files_found = True
             try:
                 coords, elements = parse_pdb_file(str(solvent_pdb))
-                
+
                 # Select environment atoms: consensus membership if available,
                 # else fall back to distance-to-substituent filtering.
                 if sub_coords is not None and len(sub_coords) > 0:
@@ -1475,22 +1420,25 @@ def _load_environment_pdb(
                     if len(coords) > 256:
                         coords = coords[:256]
                         elements = elements[:256]
-                    print(f"        [ENV] {solvent_pdb.name}: loaded {len(coords)} atoms (no distance filtering, capped at 256)")
+                    print(f"        [ENV] {solvent_pdb.name}: loaded {len(coords)} atoms (no "
+                          "distance filtering, capped at 256)")
                     result = _apply_consensus_if_needed(coords, elements, str(solvent_pdb))
                     if result and result[0] is not None:
                         return result
                     # If no consensus match, continue to next source
             except Exception as e:
                 warnings.warn(f"Could not load {solvent_pdb.name}: {e}, trying next source")
-    
+
     # Fallback: If solvent files exist but all failed (0 atoms), try minimized structure
     if solvent_files_found and not skip_minimized:
         minimized_pdb = prep_dir / "minimized.pdb"
         if minimized_pdb.exists():
             try:
-                print(f"        [ENV] Solvent files found but returned 0 atoms, falling back to minimized structure")
+                print(
+                    "        [ENV] Solvent files found but returned 0 atoms, falling back to "
+                    "minimized structure")
                 coords, elements = parse_pdb_file(str(minimized_pdb))
-                
+
                 if sub_coords is not None and len(sub_coords) > 0:
                     result = _select_environment_atoms(
                         coords, elements, str(minimized_pdb),
@@ -1504,17 +1452,20 @@ def _load_environment_pdb(
                     if len(coords) > 256:
                         coords = coords[:256]
                         elements = elements[:256]
-                    print(f"        [ENV] minimized.pdb: loaded {len(coords)} atoms (no distance filtering, capped at 256)")
+                    print(f"        [ENV] minimized.pdb: loaded {len(coords)} atoms (no distance "
+                          "filtering, capped at 256)")
                     result = _apply_consensus_if_needed(coords, elements, str(minimized_pdb))
                     if result and result[0] is not None:
                         return result
                     return (coords, elements)
             except Exception as e:
                 warnings.warn(f"Fallback to minimized.pdb failed: {e}")
-    
+
     # No environment found from solvent or fallback
     if solvent_files_found:
-        print(f"        [ENV] WARNING: Environment files exist but no atoms within {ligand_cutoff} Å found")
+        print(
+            f"        [ENV] WARNING: Environment files exist but no atoms within {ligand_cutoff} "
+            "Å found")
     else:
         print(f"        [ENV] no environment file found in {prep_dir.name}")
     return None
@@ -1542,7 +1493,7 @@ def construct_full_ligand(
     For multi-site systems, the ref_sub_info should contain reference substituents from
     other sites (typically site#_sub1). These provide full molecular context for the
     substitution pattern at non-target sites.
-    
+
     **Important:** When ref_subs are pre-filtered by distance (from main substituent),
     they should be passed as (pdb_path, (coords, elements), rtf_data) tuples. When not
     pre-filtered, use (pdb_path, rtf_data) tuples and they will be loaded in full.
@@ -1598,7 +1549,7 @@ def construct_full_ligand(
         else:
             warnings.warn(f"Unexpected ref_sub_info format: {ref_entry}, skipping")
             continue
-        
+
         ref_coords_list.append(ref_coords)
         ref_elements_list.append(ref_elements)
         n_ref_per_site.append(len(ref_coords))
@@ -1613,14 +1564,14 @@ def construct_full_ligand(
     n_env = 0
     env_coords_to_add = []
     env_elements_to_add = []
-    
+
     # Build full ligand coordinate array for filtering
     all_ligand_coords_arr = np.vstack([np.array(coords) for coords in all_coords])
 
     if solvent_coords is not None and solvent_elements is not None:
         # Filter solvent atoms by distance to ALL ligand atoms (core + sub + refs)
         solvent_arr = np.array(solvent_coords)
-        
+
         # Compute minimum distance from each solvent atom to any ligand atom
         distances = np.min(
             np.linalg.norm(solvent_arr[:, None, :] - all_ligand_coords_arr[None, :, :], axis=2),
@@ -1629,12 +1580,12 @@ def construct_full_ligand(
         nearby_mask = distances <= cutoff
         nearby_indices = np.where(nearby_mask)[0]
         nearby_distances = distances[nearby_mask]
-        
+
         # Sort by distance (closest first) - will be helpful if truncation is needed
         if len(nearby_indices) > 0:
             sorted_order = np.argsort(nearby_distances)
             nearby_indices = nearby_indices[sorted_order]
-        
+
         env_coords_to_add = solvent_arr[nearby_indices].tolist()
         env_elements_to_add = [solvent_elements[i] for i in nearby_indices]
         n_env = len(env_coords_to_add)
@@ -1645,26 +1596,28 @@ def construct_full_ligand(
             # Raw file path: parse and filter by distance to ALL ligand atoms (core + sub + refs)
             prot_coords, prot_elements = parse_pdb_file(protein_pdb)
             prot_coords_arr = np.array(prot_coords)
-            
+
             # Compute minimum distance from each protein atom to any ligand atom
             distances = np.min(
-                np.linalg.norm(prot_coords_arr[:, None, :] - all_ligand_coords_arr[None, :, :], axis=2),
+                np.linalg.norm(prot_coords_arr[:, None, :] -
+                               all_ligand_coords_arr[None, :, :], axis=2),
                 axis=1
             )
             nearby_mask = distances <= cutoff
             nearby_indices = np.where(nearby_mask)[0]
             nearby_distances = distances[nearby_mask]
-            
+
             # Sort by distance (closest first) - will be helpful if truncation is needed
             if len(nearby_indices) > 0:
                 sorted_order = np.argsort(nearby_distances)
                 nearby_indices = nearby_indices[sorted_order]
-            
+
             env_coords_to_add = prot_coords_arr[nearby_indices].tolist()
             env_elements_to_add = [prot_elements[i] for i in nearby_indices]
             n_env = len(env_coords_to_add)
         else:
-            # Pre-filtered tuple from _load_environment_pdb(): already filtered by distance to full ligand
+            # Pre-filtered tuple from _load_environment_pdb(): already filtered by distance to full
+            # ligand
             # Just use directly without additional filtering (atoms are already sorted by distance)
             prot_coords, prot_elements = protein_pdb
             env_coords_to_add = prot_coords
@@ -1680,7 +1633,7 @@ def construct_full_ligand(
             # Ligand itself exceeds limit - this shouldn't happen in practice
             warnings.warn(
                 f"Ligand has {n_ligand} atoms, exceeds limit {enforce_atom_limit}. "
-                f"Truncating ligand to fit (removing reference subs and environment)."
+                "Truncating ligand to fit (removing reference subs and environment)."
             )
             # Truncate ligand to keep only sub + core
             all_coords = all_coords[:2]
@@ -1839,13 +1792,13 @@ def get_substituent_unimol_with_environment(
     variant: Optional[str] = None,
 ) -> np.ndarray:
     """Compute Uni-Mol 512D representation for substituent with full environment context.
-    
+
     Specifically designed for pretraining and online training. Constructs the complete
     system with intelligent fallback chain for environment PDB detection.
-    
+
     **Result Composition:**
     core + sub + filtered_ref_subs + filtered_environment
-    
+
     - core: All atoms from core.pdb
     - sub: All atoms from sub_pdb
     - filtered_ref_subs: Reference substituents from other sites, filtered to keep only
@@ -1853,38 +1806,38 @@ def get_substituent_unimol_with_environment(
     - filtered_environment: Protein, solvent, or minimized system atoms filtered to keep
       only those within env_cutoff distance from the main substituent
       (For vacuum systems, environment is always empty)
-    
+
     **Consensus Filtering:**
     If consensus_atoms is provided (set of (resnum, chain, atomname) tuples), environment
     atoms are further filtered to only include atoms that appear for ALL substituents at
     the site. This prevents odd environment noise in the mean embedding used by the policy.
-    
+
     **Vacuum System Handling:**
     Systems with "vac" or "vacuum" in their name are automatically detected and skip
     environment loading entirely. This ensures no environment atoms are accidentally
     included even if solvent.pdb or protein.pdb files exist in the prep directory.
-    
+
     **Environment Priority Chain (when skip_minimized=False, non-vacuum only):**
     1. Custom paths (if provided, e.g., from yaml config like pdb/protein.pdb)
     2. minimized.pdb (preferred; ligand atoms automatically excluded)
     3. protein.pdb / proa.pdb / proa_*.pdb / nested pdb/protein.pdb
     4. solvent.pdb / waterbox.pdb / water.pdb / etc. variants
-    
+
     **When skip_minimized=True (unrelaxed structures, non-vacuum only):**
     1. Custom paths
     2. protein.pdb / proa.pdb / variants (loads unrelaxed protein structure)
     3. solvent.pdb / waterbox.pdb / variants (loads unrelaxed solvent structure)
-    
+
     **Filtering:**
     All environment atoms are filtered by distance to the SUBSTITUENT ONLY, ensuring
     consistent filtering regardless of structure type (minimized/unrelaxed).
     Reference substituents are also filtered by the same distance criterion.
-    
+
     **Caching:**
     If cache_dir is provided, embeddings are automatically cached on disk with metadata.
     On subsequent calls with identical parameters, cached embeddings are loaded instead
     of recomputed, significantly speeding up pretraining and analysis.
-    
+
     Args:
         sub_pdb: Path to substituent fragment PDB (e.g., site1_sub2_frag.pdb)
         core_pdb: Path to core scaffold PDB
@@ -1901,7 +1854,8 @@ def get_substituent_unimol_with_environment(
             Used for yaml-configured paths like ['pdb/protein.pdb', 'proa.pdb', 'prob.pdb']
         cache_dir: Optional directory to cache embeddings. If provided, cached embeddings
             are automatically loaded if available, and newly computed ones are saved.
-        save_cache: If True and cache_dir provided, save computed embedding to cache (default: False)
+        save_cache: If True and cache_dir provided, save computed embedding to cache
+            (default: False)
         skip_minimized: If True, skip minimized.pdb and minimized.crd files (for unrelaxed).
             Has no effect for vacuum systems (which skip all environment loading).
         consensus_atoms: Optional set of (resnum, chain, atomname) tuples for consensus filtering.
@@ -1940,13 +1894,13 @@ def get_substituent_unimol_with_environment(
         )
         if cached_embedding is not None:
             return cached_embedding
-    
+
     print(f"      [UNIMOL] Computing for {sub_name} (cutoff={env_cutoff}Å)")
-    
+
     # Parse core and sub to get coordinates
     core_coords, core_elements = parse_pdb_file(str(core_pdb))
     sub_coords, sub_elements = parse_pdb_file(str(sub_pdb))
-    
+
     # Find reference subs BEFORE loading environment
     # For multi-site systems, ref_subs provide context for substituents at other sites
     # Each ref_sub is filtered by distance to the main substituent (keep only atoms within 5Å)
@@ -1967,9 +1921,10 @@ def get_substituent_unimol_with_environment(
                     )
                     if filtered_ref is not None:
                         # Store filtered coords/elements for later use
-                        filtered_ref_info.append((ref_pdb_path, filtered_ref, None))  # (path, (coords, elements), rtf)
+                        filtered_ref_info.append(
+                            (ref_pdb_path, filtered_ref, None))  # (path, (coords, elements), rtf)
                         ref_sub_pdbs_list.append(ref_pdb_path)
-                
+
                 # Create ref_sub_info for construct_full_ligand
                 if filtered_ref_info:
                     # For construct_full_ligand, we need (pdb_path, rtf_data) tuples
@@ -1978,15 +1933,15 @@ def get_substituent_unimol_with_environment(
                     ref_sub_info = filtered_ref_info
         except Exception as e:
             warnings.warn(f"Could not find/filter reference subs: {e}")
-    
+
     # Check if this is a vacuum system - skip environment loading entirely for vacuum
     # Vacuum systems should have NO environment atoms, even if PDB files exist by accident
     # For nested combos (pretraining/SYSTEM/comb_*/prep), need to look TWO levels up
     # For direct systems (pretraining/SYSTEM/prep), look ONE level up
     system_name = _system_name_for_prep(prep_dir)
-    
+
     is_vacuum_system = 'vac' in system_name or 'vacuum' in system_name
-    
+
     if is_vacuum_system:
         print(f"      [ENV] Vacuum system detected ({system_name}), skipping environment loading")
         env_data = None
@@ -2005,7 +1960,7 @@ def get_substituent_unimol_with_environment(
             skip_minimized=skip_minimized,
             consensus_atoms=consensus_atoms,  # Further filter by consensus if provided
         )
-    
+
     # Construct full ligand (sub + core + ref subs + environment)
     ligand_dict = construct_full_ligand(
         sub_pdb=sub_pdb,
@@ -2019,11 +1974,11 @@ def get_substituent_unimol_with_environment(
         cutoff=env_cutoff,
         enforce_atom_limit=atom_limit,
     )
-    
+
     # Compute and return Uni-Mol representation
     try:
         embedding = get_unimol_representation(ligand_dict, use_cuda=use_cuda)
-        
+
         # Save to cache if requested
         if save_cache and cache_dir is not None:
             save_embedding(
@@ -2169,15 +2124,15 @@ def get_substituent_dual_embeddings(
     lig_core, lig_sub, lig_refs = str(core_pdb), str(sub_pdb), ligand_refs
     _min_dir = None
     if ligand_minimized:
-        import tempfile
         _min_dir = tempfile.TemporaryDirectory()
-        copies = minimized_ligand_copies([str(core_pdb), str(sub_pdb)] + ligand_refs, prep_dir, _min_dir.name)
+        copies = minimized_ligand_copies(
+            [str(core_pdb), str(sub_pdb)] + ligand_refs, prep_dir, _min_dir.name)
         if copies:
             lig_core, lig_sub, lig_refs = copies[0], copies[1], copies[2:]
             ligand_variant += '_min'
         else:
-            print(f"      [MINIMIZED] {Path(sub_pdb).name}: no usable minimized ligand in {prep_dir}; "
-                  f"unrelaxed coordinates")
+            print(f"      [MINIMIZED] {Path(sub_pdb).name}: no usable minimized ligand in "
+                  f"{prep_dir}; " "unrelaxed coordinates")
     embedding_ligand_only = None
     if cache_dir is not None:
         embedding_ligand_only = load_embedding(

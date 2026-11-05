@@ -177,7 +177,7 @@ def test_sampling_spread_base_widened_and_shrunk_by_data():
     _, sd_wide = _spread({OFFSET_KEY: {KEY: {'explore': {'end_fwd': 8.0}}}})
     assert sd_wide == pytest.approx(4.0, rel=0.15)
     m, sd_data = _spread({OFFSET_KEY: {KEY: {'explore': {'end_fwd': 8.0},
-                                            'end_fwd': [[6.0, 0.04]]}}})
+                                             'end_fwd': [[6.0, 0.04]]}}})
     assert m == pytest.approx(6.0, abs=0.1) and sd_data < 0.3     # data sets the spread
 
 
@@ -215,14 +215,15 @@ def test_record_pair_outcomes_counts_consecutive_failures():
 def test_record_pair_outcomes_counts_epochs_once_per_epoch():
     state = {}
     for ep in (0, 0, 1, 3):           # e.g. both orientations in epoch 0
-        record_pair_outcomes(state, 'sys', LABELS, EDGES, _saved([500, 500], 30), stage='s', epoch=ep)
+        record_pair_outcomes(state, 'sys', LABELS, EDGES,
+                             _saved([500, 500], 30), stage='s', epoch=ep)
     st = state[OFFSET_KEY][KEY]['stages']['s']
     assert st['visits'] == 4 and st['epochs'] == 3 and st['last_epoch'] == 3
 
 
 @pytest.mark.parametrize('pops,trans,stuck', [([1000, 0], 0, True),     # stuck at an endpoint
-                                               ([0, 0], 0, True),       # stranded
-                                               ([500, 500], 30, False)])
+                                              ([0, 0], 0, True),       # stranded
+                                              ([500, 500], 30, False)])
 def test_stuck_or_stranded_run_sets_run_both(pops, trans, stuck):
     state = {}
     record_pair_outcomes(state, 'sys', LABELS, EDGES, _saved(pops, trans))
@@ -420,7 +421,8 @@ def test_bracket_midpoint_after_reversal():
     t, v, br = _directional_run(state, 13.0, up=False)   # overshot, needs lower: hi = 13
     assert br == 1
     assert t == pytest.approx(9.0)                   # midpoint, not 13 - 3
-    assert v == pytest.approx(2.25)                  # width 8 -> sd 2, capped at the base step sd 1.5
+    # width 8 -> sd 2, capped at the base step sd 1.5
+    assert v == pytest.approx(2.25)
     t, v, _ = _directional_run(state, 9.0, up=True)  # still low at 9: lo = 9
     assert t == pytest.approx(11.0) and v == pytest.approx((4.0 / 4.0) ** 2)
 
@@ -577,18 +579,21 @@ def test_revisits_until_satisfied_or_exhausted():
     from mllf.cb.hindsight import select_revisits
     state = {}
     _outcome(state, '/o/sys/comb_1', ok=False)
-    picks, counts = select_revisits(state, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
+    picks, counts = select_revisits(
+        state, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
     assert picks == ['/o/sys/comb_1'] and counts['active'] == 1
     _outcome(state, '/o/sys/comb_1', ok=True)
     _outcome(state, '/o/sys/comb_1', ok=True)
-    picks, counts = select_revisits(state, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
+    picks, counts = select_revisits(
+        state, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
     assert picks == [] and counts['satisfied'] == 1
     assert state[OFFSET_KEY][KEY]['retired'] == 'satisfied'
 
     other = {}
     for _ in range(3):
         _outcome(other, '/o/sys/comb_1', ok=False)
-    picks, counts = select_revisits(other, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
+    picks, counts = select_revisits(
+        other, {'sys': 2}, lambda c: True, successes_needed=2, max_visits=3)
     assert picks == [] and counts['exhausted'] == 1
 
 
@@ -607,10 +612,11 @@ def test_revisits_respect_quota_order_and_allowed():
 
 def test_merge_revisits_dedupes_and_keeps_system_minimum():
     from mllf.cb.hindsight import merge_revisits
-    system = {'/out/A/comb_1': 'A', '/man/A/comb_1': 'A', '/man/A/comb_2': 'A', '/man/A/comb_3': 'A',
-              '/man/B/comb_7': 'B', '/man/B/comb_8': 'B'}
+    system = {'/out/A/comb_1': 'A', '/man/A/comb_1': 'A', '/man/A/comb_2': 'A',
+              '/man/A/comb_3': 'A', '/man/B/comb_7': 'B', '/man/B/comb_8': 'B'}
     out = merge_revisits(['/out/A/comb_1'],
-                         ['/man/A/comb_1', '/man/A/comb_2', '/man/A/comb_3', '/man/B/comb_7', '/man/B/comb_8'],
+                         ['/man/A/comb_1', '/man/A/comb_2', '/man/A/comb_3',
+                             '/man/B/comb_7', '/man/B/comb_8'],
                          system.get, n_total=4, min_per_system=2)
     assert out == ['/out/A/comb_1', '/man/A/comb_2', '/man/B/comb_7', '/man/B/comb_8']
 
@@ -621,7 +627,8 @@ def test_merge_revisits_dedupes_and_keeps_system_minimum():
 
 def _pair_run(pops, at_lo, at_hi, edge=37500):
     return {'populations': pops,
-            'endpoint_pairs': {'2_3': {'edge': edge, 'at_lo': at_lo, 'near_lo': edge - at_lo - at_hi,
+            'endpoint_pairs': {'2_3': {'edge': edge, 'at_lo': at_lo,
+                                       'near_lo': edge - at_lo - at_hi,
                                        'near_hi': 0, 'at_hi': at_hi}}}
 
 

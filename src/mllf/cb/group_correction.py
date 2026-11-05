@@ -139,8 +139,8 @@ def _overcorrected(saved_data: Dict, nodes: Sequence[int], site_idx: int, cfg: D
     if site_idx < len(trans) and trans[site_idx] < float(cfg['guard_transitions']):
         return True
     blocks = {n + block_offset for n in nodes}
-    return any(int(h.get('dom', -1)) in blocks and float(h.get('at_frac', 0)) >= float(cfg['guard_at_min'])
-               for h in saved_data.get('site_holdoff') or [])
+    return any(int(h.get('dom', -1)) in blocks and float(h.get('at_frac', 0)) >=
+               float(cfg['guard_at_min']) for h in saved_data.get('site_holdoff') or [])
 
 
 def _m(mat, r, c) -> Optional[float]:
@@ -201,7 +201,8 @@ def update_group(state: Dict, system: str, combo_name: str, saved_data: Dict,
     for idx, (site, nodes) in enumerate(run_sites(labels)):
         if site in flagged_site_ids:
             continue
-        ids = [(i, j, edge_id(system, labels[i], labels[j])) for i in nodes for j in nodes if i != j]
+        ids = [(i, j, edge_id(system, labels[i], labels[j]))
+               for i in nodes for j in nodes if i != j]
         corrected = [(i, j, e) for i, j, e in ids if e in pairs and pairs[e]['r'] < 1.0]
         if not corrected or not _overcorrected(saved_data, nodes, idx, cfg):
             continue
@@ -213,14 +214,17 @@ def update_group(state: Dict, system: str, combo_name: str, saved_data: Dict,
         out['guarded'].append(site)
     if flagged or out['guarded']:
         entry['history'].append({
-            'epoch': int(epoch), 'run': str(run), 'stepped': out['stepped'], 'capped': out['capped'],
+            'epoch': int(epoch), 'run': str(run), 'stepped': out['stepped'],
+            'capped': out['capped'],
             'flagged': [{'kind': f['kind'], 'site': f['site'],
-                         **({'dom': f"s{labels[f['dom']][0]}:{labels[f['dom']][1]}"} if 'dom' in f else {})}
+                         **({'dom': f"s{labels[f['dom']][0]}:{labels[f['dom']][1]}"}
+                            if 'dom' in f else {})}
                         for f in flagged],
             'guarded': out['guarded'],
             'ratio': {str(f['site']): round(min((pairs[edge_id(system, labels[i], labels[j])]['r']
-                                                  for (i, j) in f['edges']
-                                                  if edge_id(system, labels[i], labels[j]) in pairs), default=1.0), 3)
+                                                 for (i, j) in f['edges']
+                                                 if edge_id(system, labels[i],
+                                                            labels[j]) in pairs), default=1.0), 3)
                       for f in flagged}})
         del entry['history'][:-int(cfg['history'])]
     return out
@@ -280,4 +284,5 @@ def run_record(state: Optional[Dict], system: str, combo_name: str, run: str) ->
     """The history record ``update_group`` wrote for this run, if any."""
     entry = ((state or {}).get(GROUP_KEY) or {}).get(group_id(system, combo_name)) or {}
     name = Path(str(run)).name
-    return next((h for h in reversed(entry.get('history') or []) if Path(h.get('run', '')).name == name), None)
+    return next((h for h in reversed(entry.get('history') or [])
+                if Path(h.get('run', '')).name == name), None)

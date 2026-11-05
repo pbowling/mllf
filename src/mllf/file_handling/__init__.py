@@ -1,5 +1,2 @@
-"""File handling utilities for the mllf package."""
-
-from .read_output import terminated_normally, parse_single_population, parse_transitions_and_rates
-
-__all__ = ["terminated_normally", "parse_single_population", "parse_transitions_and_rates"]
+"""Reading and writing simulation files: bias coefficients, PDB/RTF fragments,
+CHARMM output, combination directories and manifests."""

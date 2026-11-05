@@ -1,6 +1,7 @@
 """Multi-substituent hindsight, the per-site b fit, the cost ledger, per-system
 stages and the final-bias export's labelling."""
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +23,10 @@ from mllf.cb.hindsight import (
     record_pair_outcomes,
     uncrossed_pairs,
 )
-from mllf.cli.workflow import fit_site_b, write_variables_from_actions
+from mllf.cb.workflow_utils import set_msld_steps, template_steps
+from mllf.file_handling import combo_sets as cs
+from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
+from mllf.file_handling.write_bias_coeff import fit_site_b, write_variables_from_actions
 
 KT = KB_KCAL * 298.15
 # One site, three substituents: every directed edge.
@@ -283,10 +287,6 @@ def test_input_dir_labels_sorted_numerically(tmp_path):
 
 # ── Item 7: explicit combo sets from ALF groups ─────────────────────────────
 
-from mllf.file_handling import combo_sets as cs
-from mllf.file_handling.manifests import EXPLICIT_COMBOS, build_combo_dir_lookup
-
-
 def _rtf(path, source, atoms):
     lines = ['* stream', f'* (fragment from {source})', '*', 'PRES S1S1 0.0']
     lines += [f'ATOM {n} {t} {q:.6f}' for n, t, q in atoms]
@@ -348,10 +348,23 @@ def test_build_combo_sets_registers_for_creation(tmp_path):
     _alf_group(tmp_path, 'sysB_group1', [A, B, C])
     entry = {'name': 'sysB', 'input_dir': str(sysdir), 'out_dir': str(tmp_path / 'out'),
              'combo_sets': {'refs': 'alf_group_ref_pairs', 'groups': 'alf_groups'}}
-    sets, _ = cs.build_combo_sets(entry, tmp_path / 'pretraining')
+    registry = {}
+    sets, _ = cs.build_combo_sets(entry, tmp_path / 'pretraining', registry=registry)
     assert len(sets['refs']) == 2 and len(sets['groups']) == 1
-    lookup = build_combo_dir_lookup(sets['groups'], {})
-    assert lookup[sets['groups'][0]] is EXPLICIT_COMBOS[sets['groups'][0]]
+    assert set(registry) == set(sets['refs']) | set(sets['groups'])
+    lookup = build_combo_dir_lookup(sets['groups'], {}, explicit=registry)
+    assert lookup[sets['groups'][0]] is registry[sets['groups'][0]]
+    # Without the registry nothing is recorded anywhere else.
+    assert build_combo_dir_lookup(sets['groups'], {}) == {}
+
+
+def test_explicit_combo_needs_its_info_to_be_created(tmp_path):
+    entry = {'name': 'sysC', 'input_dir': str(tmp_path), 'out_dir': str(tmp_path / 'out'),
+             'combo_sets': {'groups': [{1: [1, 2]}]}}
+    registry = {}
+    sets, _ = cs.build_combo_sets(entry, registry=registry)
+    with pytest.raises(FileNotFoundError):        # no manifest metadata to fall back on
+        ensure_combo_dir_exists(Path(sets['groups'][0]), entry, {})
 
 
 def test_combos_progress_pool_scope():
@@ -371,8 +384,6 @@ def test_explicit_groups_and_their_pairs(tmp_path):
 
 
 # ── Short exploratory runs + full-length confirmation ───────────────────────
-
-from mllf.cb.workflow_utils import set_msld_steps, template_steps
 
 _MSLD = """timestep = 0.002            # ps
 esteps = 125000             # number of time steps for equilibration
@@ -403,13 +414,15 @@ def test_short_run_flags_confirm_not_success():
     assert not e['awaiting_confirm'] and e['stages']['p']['successes'] == 1
     # a short run with too few crossings is not promising
     record_pair_outcomes(state, 's', [(1, 1), (1, 2)], ei,
-                         {'populations': [100, 80], 'transition_pairs': {'2_3': 1}}, stage='p', short=True)
+                         {'populations': [100, 80], 'transition_pairs': {'2_3': 1}},
+                         stage='p', short=True)
     assert not e['awaiting_confirm'] and e['last_failed']
 
 
 def test_combo_pair_flags_and_resolved():
-    state = {OFFSET_KEY: {'s|s1|1|2': {'awaiting_confirm': True, 'stages': {'p': {'visits': 1, 'successes': 0}}},
-                          's|s1|1|3': {'stages': {'p': {'visits': 2, 'successes': 1}}}}}
+    state = {OFFSET_KEY: {
+        's|s1|1|2': {'awaiting_confirm': True, 'stages': {'p': {'visits': 1, 'successes': 0}}},
+        's|s1|1|3': {'stages': {'p': {'visits': 2, 'successes': 1}}}}}
     assert ss.combo_pair_flags(state, 's', '/x/pair01_site1_subs_1_2', 'p') == (True, False)
     assert ss.combo_pair_flags(state, 's', '/x/pair02_site1_subs_1_4', 'p') == (False, True)
     assert ss.combo_resolved(state, 's', '/x/pair03_site1_subs_1_3', 'p', {'successes': 1})
@@ -420,7 +433,8 @@ def test_combo_pair_flags_and_resolved():
 
 def test_group_test_every_sub_sampled():
     sampled = {'populations': [5, 900, 1, 40, 2000], 'transitions': [0, 1]}
-    assert ss.site_balanced(sampled, [3, 2], 0.0, 0)          # uneven, no transitions: still passes
+    # uneven, no transitions: still passes
+    assert ss.site_balanced(sampled, [3, 2], 0.0, 0)
     assert not ss.site_balanced({**sampled, 'populations': [5, 900, 0, 40, 2000]}, [3, 2], 0.0, 0)
     assert not ss.site_balanced(sampled, [3, 2])               # the strict default still applies
 
@@ -473,14 +487,16 @@ def test_label_group_export_renames_unconverged(tmp_path):
     g = tmp_path / 'sys' / 'group01_site1_subs_1_2_3'
     g.mkdir(parents=True)
     (g / 'variables.py').write_text('x')
-    rows = [{'pair': 's1 1-2', 'reference': True, 'status': 'resolved', 'visits': 3, 'good_runs': 2,
-             'b_offset_sd': 0.4, 'c_offset_sd': 0.9},
-            {'pair': 's1 2-3', 'reference': False, 'status': 'never run', 'visits': 0, 'good_runs': 0,
-             'b_offset_sd': 3.0, 'c_offset_sd': 8.0}]
+    rows = [{'pair': 's1 1-2', 'reference': True, 'status': 'resolved', 'visits': 3,
+             'good_runs': 2, 'b_offset_sd': 0.4, 'c_offset_sd': 0.9},
+            {'pair': 's1 2-3', 'reference': False, 'status': 'never run', 'visits': 0,
+             'good_runs': 0, 'b_offset_sd': 3.0, 'c_offset_sd': 8.0}]
     out = label_group_export(g, 'sys', g, None, rows)
-    assert out.name == 'group01_site1_subs_1_2_3' + UNCONVERGED_SUFFIX and (out / 'variables.py').exists()
+    assert out.name == 'group01_site1_subs_1_2_3' + \
+        UNCONVERGED_SUFFIX and (out / 'variables.py').exists()
     assert 'did NOT pass' in (out / 'CONFIDENCE.txt').read_text()
-    out2 = label_group_export(out, 'sys', g, '/runs/run_007', rows)        # later passed: renamed back
+    out2 = label_group_export(out, 'sys', g, '/runs/run_007',
+                              rows)        # later passed: renamed back
     assert out2.name == 'group01_site1_subs_1_2_3' and (out2 / 'confidence.json').exists()
 
 
@@ -529,7 +545,8 @@ def test_group_failed_pairs_are_those_with_an_unsampled_substituent(tmp_path):
     g = tmp_path / 'group01_site1_subs_1_5_9'
     g.mkdir()
     (g / 'mapping.json').write_text(json.dumps([
-        {'original_site': 1, 'original_sub': s, 'new_site': 1, 'new_sub': n, 'new_name': f'site1_sub{n}_pres.rtf'}
+        {'original_site': 1, 'original_sub': s, 'new_site': 1,
+            'new_sub': n, 'new_name': f'site1_sub{n}_pres.rtf'}
         for n, s in ((1, 1), (2, 5), (3, 9))]))
     keys = ss.group_failed_pairs('s', g, {'populations': [800, 0, 300]})
     assert sorted(keys) == ['s|s1|1|5', 's|s1|5|9']
@@ -537,7 +554,7 @@ def test_group_failed_pairs_are_those_with_an_unsampled_substituent(tmp_path):
 
 def test_reopen_pairs_restarts_stage_count():
     state = {OFFSET_KEY: {'s|s1|1|2': {**_st(successes=2, epochs=4), 'successes': 2, 'visits': 4,
-                                        'retired': 'satisfied'}}}
+                                       'retired': 'satisfied'}}}
     assert ss.reopen_pairs(state, ['s|s1|1|2'], 'p') == 1
     e = state[OFFSET_KEY]['s|s1|1|2']
     assert e['stages']['p']['successes'] == 0 and e['stages']['p']['epochs'] == 0
@@ -546,11 +563,14 @@ def test_reopen_pairs_restarts_stage_count():
 
 
 def test_reversed_pair_partner(tmp_path):
-    p = cs.reversed_pair(tmp_path / 'pair07_site1_subs_1_9')
+    registry = {}
+    p = cs.reversed_pair(tmp_path / 'pair07_site1_subs_1_9', registry)
     assert p == str(tmp_path / 'pair07r_site1_subs_9_1')
-    info = EXPLICIT_COMBOS[p]
+    info = registry[p]
     assert info['subs'] == [9, 1] and info['sites'] == [1]
-    assert ss.combo_pair_keys('s', p) == ss.combo_pair_keys('s', tmp_path / 'pair07_site1_subs_1_9')
+    assert ss.combo_pair_keys(
+        's', p) == ss.combo_pair_keys(
+        's', tmp_path / 'pair07_site1_subs_1_9')
     assert cs.reversed_pair(p) is None                                 # a partner has no partner
     assert cs.reversed_pair(tmp_path / 'group01_site1_subs_1_2_3') is None
 
@@ -574,7 +594,8 @@ def test_pair_retired_needs_min_successes():
 def test_partial_runs_resolve_a_slow_crossing_pair():
     ei = torch.tensor([[0, 1], [1, 0]])
     state = {}
-    slow = {'populations': [1000, 200], 'transition_pairs': {'2_3': 3}}   # 3 crossings: not a good short run
+    slow = {'populations': [1000, 200], 'transition_pairs': {
+        '2_3': 3}}   # 3 crossings: not a good short run
     for epoch in range(3):
         record_pair_outcomes(state, 's', [(1, 1), (1, 2)], ei, slow, stage='p', short=True,
                              short_min_transitions=5, short_min_fraction=0.1, confirm=False,
@@ -590,7 +611,8 @@ def test_scouting_passes_groups_and_resolves_pairs_once():
                           't/group01': {'run': 'r3', 'all_sampled': True}},
                'pass_pairs': ['s|s1|1|2', 't|s1|1|2']}
     st, bandit = {}, {}
-    passed, resolved, runs = ss.apply_scouting(st, bandit, 's', 'p', summary, ['group01', 'group02'])
+    passed, resolved, runs = ss.apply_scouting(
+        st, bandit, 's', 'p', summary, ['group01', 'group02'])
     assert passed == {'group01': 'r1'} and st['groups_done'] == {'group01': 'r1'}
     assert resolved == ['s|s1|1|2'] and sorted(runs) == ['r1', 'r2']
     assert ss.pair_resolved(bandit[OFFSET_KEY]['s|s1|1|2'], 'p', 2)
@@ -626,11 +648,24 @@ def test_pooled_group_test_passes_when_every_sub_sampled_in_some_run():
 
 
 def test_held_off_sites_needs_dominance_and_several_partners():
-    site = {'blocks': [2, 3, 4], 'dom': 2, 'dom_frac': 0.9, 'at_frac': 0.01, 'partners': {3: 0.1, 4: 0.05}}
+    site = {
+        'blocks': [
+            2,
+            3,
+            4],
+        'dom': 2,
+        'dom_frac': 0.9,
+        'at_frac': 0.01,
+        'partners': {
+            3: 0.1,
+            4: 0.05}}
     assert [h['dom'] for h in ss.held_off_sites({'site_holdoff': [site]})] == [2]
-    assert ss.held_off_sites({'site_holdoff': [{**site, 'at_frac': 0.2}]}) == []     # reaches its endpoint
-    assert ss.held_off_sites({'site_holdoff': [{**site, 'dom_frac': 0.5}]}) == []    # does not dominate
-    assert ss.held_off_sites({'site_holdoff': [{**site, 'partners': {3: 0.1, 4: 0.01}}]}) == []  # one partner
+    # reaches its endpoint
+    assert ss.held_off_sites({'site_holdoff': [{**site, 'at_frac': 0.2}]}) == []
+    assert ss.held_off_sites(
+        {'site_holdoff': [{**site, 'dom_frac': 0.5}]}) == []    # does not dominate
+    assert ss.held_off_sites(
+        {'site_holdoff': [{**site, 'partners': {3: 0.1, 4: 0.01}}]}) == []  # one partner
 
 
 def test_group_failed_pairs_pools_failed_runs(tmp_path):
@@ -638,8 +673,10 @@ def test_group_failed_pairs_pools_failed_runs(tmp_path):
     g = tmp_path / 'group01_site1_subs_1_5_9'
     g.mkdir()
     (g / 'mapping.json').write_text(json.dumps([
-        {'original_site': 1, 'original_sub': s, 'new_site': 1, 'new_sub': n, 'new_name': f'site1_sub{n}_pres.rtf'}
+        {'original_site': 1, 'original_sub': s, 'new_site': 1,
+            'new_sub': n, 'new_name': f'site1_sub{n}_pres.rtf'}
         for n, s in ((1, 1), (2, 5), (3, 9))]))
-    runs = [{'populations': [800, 0, 300]}, {'populations': [800, 0, 0]}, {'populations': [0, 0, 0]}]
+    runs = [{'populations': [800, 0, 300]}, {
+        'populations': [800, 0, 0]}, {'populations': [0, 0, 0]}]
     # sub 5 is empty in every run with any population; sub 9 only in one
     assert sorted(ss.group_failed_pairs('s', g, runs)) == ['s|s1|1|5', 's|s1|5|9']

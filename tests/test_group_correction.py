@@ -58,7 +58,16 @@ def test_ratio_steps_down_to_the_floor_then_caps():
     state = {}
     ratios = []
     for run in range(3):
-        res = gc.update_group(state, 's', 'group01', _site_stuck(), LABELS, _applied(), CFG, run, f'run_{run}')
+        res = gc.update_group(
+            state,
+            's',
+            'group01',
+            _site_stuck(),
+            LABELS,
+            _applied(),
+            CFG,
+            run,
+            f'run_{run}')
         ratios.append(res['edges'][(0, 1)][2])
     assert ratios == [0.75, 0.5, 0.5]
     assert res['capped'] and not res['stepped']
@@ -85,8 +94,20 @@ def test_group_values_replace_x_and_s_for_corrected_pairs_only():
 
 def test_overcorrected_site_steps_back_half_the_last_step():
     state = {}
-    gc.update_group(state, 's', 'group01', _site_stuck(), LABELS, _applied(), CFG, 0, 'run_0')   # r 0.75
-    trapped = {'populations': [300, 0, 200, 500, 500], 'transitions': [2, 30]}   # some unsampled, few crossings
+    gc.update_group(
+        state,
+        's',
+        'group01',
+        _site_stuck(),
+        LABELS,
+        _applied(),
+        CFG,
+        0,
+        'run_0')   # r 0.75
+    trapped = {
+        'populations': [
+            300, 0, 200, 500, 500], 'transitions': [
+            2, 30]}   # some unsampled, few crossings
     res = gc.update_group(state, 's', 'group01', trapped, LABELS, _applied(), CFG, 1, 'run_1')
     assert res['guarded'] == [1] and not res['flagged']
     assert res['edges'][(0, 1)][2] == 0.875
@@ -94,7 +115,16 @@ def test_overcorrected_site_steps_back_half_the_last_step():
 
 def test_correction_targets_cover_the_site_and_leave_b_c_free():
     state = {}
-    res = gc.update_group(state, 's', 'group01', _site_stuck(), LABELS, _applied(), CFG, 0, 'run_0')
+    res = gc.update_group(
+        state,
+        's',
+        'group01',
+        _site_stuck(),
+        LABELS,
+        _applied(),
+        CFG,
+        0,
+        'run_0')
     edges = SITE1 + [(3, 4)]
     t, v, mask = gc.correction_targets(_edge_index(edges), res, CFG)
     assert mask.tolist() == [True] * len(SITE1) + [False]

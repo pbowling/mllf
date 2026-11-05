@@ -21,12 +21,12 @@ release = '0.1.0'
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
-	'sphinx.ext.autodoc',
-	'sphinx.ext.napoleon',
-	'sphinx.ext.viewcode',
-	'sphinx.ext.autosummary',
-	'sphinxcontrib.bibtex',
-	'sphinx.ext.mathjax',
+    'sphinx.ext.autodoc',
+    'sphinx.ext.napoleon',
+    'sphinx.ext.viewcode',
+    'sphinx.ext.autosummary',
+    'sphinxcontrib.bibtex',
+    'sphinx.ext.mathjax',
 ]
 
 # generate autosummary stub pages
@@ -34,13 +34,12 @@ autosummary_generate = True
 
 # Prefer the ReadTheDocs theme; fallback to alabaster if not installed
 try:
-	html_theme = 'sphinx_rtd_theme'
+    html_theme = 'sphinx_rtd_theme'
 except Exception:
-	html_theme = 'alabaster'
+    html_theme = 'alabaster'
 
 templates_path = ['_templates']
 exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
-
 
 
 # -- Options for HTML output -------------------------------------------------

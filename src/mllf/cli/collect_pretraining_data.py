@@ -24,7 +24,6 @@ from mllf.file_handling.read_rtf import parse_rtf_dir
 from mllf.file_handling.read_output import (
     parse_single_population,
     parse_transitions_and_rates,
-    terminated_normally,
     parse_single_ddg,
     parse_pair_profile,
     resolve_output_file,
@@ -34,6 +33,7 @@ from mllf.file_handling.read_bias_coeff import (
     NONLINEAR_SIGN_KEY,
     read_bias_coeff,
 )
+from multiprocessing import Pool
 
 
 def find_run_directories(base_path: Path) -> List[Path]:
@@ -43,10 +43,10 @@ def find_run_directories(base_path: Path) -> List[Path]:
     incomplete directories and sorts results by run number.
     """
     run_dirs = []
-    
+
     # Check if this is a generated combo structure (has comb_* directories)
     combo_dirs = [d for d in base_path.iterdir() if d.is_dir() and is_combo_dir_name(d.name)]
-    
+
     def _has_run_data(p: Path) -> bool:
         """Return True if the directory contains the minimum files for a completed run."""
         has_vars = bool(list(p.glob("variables*.py")) or list(p.glob("variables*.inp")))
@@ -69,12 +69,12 @@ def find_run_directories(base_path: Path) -> List[Path]:
             d for d in run_dirs
             if d.is_dir() and '_failed' not in d.name.lower() and _has_run_data(d)
         ]
-    
+
     # Sort numerically by extracting run number
     def get_run_num(p: Path) -> int:
         match = re.search(r'run[_]?(\d+)', p.name)
         return int(match.group(1)) if match else 0
-    
+
     return sorted(run_dirs, key=get_run_num)
 
 
@@ -123,12 +123,12 @@ def parse_bias_from_py(
 
 def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
     """Parse bias coefficients from variables*.inp file (old format).
-    
+
     Old format has individual coefficient entries like:
       set lams1s1 = 0.00        # baseline bias for site1_sub1
       set cs1s1s1s2 = -0.00     # quadratic coefficient
       set xs1s1s2s3 = 1.50      # skew coefficient
-    
+
     We need to convert these to matrix format for compatibility with the
     graph building code that expects c, x, s matrices.
 
@@ -139,16 +139,16 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
     e.g. matrix ``c[0][1] = +19.53`` with ``cs1s1s1s2 = -19.53``). The
     nonlinear entries are therefore negated here; ``lams*`` (b) is stored
     unchanged in both conventions.
-    
+
     Args:
         variables_file: Path to variables*.inp file
-        
+
     Returns:
         Dict with bias coefficients in matrix format (c, x, s, b keys)
     """
     # Read old format (returns {"lams": {...}, "cs": {...}, "xs": {...}, "ss": {...}})
     old_data = read_bias_coeff(str(variables_file))
-    
+
     # Determine dimensions from lams entries (baseline biases)
     # lams format: lams1s1, lams1s2, ..., lams2s1, lams2s2, ...
     site_sub_counts = {}
@@ -160,7 +160,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             if site_num not in site_sub_counts:
                 site_sub_counts[site_num] = set()
             site_sub_counts[site_num].add(sub_num)
-    
+
     if not site_sub_counts:
         # Try to infer from cs entries: cs1s1s1s2 means site1_sub1 to site1_sub2
         for cs_key in old_data.get("cs", {}).keys():
@@ -171,13 +171,13 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
                     if site not in site_sub_counts:
                         site_sub_counts[site] = set()
                     site_sub_counts[site].add(sub)
-    
+
     # Calculate total number of blocks (sum of substituents across all sites)
     num_blocks = sum(len(subs) for subs in site_sub_counts.values())
-    
+
     if num_blocks == 0:
         raise ValueError(f"Could not determine number of blocks from {variables_file}")
-    
+
     # Create mapping from site_sub to block index
     block_idx = 0
     site_sub_to_idx = {}
@@ -185,13 +185,13 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
         for sub_num in sorted(site_sub_counts[site_num]):
             site_sub_to_idx[(site_num, sub_num)] = block_idx
             block_idx += 1
-    
+
     # Initialize matrices
     c_matrix = [[0.0] * num_blocks for _ in range(num_blocks)]
     x_matrix = [[0.0] * num_blocks for _ in range(num_blocks)]
     s_matrix = [[0.0] * num_blocks for _ in range(num_blocks)]
     b_vector = [0.0] * num_blocks
-    
+
     # Fill b vector from lams entries (baseline biases)
     for key, value in old_data.get("lams", {}).items():
         match = re.match(r'lams(\d+)s(\d+)', key)
@@ -201,7 +201,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             idx = site_sub_to_idx.get((site_num, sub_num))
             if idx is not None:
                 b_vector[idx] = float(value)
-    
+
     # Fill c matrix from cs entries (quadratic coefficients)
     # Note: Original format stores full matrix, not just upper triangle
     for key, value in old_data.get("cs", {}).items():
@@ -212,7 +212,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
                 c_matrix[i][j] = FLAT_TO_MATRIX_NONLINEAR * float(value)
-    
+
     # Fill x matrix from xs entries (skew coefficients)
     for key, value in old_data.get("xs", {}).items():
         match = re.match(r'xs(\d+)s(\d+)s(\d+)s(\d+)', key)
@@ -223,7 +223,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             if i is not None and j is not None:
                 x_matrix[i][j] = FLAT_TO_MATRIX_NONLINEAR * float(value)
                 # Note: x is typically asymmetric
-    
+
     # Fill s matrix from ss entries (end-state coefficients)
     # Note: Original format stores full matrix, not just upper triangle
     for key, value in old_data.get("ss", {}).items():
@@ -234,7 +234,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
             j = site_sub_to_idx.get((site2, sub2))
             if i is not None and j is not None:
                 s_matrix[i][j] = FLAT_TO_MATRIX_NONLINEAR * float(value)
-    
+
     return {
         "b": b_vector,
         "c": c_matrix,
@@ -250,7 +250,7 @@ def parse_bias_from_inp(variables_file: Path) -> Dict[str, Any]:
 
 def convert_to_json_serializable(data: Any) -> Any:
     """Convert data structures to JSON-serializable format.
-    
+
     Handles:
     - Tuple keys in dicts (convert to string)
     - Float keys in dicts (convert to string)
@@ -276,30 +276,30 @@ def convert_to_json_serializable(data: Any) -> Any:
 
 def parse_output_file(output_file: Path, run_dir: Path) -> Dict[str, Any]:
     """Parse population and transition data from output file.
-    
+
     Uses existing file_handling utilities to parse CHARMM output.
     Assumes normal termination unless '_failed' appears in run directory name.
-    
+
     Args:
         output_file: Path to output file
         run_dir: Path to run directory (used to check for _failed)
-        
+
     Returns:
         Dict with 'populations', 'transitions', 'rates', 'terminated_normally',
         the per-pair fields and 'simulated_ns' (run length, None if unknown)
     """
     content = output_file.read_text()
-    
+
     # Check termination status based on directory name
     # Assume normal termination unless _failed in path
     terminated = '_failed' not in str(run_dir).lower()
-    
+
     # Parse populations using existing utility
     populations = parse_single_population(content)
-    
-    # Parse transitions and rates using existing utility  
+
+    # Parse transitions and rates using existing utility
     transitions, rates = parse_transitions_and_rates(content)
-    
+
     # Parse per-pair DDG data (NaN = no transitions between that pair)
     ddg_raw = parse_single_ddg(content)
     # Per-pair barrier / skew / end signals from the lambda trajectory
@@ -353,7 +353,8 @@ def _backfill_profile_one(sim_path: Path, dry_run: bool, overwrite: bool) -> Tup
         return 'updated', f"{run_dir}: simulated_ns = {ns}"
     try:
         content = output_file.read_text()
-        pairs = [tuple(int(v) for v in k.split('_')) for k in sim_results.get('ddg_pairs', {})] or None
+        pairs = [tuple(int(v) for v in k.split('_'))
+                 for k in sim_results.get('ddg_pairs', {})] or None
         fields = _profile_fields(parse_pair_profile(content, pairs=pairs))
     except Exception as exc:
         return 'error', f"could not parse lambda profile for {run_dir}: {exc}"
@@ -417,7 +418,6 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
                 print(f"  ... {n}/{total} runs checked", flush=True)
 
     if workers > 1:
-        from multiprocessing import Pool
         with Pool(workers) as pool:
             _consume(pool.imap_unordered(_backfill_profile_task, tasks, chunksize=16))
     else:
@@ -425,8 +425,9 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
 
     n_skipped = counts['present'] + counts['no_output'] + counts['error']
     verb = "would update" if dry_run else "updated"
-    print(f"\nLambda-profile backfill summary: {counts['updated']} {verb}, {counts['present']} already had "
-          f"the fields, {counts['no_output']} without an output file, {counts['error']} errors", flush=True)
+    print(f"\nLambda-profile backfill summary: {counts['updated']} {verb}, "
+          f"{counts['present']} already had the fields, {counts['no_output']} without "
+          f"an output file, {counts['error']} errors", flush=True)
     return counts['updated'], n_skipped
 
 
@@ -492,14 +493,16 @@ def fix_inp_nonlinear_signs(pretraining_root: Path, dry_run: bool = False) -> Tu
             continue
         for key in ('c', 'x', 's'):
             if key in bias:
-                bias[key] = [[(-float(v) if float(v) != 0.0 else 0.0) for v in row] for row in bias[key]]
+                bias[key] = [[(-float(v) if float(v) != 0.0 else 0.0)
+                              for v in row] for row in bias[key]]
         bias[NONLINEAR_SIGN_KEY] = "matrix"
         if dry_run:
             if n_fixed < 5:
                 print(f"  Would fix {run_dir}")
         else:
             bias_yaml = yaml.dump(bias, default_flow_style=False, sort_keys=False)
-            var_path.write_text(text[:m.start(1)] + "\n" + bias_yaml.strip() + "\n" + text[m.end(1):])
+            var_path.write_text(text[:m.start(1)] + "\n" + bias_yaml.strip() + "\n"
+                                + text[m.end(1):])
         n_fixed += 1
     verb = "would fix" if dry_run else "fixed"
     print(f"\n.inp sign fix: {n_fixed} {verb}, {n_ok} already correct (.py source or marked), "
@@ -601,40 +604,40 @@ def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[i
 
 def extract_graph_info(source_prep: Path, solvent_state: str = "unknown") -> Dict[str, Any]:
     """Extract essential graph information from prep directory.
-    
+
     Instead of copying the entire prep directory, extract only the information
     needed for graph construction: atom types, total charge, and solvent state.
     Only includes site#_sub# entries, filtering out full_ligand and top_all36_msld.
-    
+
     Args:
         source_prep: Source prep directory (may be symlink)
         solvent_state: Solvent state ("solvent", "vacuum", "protein", or "unknown")
-        
+
     Returns:
         Dict containing site/sub information with atom_types and total_charge
     """
     # Resolve symlink if present
     if source_prep.is_symlink():
         source_prep = source_prep.resolve()
-    
+
     if not source_prep.exists() or not source_prep.is_dir():
         raise ValueError(f"prep directory not found: {source_prep}")
-    
+
     # Parse all RTF files in prep directory
     rtf_data = parse_rtf_dir(str(source_prep))
-    
+
     # Filter to only include site#_sub# entries
     filtered_sites = {
         key: value for key, value in rtf_data.items()
         if key.startswith("site") and "_sub" in key
     }
-    
+
     # Add solvent state to the data
     graph_info = {
         "solvent_state": solvent_state,
         "sites": filtered_sites
     }
-    
+
     return graph_info
 
 
@@ -865,7 +868,7 @@ def _parse_nsubs_from_mapping(mapping_path: Path) -> Optional[List[int]]:
         subs_per_site: Dict[int, int] = {}
         for entry in entries:
             site = entry.get('new_site')
-            sub  = entry.get('new_sub')
+            sub = entry.get('new_sub')
             if site is None or sub is None:
                 continue
             if site not in subs_per_site or sub > subs_per_site[site]:
@@ -879,15 +882,15 @@ def _parse_nsubs_from_mapping(mapping_path: Path) -> Optional[List[int]]:
 
 def detect_solvent_state(run_dir: Path) -> str:
     """Detect solvent state from directory path.
-    
+
     Args:
         run_dir: Path to run directory
-        
+
     Returns:
         Solvent state: 'solv', 'gas', 'protein', or 'unknown'
     """
     path_str = str(run_dir).lower()
-    
+
     if "protein" in path_str or "prot" in path_str:
         return "protein"
     elif "vac" in path_str or "vacuum" in path_str or "gas" in path_str:
@@ -904,18 +907,18 @@ def collect_run_data(
     nsubs_per_site_override: Optional[List[int]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """Collect all data from a single run directory.
-    
+
     Handles two directory structures:
     1. MSLD runs: run_dir contains prep/, output, variables*.py
     2. Generated combos: run_dir/output.out, run_dir/variables.py, prep/ at parent level
-    
+
     Args:
         run_dir: Path to run directory
         solvent_state: Optional solvent state override (if None, auto-detect)
         nsubs_per_site_override: If provided, use this nsubs_per_site instead of
             the value read from alf_info.py.  Needed when prep/ is a full-system
             prep but only a subset of substituents are active (e.g. combo runs).
-        
+
     Returns:
         Tuple of (bias_data, output_results, graph_info)
     """
@@ -923,10 +926,10 @@ def collect_run_data(
     variables_files = list(run_dir.glob("variables*.py"))
     if not variables_files:
         variables_files = list(run_dir.glob("variables*.inp"))
-    
+
     if not variables_files:
         raise ValueError(f"No variables file found in {run_dir}")
-    
+
     variables_file = variables_files[0]
 
     # Find prep directory early so parse_bias_from_py can read alf_info.py
@@ -950,9 +953,9 @@ def collect_run_data(
         output_file = run_dir / 'output.out'
     if not output_file.exists():
         raise ValueError(f"output file not found in {run_dir}")
-    
+
     output_results = parse_output_file(output_file, run_dir)
-    
+
     # Find prep directory - check local first, then parent (for generated combos)
     if not prep_path.exists():
         raise ValueError(f"prep directory not found in {run_dir} or {run_dir.parent}")
@@ -960,7 +963,7 @@ def collect_run_data(
     # Detect or use provided solvent state
     if solvent_state is None:
         solvent_state = detect_solvent_state(run_dir)
-    
+
     graph_info = extract_graph_info(prep_path, solvent_state)
 
     # Build the active-substituent mapping: which master sub carries each
@@ -1055,25 +1058,25 @@ def create_pretraining_entry(
     min_transitions: int = 0,
 ) -> Optional[Path]:
     """Create a pretraining directory entry from a run directory.
-    
+
     Args:
         run_dir: Source run# directory
         output_dir: Output directory for pretraining data
         combo_name: Optional name for the combination (default: run directory name)
         solvent_state: Optional solvent state override (if None, auto-detect)
         min_transitions: Skip runs with fewer total transitions than this threshold.
-        
+
     Returns:
         Path to created pretraining entry directory, or None if skipped.
     """
     if combo_name is None:
         combo_name = run_dir.name
-    
+
     # Collect data
     bias_data, output_results, graph_info = collect_run_data(
         run_dir, solvent_state, nsubs_per_site_override=nsubs_per_site_override
     )
-    
+
     # Extract topology metadata before writing YAML (not stored in variables.py)
     nsubs_per_site = bias_data.pop('_nsubs_per_site', None)
 
@@ -1096,12 +1099,12 @@ def create_pretraining_entry(
     # Create output directory
     entry_dir = output_dir / combo_name
     entry_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Save graph info as JSON instead of copying prep directory
     graph_info_file = entry_dir / 'graph_info.json'
     with open(graph_info_file, 'w') as f:
         json.dump(graph_info, f, indent=2)
-    
+
     # Write bias data to variables.py
     bias_yaml = yaml.dump(bias_data, default_flow_style=False, sort_keys=False)
     variables_content = f'''"""Auto-generated variables file for pretraining data."""
@@ -1114,11 +1117,11 @@ bias_string = """
 bias = yaml.safe_load(bias_string)
 '''
     (entry_dir / 'variables.py').write_text(variables_content)
-    
+
     # Write output results to JSON
     with open(entry_dir / 'simulation_results.json', 'w') as f:
         json.dump(output_results, f, indent=2)
-    
+
     # Count populated blocks (blocks with non-zero counts at HIGHEST lambda value)
     num_populated = 0
     for block_data in output_results['populations'].values():
@@ -1129,7 +1132,7 @@ bias = yaml.safe_load(bias_string)
                 max_lambda = max(counts.keys(), key=lambda x: float(x))
                 if counts[max_lambda] > 0:
                     num_populated += 1
-    
+
     # Derive site topology from bias data (authoritative: bias encodes only the
     # active substituents for this group; the prep dir may be a superset).
     if nsubs_per_site is not None:
@@ -1141,7 +1144,7 @@ bias = yaml.safe_load(bias_string)
         num_sites = len(unique_sites)
         num_substituents = len(graph_info['sites'])
         nsubs_per_site = []
-    
+
     metadata = {
         'source_run_dir': str(run_dir),
         'combo_name': combo_name,
@@ -1153,10 +1156,10 @@ bias = yaml.safe_load(bias_string)
         'nsubs_per_site': nsubs_per_site,
         'solvent_state': graph_info['solvent_state']
     }
-    
+
     with open(entry_dir / 'metadata.json', 'w') as f:
         json.dump(metadata, f, indent=2)
-    
+
     return entry_dir
 
 
@@ -1179,8 +1182,10 @@ def _relabel_one(entry_dir: Path, dry_run: bool) -> Tuple[str, str]:
                                new_subs, nsubs)
         if not all(e.get('atom_types') for e in new['sites'].values()):
             return 'error', f"{entry_dir}: unresolved substituents {new_subs}"
-        if {k: (v.get('site'), v.get('sub'), v.get('master')) for k, v in new['sites'].items()} == \
-                {k: (v.get('site'), v.get('sub'), v.get('master')) for k, v in old.get('sites', {}).items()}:
+        if {k: (v.get('site'), v.get('sub'), v.get('master')) for k,
+            v in new['sites'].items()} == {
+                k: (v.get('site'), v.get('sub'), v.get('master')) for k, v in old.get('sites',
+                                                                                      {}).items()}:
             return 'same', str(entry_dir)
         changed = old.get('active_subs_ordered') != new_subs
         if not dry_run:
@@ -1218,7 +1223,6 @@ def relabel_active_subs(root: Path, datasets: Optional[List[str]] = None,
     by_dataset: Dict[str, str] = {}
     tasks = [(e, dry_run) for e in entries]
     if workers > 1:
-        from multiprocessing import Pool
         with Pool(workers) as pool:
             results = list(pool.imap(_relabel_task, tasks, chunksize=8))
     else:
@@ -1232,7 +1236,12 @@ def relabel_active_subs(root: Path, datasets: Optional[List[str]] = None,
     for ds, change in sorted(by_dataset.items()):
         print(f"  {ds}: {change}", flush=True)
     verb = 'would be' if dry_run else 'were'
-    print(f"\nRelabel summary ({verb}): " + ', '.join(f"{v} {k}" for k, v in counts.items()), flush=True)
+    print(
+        f"\nRelabel summary ({verb}): " +
+        ', '.join(
+            f"{v} {k}" for k,
+            v in counts.items()),
+        flush=True)
     return counts
 
 
@@ -1247,13 +1256,13 @@ Examples:
   python -m mllf.cli.collect_pretraining_data \\
       /path/to/wLambda \\
       --output-dir pretraining/14benz_solv
-  
+
   # Collect specific runs with custom names
   python -m mllf.cli.collect_pretraining_data \\
       /path/to/wLambda \\
       --output-dir pretraining/14benz_solv \\
       --runs run1 run5 run10
-  
+
   # Process with custom combo name pattern
   python -m mllf.cli.collect_pretraining_data \\
       /path/to/wLambda \\
@@ -1261,7 +1270,7 @@ Examples:
       --name-pattern "14benz_solv_{:03d}"
         """
     )
-    
+
     parser.add_argument(
         'base_path',
         type=Path,
@@ -1276,24 +1285,23 @@ Examples:
         default=None,
         help='Output directory for pretraining data (not required with --backfill-ddg)'
     )
-    
+
     parser.add_argument(
         '--runs',
         nargs='+',
         help='Specific run directories to process (default: all run* directories)'
     )
-    
-    parser.add_argument(
-        '--name-pattern',
-        help='Name pattern for combinations (e.g., "combo_{:03d}"). Use {} or {:03d} for run number.'
-    )
-    
+
+    parser.add_argument('--name-pattern',
+                        help='Name pattern for combinations (e.g., "combo_{:03d}"). '
+                             'Use {} or {:03d} for run number.')
+
     parser.add_argument(
         '--solvent-state',
         choices=['solvent', 'vacuum', 'protein', 'unknown'],
         help='Solvent state for all runs (default: auto-detect from path)'
     )
-    
+
     parser.add_argument(
         '--min-transitions',
         type=int,
@@ -1419,33 +1427,37 @@ Examples:
 
     # Normal collection mode — base_path and --output-dir are required
     if args.base_path is None:
-        parser.error("base_path is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode is specified")
+        parser.error(
+            "base_path is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode is "
+            "specified")
     if args.output_dir is None:
-        parser.error("--output-dir is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode is specified")
+        parser.error(
+            "--output-dir is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode "
+            "is specified")
 
     base_path = args.base_path.resolve()
     if not base_path.exists():
         print(f"Error: Base path does not exist: {base_path}")
         return 1
-    
+
     # Find run directories
     if args.runs:
         run_dirs = [base_path / run_name for run_name in args.runs]
         run_dirs = [d for d in run_dirs if d.exists() and d.is_dir()]
     else:
         run_dirs = find_run_directories(base_path)
-    
+
     if not run_dirs:
         print(f"No run directories found in {base_path}")
         return 1
-    
+
     print(f"Found {len(run_dirs)} run directories")
-    
+
     # Process each run directory
     success_count = 0
     skipped_count = 0
     error_count = 0
-    
+
     for i, run_dir in enumerate(run_dirs, start=1):
         # Determine combo name
         if args.name_pattern:
@@ -1459,13 +1471,14 @@ Examples:
                 combo_name = f"{run_dir.parent.name}_{run_dir.name}"
             else:
                 combo_name = run_dir.name
-        
+
         print(f"\n[{i}/{len(run_dirs)}] Processing {run_dir.name} -> {combo_name}")
-        
+
         if args.dry_run:
             print(f"  Would create: {args.output_dir / combo_name}")
             try:
-                bias_data, output_results, graph_info = collect_run_data(run_dir, args.solvent_state)
+                bias_data, output_results, graph_info = collect_run_data(
+                    run_dir, args.solvent_state)
                 # Compute dry-run transition count
                 dry_trans = 0
                 for trans_dict in output_results['transitions'].values():
@@ -1504,13 +1517,14 @@ Examples:
             except Exception as e:
                 print(f"  ✗ Error: {e}")
                 error_count += 1
-    
-    print(f"\n{'='*60}")
-    print(f"Summary: {success_count} successful, {skipped_count} skipped (< {args.min_transitions} transitions), {error_count} errors")
-    
+
+    print(f"\n{'=' * 60}")
+    print(f"Summary: {success_count} successful, {skipped_count} skipped (< "
+          f"{args.min_transitions} transitions), {error_count} errors")
+
     if not args.dry_run and success_count > 0:
         print(f"Pretraining data written to: {args.output_dir.resolve()}")
-    
+
     return 0 if error_count == 0 else 1
 
 

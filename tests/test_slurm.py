@@ -1,4 +1,4 @@
-"""Tests for mllf.cli.slurm (migrated from training/workflow.py).
+"""Tests for mllf.cb.slurm.
 
 Covers submit_epoch_simulation: writing run_epoch.sh with the right SLURM
 directives (defaults and config overrides) and parsing the sbatch job id,
@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mllf.cli import slurm as slurm_mod
-from mllf.cli.slurm import submit_epoch_simulation
+from mllf.cb import slurm as slurm_mod
+from mllf.cb.slurm import submit_epoch_simulation
 
 
 class _FakeCompletedProcess(SimpleNamespace):
@@ -31,7 +31,8 @@ def _fake_sbatch_run(job_id='12345'):
     return _run
 
 
-def test_submit_epoch_simulation_minimal_config_omits_site_specific_directives(tmp_path, monkeypatch):
+def test_submit_epoch_simulation_minimal_config_omits_site_specific_directives(
+        tmp_path, monkeypatch):
     """No `slurm:` block at all: no partition, no GRES, no module load -- must
     still produce a runnable script (portable to a GPU-less, module-less,
     default-partition-only cluster)."""

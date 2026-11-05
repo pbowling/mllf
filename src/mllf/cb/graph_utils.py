@@ -5,7 +5,6 @@ Graph class and fall back to handling networkx-like graph objects.
 """
 from typing import Tuple, Optional, List, Dict
 import torch
-import os
 import warnings
 from torch_geometric.data import Data
 from .atom_vocab import get_atom_type_vocab
@@ -30,27 +29,27 @@ def _find_protein_pdb(prep_path) -> Optional[str]:
 
 def build_directed_pairs(nsubs_per_site: List[int]) -> List[Tuple[int, int]]:
     """Build list of directed pairs for all substituents within each site.
-    
+
     Generates BOTH directions (i→j and j→i) within each site to allow
     independent predictions for skew and end biases.
     No cross-site pairs are generated.
-    
+
     This is useful for both graph-based and pairwise approaches when you need
     all directed edges within sites for training or prediction.
-    
+
     Args:
         nsubs_per_site: List of substituent counts per site
-    
+
     Returns:
         List of (i, j) pairs including both directions within the same site
-        
+
     Example:
         >>> build_directed_pairs([2, 3])  # Site 1: 2 subs, Site 2: 3 subs
         [(0, 1), (1, 0), (2, 3), (2, 4), (3, 2), (3, 4), (4, 2), (4, 3)]
     """
     pairs = []
     offset = 0
-    
+
     for nsubs in nsubs_per_site:
         # Generate both directions for all pairs within site
         for i in range(nsubs):
@@ -58,78 +57,79 @@ def build_directed_pairs(nsubs_per_site: List[int]) -> List[Tuple[int, int]]:
                 if i != j:  # Skip diagonal (self-pairs)
                     pairs.append((offset + i, offset + j))
         offset += nsubs
-    
+
     return pairs
 
 
-
-def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None, element_vocab: dict = None, atom_to_element: dict = None):
+def _node_feature_from_meta(meta: dict, atom_type_vocab: dict = None,
+                            element_vocab: dict = None, atom_to_element: dict = None):
     """Create a numeric vector from node metadata.
 
-    Expected keys in meta: 
+    Expected keys in meta:
     - 'total_charge' (float) - from RTF file, summed over all atoms
     - 'solvent' (str: 'solvent'/'solv' or 'protein') - environmental context
     - 'distinct_atom_types' (list of atom type strings, e.g., ['CG2R61', 'HGR61', 'CG2R61'])
-    
+
     The function returns a 1-D torch.float tensor with features:
     [charge, is_solvent, is_protein, <element counts>, <atom type counts>]
-    
-    If atom_type_vocab, element_vocab, and atom_to_element mapping are provided, distinct_atom_types
+
+    If atom_type_vocab, element_vocab, and atom_to_element mapping are provided,
+    distinct_atom_types
     are encoded as two separate count vectors:
     - Element counts: how many atoms of each element (e.g., 6 C, 4 H, 1 O)
     - Atom type counts: how many of each specific atom type (e.g., 3 CG2R61, 2 HGR61)
-    
+
     Elements are extracted from atom types using the atom_to_element mapping.
-    
+
     This encoding captures both composition (counts) and chemical diversity:
     - Coarse counts: total atoms per element
     - Fine counts: atoms per specific CHARMM type
     - More informative than binary presence/absence
     """
     charge = float(meta.get('total_charge', 0.0))
-    
+
     # Handle solvent as categorical: solvent/solv or protein
     solvent_str = (meta.get('solvent', '') or '').lower()
     is_solvent = 1.0 if solvent_str in ('solvent', 'solv', 'water', 'aq', 'sol') else 0.0
     is_protein = 1.0 if solvent_str in ('protein', 'prot') else 0.0
-    
+
     base_features = [charge, is_solvent, is_protein]
-    
+
     # Encode elements and atom types with counts if vocabularies provided
     if element_vocab is not None and atom_type_vocab is not None and atom_to_element is not None:
         distinct_types = meta.get('distinct_atom_types', [])
         if not isinstance(distinct_types, (list, tuple)):
             distinct_types = []
-        
+
         # Create element count encoding (how many atoms of each element)
         element_encoding = [0.0] * len(element_vocab)
         # Create atom type count encoding (how many of each specific type)
         atom_type_encoding = [0.0] * len(atom_type_vocab)
-        
+
         # Count occurrences of each atom type and element
         for atom_type in distinct_types:
             # Increment atom type count
             if atom_type in atom_type_vocab:
                 idx = atom_type_vocab[atom_type]
                 atom_type_encoding[idx] += 1.0
-                
+
                 # Increment element count using the mapping
                 element = atom_to_element.get(atom_type)
                 if element and element in element_vocab:
                     elem_idx = element_vocab[element]
                     element_encoding[elem_idx] += 1.0
-        
+
         base_features.extend(element_encoding)
         base_features.extend(atom_type_encoding)
-    
+
     return torch.tensor(base_features, dtype=torch.get_default_dtype())
 
 
 def build_pyg_graph_from_mllf_graph(
-    g, 
-    relation_names: list = None, 
-    toppar_dir: Optional[str] = None, 
-    toppar_files: list = None, 
+    g,
+    relation_names: list = None,
+    toppar_dir: Optional[str] = None,
+    toppar_files: list = None,
     warn_missing_types: bool = True,
     pdb_dir: Optional[str] = None,
     pdb_pattern: str = "site{site}_sub{sub}.pdb",
@@ -143,17 +143,18 @@ def build_pyg_graph_from_mllf_graph(
 
     We expand each undirected graph edge into up to four directed relation edges,
     one per bias type. The default `relation_names` is ['linear','quadratic','skw','end'].
-    
+
     Standard mode:
        - Charge, environment type (solvent/protein)
        - Element count encoding (coarse chemical composition)
        - Atom type count encoding (fine CHARMM type composition)
-    
+
     The vocabularies are loaded from CHARMM CGenFF toppar file by default.
 
     Args:
         g: Graph object with node metadata
-        relation_names: List of base relation types (default: ['linear', 'quadratic', 'skew', 'end'])
+        relation_names: List of base relation types
+            (default: ['linear', 'quadratic', 'skew', 'end'])
         toppar_dir: Path to toppar directory (None uses package default)
         toppar_files: List of specific toppar filenames to include.
                      Default: ['top_all36_cgenff.rtf'] (CGenFF only)
@@ -195,7 +196,7 @@ def build_pyg_graph_from_mllf_graph(
     # Pass toppar_files=None when unspecified so all .rtf/.str files in the
     # toppar directory are parsed (including custom_ligand_types.rtf).
     atom_type_vocab, element_vocab, atom_to_element = get_atom_type_vocab(toppar_dir, toppar_files)
-    
+
     # Check for missing atom types in graph if requested
     if warn_missing_types and atom_type_vocab:
         missing_types = set()
@@ -205,30 +206,31 @@ def build_pyg_graph_from_mllf_graph(
             for atom_type in distinct_types:
                 if atom_type not in atom_type_vocab:
                     missing_types.add(atom_type)
-        
+
         if missing_types:
-            import warnings
             sorted_missing = sorted(missing_types)
-            warnings.warn(
-                f"Found {len(sorted_missing)} atom type(s) in substituent RTF files that are not in the vocabulary: "
-                f"{sorted_missing}. These atom types will not be encoded in node features. "
-                f"Consider adding the corresponding toppar file(s) to the vocabulary.",
-                UserWarning
-            )
-    
+            warnings.warn(f"Found {len(sorted_missing)} atom type(s) in substituent RTF files "
+                          f"that are not in the vocabulary: {sorted_missing}. These atom "
+                          "types will not be encoded in node features. Consider adding the "
+                          "corresponding toppar file(s) to the vocabulary.", UserWarning)
+
     # collect node features
     node_feats = []
     site_ids = []  # 0-indexed site assignment per node
-    
-    
+
     # Build node features
     for i in range(g.num_nodes):
         meta = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
         # site is 1-indexed in node metadata; store as 0-indexed for indexing
         site_ids.append(max(0, meta.get('site', 1) - 1))
-        
-        node_feats.append(_node_feature_from_meta(meta, atom_type_vocab, element_vocab, atom_to_element))
-    
+
+        node_feats.append(
+            _node_feature_from_meta(
+                meta,
+                atom_type_vocab,
+                element_vocab,
+                atom_to_element))
+
     x = torch.stack(node_feats, dim=0)
     site_index = torch.tensor(site_ids, dtype=torch.long)
 
@@ -248,27 +250,27 @@ def build_pyg_graph_from_mllf_graph(
         mask = None
         if hasattr(g, 'edge_mask'):
             mask = g.edge_mask.get((i, j))
-        
+
         # Get node metadata for directionality rules
         node_i_info = g.get_node_info(i) if hasattr(g, 'get_node_info') else {}
         node_j_info = g.get_node_info(j) if hasattr(g, 'get_node_info') else {}
         sub_i = node_i_info.get('sub')
         sub_j = node_j_info.get('sub')
-        
+
         for bias in base_relation_names:
             allowed = True if mask is None else bool(mask.get(bias, False))
             if not allowed:
                 continue
-            
+
             fwd_name, bwd_name = base_relation_map[bias]
             fwd_idx = rel_to_idx[fwd_name]
             bwd_idx = rel_to_idx[bwd_name]
             k = len(relation_names)
-            
+
             # Determine directionality based on bias type
             create_forward = True
             create_backward = True
-            
+
             if bias == 'linear':
                 # Linear: Only from reference sub (sub 1) to other subs
                 # If i is sub 1: create i->j only
@@ -283,7 +285,7 @@ def build_pyg_graph_from_mllf_graph(
                 else:
                     # Both are sub 1 or neither is sub 1 - shouldn't happen with proper edge_mask
                     continue
-                    
+
             elif bias == 'quadratic':
                 # Quadratic: Only upper triangle (i < j)
                 if i < j:
@@ -292,9 +294,9 @@ def build_pyg_graph_from_mllf_graph(
                 else:
                     create_forward = False
                     create_backward = True
-                    
+
             # Skew and end: both directions (default behavior)
-            
+
             # Create forward edge (i->j)
             if create_forward:
                 src.append(int(i))
@@ -303,7 +305,7 @@ def build_pyg_graph_from_mllf_graph(
                 one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
                 one_hot[fwd_idx] = 1.0
                 edge_attr_list.append(one_hot)
-            
+
             # Create backward edge (j->i)
             if create_backward:
                 src.append(int(j))
@@ -333,5 +335,5 @@ def build_pyg_graph_from_mllf_graph(
         'element_vocab': element_vocab,
         'atom_to_element': atom_to_element,
     }
-    
+
     return data, extras

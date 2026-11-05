@@ -33,10 +33,10 @@ def build_system_index(systems_cfg: List[Dict]) -> Dict[str, int]:
 
 
 def filter_combos_by_curriculum(combos: List[Path],
-                                 min_sites: int, max_sites: int,
-                                 min_subs_per_site: int = 1,
-                                 max_subs_per_site: Optional[int] = None,
-                                 whitelist: Optional[List[str]] = None) -> List[Path]:
+                                min_sites: int, max_sites: int,
+                                min_subs_per_site: int = 1,
+                                max_subs_per_site: Optional[int] = None,
+                                whitelist: Optional[List[str]] = None) -> List[Path]:
     """Keep combos whose encoded site and substituent counts meet the limits.
 
     If provided, ``whitelist`` further restricts results to matching names.
@@ -71,7 +71,7 @@ def filter_combos_by_curriculum(combos: List[Path],
 
 
 def filter_combos_by_transitions(combos: List, min_transitions: int,
-                                  lookback: int = 3) -> List:
+                                 lookback: int = 3) -> List:
     """Keep combos whose recent results meet the per-site transition floor."""
     qualifying = []
     for combo_dir in combos:
@@ -98,8 +98,8 @@ def filter_combos_by_transitions(combos: List, min_transitions: int,
 
 
 def apply_stage_combo_filter(train_combos, stage, curriculum_config, stage_idx, seed,
-                               apply_transition_filter: bool = True,
-                               combo_system_map: Optional[Dict[str, Dict]] = None):
+                             apply_transition_filter: bool = True,
+                             combo_system_map: Optional[Dict[str, Dict]] = None):
     """Apply curriculum + optional transition filter for a given stage config.
 
     A stage may list ``systems: [name, ...]`` to train on only those systems
@@ -138,48 +138,48 @@ def apply_stage_combo_filter(train_combos, stage, curriculum_config, stage_idx, 
 
 
 def sample_combos_stratified(system_combo_pools: Dict[str, List[str]],
-                              n_total: int = 500,
-                              min_per_system: int = 5,
-                              seed: Optional[int] = None) -> List[str]:
+                             n_total: int = 500,
+                             min_per_system: int = 5,
+                             seed: Optional[int] = None) -> List[str]:
     """Sample combos with uniform minimum allocation per system, then proportional.
-    
+
     Guarantees each system gets at least min_per_system combos, then allocates
     remaining combos proportionally to system pool size.
-    
+
     Args:
         system_combo_pools: Dict mapping system_name -> list of combo paths
         n_total: Total number of combos to sample
         min_per_system: Minimum combos per system
         seed: Random seed for reproducibility
-        
+
     Returns:
         List of sampled combo paths
     """
     rng = np.random.RandomState(seed)
     n_systems = len(system_combo_pools)
-    
+
     # Check feasibility
     min_total = min_per_system * n_systems
     if min_total > n_total:
         logging.warning(f"n_total={n_total} < min required {min_total}; "
-                       f"reducing min_per_system to {n_total // n_systems}")
+                        f"reducing min_per_system to {n_total // n_systems}")
         min_per_system = max(1, n_total // n_systems)
-    
+
     # Allocate minimum to each system first
     allocated_per_system = {name: min_per_system for name in system_combo_pools}
     remaining = n_total - (min_per_system * n_systems)
-    
+
     # Get system sizes
     system_sizes = {name: len(combos) for name, combos in system_combo_pools.items()}
     total_size = sum(system_sizes.values())
-    
+
     # Allocate remaining proportionally
     if total_size > 0 and remaining > 0:
         for system_name in allocated_per_system:
             if total_size > 0:
                 extra = int(remaining * system_sizes[system_name] / total_size)
                 allocated_per_system[system_name] += extra
-    
+
     # Collect sampled combos
     sampled_combos = []
     for system_name, n_samples in allocated_per_system.items():
@@ -189,9 +189,9 @@ def sample_combos_stratified(system_combo_pools: Dict[str, List[str]],
         if n_samples > 0:
             sampled = rng.choice(combo_list, size=n_samples, replace=False).tolist()
             sampled_combos.extend(sampled)
-    
+
     # Final cap to ensure exactly n_total (may be slightly less due to rounding)
     if len(sampled_combos) > n_total:
         sampled_combos = sampled_combos[:n_total]
-    
+
     return sampled_combos

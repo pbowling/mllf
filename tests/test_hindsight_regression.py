@@ -107,10 +107,15 @@ def test_precision_and_sampling_spread_survive_checkpoint_load(tmp_path):
 
     before = spread(pol)
     lam0 = pol.edge_mlp.mlps[0].bayesian_head.Lambda.clone()
-    online = [online_item(*_graph(s), torch.tensor([[5.0, 20.0, 1.0, 2.0], [-5.0, 20.0, 1.0, 2.0]]),
-                          torch.full((2, 4), 0.25, dtype=torch.float64)) for s in range(4)]
+    online = [
+        online_item(
+            *_graph(s),
+            torch.tensor([[5.0, 20.0, 1.0, 2.0],
+                          [-5.0, 20.0, 1.0, 2.0]]),
+            torch.full((2, 4),
+                       0.25, dtype=torch.float64)) for s in range(4)]
     regression_step(pol, online, [], regression_config({'regression': {'steps': 20, 'lr': 1e-3,
-                                                                        'replay_weight': 0.0}}))
+                                                                       'replay_weight': 0.0}}))
     h = pol.edge_mlp.mlps[0].bayesian_head
     assert torch.allclose(h.Lambda, lam0)
     assert torch.allclose(h.Lambda_mu, h.Lambda @ h.mu)
@@ -137,7 +142,8 @@ def test_replay_cache_built_for_another_env_input_is_refused():
 
 def test_replay_cache_built_with_other_ligand_embeddings_is_refused(tmp_path):
     cache = tmp_path / 'replay.pt'
-    _check_replay_ligand({'ligand_other_sites': False}, cache)          # no info file: built without
+    _check_replay_ligand({'ligand_other_sites': False},
+                         cache)          # no info file: built without
     with pytest.raises(ValueError, match='ligand_other_sites'):
         _check_replay_ligand({'ligand_other_sites': True}, cache)
     (tmp_path / 'replay.pt.json').write_text('{"ligand_other_sites": true}')

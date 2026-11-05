@@ -1,16 +1,18 @@
-import os
 from pathlib import Path
 import yaml
 import numpy as np
 from mllf.cb.graph import Graph
-from mllf.file_handling.write_bias_coeff import write_bias_inp_from_graph, write_variables_py_from_inp
+from mllf.file_handling.write_bias_coeff import (
+    write_bias_inp_from_graph,
+    write_variables_py_from_inp,
+)
 
 
 def _get_example_path(filename):
-	"""Get absolute path to example file, relative to repository root."""
-	test_file = Path(__file__)
-	repo_root = test_file.parent.parent
-	return repo_root / "tests" / "samples" / filename
+    """Get absolute path to example file, relative to repository root."""
+    test_file = Path(__file__)
+    repo_root = test_file.parent.parent
+    return repo_root / "tests" / "samples" / filename
 
 
 def _read_set_names(path):
@@ -37,17 +39,17 @@ def test_write_matches_example(tmp_path):
     g = Graph(5)
     # arbitrary coeffs
     for i in range(5):
-        for j in range(i+1, 5):
+        for j in range(i + 1, 5):
             g.set_edge(i, j, [0.0, 0.0, 0.0, 0.0])
 
     subs = [3, 4, 8, 8, 8]
     out = tmp_path / "generated.inp"
     example = _get_example_path('variables85.inp')
-    
+
     if not example.exists():
         import pytest
         pytest.skip(f"Example file not found: {example}")
-    
+
     # use the example file as the header source so non-bias lines are copied verbatim
     write_bias_inp_from_graph(g, str(out), sub_counts=subs, header_source=str(example))
     gen_names = set(_read_set_names(str(out)))
@@ -67,11 +69,11 @@ def test_variables_py_contains_bias(tmp_path):
     """
 
     inp = _get_example_path('variables85.inp')
-    
+
     if not inp.exists():
         import pytest
         pytest.skip(f"Example file not found: {inp}")
-    
+
     out = tmp_path / "variables.py"
     write_variables_py_from_inp(str(inp), str(out))
 
@@ -99,16 +101,19 @@ def test_variables_py_contains_bias(tmp_path):
     assert len(flat_b) == c.shape[0]
 
     # ensure no duplicate scalar lines after the bias_string closing quotes
-    after = s[end + 3 :]
-    dup_lines = [ln for ln in after.splitlines() if ln.strip().startswith(('lams', 'cs', 'xs', 'ss'))]
+    after = s[end + 3:]
+    dup_lines = [
+        ln for ln in after.splitlines() if ln.strip().startswith(
+            ('lams', 'cs', 'xs', 'ss'))]
     assert dup_lines == []
-    
+
     # ensure bias = yaml.safe_load(bias_string) line is present
     assert 'bias = yaml.safe_load(bias_string)' in s, "Missing yaml.safe_load line"
 
 # ---------------------------------------------------------------------------
 # Sign convention: flat cs/xs/ss (CHARMM, .inp) = -matrix c/x/s; lams = b.
 # ---------------------------------------------------------------------------
+
 
 def _load_bias_string(path):
     import re
@@ -149,7 +154,15 @@ def test_inp_writer_round_trips_through_collector_reader(tmp_path):
 
 def test_inp_writer_zero_coefficients_not_written_as_negative_zero(tmp_path):
     out = tmp_path / "variables.inp"
-    write_bias_inp_from_graph(_two_site_graph(quad=0.0, skew=0.0, end=0.0), str(out), sub_counts=[1, 1])
+    write_bias_inp_from_graph(
+        _two_site_graph(
+            quad=0.0,
+            skew=0.0,
+            end=0.0),
+        str(out),
+        sub_counts=[
+            1,
+            1])
     assert '-0.00000000' not in out.read_text()
 
 
@@ -182,7 +195,8 @@ def test_variables_py_from_inp_end_term_sign(tmp_path):
 
 
 def test_both_inp_readers_agree(tmp_path):
-    """write_variables_py_from_inp and the collector's parse_bias_from_inp give the same matrices."""
+    """write_variables_py_from_inp and the collector's parse_bias_from_inp give the same
+    matrices."""
     from mllf.cli.collect_pretraining_data import parse_bias_from_inp
     inp = _get_example_path('variables85.inp')
     if not inp.exists():

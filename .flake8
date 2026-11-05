@@ -1,0 +1,16 @@
+[flake8]
+# PEP 8 allows a team to raise the limit to 99 characters.
+max-line-length = 99
+exclude =
+    .git,
+    __pycache__,
+    _build,
+    docs,
+    old_files,
+    training,
+    pretraining,
+    examples,
+    tests/samples
+per-file-ignores =
+    # Fixture strings reproduce PDB records, whose trailing columns are blanks.
+    tests/test_pdb_reader.py: W291

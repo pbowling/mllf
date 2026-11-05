@@ -36,8 +36,6 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from mllf.file_handling.manifests import register_explicit_combos
-
 ALF_GROUPS = 'alf_groups'
 ALF_GROUP_PAIRS = 'alf_group_pairs'
 # Only the pairs between each group site's reference (its first substituent)
@@ -50,7 +48,7 @@ def _natural_key(p: Path):
     return (int(m.group(1)) if m else 10 ** 9, p.name)
 
 
-def _rtf_signature(path) -> Tuple[Optional[str], tuple]:
+def rtf_signature(path) -> Tuple[Optional[str], tuple]:
     """(source-ligand tag, sorted (atom name, type, charge)) of a fragment's
     pres.rtf: the substituent's identity independent of its numbering, its
     PRES name and its coordinates (ALF groups were sometimes prepared with
@@ -79,15 +77,17 @@ def _alf_dataset_dirs(system: str, root: Path) -> List[Path]:
         groups = sorted(root.glob(f"{name}_group*"), key=_natural_key)
         if groups:
             return groups
-    return [root / name for name in names if any((root / name).glob('run[0-9]*/graph_info.json'))][:1]
+    return [
+        root / name for name in names if any((root / name).glob('run[0-9]*/graph_info.json'))][:1]
 
 
-def read_alf_groups(system: str, alf_root, input_dir) -> Tuple[List[Dict[int, List[int]]], List[str]]:
+def read_alf_groups(system: str, alf_root,
+                    input_dir) -> Tuple[List[Dict[int, List[int]]], List[str]]:
     """ALF's groups for ``system``: [{site: [subs in ALF's node order]}] in the
     system's own numbering, and warnings.
 
     Each group node's fragment is matched to the input_dir fragment with the
-    same content (``_rtf_signature``); failing that, with the same atoms
+    same content (``rtf_signature``); failing that, with the same atoms
     alone if that is unique. A node with no match is dropped (the system was
     prepared without that substituent), as is a site left with one
     substituent (fixed, not perturbed)."""
@@ -98,12 +98,13 @@ def read_alf_groups(system: str, alf_root, input_dir) -> Tuple[List[Dict[int, Li
     for f in prep.glob('site*_sub*_pres.rtf'):
         m = re.match(r'site(\d+)_sub(\d+)_', f.name)
         if m:
-            sig = _rtf_signature(f)
+            sig = rtf_signature(f)
             ours.setdefault(sig, []).append((int(m.group(1)), int(m.group(2))))
             by_atoms.setdefault(sig[1], []).append((int(m.group(1)), int(m.group(2))))
     groups, warnings = [], []
     for gdir in _alf_dataset_dirs(system, root):
-        info_path = next((r / 'graph_info.json' for r in sorted(gdir.glob('run[0-9]*'), key=_natural_key)
+        info_path = next((r / 'graph_info.json'
+                          for r in sorted(gdir.glob('run[0-9]*'), key=_natural_key)
                           if (r / 'graph_info.json').exists()), None)
         if info_path is None:
             warnings.append(f"{gdir.name}: no run with graph_info.json; skipped")
@@ -122,12 +123,17 @@ def read_alf_groups(system: str, alf_root, input_dir) -> Tuple[List[Dict[int, Li
             if use is None or not use.exists():
                 warnings.append(f"{gdir.name}: {label}: no fragment file ({copy}, {src}); dropped")
                 continue
-            sig = _rtf_signature(use)
-            if use == copy and src and Path(src).exists() and _rtf_signature(src) != sig:
+            sig = rtf_signature(use)
+            if use == copy and src and Path(src).exists() and rtf_signature(src) != sig:
                 warnings.append(f"{gdir.name}: {label}: ALF's runs used a different fragment "
                                 f"({src}) than the dataset's prep copy; its ALF biases and cost "
-                                f"are not for this substituent")
-            hits = ours.get(sig) or (by_atoms.get(sig[1]) if len(by_atoms.get(sig[1], [])) == 1 else None)
+                                "are not for this substituent")
+            hits = ours.get(sig) or (
+                by_atoms.get(
+                    sig[1]) if len(
+                    by_atoms.get(
+                        sig[1],
+                        [])) == 1 else None)
             if not hits:
                 warnings.append(f"{gdir.name}: {label} ({Path(src).name}) matches no substituent "
                                 f"in {prep}; dropped")
@@ -159,11 +165,12 @@ def group_combo_info(prefix: str, index: int, group: Dict[int, List[int]], out_d
             'subs_per_site_counts': counts if len(sites) > 1 else None, 'counter': index}
 
 
-def reversed_pair(combo_path) -> Optional[str]:
+def reversed_pair(combo_path, registry: Optional[Dict[str, Dict]] = None) -> Optional[str]:
     """The reverse-orientation partner of a one-site pair combo
     (``pair07_site1_subs_1_9`` -> ``pair07r_site1_subs_9_1``, in the same
     directory): the same pair with lambda starting on the other substituent.
-    Registered for on-demand creation; returns its path, or None if
+    Its combo info is added to ``registry`` (combo path -> info, for
+    ``ensure_combo_dir_exists``); returns its path, or None if
     ``combo_path`` is not a one-site pair (or is itself a partner)."""
     p = Path(combo_path)
     m = re.match(r'pair(\d+)_site(\d+)_subs_(\d+)_(\d+)$', p.name)
@@ -173,7 +180,8 @@ def reversed_pair(combo_path) -> Optional[str]:
     info = group_combo_info('pair', index, {site: [b, a]}, p.parent)
     info['name'] = info['name'].replace(f'pair{index:02d}_', f'pair{index:02d}r_', 1)
     info['path'] = str(p.parent / info['name'])
-    register_explicit_combos([info])
+    if registry is not None:
+        registry[info['path']] = info
     return info['path']
 
 
@@ -194,9 +202,15 @@ def group_pairs(groups: List[Dict[int, List[int]]],
     return out
 
 
-def build_combo_sets(sys_entry: Dict, alf_root=None) -> Tuple[Dict[str, List[str]], List[str]]:
-    """The system's ``combo_sets`` as {set name: [combo paths]}, registered
-    for on-demand creation, plus warnings."""
+def build_combo_sets(sys_entry: Dict, alf_root=None,
+                     registry: Optional[Dict[str, Dict]] = None
+                     ) -> Tuple[Dict[str, List[str]], List[str]]:
+    """The system's ``combo_sets`` as {set name: [combo paths]}, plus warnings.
+
+    These combos are in no manifest; their combo infos are added to
+    ``registry`` (combo path -> info), which callers pass to
+    ``build_combo_dir_lookup`` / ``ensure_combo_dir_exists`` so the
+    directories can be created on demand."""
     spec = sys_entry.get('combo_sets') or {}
     if not spec:
         return {}, []
@@ -214,7 +228,7 @@ def build_combo_sets(sys_entry: Dict, alf_root=None) -> Tuple[Dict[str, List[str
             src = how.get('pairs_of')
             if src not in groups_of:
                 raise ValueError(f"{system}: combo set {set_name}: pairs_of {src!r} must name "
-                                 f"an explicit group set defined before it")
+                                 "an explicit group set defined before it")
             groups = groups_of[src]
             pairs_mode = 'ref' if how.get('reference_only') else 'all'
         elif how in (ALF_GROUPS, ALF_GROUP_PAIRS, ALF_GROUP_REF_PAIRS):
@@ -244,5 +258,6 @@ def build_combo_sets(sys_entry: Dict, alf_root=None) -> Tuple[Dict[str, List[str
                          for n, g in enumerate(groups, start=1)]
         infos += set_infos
         sets[set_name] = [i['path'] for i in set_infos]
-    register_explicit_combos(infos)
+    if registry is not None:
+        registry.update({str(i['path']): i for i in infos})
     return sets, warnings

@@ -1,6 +1,23 @@
-"""bandit.algorithm and the settings a hindsight run uses unless its config says otherwise."""
+"""The ``bandit:`` block of a workflow config.
+
+``with_hindsight_defaults`` fills in the settings a hindsight run uses unless
+its config says otherwise; ``BanditConfig.from_config`` then reads the block
+once, with every remaining default in one place.
+"""
 import copy
-from typing import Dict, Optional
+import dataclasses
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from mllf.cb.hindsight import (
+    BARRIER_TRAP_WIDTH,
+    BIAS_DIMS,
+    DEFAULT_TEMPERATURE,
+    EXPLORE_FACTOR_MAX,
+    OFFSET_DIMS,
+    PERSISTENT_FAILURES,
+    QUADRATIC_STEP_MAX,
+)
 
 # 'reinforce' (default) or 'hindsight'; 'neurallinear_ts' is hindsight's
 # former name, still accepted.
@@ -66,3 +83,121 @@ def with_hindsight_defaults(config: Dict) -> Dict:
         for key, value in HINDSIGHT_STAGE_DEFAULTS.items():
             stage.setdefault(key, value)
     return config
+
+
+@dataclass(frozen=True)
+class BanditConfig:
+    """Typed view of ``config['bandit']`` with the defaults the training code
+    uses when a key is absent. Build it with ``from_config`` after
+    ``with_hindsight_defaults``; ``raw`` keeps the block itself for the
+    sub-blocks other modules merge with their own defaults
+    (``group_correction.correction_config``, ``hindsight_regression.regression_config``).
+    """
+    algorithm: str = 'reinforce'
+    update_target: str = 'awr'                 # 'awr' or 'hindsight'
+    shared_update: str = 'posterior'           # 'posterior' or 'regression'
+    selection: Optional[str] = None            # None: uncertainty for hindsight, else random
+    selection_attention_weight: float = 0.0
+    candidate_pool_size: Optional[int] = None  # None: 5 x the epoch's combo budget
+    min_observations_before_confident: int = 3
+    prior_precision: float = 1.0
+    exploration_scale: float = 1.0
+    failure_retry_cap: int = 3
+    awr_temperature: float = 0.5
+    # per-pair offsets
+    pair_offsets: bool = True
+    offset_sampling: bool = False
+    offset_prior_sd: Optional[Dict[str, float]] = None
+    offset_base_sd: Optional[Dict[str, float]] = None
+    offset_history: int = 5
+    c_cap: Optional[Dict[str, float]] = None
+    # hindsight targets
+    hindsight_dims: Tuple[str, ...] = BIAS_DIMS
+    hindsight_weight_scale: Union[float, Dict[str, float]] = 1.0
+    temperature: float = DEFAULT_TEMPERATURE
+    hindsight_linear_step_cap: float = 3.0
+    hindsight_quadratic_step_cap: float = 12.0
+    hindsight_skew_step_cap: float = 3.0
+    hindsight_end_step_cap: float = 1.5
+    end_reference_s: float = 1.5
+    linear_step_max: Optional[float] = None    # None: hindsight_linear_step_cap
+    quadratic_step_max: float = QUADRATIC_STEP_MAX
+    barrier_trap_width: float = BARRIER_TRAP_WIDTH
+    b_direction_requires_crossing: bool = True
+    c_up_requires_b_bracket: bool = False
+    explore_factor_max: float = EXPLORE_FACTOR_MAX
+    explore_after_failures: int = PERSISTENT_FAILURES
+    # group runs and revisits (sub-blocks)
+    group_holdoff: Optional[Dict[str, float]] = None
+    revisit: Dict[str, Any] = field(default_factory=dict)
+    regression: Dict[str, Any] = field(default_factory=dict)
+    raw: Dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+
+    @classmethod
+    def from_config(cls, config: Dict) -> 'BanditConfig':
+        """Read ``config['bandit']`` (absent or null: all defaults)."""
+        return cls.from_dict(config.get('bandit') or {})
+
+    @classmethod
+    def from_dict(cls, bandit: Dict) -> 'BanditConfig':
+        names = {f.name for f in dataclasses.fields(cls)} - {'raw', 'algorithm'}
+        # An explicit null keeps the default, except for keys where null means "off".
+        kwargs = {k: bandit[k] for k in names
+                  if k in bandit and (bandit[k] is not None or k in _NULLABLE)}
+        if 'hindsight_dims' in kwargs:
+            kwargs['hindsight_dims'] = tuple(kwargs['hindsight_dims'])
+        for k in ('revisit', 'regression'):
+            kwargs[k] = dict(kwargs.get(k) or {})
+        return cls(algorithm=bandit_algorithm(bandit), raw=bandit, **kwargs)
+
+    @staticmethod
+    def unknown_keys(bandit: Optional[Dict]) -> List[str]:
+        """Keys of a bandit block that nothing reads (likely typos)."""
+        known = {f.name for f in dataclasses.fields(BanditConfig)} | {'group_correction'}
+        return sorted(k for k in (bandit or {}) if k not in known)
+
+    # -- derived settings -------------------------------------------------
+    @property
+    def use_hindsight(self) -> bool:
+        """Heads regress toward hindsight targets (``update_target: hindsight``)."""
+        return self.update_target == 'hindsight'
+
+    @property
+    def shared_regression(self) -> bool:
+        """Hindsight targets fit by gradient steps on the full network."""
+        return self.use_hindsight and self.shared_update == 'regression'
+
+    @property
+    def validation_gate(self) -> bool:
+        """Keep the shared model only while held-out pairs hold up."""
+        return self.shared_update == 'regression' and self.regression.get('validation_gate', True)
+
+    @property
+    def selection_mode(self) -> str:
+        return self.selection or ('uncertainty' if self.algorithm == 'hindsight' else 'random')
+
+    @property
+    def offset_dims(self) -> List[str]:
+        """``hindsight_dims`` that have per-pair offsets, in config order."""
+        return [d for d in self.hindsight_dims if d in OFFSET_DIMS]
+
+    def weight_scale(self, dims) -> Dict[str, float]:
+        """Shared-model update strength per head (one number, or per head, others 1.0)."""
+        ws = self.hindsight_weight_scale
+        if isinstance(ws, dict):
+            return {d: float(ws.get(d, 1.0)) for d in dims}
+        return {d: float(ws) for d in dims}
+
+    @property
+    def step_caps(self) -> Dict[str, float]:
+        """``hindsight_targets`` step caps."""
+        return dict(linear_step_cap=float(self.hindsight_linear_step_cap),
+                    quadratic_step_cap=float(self.hindsight_quadratic_step_cap),
+                    skew_step_cap=float(self.hindsight_skew_step_cap),
+                    end_step_cap=float(self.hindsight_end_step_cap),
+                    end_reference=float(self.end_reference_s))
+
+
+# Keys whose explicit null means "off" rather than "use the default".
+_NULLABLE = ('c_cap', 'group_holdoff', 'offset_prior_sd', 'offset_base_sd', 'selection',
+             'candidate_pool_size', 'linear_step_max')

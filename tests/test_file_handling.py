@@ -3,7 +3,11 @@ import math
 import pytest
 
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
-from mllf.file_handling.read_output import parse_lambda_trajectory, parse_pair_barriers, parse_site_holdoff
+from mllf.file_handling.read_output import (
+    parse_lambda_trajectory,
+    parse_pair_barriers,
+    parse_site_holdoff,
+)
 from mllf.file_handling.read_rtf import parse_rtf_file, parse_rtf_dir
 
 
@@ -91,97 +95,97 @@ def test_resolve_output_file_none_when_missing(tmp_path):
 
 
 def test_read_bias_coeff_parses_old_file():
-	"""Ensure read_bias_coeff can parse the example variables85.inp (old ALF format)."""
-	here = os.path.dirname(__file__)
-	fn = os.path.join(here, 'samples', 'variables85.inp')
+    """Ensure read_bias_coeff can parse the example variables85.inp (old ALF format)."""
+    here = os.path.dirname(__file__)
+    fn = os.path.join(here, 'samples', 'variables85.inp')
 
-	data = read_bias_coeff(fn)
+    data = read_bias_coeff(fn)
 
-	# top-level groups should exist
-	assert set(data.keys()) == {'lams', 'cs', 'xs', 'ss'}
+    # top-level groups should exist
+    assert set(data.keys()) == {'lams', 'cs', 'xs', 'ss'}
 
-	# check a few known values from the example file
-	# lams1s2 = 0.13
-	assert 'lams1s2' in data['lams']
-	assert math.isclose(data['lams']['lams1s2'], 0.13, rel_tol=1e-6)
+    # check a few known values from the example file
+    # lams1s2 = 0.13
+    assert 'lams1s2' in data['lams']
+    assert math.isclose(data['lams']['lams1s2'], 0.13, rel_tol=1e-6)
 
-	# lams3s8 = -14.20
-	assert math.isclose(data['lams']['lams3s8'], -14.20, rel_tol=1e-6)
+    # lams3s8 = -14.20
+    assert math.isclose(data['lams']['lams3s8'], -14.20, rel_tol=1e-6)
 
-	# cs1s1s1s2 = -39.95
-	assert 'cs1s1s1s2' in data['cs']
-	assert math.isclose(data['cs']['cs1s1s1s2'], -39.95, rel_tol=1e-6)
+    # cs1s1s1s2 = -39.95
+    assert 'cs1s1s1s2' in data['cs']
+    assert math.isclose(data['cs']['cs1s1s1s2'], -39.95, rel_tol=1e-6)
 
-	# some entries should be zero values parsed as floats
-	assert math.isclose(data['cs'].get('cs1s1s2s1', 0.0), -0.0, rel_tol=1e-6)
+    # some entries should be zero values parsed as floats
+    assert math.isclose(data['cs'].get('cs1s1s2s1', 0.0), -0.0, rel_tol=1e-6)
+
 
 def test_read_bias_coeff_parses_new_file():
-	"""Ensure read_bias_coeff can parse the example variables16.py (new ALF format).
+    """Ensure read_bias_coeff can parse the example variables16.py (new ALF format).
 
-	The `b:` nested list encodes linear biases for multiple i blocks. Each block
-	begins with a 0.0 value. We assert some sample lams assignments to ensure
-	the zero-handling logic is correct.
-	"""
-	here = os.path.dirname(__file__)
-	fn = os.path.join(here, 'samples', 'variables.py')
+    The `b:` nested list encodes linear biases for multiple i blocks. Each block
+    begins with a 0.0 value. We assert some sample lams assignments to ensure
+    the zero-handling logic is correct.
+    """
+    here = os.path.dirname(__file__)
+    fn = os.path.join(here, 'samples', 'variables.py')
 
-	data = read_bias_coeff(fn)
+    data = read_bias_coeff(fn)
 
-	# top-level groups should exist (scalar entries)
-	assert set(data.keys()) >= {'lams', 'cs', 'xs', 'ss'}
-	
-	# matrices should also be present
-	assert 'b' in data and 'c' in data and 'x' in data and 's' in data
-	
-	# b is normalised to a flat 1-D list (parse_new unwraps the [[...]] wrapper)
-	b = data['b']
-	assert isinstance(b, list), "b should be a list"
-	assert len(b) == 31, "b should have 31 values for this example"
-	assert isinstance(b[0], float), "b[0] should be a scalar float"
-	assert b[0] == 0.0 and b[1] == 0.13, "b vector values should match"
-	
-	# c should be a 31x31 matrix
-	c = data['c']
-	assert isinstance(c, list) and len(c) == 31
-	assert all(isinstance(row, list) and len(row) == 31 for row in c)
+    # top-level groups should exist (scalar entries)
+    assert set(data.keys()) >= {'lams', 'cs', 'xs', 'ss'}
 
-	assert 'lams1s2' in data['lams']
-	assert math.isclose(data['lams']['lams1s2'], 0.13, rel_tol=1e-6)
+    # matrices should also be present
+    assert 'b' in data and 'c' in data and 'x' in data and 's' in data
 
-	# lams3s8 = -14.20
-	assert math.isclose(data['lams']['lams3s8'], -14.20, rel_tol=1e-6)
+    # b is normalised to a flat 1-D list (parse_new unwraps the [[...]] wrapper)
+    b = data['b']
+    assert isinstance(b, list), "b should be a list"
+    assert len(b) == 31, "b should have 31 values for this example"
+    assert isinstance(b[0], float), "b[0] should be a scalar float"
+    assert b[0] == 0.0 and b[1] == 0.13, "b vector values should match"
 
-	# cs1s1s1s2 = -39.95
-	assert 'cs1s1s1s2' in data['cs']
-	assert math.isclose(data['cs']['cs1s1s1s2'], -39.95, rel_tol=1e-6)
+    # c should be a 31x31 matrix
+    c = data['c']
+    assert isinstance(c, list) and len(c) == 31
+    assert all(isinstance(row, list) and len(row) == 31 for row in c)
 
-	# some entries should be zero values parsed as floats
-	assert math.isclose(data['cs'].get('cs1s1s2s1', 0.0), -0.0, rel_tol=1e-6)
+    assert 'lams1s2' in data['lams']
+    assert math.isclose(data['lams']['lams1s2'], 0.13, rel_tol=1e-6)
+
+    # lams3s8 = -14.20
+    assert math.isclose(data['lams']['lams3s8'], -14.20, rel_tol=1e-6)
+
+    # cs1s1s1s2 = -39.95
+    assert 'cs1s1s1s2' in data['cs']
+    assert math.isclose(data['cs']['cs1s1s1s2'], -39.95, rel_tol=1e-6)
+
+    # some entries should be zero values parsed as floats
+    assert math.isclose(data['cs'].get('cs1s1s2s1', 0.0), -0.0, rel_tol=1e-6)
 
 
 def test_parse_rtf_file_and_dir():
-	"""Test parse_rtf_file and parse_rtf_dir on the example PRES file."""
-	here = os.path.dirname(__file__)
-	rtf_path = os.path.join(here, 'samples', '14benz_solv_5.5', 'site1_sub1_pres.rtf')
+    """Test parse_rtf_file and parse_rtf_dir on the example PRES file."""
+    here = os.path.dirname(__file__)
+    rtf_path = os.path.join(here, 'samples', '14benz_solv_5.5', 'site1_sub1_pres.rtf')
 
-	parsed = parse_rtf_file(rtf_path)
+    parsed = parse_rtf_file(rtf_path)
 
-	# site and sub should be detected from the filename
-	assert parsed['site'] == 1
-	assert parsed['sub'] == 1
+    # site and sub should be detected from the filename
+    assert parsed['site'] == 1
+    assert parsed['sub'] == 1
 
-	# atom_types should include the two types in the file
-	assert 'C261' in parsed['atom_types']
-	assert 'HG61' in parsed['atom_types']
+    # atom_types should include the two types in the file
+    assert 'C261' in parsed['atom_types']
+    assert 'HG61' in parsed['atom_types']
 
-	# total_charge should be the sum of -0.115000 and 0.115000 -> 0.0
-	assert math.isclose(parsed['total_charge'], 0.0, abs_tol=1e-9)
+    # total_charge should be the sum of -0.115000 and 0.115000 -> 0.0
+    assert math.isclose(parsed['total_charge'], 0.0, abs_tol=1e-9)
 
-	# parse directory and ensure key exists
-	d = os.path.join(here, 'samples', '14benz_solv_5.5')
-	results = parse_rtf_dir(d)
-	assert 'site1_sub1' in results
-
+    # parse directory and ensure key exists
+    d = os.path.join(here, 'samples', '14benz_solv_5.5')
+    results = parse_rtf_dir(d)
+    assert 'site1_sub1' in results
 
 
 def _profile_rows(counts):
@@ -244,7 +248,12 @@ def test_parse_pair_profile_endpoint_held_off_signature():
     # the mup1 failure. Occupancy is reported although no barrier/skew/end is defined.
     from mllf.file_handling.read_output import parse_pair_profile
     prof = parse_pair_profile(_lambda_output(_profile_rows({0.1: 800, 0.3: 200})))[(2, 3)]
-    assert prof["endpoints"] == {"edge": 1000, "at_lo": 0, "near_lo": 800, "near_hi": 0, "at_hi": 0}
+    assert prof["endpoints"] == {
+        "edge": 1000,
+        "at_lo": 0,
+        "near_lo": 800,
+        "near_hi": 0,
+        "at_hi": 0}
     assert prof["barrier"] is None and prof["end"] is None
 
 
@@ -257,7 +266,16 @@ def test_parse_pair_barriers_matches_profile():
 def test_pair_transitions_credit_each_state_change_to_its_pair():
     # site with 3 subs (blocks 2,3,4): states 2 → 3 → 2 → 4 → 3, with non-physical frames between
     from mllf.file_handling.read_output import parse_pair_profile
-    seq = [[1, 0, 0], [0.5, 0.5, 0], [0, 1, 0], [0, 1, 0], [1, 0, 0], [0.4, 0, 0.6], [0, 0, 1], [0, 1, 0]]
+    seq = [
+        [
+            1, 0, 0], [
+            0.5, 0.5, 0], [
+                0, 1, 0], [
+                    0, 1, 0], [
+                        1, 0, 0], [
+                            0.4, 0, 0.6], [
+                                0, 0, 1], [
+                                    0, 1, 0]]
     rows = []
     for r in seq:
         rows += [r] * 30          # keep every pair above the minimum-frames threshold
@@ -288,7 +306,8 @@ def test_site_holdoff_dominant_sub_short_of_its_endpoint():
     (site,) = parse_site_holdoff(_lambda_output(rows))
     assert site['blocks'] == [2, 3, 4] and site['dom'] == 2
     assert site['dom_frac'] == pytest.approx(0.9)
-    assert site['at_frac'] == pytest.approx(1 / 9)              # one of its 9 frames at lambda >= 0.99
+    # one of its 9 frames at lambda >= 0.99
+    assert site['at_frac'] == pytest.approx(1 / 9)
     assert site['partners'] == pytest.approx({3: 0.96 / 9, 4: 0.64 / 9})
 
 

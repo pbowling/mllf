@@ -80,7 +80,7 @@ and 25% of its scale, which gives every head the same proportional room to explo
 From Edge Predictions to Biases
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``write_variables_from_actions`` (``mllf.cli.workflow``) turns the per-edge predictions
+``write_variables_from_actions`` (``mllf.file_handling.write_bias_coeff``) turns the per-edge predictions
 into the per-site matrices of ``variables.py`` (storage conventions in
 :doc:`file_handling`), combining each coefficient according to its symmetry.
 

@@ -123,7 +123,8 @@ def _write_mapping(combo, subs):
 def test_offsets_follow_original_sub_order(tmp_path):
     # Same physical pair (subs 4, 8) seen with nodes in both orders.
     a, b = tmp_path / 'a', tmp_path / 'b'
-    a.mkdir(); b.mkdir()
+    a.mkdir()
+    b.mkdir()
     _write_mapping(a, [4, 8])
     _write_mapping(b, [8, 4])
     state = {}

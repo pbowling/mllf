@@ -11,8 +11,8 @@ from mllf.cb import unimol_representation as ur
 
 def _pdb(path: Path, atoms, segid):
     """atoms: [(name, resname, resnum, x, y, z, element)]"""
-    lines = [f"ATOM  {k + 1:5d} {n:<4s} {r:<4s} {i:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00      {segid:<4s}{e:>2s}"
-             for k, (n, r, i, x, y, z, e) in enumerate(atoms)]
+    lines = [f"ATOM  {k + 1:5d} {n:<4s} {r:<4s} {i:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00    "
+             f"  {segid:<4s}{e:>2s}" for k, (n, r, i, x, y, z, e) in enumerate(atoms)]
     path.write_text("\n".join(lines + ["END"]) + "\n")
 
 
@@ -21,10 +21,10 @@ def _prep(root: Path, system: str) -> Path:
     prep.mkdir(parents=True)
     _pdb(prep / 'core.pdb', [('C1', 'LIG', 1, 0.0, 0.0, 0.0, 'C')], 'LIG')
     _pdb(prep / 'proa.pdb', [('CA', 'GLY', 10, 1.0, 0.0, 0.0, 'C'),
-                            ('N', 'GLY', 10, 0.0, 1.5, 0.0, 'N')], 'PROA')
+                             ('N', 'GLY', 10, 0.0, 1.5, 0.0, 'N')], 'PROA')
     _pdb(prep / 'solvent.pdb', [('OH2', 'TIP3', 1, 3.0, 0.0, 0.0, 'O'),
-                               ('OH2', 'TIP3', 2, 0.0, 3.0, 0.0, 'O'),
-                               ('OH2', 'TIP3', 3, 0.0, 0.0, 3.0, 'O')], 'SOLV')
+                                ('OH2', 'TIP3', 2, 0.0, 3.0, 0.0, 'O'),
+                                ('OH2', 'TIP3', 3, 0.0, 0.0, 3.0, 'O')], 'SOLV')
     return prep
 
 
@@ -65,8 +65,8 @@ def test_cache_key_changes_only_for_affected_solvent_legs(tmp_path):
     args = dict(env_cutoff=8.0, include_other_sites=False)
 
     def key(prep, marked):
-        k = ur._generate_embedding_cache_key(str(prep / 'site1_sub1_frag.pdb'), str(prep / 'core.pdb'),
-                                             str(prep), **args)
+        k = ur._generate_embedding_cache_key(
+            str(prep / 'site1_sub1_frag.pdb'), str(prep / 'core.pdb'), str(prep), **args)
         orig = ur._solvent_leg_with_protein_file
         ur._solvent_leg_with_protein_file = lambda p: marked
         try:
@@ -84,7 +84,8 @@ def test_cache_key_changes_only_for_affected_solvent_legs(tmp_path):
 
 
 @pytest.mark.parametrize('system, flags', [
-    ('luis_bace_solvent', [1.0, 0.0]), ('abl_water', [1.0, 0.0]), ('luis_bace_protein', [1.0, 1.0]),
+    ('luis_bace_solvent', [1.0, 0.0]), ('abl_water',
+                                        [1.0, 0.0]), ('luis_bace_protein', [1.0, 1.0]),
     ('indolizine_prot', [1.0, 1.0]), ('1benz_vac', [0.0, 0.0]), ('123benz_gas', [0.0, 0.0]),
 ])
 def test_phase_flags_from_system_name(tmp_path, system, flags):

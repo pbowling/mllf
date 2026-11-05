@@ -3,12 +3,12 @@ import numpy as np
 import torch
 
 from mllf.cb.graph_utils import build_directed_pairs
-from mllf.cb.pretrain_policy import (
-    _compute_physical_residual_variance,
-    _edge_confidence,
+from mllf.cb.pair_weights import (
     compute_pairwise_confidence_weights,
     compute_pairwise_measured_mask,
+    is_finite,
 )
+from mllf.cb.pretrain_policy import _compute_physical_residual_variance, _edge_confidence
 
 PAIRS = build_directed_pairs([3])  # (0,1) (0,2) (1,0) (1,2) (2,0) (2,1)
 
@@ -69,6 +69,7 @@ def test_edge_confidence_shapes_and_hygiene_skip():
 
 class _Constant:
     """Stand-in deterministic policy predicting zeros."""
+
     def eval(self):
         return self
 
@@ -102,3 +103,8 @@ def test_hygiene_loss_scales_with_absolute_weight():
     s = _awr_run_loss(strong, logp, active, active, strong.sum(), True).item()
     k = _awr_run_loss(weak, logp, active, active, weak.sum(), True).item()
     assert abs(s - 1.0) < 1e-6 and abs(k - 0.1) < 1e-6
+
+
+def test_is_finite():
+    assert is_finite(1) and is_finite(2.5) and is_finite(np.float32(1.0)) and is_finite('3')
+    assert not any(is_finite(v) for v in (None, float('nan'), float('inf'), 'x', [1]))

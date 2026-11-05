@@ -25,7 +25,7 @@ from mllf.file_handling.read_rtf import parse_rtf_dir
 
 
 def build_graph_and_data(combo_dir: str, system_config: Dict,
-                          global_config: Dict, device: str = 'cpu'):
+                         global_config: Dict, device: str = 'cpu'):
     """Build graph and compute Uni-Mol embeddings for the ligand system.
 
     Constructs the full ligand (core + substituent + ref subs + environment)
@@ -37,12 +37,10 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     combo_path = Path(combo_dir)
 
     rtf_results = parse_rtf_dir(combo_dir)
-    rtf_dir = combo_dir
     if not rtf_results:
         prep_dir = combo_path / 'prep'
         if prep_dir.exists():
             rtf_results = parse_rtf_dir(str(prep_dir))
-            rtf_dir = str(prep_dir)
     if not rtf_results:
         raise FileNotFoundError(
             f"No RTF files found in {combo_dir} or {combo_dir}/prep"
@@ -65,7 +63,12 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     embed_cache_dir: Optional[Path] = None
     if unimol_cfg.get('cache_embeddings', False):
         _cd = unimol_cfg.get('cache_dir')
-        embed_cache_dir = Path(_cd) if _cd else Path(global_config.get('output', {}).get('base_dir', 'checkpoints')) / 'embeddings_cache'
+        embed_cache_dir = Path(_cd) if _cd else Path(
+            global_config.get(
+                'output',
+                {}).get(
+                'base_dir',
+                'checkpoints')) / 'embeddings_cache'
 
     # For Uni-Mol, we need to construct the full ligand geometry
     # Find the substituent and core PDB files
@@ -83,7 +86,6 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     sub_pdb_candidates = list(pdb_dir.glob('site*_sub*.pdb'))
     if not sub_pdb_candidates:
         raise FileNotFoundError(f"No substituent PDB found in {pdb_dir}")
-    sub_pdb = str(sub_pdb_candidates[0])
 
     # Note: Environment loading now handled by get_substituent_unimol_with_environment()
     # which uses intelligent fallback chain (minimized.pdb preferred, with distance filtering)
@@ -95,7 +97,7 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     sub_pdb_files = sorted(list(pdb_dir.glob('site*_sub*.pdb')))
     if not sub_pdb_files:
         raise FileNotFoundError(f"No substituent PDB files found in {pdb_dir}")
-    
+
     # Parse all substituents at each site
     site_to_sub_map = {}  # site_idx -> dict of {sub_idx: pdb_path}
     for pdb_file in sub_pdb_files:
@@ -104,14 +106,14 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
             site_idx = int(match.group(1)) - 1  # Convert to 0-indexed
             sub_idx = int(match.group(2))  # Keep 1-indexed for internal consistency
             site_to_sub_map.setdefault(site_idx, {})[sub_idx] = str(pdb_file)
-    
+
     if not site_to_sub_map:
         raise ValueError(f"Could not extract site/substituent structure from {combo_dir}")
-    
+
     # Build nsubs_per_site list: count of substituents at each site
     max_site = max(site_to_sub_map.keys())
     nsubs_per_site = [len(site_to_sub_map.get(i, {})) for i in range(max_site + 1)]
-    
+
     # Extract yaml-configured custom PDB paths (if any)
     # Support protein_pdbs (list) and solvent_pdb (str) from yaml config
     custom_search_paths = []
@@ -127,7 +129,7 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
             custom_search_paths.extend(solvent_pdb)
         else:
             custom_search_paths.append(solvent_pdb)
-    
+
     # Compute Uni-Mol embeddings for each substituent at each site
     # Use dual embeddings [ligand_only (512D) + full (512D)] = 1024D
     # This matches pretraining configuration: edge input = [diff_ligand, mean_full]
@@ -143,7 +145,8 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     combo_name = combo_path.name
     _env_input = global_config.get('unimol', {}).get('env_input', 'dual')
     _kind = 'dual' if _env_input == 'dual' else f'ligand + {_env_input}'
-    print(f"  Computing Uni-Mol embeddings ({_kind}) for {combo_name} (system: {system_config.get('name', 'unknown')}, solvent_state: {solvent_state})")
+    print(f"  Computing Uni-Mol embeddings ({_kind}) for {combo_name} (system: "
+          f"{system_config.get('name', 'unknown')}, solvent_state: {solvent_state})")
     if custom_search_paths:
         print(f"    Custom environment PDB paths: {custom_search_paths}")
 
@@ -161,11 +164,14 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                     site_consensus[site_idx] = consensus_atoms
                     print(f"    Site {site_idx}: consensus contains {len(consensus_atoms)} atoms")
                 else:
-                    print(f"    Site {site_idx}: no consensus found, using distance-based fallback")
+                    print(
+                        f"    Site {site_idx}: no consensus found, using distance-based fallback")
             except Exception as e:
-                print(f"    Site {site_idx}: consensus building failed ({e}), using distance-based fallback")
+                print(
+                    f"    Site {site_idx}: consensus building failed ({e}), using distance-based "
+                    "fallback")
     else:
-        print(f"    Skipping consensus building for gas-phase system (no environment)")
+        print("    Skipping consensus building for gas-phase system (no environment)")
 
     unimol_embeddings = []
     for site_idx in sorted(site_to_sub_map.keys()):
@@ -194,7 +200,10 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                     # unimol.env_input 'phase': phase flags in the full half (UnimolPolicy)
                     env_input=global_config.get('unimol', {}).get('env_input', 'dual'),
                     # unimol.ligand_other_sites: other sites' reference subs in the ligand half
-                    ligand_other_sites=bool(global_config.get('unimol', {}).get('ligand_other_sites', False)),
+                    ligand_other_sites=bool(
+                        global_config.get(
+                            'unimol', {}).get(
+                            'ligand_other_sites', False)),
                 )
                 # Concatenate dual embeddings: [512 ligand + 512 full] = 1024D
                 sub_emb = np.concatenate([emb_ligand, emb_full])  # [1024]
@@ -202,29 +211,31 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                     sub_emb = sub_emb[np.newaxis, :]  # [1024] -> [1, 1024]
                 unimol_embeddings.append(sub_emb)
             except Exception as e:
-                warnings.warn(f"Failed to compute dual Uni-Mol embedding for {Path(sub_pdb_path).name}: {e}")
+                warnings.warn(
+                    f"Failed to compute dual Uni-Mol embedding for {Path(sub_pdb_path).name}: {e}")
                 # Create a zero embedding as fallback (1024D)
                 unimol_embeddings.append(np.zeros((1, 1024), dtype=np.float32))
-    
+
     if unimol_embeddings:
         unimol_emb_array = np.vstack(unimol_embeddings)  # [N, 1024] where N = total number of subs
     else:
         raise ValueError(f"No Uni-Mol embeddings computed for {combo_dir}")
-    
+
     # Build directed edges within each site (using the build_directed_pairs pattern)
     pairs = build_directed_pairs(nsubs_per_site)
-    
+
     # Create one edge per directed pair.
     # Policy._forward_edges outputs [E, 4] where all 4 bias types are predicted per edge.
     # This matches the pretraining analysis script which processes per-edge predictions directly.
-    # Edge type is set to None (no routing) so all 4 MLPs process each edge, producing [E, 2*4] output.
+    # Edge type is set to None (no routing) so all 4 MLPs process each edge,
+    # producing [E, 2*4] output.
     src_list = []
     dst_list = []
-    
+
     for (src, dst) in pairs:
         src_list.append(src)
         dst_list.append(dst)
-    
+
     # Convert to edge_index tensor
     if src_list:
         edge_index = torch.LongTensor([src_list, dst_list])  # [2, E]
@@ -232,19 +243,19 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     else:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
         edge_type = None
-    
+
     # Create site_index: which site each substituent belongs to
     site_index = []
     for site_idx, nsubs in enumerate(nsubs_per_site):
         site_index.extend([site_idx] * nsubs)
     site_index = torch.LongTensor(site_index)
-    
+
     # Prepare embedding as node features (now 1024D for dual embeddings)
     unimol_emb_t = torch.from_numpy(unimol_emb_array).float().to(device)  # [N, 1024]
     # unimol.site_size_input: this combo's site sizes in the full half (UnimolPolicy)
     if global_config.get('unimol', {}).get('site_size_input', False):
         fill_site_size(unimol_emb_t, nsubs_per_site)
-    
+
     # Create a simple data-like object with required attributes
     class UnimolData:
         """Container for node features, directed edges, and site assignments."""
@@ -255,10 +266,12 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
             self.edge_type = edge_type if edge_type is None else edge_type.to(device)
             self.edge_attr = edge_attr
             self.site_index = site_index.to(device)
-    
-    edge_attr = torch.zeros((edge_index.shape[1], 1), dtype=torch.float32) if edge_index.shape[1] > 0 else torch.zeros((0, 1), dtype=torch.float32)
+
+    edge_attr = torch.zeros(
+        (edge_index.shape[1], 1), dtype=torch.float32) if edge_index.shape[1] > 0 else torch.zeros(
+        (0, 1), dtype=torch.float32)
     data = UnimolData(unimol_emb_t, edge_index, edge_type, edge_attr, site_index)
-    
+
     extras = {
         'relation_names': ['linear', 'quadratic', 'skew', 'end'],
         'base_relation_map': {

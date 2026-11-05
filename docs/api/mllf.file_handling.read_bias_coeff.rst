@@ -1,4 +1,4 @@
-﻿mllf.file\_handling.read\_bias\_coeff
+mllf.file\_handling.read\_bias\_coeff
 =====================================
 
 .. automodule:: mllf.file_handling.read_bias_coeff

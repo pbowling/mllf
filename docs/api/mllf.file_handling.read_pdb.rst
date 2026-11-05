@@ -1,4 +1,4 @@
-﻿mllf.file\_handling.read\_pdb
+mllf.file\_handling.read\_pdb
 =============================
 
 .. automodule:: mllf.file_handling.read_pdb

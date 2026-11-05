@@ -17,12 +17,13 @@ def terminated_normally(text: str) -> bool:
     return has_termination and has_dynamics
 
 
-def _find_header_lambdas(lines: List[str], start_idx: int, search_forward: bool = False) -> List[float]:
+def _find_header_lambdas(lines: List[str], start_idx: int,
+                         search_forward: bool = False) -> List[float]:
     """Search for a header line containing lambda values.
 
     Looks for lines containing 'BLOCK' or 'SITE' and extracts all floats in that line.
     Returns a list of lambda floats in the order they appear.
-    
+
     Args:
         lines: List of text lines
         start_idx: Index to start searching from
@@ -30,7 +31,7 @@ def _find_header_lambdas(lines: List[str], start_idx: int, search_forward: bool 
     """
     header_re = re.compile(r"\b(?:BLOCK|SITE)\b.*>")
     float_re = re.compile(r"\d+\.\d+")
-    
+
     if search_forward:
         # Search forward up to 10 lines
         for i in range(start_idx, min(len(lines), start_idx + 10)):
@@ -85,7 +86,7 @@ def parse_single_population(text: str) -> Dict[int, Dict[float, int]]:
         lambdas = _find_header_lambdas(lines, header_idx, search_forward=True)
     else:
         lambdas = _find_header_lambdas(lines, pop_lines_idx[0], search_forward=False)
-    
+
     # If header detection fails, fall back to default two lambdas [0.95, 0.99]
     if not lambdas:
         lambdas = [0.95, 0.99]
@@ -93,7 +94,7 @@ def parse_single_population(text: str) -> Dict[int, Dict[float, int]]:
     # Build block->site mapping by scanning SINGLE DDG entries grouped under Site: sections
     block_to_site: Dict[int, int] = {}
     site_re = re.compile(r"^Site:\s*(\d+)")
-    ddg_re = re.compile(r"SINGLE DDG>\s*(\d+)\s+(\d+)" )
+    ddg_re = re.compile(r"SINGLE DDG>\s*(\d+)\s+(\d+)")
     current_site = None
     for ln in lines:
         m = site_re.search(ln)
@@ -123,11 +124,14 @@ def parse_single_population(text: str) -> Dict[int, Dict[float, int]]:
         else:
             # Not enough numeric columns; pad with zeros
             vals = ([0] * (len(lambdas) - len(nums))) + nums
-        results[block] = {"counts": {l: v for l, v in zip(lambdas, vals)}, "site": block_to_site.get(block)}
+        results[block] = {
+            "counts": {lam: v for lam, v in zip(lambdas, vals)},
+            "site": block_to_site.get(block)}
     return results
 
 
-def parse_transitions_and_rates(text: str) -> Tuple[Dict[int, Dict[float, int]], Dict[int, Dict[float, float]]]:
+def parse_transitions_and_rates(
+        text: str) -> Tuple[Dict[int, Dict[float, int]], Dict[int, Dict[float, float]]]:
     """Parse SINGLE TRANSITIONS and SINGLE TRANS RATES tables.
 
     Returns (transitions, rates) where each is mapping site -> {lambda: value}
@@ -169,7 +173,7 @@ def parse_transitions_and_rates(text: str) -> Tuple[Dict[int, Dict[float, int]],
             vals = nums[-len(lambdas):]
         else:
             vals = ([0] * (len(lambdas) - len(nums))) + nums
-        transitions[site] = {l: v for l, v in zip(lambdas, vals)}
+        transitions[site] = {lam: v for lam, v in zip(lambdas, vals)}
 
     # parse rates lines
     for idx in rates_idx:
@@ -185,7 +189,7 @@ def parse_transitions_and_rates(text: str) -> Tuple[Dict[int, Dict[float, int]],
             vals = nums[-len(lambdas):]
         else:
             vals = ([0.0] * (len(lambdas) - len(nums))) + nums
-        rates[site] = {l: v for l, v in zip(lambdas, vals)}
+        rates[site] = {lam: v for lam, v in zip(lambdas, vals)}
 
     return transitions, rates
 
@@ -386,9 +390,11 @@ def parse_lambda_trajectory(text: str) -> Tuple[Optional[int], List[List[float]]
 # Pair lambda-profile estimator settings (see parse_pair_profile).
 BARRIER_MID_WINDOW = (0.45, 0.55)   # pair coordinate r treated as "midpoint"
 BARRIER_END_WIDTH = 0.10            # r < 0.10 / r >= 0.90 treated as the two endpoints (barrier)
-BARRIER_MIN_PAIR_SUM = 0.90         # frame must have lambda_i + lambda_j >= this to be on the pair's edge
+# frame must have lambda_i + lambda_j >= this to be on the pair's edge
+BARRIER_MIN_PAIR_SUM = 0.90
 BARRIER_PSEUDOCOUNT = 0.5           # keeps estimates finite when a bin is rarely visited
-BARRIER_MIN_FRAMES = 100            # below this many on-edge frames the estimates are too noisy to use
+# below this many on-edge frames the estimates are too noisy to use
+BARRIER_MIN_FRAMES = 100
 # Finer bins for the skew / end asymmetries: endpoint cores (r < 0.01, r >= 0.99),
 # near-end shoulders ([0.01, 0.05), [0.95, 0.99)) and the two flanks ([0.25, 0.35), [0.65, 0.75)).
 PROFILE_BINS = {"E0": (0.0, 0.01), "K0": (0.01, 0.05), "M0": (0.25, 0.35),
@@ -440,7 +446,8 @@ def _pair_counts(frames, ci: int, cj: int) -> Dict[str, int]:
 PHYSICAL_LAMBDA = 0.99   # a site is in a physical state when one substituent has λ ≥ this
 
 
-def _pair_transition_counts(frames, pairs, first_block: int, n_cols: int) -> Dict[Tuple[int, int], int]:
+def _pair_transition_counts(frames, pairs, first_block: int,
+                            n_cols: int) -> Dict[Tuple[int, int], int]:
     """Per-pair transition counts at the λ ≥ PHYSICAL_LAMBDA cutoff.
 
     CHARMM's SINGLE TRANSITIONS definition, resolved by pair: at each site,
@@ -472,7 +479,8 @@ def _pair_transition_counts(frames, pairs, first_block: int, n_cols: int) -> Dic
 
     counts: Dict[Tuple[int, int], int] = {}
     for blocks in sites.values():
-        cols = [(blk, blk - first_block) for blk in sorted(blocks) if 0 <= blk - first_block < n_cols]
+        cols = [(blk, blk - first_block)
+                for blk in sorted(blocks) if 0 <= blk - first_block < n_cols]
         prev = None
         for f in frames:
             state = next((blk for blk, c in cols if f[c] >= PHYSICAL_LAMBDA), None)

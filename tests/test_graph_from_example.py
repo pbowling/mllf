@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 import warnings
 
@@ -17,8 +16,11 @@ def _find_repo_root(start: Path) -> Path:
 def test_graph_construction_from_example():
     # Suppress expected solvent state warning for test data
     with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message="Could not detect solvent state", category=UserWarning)
-        
+        warnings.filterwarnings(
+            'ignore',
+            message="Could not detect solvent state",
+            category=UserWarning)
+
         repo = _find_repo_root(Path(__file__))
         examples_dir = repo / 'tests' / 'samples' / '14benz_solv_5.5'
         assert examples_dir.is_dir(), f"example dir not found: {examples_dir}"

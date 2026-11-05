@@ -193,7 +193,7 @@ def test_stage_systems_filter_keeps_listed_systems():
     stage = {'min_sites': 1, 'max_sites': 1, 'min_subs_per_site': 2, 'max_subs_per_site': 2}
     only_solv = apply_stage_combo_filter(combos, {**stage, 'systems': ['p38_solv']}, {}, 0, 0,
                                          apply_transition_filter=False, combo_system_map=cmap)
-    both = apply_stage_combo_filter(combos, {**stage, 'systems': ['p38_solv', 'p38_prot']}, {}, 0, 0,
-                                    apply_transition_filter=False, combo_system_map=cmap)
+    both = apply_stage_combo_filter(combos, {**stage, 'systems': ['p38_solv', 'p38_prot']}, {},
+                                    0, 0, apply_transition_filter=False, combo_system_map=cmap)
     assert only_solv == [combos[0]]
     assert sorted(both) == sorted(combos)

@@ -15,7 +15,8 @@ def _sim(ns, pops, transitions, pair_trans):
     """One-site simulation_results dict; pops are the highest-lambda counts of blocks 2.."""
     return {
         'simulated_ns': ns,
-        'populations': {str(b + 2): {'counts': {'0.99': p}, 'site': 1} for b, p in enumerate(pops)},
+        'populations': {str(b + 2): {'counts': {'0.99': p}, 'site': 1} for b,
+                        p in enumerate(pops)},
         'transitions': {'1': {'0.99': transitions}},
         'transition_pairs': pair_trans,
         'ddg_pairs': {k: 0.0 for k in pair_trans},

@@ -40,7 +40,8 @@ For the policy architecture, see :doc:`cb_setup`.
    mllf.cb.graph_utils
    mllf.cb.policy
    mllf.cb.bayesian_head
-   mllf.cb.train_improved
+   mllf.cb.msld_reward
+   mllf.cb.pair_weights
 
 Pretraining (Behavior Cloning)
 -------------------------------
@@ -61,12 +62,14 @@ For the workflow system, see :doc:`workflow`.
 .. autosummary::
    :toctree: api
 
-   mllf.cli.workflow
-   mllf.cli.sim
-   mllf.cb.workflow_utils
    mllf.cli.train_workflow
+   mllf.cb.training_loop
+   mllf.cb.training_setup
    mllf.cb.bandit_config
    mllf.cb.reinforce_trainer
+   mllf.cb.epoch_runs
+   mllf.cb.epoch_updates
+   mllf.cb.workflow_utils
    mllf.cb.graph_build
    mllf.cb.hindsight
    mllf.cb.hindsight_regression
@@ -77,6 +80,6 @@ For the workflow system, see :doc:`workflow`.
    mllf.cb.export_biases
    mllf.cb.cost_ledger
    mllf.cb.epoch_log
-   mllf.cli.slurm
+   mllf.cb.slurm
    mllf.file_handling.manifests
    mllf.file_handling.combo_sets

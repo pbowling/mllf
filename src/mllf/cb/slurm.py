@@ -1,15 +1,9 @@
 """SLURM job submission for one online-training epoch's simulation.
 
-Distinct from ``mllf.cli.sim.run_simulation_batch`` (which runs a manifest of
-combos concurrently via an arbitrary shell command, for the lighter
-``mllf.cli.workflow.run_from_config`` pipeline): this module writes and
-submits a single per-combo, per-epoch ``run_epoch.sh`` SLURM script for the
-online CB-policy training driver (``mllf.cli.train_workflow`` /
-``mllf.cb.reinforce_trainer``), which polls job completion itself rather than
-blocking on submission.
-
-Moved here from ``training/workflow.py`` as part of making the online CB
-training driver importable as a library.
+Writes and submits a single per-combo, per-epoch ``run_epoch.sh`` SLURM
+script for the online CB-policy training driver (``mllf.cli.train_workflow``
+/ ``mllf.cb.reinforce_trainer``), which polls job completion itself rather
+than blocking on submission.
 
 All SLURM specifics (partition, GRES, wall time, environment module) come
 from the config's ``slurm:`` block and are optional except ``time``, which
@@ -87,7 +81,7 @@ def submit_epoch_simulation(
 # Change to combo directory and run with epoch-specific variables
 cd {combo_path}
 python3 msld_flat.py --vars-file {vars_relative} --out-dir {out_relative} > {out_relative}/output.out 2>&1
-"""
+"""  # noqa: E501 -- the script's command line is kept on one line
     script_path = epoch_dir / 'run_epoch.sh'
     script_path.write_text(script_content)
     script_path.chmod(0o755)

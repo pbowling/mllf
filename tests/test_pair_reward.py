@@ -1,5 +1,4 @@
 """Tests for compute_pair_reward and QNetwork (per-pair credit assignment)."""
-import math
 import pytest
 import torch
 
@@ -95,7 +94,7 @@ class TestComputePairReward:
 
     def test_zero_populations_no_division_error(self):
         """Both populations zero should not raise; signals should be penalized (-1.0).
-        
+
         When both substituents have zero population, this indicates a sampling failure
         (neither substituent was ever explored by REMD), so all dimensions are penalized
         with -1.0.
@@ -225,7 +224,6 @@ class TestComputePairReward:
         r = compute_pair_reward(edge_index, {"2_3": None}, [50, 50], barrier_pairs={"2_3": 1.5})
         assert r[0].tolist() == pytest.approx([-1.0, -1.0, -1.0, -1.0])
 
-
     # ------- skew / end dims: profile-asymmetry signals -------
 
     def test_zero_asymmetry_gives_max_skew_and_end(self):
@@ -268,6 +266,7 @@ class TestComputePairReward:
         r = compute_pair_reward(edge_index, {"2_3": None}, [50, 50],
                                 skew_pairs={"2_3": 0.0}, end_pairs={"2_3": 0.0})
         assert r[0].tolist() == pytest.approx([-1.0, -1.0, -1.0, -1.0])
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

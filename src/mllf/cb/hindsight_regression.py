@@ -5,15 +5,21 @@ feature trunk and readout. The trained readout becomes the Bayesian posterior
 mean; its precision is retained for Thompson sampling and uncertainty-based
 selection.
 """
+import csv
 import json
-import math
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from mllf.cb.hindsight import BIAS_DIMS, OFFSET_DIMS
+from mllf.cb.graph_utils import build_directed_pairs
+from mllf.cb.pair_weights import (
+    compute_pairwise_confidence_weights,
+    compute_pairwise_measured_mask,
+)
+from mllf.cb.policy import PHASE_NODE_INPUTS, SITE_SIZE_SLOT
+from mllf.cb.replay_selection import plan_replay
 
 DEFAULTS = {
     'steps': 100,              # gradient steps per epoch
@@ -113,10 +119,6 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
     planned runs (``replay_selection.plan_replay``), each with its hygiene
     weights kept only on the edges of the pairs it owns. Writes the plan's
     per-pair report next to the replay cache (``*_pairs.csv``)."""
-    import csv
-    from mllf.cb.graph_utils import build_directed_pairs
-    from mllf.cb.pretrain_policy import compute_pairwise_confidence_weights, compute_pairwise_measured_mask
-    from mllf.cb.replay_selection import plan_replay
     if not cfg.get('replay_systems_root'):
         raise ValueError("replay_selection: coverage needs bandit.regression.replay_systems_root")
     # Candidates: the directories pretraining built graphs for (the keys of
@@ -170,17 +172,15 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
 def _check_replay_env_input(data, env_input: str, cache) -> None:
     """A replay set built for the other env_input would feed the policy the
     wrong environment half; phase-mode graphs are zero past the phase flags."""
-    from mllf.cb.policy import SITE_SIZE_SLOT
     sample = [e for e, *_ in data[:50] if e.dim() == 2 and e.size(1) >= 1024]
     if not sample:
         return
     # past the phase flags and the site-size slot
     built_phase = all(float(e[:, SITE_SIZE_SLOT + 1:].abs().sum()) == 0.0 for e in sample)
-    from mllf.cb.policy import PHASE_NODE_INPUTS
     if built_phase != (env_input in PHASE_NODE_INPUTS):
-        raise ValueError(f"replay cache {cache} was built with env_input="
-                         f"{'phase' if built_phase else 'dual'}, but the model uses {env_input!r}; "
-                         f"set regression.replay_cache to a new file")
+        raise ValueError(f"replay cache {cache} was built with "
+                         f"env_input={'phase' if built_phase else 'dual'}, but the model "
+                         f"uses {env_input!r}; set regression.replay_cache to a new file")
 
 
 def _replay_info_path(cache) -> Path:
@@ -216,12 +216,11 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
             print(f"  [regression] replay set loaded from {cache}: {len(data)} runs")
         return data
 
-    from mllf.cb.graph_utils import build_directed_pairs
+    # Deferred: the pretraining module (Uni-Mol embeddings, run loading) is
+    # large and only needed when the replay cache has to be (re)built.
     from mllf.cb.pretrain_policy import (
-        _compute_unimol_embeddings_and_edges,
-        _extract_targets_from_variables,
-        compute_pairwise_confidence_weights,
-        compute_pairwise_measured_mask,
+        compute_unimol_embeddings_and_edges,
+        extract_targets_from_variables,
         load_pretraining_runs,
     )
     manifest = cfg.get('replay_manifest')
@@ -270,7 +269,8 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
                 continue
             rng.shuffle(runs)
             for run in runs:
-                if cfg.get('replay_pretraining_only', True) and run['metadata'].get('collection_tag'):
+                if cfg.get('replay_pretraining_only',
+                           True) and run['metadata'].get('collection_tag'):
                     continue
                 ns = run['metadata'].get('nsubs_per_site')
                 if not ns:
@@ -293,14 +293,14 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
     for n, (run, ns, pairs, weights) in enumerate(chosen):
         run_dir = Path(run['run_dir'])
         try:
-            emb, ei, ns2, _ = _compute_unimol_embeddings_and_edges(
+            emb, ei, ns2, _ = compute_unimol_embeddings_and_edges(
                 run_dir, run_dir / 'graph_info.json',
                 structure_type=cfg['structure_type'], use_environment_difference=True,
                 consensus_dict=consensus, cache_dir=cfg.get('embedding_cache_dir'), run_idx=n,
                 env_input=cfg.get('env_input', 'dual'),
                 ligand_other_sites=bool(cfg.get('ligand_other_sites', False)),
                 site_size_input=bool(cfg.get('site_size_input', False)))
-            targets = _extract_targets_from_variables(run_dir, ns2, build_directed_pairs(ns2))
+            targets = extract_targets_from_variables(run_dir, ns2, build_directed_pairs(ns2))
             if not targets or len(targets) != ei.size(1) or len(weights) != ei.size(1):
                 continue
             data.append((emb.cpu(), ei.cpu(), torch.tensor(targets, dtype=torch.float32),
@@ -429,8 +429,8 @@ def regression_step(policy, online: List[Tuple], replay: List[Tuple], cfg: Dict,
     with torch.no_grad():
         eval_on = _sample(online, 64)
         eval_rp = _sample(replay, 64)
-        before = (float(_batch_loss(policy, eval_on, ws, scale_on, device)),
-                  float(_batch_loss(policy, eval_rp, ws, scale_rp, device)) if eval_rp else float('nan'))
+        before = (float(_batch_loss(policy, eval_on, ws, scale_on, device)), float(
+            _batch_loss(policy, eval_rp, ws, scale_rp, device)) if eval_rp else float('nan'))
     policy.train()
     for _ in range(int(cfg['steps'])):
         opt.zero_grad()
@@ -438,13 +438,13 @@ def regression_step(policy, online: List[Tuple], replay: List[Tuple], cfg: Dict,
         loss = (1.0 - rw) * l_on
         if rw > 0:
             loss = loss + rw * _batch_loss(policy, _sample(replay, int(cfg['batch_replay'])),
-                                            ws, scale_rp, device)
+                                           ws, scale_rp, device)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trunk_params + ws, float(cfg['grad_clip']))
         opt.step()
     with torch.no_grad():
-        after = (float(_batch_loss(policy, eval_on, ws, scale_on, device)),
-                 float(_batch_loss(policy, eval_rp, ws, scale_rp, device)) if eval_rp else float('nan'))
+        after = (float(_batch_loss(policy, eval_on, ws, scale_on, device)), float(
+            _batch_loss(policy, eval_rp, ws, scale_rp, device)) if eval_rp else float('nan'))
     for p, r in zip(trunk_params, req):
         p.requires_grad_(r)
     # Each head's posterior mean becomes the trained weights; its precision

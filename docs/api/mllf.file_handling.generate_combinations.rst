@@ -1,4 +1,4 @@
-﻿mllf.file\_handling.generate\_combinations
+mllf.file\_handling.generate\_combinations
 ==========================================
 
 .. automodule:: mllf.file_handling.generate_combinations
@@ -14,6 +14,7 @@
       create_combination_dirs
       create_single_combination_dir
       find_site_sub_files
+      is_combo_dir_name
       list_possible_combinations
       main
       make_combo_dir_name

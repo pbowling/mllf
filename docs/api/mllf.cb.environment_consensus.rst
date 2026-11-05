@@ -1,4 +1,4 @@
-﻿mllf.cb.environment\_consensus
+mllf.cb.environment\_consensus
 ==============================
 
 .. automodule:: mllf.cb.environment_consensus

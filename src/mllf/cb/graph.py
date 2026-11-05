@@ -5,15 +5,16 @@ interface (Graph, EdgeCoeffs) used by the tests and helpers.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional
 
 import numpy as np
+import warnings
 
 
 def _detect_solvent_state(filename: str) -> str:
     """Detect solvent state from filename and normalize to standard values.
-    
+
     Returns one of: 'solv', 'gas', 'protein'
     Defaults to 'unknown' with a warning if not detected.
     """
@@ -22,11 +23,13 @@ def _detect_solvent_state(filename: str) -> str:
         return 'protein'
     if 'vac' in fn or 'vacuum' in fn or 'gas' in fn:
         return 'gas'
-    if 'solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn or 'solution' in fn or 'solvent' in fn:
+    if ('solv' in fn or 'water' in fn or 'aq' in fn or 'sol' in fn or 'solution' in fn
+            or 'solvent' in fn):
         return 'solv'
     else:
-        import warnings
-        warnings.warn(f"Could not detect solvent state from filename '{filename}'; setting to 'unknown'", UserWarning)
+        warnings.warn(
+            f"Could not detect solvent state from filename '{filename}'; setting to 'unknown'",
+            UserWarning)
         return 'unknown'
 
 
@@ -58,17 +61,20 @@ class Graph:
                 self.edges[(i, j)] = EdgeCoeffs()
 
         # per-edge masks indicating whether a particular coeff type is active
-        # e.g. self.edge_mask[(i,j)] = {'linear': True, 'quadratic': True, 'skew': True, 'end': True}
+        # e.g. self.edge_mask[(i,j)] = {'linear': True, 'quadratic': True, 'skew': True, 'end':
+        # True}
         self.edge_mask: Dict[Tuple[int, int], Dict[str, bool]] = {}
         for i in range(num_nodes):
             for j in range(i + 1, num_nodes):
-                self.edge_mask[(i, j)] = {'linear': True, 'quadratic': True, 'skew': True, 'end': True}
+                self.edge_mask[(i, j)] = {'linear': True,
+                                          'quadratic': True, 'skew': True, 'end': True}
 
         # initialize empty node metadata
         for i in range(num_nodes):
             self.nodes[i] = {}
 
-    def set_edge(self, i: int, j: int, coeffs: EdgeCoeffs | List[float] | Tuple[float, float, float, float]):
+    def set_edge(self, i: int, j: int, coeffs: EdgeCoeffs |
+                 List[float] | Tuple[float, float, float, float]):
         a, b = (i, j) if i < j else (j, i)
         if (a, b) not in self.edges:
             raise KeyError(f"Edge ({a},{b}) not present for {self.num_nodes} nodes")
@@ -98,11 +104,13 @@ class Graph:
         arr = np.asarray(vec, dtype=float)
         expected = (self.num_nodes * (self.num_nodes - 1) // 2) * 4
         if arr.size != expected:
-            raise ValueError(f"Vector length {arr.size} does not match expected {expected} for {self.num_nodes} nodes")
+            raise ValueError(f"Vector length {arr.size} does not match expected {expected} for "
+                             f"{self.num_nodes} nodes")
         idx = 0
         for i in range(self.num_nodes):
             for j in range(i + 1, self.num_nodes):
-                self.edges[(i, j)] = EdgeCoeffs(float(arr[idx]), float(arr[idx+1]), float(arr[idx+2]), float(arr[idx+3]))
+                self.edges[(i, j)] = EdgeCoeffs(float(arr[idx]), float(
+                    arr[idx + 1]), float(arr[idx + 2]), float(arr[idx + 3]))
                 idx += 4
 
     # Node metadata helpers
@@ -170,7 +178,13 @@ class Graph:
                     'rtf': parsed,
                 }
 
-            info = {'site': site_idx, 'subs': sorted(list(per_sub.keys())), 'rtf': per_sub, 'subs_meta': subs_meta}
+            info = {
+                'site': site_idx,
+                'subs': sorted(
+                    list(
+                        per_sub.keys())),
+                'rtf': per_sub,
+                'subs_meta': subs_meta}
             self.set_node_info(site_idx - 1, info)
 
         # after populating node metadata, apply default connectivity rules
@@ -183,14 +197,15 @@ class Graph:
             pass
 
     @classmethod
-    def from_rtf_results(cls, rtf_results: Dict[str, Dict], solvent_override: Optional[str] = None, directory: Optional[str] = None) -> "Graph":
+    def from_rtf_results(cls, rtf_results: Dict[str, Dict], solvent_override: Optional[str]
+                         = None, directory: Optional[str] = None) -> "Graph":
         """Create a Graph with one node per substituent (sub), populating node metadata.
 
         rtf_results is expected to contain parsed entries with keys including
         'site' and 'sub'. The returned Graph will have nodes enumerated in
         deterministic order (sorted by site then sub) and node metadata containing
         'site', 'sub', 'total_charge', 'atom_types', 'unique_atom_types', 'solvent', and 'rtf'.
-        
+
         Args:
             rtf_results: Dictionary mapping keys to parsed RTF data
             solvent_override: Optional environment type override. Allowed values:
@@ -254,10 +269,10 @@ class Graph:
                 if solvent_override in allowed_solvents:
                     sol_state = solvent_override
                 else:
-                    import warnings
 
                     warnings.warn(
-                        f"Invalid solvent override '{solvent_override}' provided; temporarily setting solvent to 'unknown'",
+                        f"Invalid solvent override '{solvent_override}' provided; temporarily "
+                        "setting solvent to 'unknown'",
                         UserWarning,
                     )
                     sol_state = 'unknown'
@@ -284,10 +299,10 @@ class Graph:
     @classmethod
     def from_graph_info(cls, graph_info: Dict) -> "Graph":
         """Create a Graph from graph_info.json data.
-        
+
         This is used during pretraining when RTF files aren't available but
         graph_info.json was saved during data collection.
-        
+
         Args:
             graph_info: Dictionary loaded from graph_info.json with keys:
                 - 'solvent_state': Environment type ('solv', 'gas', 'protein')
@@ -296,13 +311,13 @@ class Graph:
                     - 'sub': Substituent number
                     - 'atom_types': List of atom type strings
                     - 'total_charge': Total charge
-                    
+
         Returns:
             Graph with nodes populated from site/sub data
         """
         sites_data = graph_info.get('sites', {})
         solvent_state = graph_info.get('solvent_state', 'solv')
-        
+
         # Parse and sort by (site, sub)
         subs = []
         for key, data in sites_data.items():
@@ -310,38 +325,39 @@ class Graph:
             sub = data.get('sub')
             if site is not None and sub is not None:
                 subs.append((int(site), int(sub), key, data))
-        
+
         if not subs:
             # Fallback: single node
             return cls(1)
-        
+
         subs.sort(key=lambda x: (x[0], x[1]))
-        
+
         # Compute atom type sets per site for distinct types calculation
         per_site = {}
         for site, sub, key, data in subs:
             per_site.setdefault(site, {})
             per_site[site][sub] = data
-        
+
         # Compute distinct atom types (excluding atoms common to all subs at site)
         site_intersection = {}
         for site, subdict in per_site.items():
             atom_sets = {s: set(subdict[s].get('atom_types', [])) for s in subdict}
             if atom_sets:
-                intersection_all = set.intersection(*atom_sets.values()) if len(atom_sets) > 0 else set()
+                intersection_all = set.intersection(
+                    *atom_sets.values()) if len(atom_sets) > 0 else set()
             else:
                 intersection_all = set()
             site_intersection[site] = intersection_all
-        
+
         # Create graph with one node per substituent
         nsubs = len(subs)
         g = cls(nsubs)
-        
+
         # Populate node metadata
         for idx, (site, sub, key, data) in enumerate(subs):
             atom_types = list(data.get('atom_types', []))
             total_charge = float(data.get('total_charge', 0.0))
-            
+
             # Use distinct_atom_types from saved data if available, otherwise compute it
             if 'distinct_atom_types' in data:
                 distinct_list = list(data.get('distinct_atom_types', []))
@@ -349,7 +365,7 @@ class Graph:
                 # Compute distinct atom types (excluding site intersection)
                 intersection_all = site_intersection.get(site, set())
                 distinct_list = [a for a in atom_types if a not in intersection_all]
-            
+
             node_meta = {
                 'site': site,
                 'sub': sub,
@@ -359,7 +375,7 @@ class Graph:
                 'solvent': solvent_state,
             }
             g.set_node_info(idx, node_meta)
-        
+
         # Apply connectivity rules
         g.apply_site_connectivity_rules()
         return g
@@ -371,11 +387,13 @@ class Graph:
         - Inter-site edges: all coefficient masks set to False (no coupling between sites)
         - Intra-site edges:
             * 'linear' coefficients allowed only for edges that include sub==1 (the primary sub)
-              i.e., sub1 connected to each other sub; edges between non-sub1 subs have linear disabled.
+              i.e., sub1 connected to each other sub; edges between non-sub1 subs have
+              linear disabled.
             * 'quadratic', 'skew', and 'end' coefficients are allowed for all intra-site pairs
 
         This method relies on node metadata stored via `set_node_info` / `from_rtf_results`.
-        If node metadata is missing for a node, conservative defaults (all False for inter-site) are used.
+        If node metadata is missing for a node, conservative defaults (all False for
+        inter-site) are used.
         """
         # build mapping node -> site, sub
         node_site = {}
@@ -433,7 +451,8 @@ class Graph:
         newg = Graph(new_num_nodes)
         # copy edges
         for (i, j), coeffs in self.edges.items():
-            newg.edges[(i, j)] = EdgeCoeffs(coeffs.linear, coeffs.quadratic, coeffs.skew, coeffs.end)
+            newg.edges[(i, j)] = EdgeCoeffs(coeffs.linear,
+                                            coeffs.quadratic, coeffs.skew, coeffs.end)
         # copy masks as well
         for (i, j), mask in self.edge_mask.items():
             newg.edge_mask[(i, j)] = dict(mask)

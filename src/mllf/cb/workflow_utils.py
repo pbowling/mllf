@@ -4,19 +4,24 @@ This module contains reusable functions for:
 - Fixing system-specific simulation scripts
 - Managing simulation success checking and metric parsing
 - SLURM job submission and monitoring utilities
-
-Note: For manifest loading, use mllf.cli.workflow.load_manifest()
 """
 import math
-import random
 from pathlib import Path
 from typing import Callable, List, Dict, Optional
 import json
 import re
 import torch
 
-# Re-export load_manifest from cli.workflow for convenience
-from mllf.cli.workflow import load_manifest
+from mllf.cb.pair_weights import is_finite
+from mllf.file_handling.read_output import (
+    terminated_normally,
+    parse_single_population,
+    parse_transitions_and_rates,
+    parse_single_ddg,
+    parse_fraction_physical_ligand,
+    parse_pair_profile,
+    parse_site_holdoff,
+)
 
 
 _STEPS_RE = {'equil': re.compile(r"^(esteps\s*=\s*)(\d+)", re.M),
@@ -57,34 +62,34 @@ def set_msld_steps(combo_path: Path, equil: int, prod: int) -> bool:
     return False
 
 
-def fix_msld_flat_for_single_site(combo_path: Path, 
-                                   site_atoms: Dict[int, str] = None) -> bool:
+def fix_msld_flat_for_single_site(combo_path: Path,
+                                  site_atoms: Dict[int, str] = None) -> bool:
     """Modify msld_flat.py to delete only atoms that overlap with present sites.
-    
+
     For multi-site λ-dynamics simulations, certain atoms in the base structure
     may overlap with specific substituents. When only a subset of sites are
     present in a combination, we should only delete atoms that would overlap
     with the present sites.
-    
+
     This function reads mapping.json to determine which original sites are
     present, then modifies the atom deletion command in msld_flat.py accordingly.
-    
+
     Example usage:
         # 14benz system
         site_atoms = {1: 'C4 H4', 2: 'C5 H5'}
         fix_msld_flat_for_single_site(combo_path, site_atoms)
-        
+
         # Indole system
         site_atoms = {1: 'C2 H2', 2: 'C6 H6'}
         fix_msld_flat_for_single_site(combo_path, site_atoms)
-    
+
     Args:
         combo_path: Path to combination directory containing msld_flat.py
             and mapping.json.
         site_atoms: Dictionary mapping site numbers to atom selection strings.
             Example: {1: 'C4 H4', 2: 'C5 H5'} for 14benz system.
             If None, defaults to 14benz atoms for backward compatibility.
-    
+
     Returns:
         True if file was modified, False if skipped or unchanged.
     """
@@ -94,64 +99,65 @@ def fix_msld_flat_for_single_site(combo_path: Path,
     msld_flat = combo_path / 'msld_flat.py'
     if not msld_flat.exists():
         return False
-    
+
     # Read mapping.json to determine ORIGINAL sites present
     mapping_file = combo_path / 'mapping.json'
     if not mapping_file.exists():
         return False
-    
+
     with open(mapping_file, 'r') as f:
         mapping = json.load(f)
-    
+
     # Extract unique original site numbers from entries that have site info
     original_sites = set()
     for entry in mapping:
         site = entry.get('original_site')
         if site is not None:
             original_sites.add(site)
-    
+
     # Determine what to delete based on original sites
     # Only modify if exactly one site is present
     if len(original_sites) != 1:
         return False  # Either no sites identified or multiple sites - leave unchanged
-    
+
     original_site = list(original_sites)[0]
-    
+
     # Determine which atoms to delete based on ORIGINAL site number
     atoms_to_delete = site_atoms.get(original_site)
     if atoms_to_delete is None:
         # Site not in mapping - leave as is
         return False
-    
+
     # Read and modify the msld_flat.py content
     content = msld_flat.read_text()
-    
+
     # Replace the delete line - handle both original and already-modified versions
     # Pattern matches any combination of atoms in the selection
-    old_pattern = r"select\.store_selection\('todelete',pycharmm\.SelectAtoms\(\)\.by_res_and_type\(ligseg,resnum,'[^']+'\)\)"
-    new_line = f"select.store_selection('todelete',pycharmm.SelectAtoms().by_res_and_type(ligseg,resnum,'{atoms_to_delete}'))"
-    
+    old_pattern = (r"select\.store_selection\('todelete',pycharmm\.SelectAtoms\(\)"
+                   r"\.by_res_and_type\(ligseg,resnum,'[^']+'\)\)")
+    new_line = ("select.store_selection('todelete',pycharmm.SelectAtoms()"
+                f".by_res_and_type(ligseg,resnum,'{atoms_to_delete}'))")
+
     new_content = re.sub(old_pattern, new_line, content)
-    
+
     # Only write if something changed
     if new_content != content:
         msld_flat.write_text(new_content)
         return True
-    
+
     return False
 
 
 def check_simulation_success(output_file: Path) -> bool:
     """Check if a simulation completed successfully.
-    
+
     Args:
         output_file: Path to simulation output file.
-    
+
     Returns:
         True if simulation terminated normally, False otherwise.
     """
-    from mllf.file_handling.read_output import terminated_normally
-    
+
     try:
         with open(output_file, 'r') as f:
             output_text = f.read()
@@ -162,14 +168,14 @@ def check_simulation_success(output_file: Path) -> bool:
 
 def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
     """Parse raw populations, transitions, and per-pair DDG data from simulation output.
-    
+
     This is a convenience wrapper that extracts aggregate metrics
     (total populations per block, total transitions per site, per-pair DDG presence)
     for use in reward computation and per-pair credit assignment.
-    
+
     Args:
         output_file: Path to simulation output file.
-    
+
     Returns:
         Dict with:
           'populations': list of population counts per block at highest lambda
@@ -197,14 +203,6 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
           'site_holdoff': per site, where lambda sits around the dominant
                        substituent (see ``parse_site_holdoff``)
     """
-    from mllf.file_handling.read_output import (
-        parse_single_population,
-        parse_transitions_and_rates,
-        parse_single_ddg,
-        parse_fraction_physical_ligand,
-        parse_pair_profile,
-        parse_site_holdoff,
-    )
 
     raw_metrics = {'populations': [], 'population_sites': [], 'transitions': [], 'ddg_pairs': {},
                    'fraction_physical': None,
@@ -224,16 +222,19 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         # so it gets its own guard and the reward falls back per pair.
         try:
             profile = parse_pair_profile(output_text, pairs=list(ddg_data.keys()))
-            for field, key in (('barrier_pairs', 'barrier'), ('skew_pairs', 'skew'), ('end_pairs', 'end'),
-                               ('transition_pairs', 'transitions'), ('endpoint_pairs', 'endpoints')):
-                raw_metrics[field] = {f"{lo}_{hi}": vals[key] for (lo, hi), vals in profile.items()}
+            for field, key in (('barrier_pairs', 'barrier'), ('skew_pairs', 'skew'),
+                               ('end_pairs', 'end'), ('transition_pairs', 'transitions'),
+                               ('endpoint_pairs', 'endpoints')):
+                raw_metrics[field] = {f"{lo}_{hi}": vals[key]
+                                      for (lo, hi), vals in profile.items()}
         except Exception:
             pass
         try:
-            raw_metrics['site_holdoff'] = parse_site_holdoff(output_text, pairs=list(ddg_data.keys()))
+            raw_metrics['site_holdoff'] = parse_site_holdoff(
+                output_text, pairs=list(ddg_data.keys()))
         except Exception:
             pass
-        
+
         # Extract populations per block - use only HIGHEST lambda value (0.990)
         for block_id, block_info in population_data.items():
             counts_dict = block_info.get('counts', {})
@@ -244,7 +245,7 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
             else:
                 raw_metrics['populations'].append(0)
             raw_metrics['population_sites'].append(block_info.get('site'))
-        
+
         # Extract transitions per site - use only HIGHEST lambda value (0.990)
         for site_id, trans_dict in transitions_data.items():
             if trans_dict:
@@ -260,7 +261,7 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         }
     except Exception:
         pass
-    
+
     return raw_metrics
 
 
@@ -390,13 +391,10 @@ def gaussian_quality(value: float, target: float, width: float) -> float:
     return 0.5 + 0.5 * math.exp(-0.5 * ((value - target) / width) ** 2)
 
 
-def barrier_quality(barrier: float, target: float = BARRIER_TARGET, width: float = BARRIER_WIDTH) -> float:
+def barrier_quality(barrier: float, target: float = BARRIER_TARGET,
+                    width: float = BARRIER_WIDTH) -> float:
     """Quadratic-reward signal for a midpoint barrier (kcal/mol); see gaussian_quality."""
     return gaussian_quality(barrier, target, width)
-
-
-def _finite(value) -> bool:
-    return value is not None and math.isfinite(float(value))
 
 
 def compute_pair_reward(
@@ -551,7 +549,7 @@ def compute_pair_reward(
             # Quadratic: the pair's own midpoint barrier when available.
             key = f"{lo}_{hi}"
             barrier = (barrier_pairs or {}).get(key)
-            if _finite(barrier):
+            if is_finite(barrier):
                 quad_signal = barrier_quality(float(barrier), barrier_target, barrier_width)
             else:
                 quad_signal = trans_signal
@@ -572,13 +570,15 @@ def compute_pair_reward(
 
             # Skew / end: the pair's own profile asymmetries when available.
             skew = (skew_pairs or {}).get(key)
-            skew_signal = gaussian_quality(float(skew), 0.0, skew_width) if _finite(skew) else combined
+            skew_signal = gaussian_quality(
+                float(skew), 0.0, skew_width) if is_finite(skew) else combined
             end_asym = (end_pairs or {}).get(key)
-            if _finite(end_asym):
+            if is_finite(end_asym):
                 end_signal = gaussian_quality(float(end_asym), 0.0, end_width)
 
             rewards[k, 0] = minority_frac   # linear:    population balance ∈ [0, 0.5]
-            rewards[k, 1] = quad_signal     # quadratic: barrier quality (or legacy proxy) ∈ [0.5, 1]
+            # quadratic: barrier quality (or legacy proxy) ∈ [0.5, 1]
+            rewards[k, 1] = quad_signal
             rewards[k, 2] = skew_signal     # skew:      skew-asymmetry quality (or combined proxy)
             rewards[k, 3] = end_signal      # end:       end-asymmetry quality (or legacy proxy)
 
@@ -862,7 +862,7 @@ def select_combos_by_uncertainty(
 
     if n_skipped:
         print(f"  select_combos_by_uncertainty: {n_skipped}/{len(eligible)} candidates "
-              f"could not be scored (graph build failed) — excluded from ranking")
+              "could not be scored (graph build failed) — excluded from ranking")
 
     scored.sort(key=lambda t: t[0], reverse=True)
 

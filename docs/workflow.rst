@@ -31,10 +31,10 @@ Online training is driven by a YAML configuration file:
    cd mllf   # repository root
    python -m mllf.cli.train_workflow examples/workflow_14benz.yaml
 
-``examples/run_workflow.py`` runs the same driver, and :doc:`examples` walks through the
-1,4-benzene (14benz) example. ``mllf.cli.workflow.run_from_config`` covers combination
-generation, the split, a single-combination check, an optional batch of simulations and
-archiving, without the training loop.
+:doc:`examples` walks through the 1,4-benzene (14benz) example. The driver itself is
+``mllf.cb.training_loop.run_training``: setup in ``mllf.cb.training_setup``, one epoch's
+simulations and updates in ``mllf.cb.reinforce_trainer`` (``epoch_runs`` /
+``epoch_updates``).
 
 Configuration Format
 ~~~~~~~~~~~~~~~~~~~~
@@ -584,7 +584,7 @@ Launching Simulations
 ~~~~~~~~~~~~~~~~~~~~~
 
 Each combo's biases are written to ``variables.py``, and its simulation is submitted as one
-SLURM job per combo per epoch (``mllf.cli.slurm.submit_epoch_simulation``), with every
+SLURM job per combo per epoch (``mllf.cb.slurm.submit_epoch_simulation``), with every
 cluster-specific setting taken from the config's ``slurm:`` block:
 
 * ``partition`` (``#SBATCH -p``), omitted for the account's default partition

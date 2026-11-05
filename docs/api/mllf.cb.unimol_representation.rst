@@ -1,4 +1,4 @@
-﻿mllf.cb.unimol\_representation
+mllf.cb.unimol\_representation
 ==============================
 
 .. automodule:: mllf.cb.unimol_representation
@@ -15,5 +15,9 @@
       get_substituent_unimol_with_environment
       get_unimol_representation
       load_embedding
+      minimized_ligand_copies
+      other_site_reference_subs
+      phase_embedding
+      phase_flags
       save_embedding
    

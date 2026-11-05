@@ -22,7 +22,7 @@ def _block(**kw):
         groups_reopened=[('14benz_vac/group01', 12)],
         validation={'both': 7, 'total': 48}, gate='model accepted, new best saved',
         regression={'online_before': 2.943, 'online_after': 2.694, 'replay_before': 4.888,
-                     'replay_after': 4.457},
+                    'replay_after': 4.457},
         hindsight={'median_step': {'linear': 2.31, 'quadratic': 4.33, 'skew': 0.94, 'end': None},
                    'b_grown': 53, 'b_bisected': 88, 'b_unlocked': 4, 'c_up': 57, 'c_down': 26,
                    'c_unlocked': 2, 'pinned': 13, 'stranded': 34, 'held_off': 33},
