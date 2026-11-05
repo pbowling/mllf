@@ -28,8 +28,8 @@ The training driver labels each system when it finishes; for a finished run::
 
     python -m mllf.cb.export_biases config.yaml --label checkpoints_online_A
 """
-import logging
 import json
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -40,6 +40,7 @@ import torch
 from mllf.cb import system_stages as ss
 from mllf.cb.bandit_config import BanditConfig
 from mllf.cb.graph_build import build_graph_and_data
+from mllf.cb.group_correction import apply_group_values, correction_config
 from mllf.cb.hindsight import (
     BIAS_DIMS,
     OFFSET_KEY,
@@ -50,9 +51,9 @@ from mllf.cb.hindsight import (
     linear_edge_variance,
     pair_offset_posterior,
 )
-from mllf.cb.group_correction import apply_group_values, correction_config
 from mllf.file_handling.combo_sets import build_combo_sets
 from mllf.file_handling.write_bias_coeff import write_variables_from_actions
+
 
 log = logging.getLogger(__name__)
 

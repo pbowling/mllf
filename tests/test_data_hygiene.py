@@ -2,14 +2,15 @@
 import numpy as np
 import torch
 
-from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.pair_weights import (
     compute_pairwise_confidence_weights,
     compute_pairwise_measured_mask,
     is_finite,
 )
+from mllf.cb.pairs import build_directed_pairs
 from mllf.pretrain.bayesian_init import _compute_physical_residual_variance
 from mllf.pretrain.trainer import _edge_confidence
+
 
 PAIRS = build_directed_pairs([3])  # (0,1) (0,2) (1,0) (1,2) (2,0) (2,1)
 

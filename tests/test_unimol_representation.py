@@ -6,17 +6,18 @@ pretraining and online training, replacing the deprecated AEV/DeepSet/atombond G
 These tests verify embedding computation, caching, and environment handling.
 """
 
-import pytest
-import numpy as np
-import tempfile
 import json
+import tempfile
 from pathlib import Path
+
+import numpy as np
+import pytest
 
 from mllf.cb.unimol_representation import (
     _generate_embedding_cache_key,
     _system_label_from_prep_dir,
-    save_embedding,
     load_embedding,
+    save_embedding,
 )
 
 

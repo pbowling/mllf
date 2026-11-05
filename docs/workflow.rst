@@ -584,13 +584,39 @@ Launching Simulations
 ~~~~~~~~~~~~~~~~~~~~~
 
 Each combo's biases are written to ``variables.py``, and its simulation is submitted as one
-SLURM job per combo per epoch (``mllf.cb.slurm.submit_epoch_simulation``), with every
-cluster-specific setting taken from the config's ``slurm:`` block:
+SLURM job per combo per epoch (``mllf.cb.slurm.submit_epoch_simulation``). The job script
+is built from the config's ``slurm:`` block (``mllf.slurm``), where every key becomes an
+``#SBATCH`` option, so any sbatch setting can be used without code changes:
 
-* ``partition`` (``#SBATCH -p``), omitted for the account's default partition
-* ``gres`` (``#SBATCH --gres``), omitted on a CPU-only cluster
-* ``time`` (``#SBATCH --time``, default ``01:00:00``)
-* ``module`` (``module load``), omitted when the simulator is already on ``PATH``
+.. code-block:: yaml
+
+   slurm:
+     partition: gpu2080
+     gres: gpu:1
+     time: '02:00:00'
+     exclude: [gollum003, gollum007]     # or 'gollum[003,007]'
+     exclude_file: bad_nodes.txt         # re-read at every submission
+     qos: normal
+     mem: 8G
+     mail_type: FAIL                     # underscores become dashes: --mail-type=FAIL
+     requeue: true                       # true writes a bare flag
+     module: charmm/charmm/c51a1         # one or a list: 'module load' lines
+     setup:                              # shell lines run before the simulation
+       - source ~/miniconda3/etc/profile.d/conda.sh
+       - conda activate charmm
+     extra: ['--signal=B:USR1@60']       # raw directives, written as given
+
+* A list value is joined with commas; ``null`` or ``false`` leaves an option out.
+* ``ntasks: 1``, ``cpus_per_task: 1``, ``export: ALL`` and ``time: '01:00:00'`` are the
+  defaults; set a key to change one, or to ``null`` to drop it. Nothing else is assumed,
+  so with no ``slurm:`` block the script asks for no partition, GPU or module.
+* ``job_name`` and ``output`` are set for each job and cannot be configured.
+* ``exclude_file`` names a file of node names (whitespace, comma or line separated, ``#``
+  comments). It is read every time a job is submitted or resubmitted, so adding a node to
+  it keeps the next jobs of a running training off that node without restarting it.
+
+The same block sets the ``run.sh`` written into each combination directory for submitting
+it by hand (``mllf combos --slurm-config workflow.yaml``).
 
 At most ``max_concurrent_jobs`` (default 10) run at once. A failed run is resubmitted up
 to ``max_retries`` times (default 2), and a combo that still fails is replaced from a

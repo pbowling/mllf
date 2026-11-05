@@ -2,10 +2,10 @@
 directed edges for a run's substituents, the bias targets read from its
 ``variables.py``, and the record of which structure each run used.
 """
-import logging
 import collections
 import csv
 import json
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -30,6 +30,7 @@ from mllf.cb.unimol_representation import (
 )
 from mllf.file_handling.generate_combinations import is_combo_dir_name
 from mllf.pretrain.config import UnimolSettings
+
 
 log = logging.getLogger(__name__)
 

@@ -14,4 +14,3 @@ the ``docs/`` directory; see the sections below.
    docs/cli
    docs/examples
    docs/api
-

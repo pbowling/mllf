@@ -1,15 +1,16 @@
 """Build and persist consistent environment atom selections for pretraining."""
 
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional
-import json
 
 from mllf.cb.unimol_representation import (
     build_environment_consensus,
-    get_substituent_unimol_with_environment,
     get_substituent_dual_embeddings,
+    get_substituent_unimol_with_environment,
 )
+
 
 log = logging.getLogger(__name__)
 

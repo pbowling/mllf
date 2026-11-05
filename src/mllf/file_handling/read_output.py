@@ -2,7 +2,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 
 def terminated_normally(text: str) -> bool:

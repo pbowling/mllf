@@ -11,11 +11,11 @@ Sign convention: flat ``cs*``/``xs*``/``ss*`` values (what CHARMM receives via
 """
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 import json
 import os
 import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 

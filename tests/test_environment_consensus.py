@@ -6,14 +6,15 @@ across pretraining and online training by identifying atoms that appear in all
 substituents' environments at a given site.
 """
 
-import pytest
 import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from mllf.cb.environment_consensus import (
-    save_consensus_atoms,
     load_consensus_atoms,
+    save_consensus_atoms,
 )
 
 

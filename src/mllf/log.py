@@ -19,6 +19,7 @@ To route mllf's messages elsewhere, configure the ``mllf`` logger, e.g.
 import logging
 import sys
 
+
 LOGGER_NAME = 'mllf'
 PLAIN = '%(message)s'
 DEBUG_FORMAT = '%(levelname)s %(name)s: %(message)s'

@@ -6,6 +6,7 @@ The training itself is ``mllf.cb.training_loop.run_training`` (setup in
 """
 import argparse
 
+
 DESCRIPTION = 'Run online CB-policy training from a YAML config'
 EPILOG = ('Example: mllf train examples/workflow_14benz.yaml\n'
           'Rerunning the same command resumes from the latest checkpoint.')
@@ -17,6 +18,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run(args: argparse.Namespace) -> None:
     from mllf.cb.training_loop import run_training
+
     # -v turns on the config's verbose detail (as 'verbose: true' does)
     run_training(args.config, verbose=True if getattr(args, 'verbose', 0) > 0 else None)
 

@@ -62,9 +62,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import yaml
 
 from mllf.cb.pair_weights import is_finite
-import yaml
+
 
 KB_KCAL = 0.0019872041
 DEFAULT_TEMPERATURE = 298.15

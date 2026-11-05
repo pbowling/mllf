@@ -1,5 +1,6 @@
-import os
 import math
+import os
+
 import pytest
 
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
@@ -8,7 +9,7 @@ from mllf.file_handling.read_output import (
     parse_pair_barriers,
     parse_site_holdoff,
 )
-from mllf.file_handling.read_rtf import parse_rtf_file, parse_rtf_dir
+from mllf.file_handling.read_rtf import parse_rtf_dir, parse_rtf_file
 
 
 def _lambda_output(rows, first_block=2, temperature="298.150"):
@@ -73,6 +74,7 @@ def test_parse_pair_barriers_empty_without_trajectory():
 
 def test_resolve_output_file_prefers_local_then_source(tmp_path):
     import json
+
     from mllf.file_handling.read_output import resolve_output_file
     source = tmp_path / "source_run"
     source.mkdir()

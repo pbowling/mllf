@@ -64,17 +64,19 @@ Additional Features:
 """
 from __future__ import annotations
 
-import logging
-import json
-import re
 import itertools
-import warnings
-from pathlib import Path
-from shutil import copy2
-from shutil import make_archive
-from typing import Dict, List, Optional, Tuple
-from glob import glob
+import json
+import logging
+import re
 import shutil
+import warnings
+from glob import glob
+from pathlib import Path
+from shutil import copy2, make_archive
+from typing import Dict, List, Optional, Tuple
+
+from mllf.slurm import job_script
+
 
 log = logging.getLogger(__name__)
 
@@ -564,7 +566,7 @@ def augment_core_with_excluded_sub1(
 
 def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Dict,
                                   include_patterns: List[str] | None = None,
-                                  verbose: bool = True) -> Path:
+                                  verbose: bool = True, slurm: Dict | None = None) -> Path:
     """Create a single combination directory with renamed files and support files.
 
     Args:
@@ -572,6 +574,8 @@ def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Di
         out_dir: Output directory where combination subdir will be created.
         combo_info: Dict with 'name', 'sites', 'subs', 'subs_per_site_counts', 'counter'.
         include_patterns: Glob patterns for extra files to copy (e.g., ['prep/*', '*.py']).
+        slurm: The config's ``slurm:`` block, for the directory's run.sh
+            (``mllf.slurm``); None writes only the generic defaults.
 
     Returns:
         Path to created directory.
@@ -725,22 +729,10 @@ info['temp'] = 298.15
 """
     (combo_path / 'info.py').write_text(info_content)
 
-    # Generate run.sh
-    run_sh = f"""#!/bin/bash
-#SBATCH --job-name={name}
-#SBATCH --output={name}.%j.out
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH -p gpu2080 --gres=gpu:1
-#SBATCH --export=ALL
-#SBATCH --time=01:00:00
-
-module load charmm/charmm/c51a1
-
-python3 msld_flat.py > output.out 2>&1
-"""
+    # run.sh: submit this combo by hand (options from the slurm block)
     run_script = combo_path / 'run.sh'
-    run_script.write_text(run_sh)
+    run_script.write_text(job_script(slurm, name, f"{name}.%j.out",
+                                     ['python3 msld_flat.py > output.out 2>&1']))
     run_script.chmod(0o755)
 
     # Copy additional files matching include patterns
@@ -761,7 +753,8 @@ python3 msld_flat.py > output.out 2>&1
 
 def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = False,
                             include_patterns: List[str] | None = None,
-                            max_subs_per_site: int = 10) -> List[Path]:
+                            max_subs_per_site: int = 10,
+                            slurm: Dict | None = None) -> List[Path]:
     """Create combination directories with renamed files and support files.
 
     For each valid combination:
@@ -783,6 +776,8 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
             combination (default: 10).
             All substituents can still participate, but each combination is limited to
             this size per site.
+        slurm: The config's ``slurm:`` block, for each directory's run.sh
+            (``mllf.slurm``); None writes only the generic defaults.
 
     Returns:
         List of created directory paths.
@@ -1045,24 +1040,12 @@ info['temp'] = 298.15
 """
             info_path.write_text(info_content)
 
-            # Generate run.sh submission script
+            # run.sh: submit this combo by hand (options from the slurm block)
             run_sh_path = combo_path / 'run.sh'
-            run_sh_content = f"""#!/bin/bash
-#SBATCH --job-name={name}
-#SBATCH --output={name}.%j.out
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH -p gpu2080 --gres=gpu:1
-#SBATCH --export=ALL
-#SBATCH --time=01:00:00
-
-module load charmm/charmm/c51a1
-
-# Run msld_flat.py with variables.py from this directory
-python3 msld_flat.py --vars-file variables.py --out-dir . > output.out
-"""
-            run_sh_path.write_text(run_sh_content)
-            # Make run.sh executable
+            run_sh_path.write_text(job_script(slurm, name, f"{name}.%j.out", [
+                '# Run msld_flat.py with variables.py from this directory',
+                'python3 msld_flat.py --vars-file variables.py --out-dir . > output.out',
+            ]))
             run_sh_path.chmod(0o755)
 
             created_dirs.append(combo_path)

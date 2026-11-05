@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from mllf.cb.workflow_utils import select_combos_by_uncertainty
 
+
 VARIANCE = {'a': 3.0, 'b': 2.0, 'c': 1.0}
 
 

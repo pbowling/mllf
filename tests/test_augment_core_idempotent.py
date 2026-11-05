@@ -3,6 +3,7 @@ by a later epoch keeps its already-augmented core, and augmenting it again
 duplicated atom names (CHARMM stops reading core.rtf)."""
 from mllf.file_handling.generate_combinations import augment_core_with_excluded_sub1
 
+
 CORE_RTF = """* core
 *
 RESI LIG 0.000000

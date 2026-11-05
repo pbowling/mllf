@@ -2,11 +2,12 @@
 """Test that bias matrices are upper-triangular (not antisymmetric) to prevent cancellation."""
 
 import sys
-import torch
-import yaml
-from types import SimpleNamespace
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+import yaml
 
 from mllf.file_handling.write_bias_coeff import write_variables_from_actions
 

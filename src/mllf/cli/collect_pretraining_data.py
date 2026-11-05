@@ -39,6 +39,7 @@ from mllf.file_handling.read_output import (
 )
 from mllf.file_handling.read_rtf import parse_rtf_dir
 
+
 log = logging.getLogger(__name__)
 
 

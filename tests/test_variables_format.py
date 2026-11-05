@@ -5,8 +5,9 @@ Verifies understanding of ALF variables file structure:
 - Quadratic biases stored antisymmetrically (implied)
 - Skew and end biases stored with independent directions
 """
-import pytest
 from pathlib import Path
+
+import pytest
 
 from mllf.file_handling.read_bias_coeff import parse_old
 

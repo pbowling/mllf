@@ -4,9 +4,9 @@ Reading and checking the workflow config, building every system's combo
 pool, the policy and its optimizers, restoring a checkpoint or pretrained
 weights, and choosing the held-out validation combos.
 """
-import logging
 import concurrent.futures
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,6 +32,7 @@ from mllf.file_handling.manifests import (
     count_combinations_fast,
     create_and_load_system_manifest,
 )
+
 
 log = logging.getLogger(__name__)
 

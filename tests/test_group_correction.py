@@ -5,6 +5,7 @@ import torch
 
 from mllf.cb import group_correction as gc
 
+
 # Site 1: three substituents (nodes 0-2); site 2: two (nodes 3-4).
 LABELS = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]
 SITE1 = [(i, j) for i in range(3) for j in range(3) if i != j]

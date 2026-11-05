@@ -26,6 +26,7 @@ runs, the full test otherwise). Lines with nothing to report are left out.
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
+
 # stage-change reasons (system_stages.advance) in words, and back
 REASON_WORDS = {'criterion': 'converged', 'max_epochs': 'max epochs, not converged',
                 'epochs': 'stage length', 'no_combos': 'no combos'}

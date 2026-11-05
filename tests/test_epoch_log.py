@@ -3,6 +3,7 @@ import math
 
 from mllf.cb.epoch_log import format_epoch_block, parse_epoch_block
 
+
 ROWS = [
     {'system': '12benz_solvent', 'stage': 'pairs_groups', 'stage_epoch': 13, 'stage_max': 20,
      'progress': (0, 3, 'groups'), 'ref': (4, 9), 'retired': 1, 'ns': 24.81},

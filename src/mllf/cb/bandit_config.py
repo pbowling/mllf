@@ -19,6 +19,7 @@ from mllf.cb.hindsight import (
     QUADRATIC_STEP_MAX,
 )
 
+
 # 'reinforce' (default) or 'hindsight'; 'neurallinear_ts' is hindsight's
 # former name, still accepted.
 BANDIT_ALGORITHMS = ('reinforce', 'hindsight')

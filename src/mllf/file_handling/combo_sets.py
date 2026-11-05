@@ -36,6 +36,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+
 ALF_GROUPS = 'alf_groups'
 ALF_GROUP_PAIRS = 'alf_group_pairs'
 # Only the pairs between each group site's reference (its first substituent)

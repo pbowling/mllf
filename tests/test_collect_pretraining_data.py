@@ -11,25 +11,25 @@ Covers:
 """
 import json
 import math
+import re
 import textwrap
 from pathlib import Path
 
 import pytest
-import re
-import yaml
 import torch
+import yaml
 
-from mllf.cli.collect_pretraining_data import (
-    find_run_directories,
-    parse_bias_from_py,
-    parse_bias_from_inp,
-    detect_solvent_state,
-    fix_inp_nonlinear_signs,
-    backfill_barrier_pairs,
-)
-from mllf.pretrain.filters import filter_best_runs_per_system
-from mllf.file_handling.read_bias_coeff import read_bias_coeff
 from mllf.cb.unimol_representation import _read_box_from_prep_script
+from mllf.cli.collect_pretraining_data import (
+    backfill_barrier_pairs,
+    detect_solvent_state,
+    find_run_directories,
+    fix_inp_nonlinear_signs,
+    parse_bias_from_inp,
+    parse_bias_from_py,
+)
+from mllf.file_handling.read_bias_coeff import read_bias_coeff
+from mllf.pretrain.filters import filter_best_runs_per_system
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +821,7 @@ from mllf.cli.collect_pretraining_data import (  # noqa: E402
     parse_active_subs_from_inp,
     parse_active_subs_from_output,
 )
+
 
 # master sub -> atom names in its _pres.rtf
 _MASTERS = {

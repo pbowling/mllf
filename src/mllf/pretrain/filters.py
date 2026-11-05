@@ -2,8 +2,8 @@
 transition thresholds, stratified sampling of negative-reward runs and
 coefficient outliers.
 """
-import logging
 import json
+import logging
 import math
 import random
 from collections import Counter, defaultdict
@@ -14,11 +14,11 @@ import numpy as np
 import yaml
 
 from mllf.file_handling.generate_combinations import is_combo_dir_name
-
 from mllf.pretrain.rewards import (
     compute_reward_from_sim_results,
     reward_kwargs,
 )
+
 
 log = logging.getLogger(__name__)
 

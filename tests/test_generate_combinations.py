@@ -1,11 +1,12 @@
-from pathlib import Path
 import tempfile
+from pathlib import Path
+
 import pytest
 
 from mllf.file_handling.generate_combinations import (
-    find_site_sub_files,
     all_site_sub_combinations,
     create_combination_dirs,
+    find_site_sub_files,
 )
 
 

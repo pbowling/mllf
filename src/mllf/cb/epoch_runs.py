@@ -8,8 +8,8 @@ per-pair offsets in hindsight mode) and writes ``variables.py``; phase 2
 failures and records each finished run's ``epoch_results.pt``. The updates
 that read those records are in ``mllf.cb.epoch_updates``.
 """
-import logging
 import concurrent.futures
+import logging
 import shutil
 import subprocess
 import sys
@@ -45,6 +45,8 @@ from mllf.cb.workflow_utils import (
 )
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
 from mllf.file_handling.write_bias_coeff import write_variables_from_actions
+from mllf.slurm import refresh_exclude
+
 
 log = logging.getLogger(__name__)
 
@@ -576,6 +578,8 @@ class EpochRun:
             log.info(f"  Simulation failed for {job.combo_path.name}, retrying "
                      f"(attempt {job.retries + 2}/{max_retries + 1})...")
             try:
+                # nodes added to slurm.exclude_file since the first attempt apply
+                refresh_exclude(job.epoch_dir / 'run_epoch.sh', self.config.get('slurm'))
                 result = subprocess.run(['sbatch', str(job.epoch_dir / 'run_epoch.sh')],
                                         cwd=str(job.epoch_dir), capture_output=True, text=True,
                                         check=True)

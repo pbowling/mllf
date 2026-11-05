@@ -1,10 +1,11 @@
 """Loading collected pretraining runs (``collect_pretraining_data`` output)."""
-import logging
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List
 
 from mllf.file_handling.generate_combinations import is_combo_dir_name
+
 
 log = logging.getLogger(__name__)
 

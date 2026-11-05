@@ -31,11 +31,12 @@ For ANI-2x, use cutoff=5.1 Å (radial) or 3.5 Å (angular) to match the AEV func
 
 from __future__ import annotations
 
+import re
 import warnings
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import re
 
 from mllf.file_handling.read_rtf import infer_element_from_cgenff_type
 

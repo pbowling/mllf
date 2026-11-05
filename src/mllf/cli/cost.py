@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 
+
 log = logging.getLogger(__name__)
 
 DESCRIPTION = 'Simulated ns per system: online run vs ALF'

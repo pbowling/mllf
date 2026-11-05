@@ -3,6 +3,7 @@ import argparse
 import logging
 from pathlib import Path
 
+
 log = logging.getLogger(__name__)
 
 DESCRIPTION = "Generate combination directories from site_sub files"
@@ -25,6 +26,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--archive', dest='archive', action='store_true',
                         help='Create .tar.gz archives of generated combo directories matching '
                              'pattern comb_*')
+    parser.add_argument('--slurm-config', type=Path, default=None, metavar='YAML',
+                        help="YAML file whose 'slurm:' block sets each run.sh's sbatch options, "
+                             'modules and setup (e.g. the workflow config); default: generic '
+                             'options only')
     parser.add_argument('--archive-remove', dest='archive_remove', action='store_true',
                         help='Remove combo directories after successful archiving')
 
@@ -37,9 +42,13 @@ def run(args: argparse.Namespace) -> None:
     input_dir = args.input_dir
     if not input_dir.exists() or not input_dir.is_dir():
         raise SystemExit(f"Input directory not found: {input_dir}")
+    slurm = None
+    if args.slurm_config:
+        import yaml
+        slurm = (yaml.safe_load(args.slurm_config.read_text()) or {}).get('slurm')
     created = create_combination_dirs(
         input_dir, args.out_dir, dry_run=args.dry_run,
-        include_patterns=args.include or None, max_subs_per_site=args.max_subs)
+        include_patterns=args.include or None, max_subs_per_site=args.max_subs, slurm=slurm)
     log.info(f"Created {len(created)} combination dirs under {args.out_dir}")
     if args.archive:
         archived = archive_combo_dirs(args.out_dir, pattern='comb_*', remove=args.archive_remove)

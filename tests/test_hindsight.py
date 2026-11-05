@@ -9,8 +9,8 @@ from mllf.cb.hindsight import (
     BARRIER_C_SLOPE,
     KB_KCAL,
     LINEAR_STEP_CAP,
-    OFFSET_KEY,
     OFFSET_DIMS,
+    OFFSET_KEY,
     apply_pair_offsets,
     cap_quadratic,
     combo_node_labels,
@@ -21,6 +21,7 @@ from mllf.cb.hindsight import (
     read_applied_biases,
     record_pair_targets,
 )
+
 
 KT = KB_KCAL * 298.15
 EDGES = torch.tensor([[0, 1], [1, 0]])  # one pair, both directions

@@ -8,10 +8,10 @@ Moved here from ``training/workflow.py`` as part of making the online CB
 training driver importable as a library (see ``mllf.cli.train_workflow``).
 """
 import logging
-from pathlib import Path
-from typing import Dict, Optional
 import re
 import warnings
+from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ from mllf.cb.unimol_representation import (
     get_substituent_dual_embeddings,
 )
 from mllf.file_handling.read_rtf import parse_rtf_dir
+
 
 log = logging.getLogger(__name__)
 

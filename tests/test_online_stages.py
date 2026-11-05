@@ -28,6 +28,7 @@ from mllf.file_handling import combo_sets as cs
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
 from mllf.file_handling.write_bias_coeff import fit_site_b, write_variables_from_actions
 
+
 KT = KB_KCAL * 298.15
 # One site, three substituents: every directed edge.
 EI3 = torch.tensor([[0, 0, 1, 1, 2, 2], [1, 2, 0, 2, 0, 1]])
@@ -483,7 +484,7 @@ def test_short_runs_count_without_confirmation():
 
 
 def test_label_group_export_renames_unconverged(tmp_path):
-    from mllf.cb.export_biases import label_group_export, UNCONVERGED_SUFFIX
+    from mllf.cb.export_biases import UNCONVERGED_SUFFIX, label_group_export
     g = tmp_path / 'sys' / 'group01_site1_subs_1_2_3'
     g.mkdir(parents=True)
     (g / 'variables.py').write_text('x')

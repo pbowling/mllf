@@ -14,11 +14,11 @@ and, every epoch:
 5. validates on the held-out combos (with the regression validation gate);
 6. exports finished systems, logs the epoch, checkpoints.
 """
-import logging
 import collections
 import copy
 import functools
 import json
+import logging
 import re
 import sys
 import traceback
@@ -30,6 +30,7 @@ import numpy as np
 import torch
 
 from mllf.cb import epoch_log, group_correction, system_stages
+from mllf.cb import training_setup as setup
 from mllf.cb.bandit_config import BanditConfig
 from mllf.cb.cost_ledger import LEDGER_FILE, load_ledger, record_runs, summarize_ledger
 from mllf.cb.curriculum import (
@@ -42,7 +43,6 @@ from mllf.cb.export_biases import export_final_biases, label_final_biases
 from mllf.cb.graph_build import build_graph_and_data
 from mllf.cb.hindsight import combo_node_labels, merge_revisits, pair_attention, select_revisits
 from mllf.cb.reinforce_trainer import append_summary, format_pair_success, train_epoch
-from mllf.cb import training_setup as setup
 from mllf.cb.warning_summary import WarningSummary
 from mllf.cb.workflow_utils import (
     action_std_score,
@@ -53,6 +53,7 @@ from mllf.cb.workflow_utils import (
 )
 from mllf.file_handling.combo_sets import reversed_pair
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
+
 
 log = logging.getLogger(__name__)
 

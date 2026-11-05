@@ -14,11 +14,12 @@ ALF's cost comes from the pretraining datasets (``pretraining/<system>_group*``
 etc.): each ``run*/metadata.json`` names the original ALF run directory, whose
 ``output`` file is parsed the same way (``alf_cost``).
 """
-import logging
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
 
 log = logging.getLogger(__name__)
 

@@ -13,6 +13,13 @@ maintainers = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
 keywords = ["machine learning", "neural networks", "molecular dynamics", "multisite lambda dynamics"]
 # X | None annotations (generate_combinations) need 3.10.
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
 
 dependencies = [
     "numpy>=1.24",
@@ -33,6 +40,8 @@ dev = [
     "pytest>=7.0",
     "pytest-cov",
     "flake8",
+    "isort",
+    "pre-commit",
 ]
 
 [tool.setuptools.dynamic]
@@ -46,5 +55,14 @@ minversion = "7.0"
 addopts = "-q -ra --strict-markers"
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.isort]
+# Import order: standard library, third party, mllf; one name per line when wrapped.
+profile = "black"
+line_length = 99
+known_first_party = ["mllf"]
+src_paths = ["src", "tests"]
+extend_skip = ["examples", "tests/samples"]
+lines_after_imports = 2
 
 # flake8 does not read pyproject.toml; its settings are in .flake8.

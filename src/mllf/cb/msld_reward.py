@@ -5,7 +5,9 @@ concentrated populations and low transition counts, encouraging the policy
 to explore the full alchemical space rather than converging to single-substituent
 solutions.
 """
+import json
 import warnings
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -13,10 +15,8 @@ import numpy as np
 from mllf.file_handling.read_output import (
     parse_single_population,
     parse_transitions_and_rates,
-    terminated_normally
+    terminated_normally,
 )
-import json
-from collections import defaultdict
 
 
 def compute_msld_reward_improved(

@@ -7,13 +7,14 @@ integer-index map used by ``ContextBaseline``'s per-system embedding.
 Moved here from ``training/workflow.py`` as part of making the online CB
 training driver importable as a library (see ``mllf.cli.train_workflow``).
 """
-from pathlib import Path
-from typing import Dict, List, Optional
 import logging
 import re
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+
 
 log = logging.getLogger(__name__)
 

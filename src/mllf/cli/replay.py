@@ -6,6 +6,7 @@ import argparse
 import logging
 from pathlib import Path
 
+
 log = logging.getLogger(__name__)
 
 DESCRIPTION = 'Prebuild the regression replay set of a workflow config'

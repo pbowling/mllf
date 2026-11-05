@@ -2,15 +2,15 @@
 import pytest
 
 from mllf.file_handling.read_pdb import (
-    parse_pdb_file,
+    calculate_min_distance,
+    combine_pdb_files,
     extract_site_number,
     find_duplicate_atoms,
-    remove_duplicate_atoms,
-    combine_pdb_files,
-    calculate_min_distance,
     find_nearby_pdbs,
     find_reference_subs_from_other_sites,
-    parse_pdb_dir
+    parse_pdb_dir,
+    parse_pdb_file,
+    remove_duplicate_atoms,
 )
 
 

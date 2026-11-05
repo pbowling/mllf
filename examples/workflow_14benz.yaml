@@ -101,6 +101,9 @@ timeout: 1200   # seconds per simulation
 # `module` if you don't use environment modules, drop `partition` to use
 # your cluster's/account's default. `time` defaults to 01:00:00 if this
 # whole block is left out.
+# Any other sbatch option can be added the same way (underscores become
+# dashes), e.g. `exclude: [node003]`, `qos: normal`, `mem: 8G`; `exclude_file`
+# is re-read at every submission. See docs/workflow.rst (Launching Simulations).
 slurm:
   partition: gpu
   gres: gpu:1

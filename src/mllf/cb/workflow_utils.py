@@ -5,24 +5,26 @@ This module contains reusable functions for:
 - Managing simulation success checking and metric parsing
 - SLURM job submission and monitoring utilities
 """
+import json
 import logging
 import math
-from pathlib import Path
-from typing import Callable, List, Dict, Optional
-import json
 import re
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+
 import torch
 
 from mllf.cb.pair_weights import is_finite
 from mllf.file_handling.read_output import (
-    terminated_normally,
-    parse_single_population,
-    parse_transitions_and_rates,
-    parse_single_ddg,
     parse_fraction_physical_ligand,
     parse_pair_profile,
+    parse_single_ddg,
+    parse_single_population,
     parse_site_holdoff,
+    parse_transitions_and_rates,
+    terminated_normally,
 )
+
 
 log = logging.getLogger(__name__)
 

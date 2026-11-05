@@ -4,41 +4,44 @@
 ##   ** MSLD with BLADE (no OMM support) **
 ##
 
-import os
-import numpy as np
 import argparse
+import os
+
+# Load info dictionary from info.py
+import sys
+
+import numpy as np
+import pycharmm
+import pycharmm.cons_fix as cons_fix
+import pycharmm.cons_harm as cons_harm
+import pycharmm.coor as coor
+import pycharmm.crystal as crystal
+import pycharmm.dynamics as dyn
+import pycharmm.energy as energy
+import pycharmm.generate as gen
+import pycharmm.ic as ic
+import pycharmm.image as image
+import pycharmm.minimize as minimize
+import pycharmm.nbonds as nbonds
+import pycharmm.psf as psf
+import pycharmm.read as read
+import pycharmm.scalar as scalar
+import pycharmm.select as select
+import pycharmm.settings as settings
+import pycharmm.shake as shake
+import pycharmm.write as write
 import yaml
+from pycharmm.lib import charmm as libcharmm
+
 
 ##############################################
 # Load pyCHARMM libraries
 
-import pycharmm
-import pycharmm.generate as gen
-import pycharmm.ic as ic
-import pycharmm.coor as coor
-import pycharmm.energy as energy
-import pycharmm.dynamics as dyn
-import pycharmm.nbonds as nbonds
-import pycharmm.minimize as minimize
-import pycharmm.crystal as crystal
-import pycharmm.image as image
-import pycharmm.psf as psf
-import pycharmm.read as read
-import pycharmm.write as write
-import pycharmm.settings as settings
-import pycharmm.cons_harm as cons_harm
-import pycharmm.cons_fix as cons_fix
-import pycharmm.select as select
-import pycharmm.shake as shake
-import pycharmm.scalar as scalar
-from pycharmm.lib import charmm as libcharmm
 
 
 ##############################################
 # Set up global parameters
 
-# Load info dictionary from info.py
-import sys
 if os.path.exists('info.py'):
     sys.path.insert(0, os.path.dirname(os.path.abspath('info.py')))
     from info import info

@@ -27,6 +27,7 @@ from mllf.cb.hindsight import (
     update_exploration,
 )
 
+
 EDGES = torch.tensor([[0, 1], [1, 0]])  # one pair, both directions
 LABELS = [(1, 1), (1, 2)]
 KEY = 'sys|s1|1|2'

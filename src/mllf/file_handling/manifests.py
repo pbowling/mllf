@@ -8,10 +8,12 @@ loading a whole system's ``combo_metadata.json`` into memory at once.
 Moved here from ``training/workflow.py`` as part of making the online CB
 training driver importable as a library (see ``mllf.cli.train_workflow``).
 """
+import json
 import logging
+from itertools import combinations as _icombinations
+from math import comb as _comb
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
-import json
 
 import numpy as np
 
@@ -20,8 +22,7 @@ from mllf.file_handling.generate_combinations import (
     find_site_sub_files,
     list_possible_combinations,
 )
-from math import comb as _comb
-from itertools import combinations as _icombinations
+
 
 log = logging.getLogger(__name__)
 
@@ -329,6 +330,6 @@ def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
         log.info(f"  Creating combo directory on-demand: {combo_path.name}")
     created_path = create_single_combination_dir(
         input_dir, output_dir, combo_info, include_patterns=include_patterns,
-        verbose=verbose,
+        verbose=verbose, slurm=global_config.get('slurm'),
     )
     return created_path

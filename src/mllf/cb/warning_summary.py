@@ -1,10 +1,11 @@
 """Deduplicated summary of the warnings raised during a long run."""
-import logging
 import collections
+import logging
 import re
 import threading
 import warnings
 from pathlib import Path
+
 
 log = logging.getLogger(__name__)
 

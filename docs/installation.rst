@@ -12,7 +12,7 @@ environment:
    pip install -r docs/requirements.txt
 
 Simulations need CHARMM with pyCHARMM on the cluster; the workflow loads it through the
-``slurm.module`` setting (:doc:`workflow`).
+``slurm:`` block's ``module`` and ``setup`` settings (:doc:`workflow`).
 
 Run the tests with:
 

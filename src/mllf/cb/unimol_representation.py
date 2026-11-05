@@ -3,10 +3,10 @@
 Assembles core, substituent, reference-site, and optional environment atoms.
 The APIs support ligand-only/full dual embeddings and phase-feature inputs.
 """
-import logging
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import tempfile
@@ -15,16 +15,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-
 from unimol_tools import UniMolRepr
 
 from mllf.cb.policy import ENV_INPUTS, PHASE_DIM, PHASE_NODE_INPUTS
 from mllf.file_handling.generate_combinations import is_combo_dir_name
 from mllf.file_handling.read_pdb import (
-    parse_pdb_file,
-    find_reference_subs_from_other_sites,
     extract_site_number,
+    find_reference_subs_from_other_sites,
+    parse_pdb_file,
 )
+
 
 log = logging.getLogger(__name__)
 

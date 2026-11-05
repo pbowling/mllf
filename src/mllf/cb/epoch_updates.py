@@ -18,7 +18,6 @@ import torch.nn.functional as F
 
 from mllf.cb.epoch_runs import EpochRun, load_graph_data_cache
 from mllf.cb.graph_build import build_graph_and_data
-from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.group_correction import correction_targets, update_group
 from mllf.cb.hindsight import (
     BIAS_DIMS,
@@ -48,6 +47,7 @@ from mllf.cb.hindsight_regression import (
     regression_step,
 )
 from mllf.cb.pair_weights import compute_pairwise_confidence_weights
+from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.workflow_utils import (
     BARRIER_TARGET,
     BARRIER_WIDTH,
@@ -59,6 +59,7 @@ from mllf.cb.workflow_utils import (
     compute_pair_success_stats,
 )
 from mllf.file_handling.manifests import ensure_combo_dir_exists
+
 
 log = logging.getLogger(__name__)
 

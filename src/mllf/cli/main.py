@@ -15,6 +15,7 @@ from mllf import __version__
 from mllf.cli.common import UsageError
 from mllf.log import setup_logging
 
+
 # command -> (module, one-line help); in pipeline order
 COMMANDS = {
     'combos': ('mllf.cli.combos', 'generate combination directories from site/sub files'),

@@ -1,12 +1,15 @@
 """mllf.cb.hindsight_regression: full-network update toward hindsight targets."""
 import math
 
+import pytest
 import torch
 
-import pytest
-
 from mllf.cb.hindsight_regression import (
-    _check_replay_env_input, _check_replay_ligand, online_item, regression_config, regression_step,
+    _check_replay_env_input,
+    _check_replay_ligand,
+    online_item,
+    regression_config,
+    regression_step,
 )
 from mllf.cb.policy import PHASE_DIM, UnimolPolicy, env_input_from_state
 

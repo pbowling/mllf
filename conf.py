@@ -9,6 +9,7 @@
 import os
 import sys
 
+
 # make sure the package in src/ is importable when building docs
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
 

@@ -104,3 +104,4 @@ For the ``mllf`` command, see :doc:`cli`.
    mllf.cli.export
    mllf.cli.cost
    mllf.log
+   mllf.slurm

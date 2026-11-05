@@ -12,7 +12,6 @@ train_epoch and run_training end to end: tests/test_training_loop.py.
 
 import torch
 
-from mllf.cb.policy import UnimolPolicy
 from mllf.cb.epoch_runs import (
     CachedGraphData,
     detach_cpu_or_none,
@@ -20,6 +19,7 @@ from mllf.cb.epoch_runs import (
     sample_actions,
     save_graph_data_cache,
 )
+from mllf.cb.policy import UnimolPolicy
 from mllf.cb.reinforce_trainer import append_summary, format_pair_success
 
 

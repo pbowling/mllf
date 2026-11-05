@@ -46,13 +46,17 @@ Run the test suite with pytest:
 python -m pytest tests/ -v
 ```
 
-Optional: run flake8 for linting (installed via dev extras):
+Lint and import order are checked by pre-commit (flake8 with `.flake8`, isort with
+`[tool.isort]` in `pyproject.toml`); the dev extras install both:
 
 ```bash
-flake8
+pre-commit install            # check staged files on every commit
+pre-commit run --all-files    # check everything
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same hooks, the tests against the built wheel on
+Python 3.10 and 3.12, and the documentation build.
 
 ## Documentation
 
 Please see full documentation at https://mllf.readthedocs.io/en/latest for more detailed information.
-

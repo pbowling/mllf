@@ -5,22 +5,23 @@ feature trunk and readout. The trained readout becomes the Bayesian posterior
 mean; its precision is retained for Thompson sampling and uncertainty-based
 selection.
 """
-import logging
 import csv
 import json
+import logging
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.pair_weights import (
     compute_pairwise_confidence_weights,
     compute_pairwise_measured_mask,
 )
+from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.policy import PHASE_NODE_INPUTS, SITE_SIZE_SLOT
 from mllf.cb.replay_selection import plan_replay
+
 
 log = logging.getLogger(__name__)
 

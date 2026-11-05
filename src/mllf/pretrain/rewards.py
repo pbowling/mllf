@@ -1,6 +1,6 @@
 """Run- and pair-level rewards for pretraining's advantage weighting."""
-import logging
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +21,7 @@ from mllf.cb.workflow_utils import (
     SKEW_WIDTH,
     compute_pair_reward,
 )
+
 
 log = logging.getLogger(__name__)
 
