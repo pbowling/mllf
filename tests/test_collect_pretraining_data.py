@@ -27,7 +27,7 @@ from mllf.cli.collect_pretraining_data import (
     fix_inp_nonlinear_signs,
     backfill_barrier_pairs,
 )
-from mllf.cb.pretrain_policy import filter_best_runs_per_system
+from mllf.pretrain.filters import filter_best_runs_per_system
 from mllf.file_handling.read_bias_coeff import read_bias_coeff
 from mllf.cb.unimol_representation import _read_box_from_prep_script
 
@@ -937,7 +937,7 @@ def test_rekey_uses_msld_site_and_records_master():
 
 
 def test_node_fragment_is_the_master_sub():
-    from mllf.cb.pretrain_policy import _node_master_sub
+    from mllf.pretrain.features import _node_master_sub
     assert _node_master_sub({'master': 'site1_sub12'}, 1, 2) == 'site1_sub12'
     assert _node_master_sub({'filename': 'site1_sub12_pres.rtf'}, 1, 2) == 'site1_sub12'
     assert _node_master_sub({}, 1, 2) == 'site1_sub2'

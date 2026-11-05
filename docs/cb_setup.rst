@@ -160,7 +160,7 @@ With ``bandit.algorithm: hindsight``, each head's readout is a
 trunk's 64-D features with a full Gaussian posterior. Acting draws one weight sample per
 decision (Thompson sampling, ``UnimolPolicy.get_actions_thompson``), scaled by
 ``bandit.exploration_scale``, and the posterior variance tells selection where the model
-is uncertain. ``pretrain_policy --bayesian-heads`` converts a pretrained policy, starting
+is uncertain. Pretraining with ``--bayesian-heads`` converts a pretrained policy, starting
 each posterior mean from the trained readout and calibrating its precision on the
 pretraining data (:doc:`cb_pretraining`).
 

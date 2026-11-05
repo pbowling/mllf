@@ -293,7 +293,7 @@ class TestPreactivationScaling:
         """estimate_reward_noise_variance must divide by scale_factors^2, not
         return raw physical-space residual variance (which would be off by
         ~scale_factors^2, badly miscalibrating the posterior update)."""
-        from mllf.cb.pretrain_policy import estimate_reward_noise_variance
+        from mllf.pretrain.bayesian_init import estimate_reward_noise_variance
         policy_det = UnimolPolicy(unimol_dim=512, mlp_out_dim=4, use_dual_embeddings=True)
         emb = torch.randn(6, 1024)
         edge_index = torch.tensor([[0, 1, 2, 3, 4, 5], [1, 0, 3, 2, 5, 4]], dtype=torch.long)
@@ -323,7 +323,7 @@ class TestPriorPrecisionCalibration:
     """
 
     def test_sampled_actions_stay_close_to_seeded_mean(self):
-        from mllf.cb.pretrain_policy import initialize_bayesian_heads_from_pretrained
+        from mllf.pretrain.bayesian_init import initialize_bayesian_heads_from_pretrained
 
         torch.manual_seed(0)
         det = UnimolPolicy(unimol_dim=512, mlp_out_dim=4, use_dual_embeddings=True,
@@ -363,7 +363,7 @@ class TestPriorPrecisionCalibration:
         graph_cache-driven calibration targets physical-unit exploration
         variance directly against real physical residual scale instead.
         """
-        from mllf.cb.pretrain_policy import initialize_bayesian_heads_from_pretrained
+        from mllf.pretrain.bayesian_init import initialize_bayesian_heads_from_pretrained
 
         torch.manual_seed(0)
         det = UnimolPolicy(unimol_dim=512, mlp_out_dim=4, use_dual_embeddings=True,
@@ -418,7 +418,7 @@ class TestPriorPrecisionCalibration:
     def test_prior_precision_scales_inversely_with_weight_magnitude(self):
         """A head whose fitted weights are 10x smaller should get an
         adaptive prior precision ~100x larger (precision ~ 1/scale^2)."""
-        from mllf.cb.pretrain_policy import initialize_bayesian_heads_from_pretrained
+        from mllf.pretrain.bayesian_init import initialize_bayesian_heads_from_pretrained
 
         torch.manual_seed(0)
         det = UnimolPolicy(unimol_dim=512, mlp_out_dim=4, use_dual_embeddings=True,

@@ -49,7 +49,7 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     solvent_state = system_config.get('solvent_state', None)
 
     # Persistent Uni-Mol embedding cache (unimol.cache_embeddings / unimol.cache_dir
-    # in the config, same convention as pretrain_policy.py). Keyed by each
+    # in the config, same convention as pretraining). Keyed by each
     # combo's own (site/sub PDB path, core.pdb path, prep dir) — NOT
     # canonicalized back to training/systems/<name>/prep/, because core.pdb
     # can be mutated per-combo for single-site combinations
@@ -136,7 +136,7 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     #
     # Build a per-site consensus atom set from the CORE scaffold (identical
     # for every substituent at a site, since the core doesn't change when
-    # swapping substituents). This matches pretrain_policy.py's approach and
+    # swapping substituents). This matches pretraining's approach and
     # ensures the environment half of the embedding is consistent across
     # subs at a site, exactly as during pretraining.
     # In a phase mode (unimol.env_input) the full half is the phase flags: no

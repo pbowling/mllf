@@ -502,7 +502,7 @@ class UnimolPolicy(nn.Module):
         This is the exact transform ``_forward_edges`` applies to every
         deterministic head's raw output, and it's why ``BayesianLinearHead``
         is seeded from the deterministic readout's raw (pre-transform)
-        weights (see ``pretrain_policy.initialize_bayesian_heads_from_pretrained``)
+        weights (see ``mllf.pretrain.bayesian_init.initialize_bayesian_heads_from_pretrained``)
         — the posterior lives in the *same* pre-activation space, so its
         output needs the same transform applied before it's a valid action.
         Skipping this (as an earlier version of this code did) produces raw,
@@ -680,7 +680,7 @@ class UnimolPolicy(nn.Module):
                 pre-activation space before regressing — the posterior was
                 seeded from the deterministic readout's pre-transform
                 weights (see
-                ``pretrain_policy.initialize_bayesian_heads_from_pretrained``)
+                ``mllf.pretrain.bayesian_init.initialize_bayesian_heads_from_pretrained``)
                 and ``get_actions_thompson`` samples in that same space, so
                 the update must too, or the posterior mean drifts away from
                 what's actually being sampled/acted on.

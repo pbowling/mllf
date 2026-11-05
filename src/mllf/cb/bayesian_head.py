@@ -44,7 +44,7 @@ class BayesianLinearHead(nn.Module):
             and lower initial posterior variance.
         noise_var: Initial observation noise variance ``sigma^2``. Should be
             re-estimated from data (see ``estimate_reward_noise_variance`` in
-            ``pretrain_policy.py``) and set via ``set_noise_var`` before online use.
+            ``mllf.pretrain.bayesian_init``) and set via ``set_noise_var`` before online use.
         jitter: Small diagonal term added before Cholesky factorization, purely
             for numerical stability against loss of positive-definiteness from
             floating point error.
@@ -218,7 +218,7 @@ class BayesianLinearHead(nn.Module):
                 — this is exactly what caused wildly-scaled, near-random
                 online-training actions from an otherwise well-trained
                 checkpoint. Pass e.g. ``prior_precision / mean(weight**2)``
-                (see ``pretrain_policy.initialize_bayesian_heads_from_pretrained``)
+                (see ``mllf.pretrain.bayesian_init.initialize_bayesian_heads_from_pretrained``)
                 to scale the prior to this head's own fitted weight
                 magnitude instead of an arbitrary absolute constant.
             precision_floor: Minimum value accepted for ``prior_precision``

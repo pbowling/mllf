@@ -51,7 +51,7 @@ Pretraining warm-starts the policy from completed simulations (:doc:`cb_pretrain
        --output-dir pretraining/14benz_solv
 
    # behavior cloning
-   python -m mllf.cb.pretrain_policy --pretraining-dir pretraining/14benz_solv \
+   python -m mllf.cli.pretrain --pretraining-dir pretraining/14benz_solv \
        --output-dir models/14benz_pretrain --config examples/workflow_pretrain.yaml \
        --epochs 50
 

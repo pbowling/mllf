@@ -24,9 +24,3 @@ mllf.cb.training\_setup
       print_curriculum
       restore
    
-   .. rubric:: Classes
-
-   .. autosummary::
-   
-      WarningSummary
-   

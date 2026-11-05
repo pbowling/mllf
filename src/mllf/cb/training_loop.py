@@ -42,6 +42,7 @@ from mllf.cb.graph_build import build_graph_and_data
 from mllf.cb.hindsight import combo_node_labels, merge_revisits, pair_attention, select_revisits
 from mllf.cb.reinforce_trainer import append_summary, format_pair_success, train_epoch
 from mllf.cb import training_setup as setup
+from mllf.cb.warning_summary import WarningSummary
 from mllf.cb.workflow_utils import (
     action_std_score,
     bayesian_variance_score,
@@ -1505,7 +1506,7 @@ def run_training(config_path: str) -> None:
     checkpoints. In deploy mode the model and output paths come from the
     ``deploy:`` block."""
     config = setup.load_training_config(config_path)
-    with setup.WarningSummary():
+    with WarningSummary():
         run = setup_run(config)
         for epoch in range(run.start_epoch, run.num_epochs):
             if not run_epoch(run, epoch):

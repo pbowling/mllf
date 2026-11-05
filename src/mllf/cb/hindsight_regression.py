@@ -218,11 +218,11 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
 
     # Deferred: the pretraining module (Uni-Mol embeddings, run loading) is
     # large and only needed when the replay cache has to be (re)built.
-    from mllf.cb.pretrain_policy import (
+    from mllf.pretrain.features import (
         compute_unimol_embeddings_and_edges,
         extract_targets_from_variables,
-        load_pretraining_runs,
     )
+    from mllf.pretrain.runs import load_pretraining_runs
     manifest = cfg.get('replay_manifest')
     if not manifest or not Path(manifest).exists():
         raise FileNotFoundError(f"bandit.regression.replay_manifest not found: {manifest}")

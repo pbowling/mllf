@@ -49,7 +49,14 @@ For behavior-cloning pretraining, see :doc:`cb_pretraining`.
 .. autosummary::
    :toctree: api
 
-   mllf.cb.pretrain_policy
+   mllf.pretrain.config
+   mllf.pretrain.runs
+   mllf.pretrain.filters
+   mllf.pretrain.features
+   mllf.pretrain.rewards
+   mllf.pretrain.trainer
+   mllf.pretrain.bayesian_init
+   mllf.cli.pretrain
    mllf.cli.collect_pretraining_data
 
 Workflow Utilities

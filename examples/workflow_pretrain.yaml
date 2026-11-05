@@ -11,23 +11,11 @@
 unimol:
   structure_selection: unrelaxed
     # Options:
-    # - 'minimized': Use minimized structures from pretraining (default, fastest, consistent)
-    # - 'unrelaxed': Use unrelaxed structures (auto-detected from pretraining directory)
-    # - 'random': Randomly select minimized or unrelaxed per run
-    #
-    # Unrelaxed structures are auto-detected in this priority:
-    # 1. Check unrelaxed_system_mappings (explicit config overrides)
-    # 2. Check pretraining/prep/unrelaxed/ subdirectory
-    # 3. Check pretraining/prep/original/ subdirectory
-    # 4. Use pretraining/prep/ directly if PDB files present
-  
-  unrelaxed_system_mappings: null
-    # Dict mapping pretraining system names to unrelaxed system paths
-    # OPTIONAL: Only needed if auto-detection fails
-    # Example:
-    #   indolizine_prot: /home/pbowling/mllf/training/systems/indolizine_prot/prep
-    #   indolizine_solv: /home/pbowling/mllf/training/systems/indolizine_solv/prep
-    # If null, automatic detection attempted
+    # - 'minimized': environment from the run's prep/minimized.pdb (or .crd) (default)
+    # - 'unrelaxed': environment from prep/protein.pdb or solvent.pdb, skipping
+    #   minimized.pdb/.crd
+    # - 'random': minimized or unrelaxed, chosen per run (recorded in
+    #   pretraining_representations_used.csv)
   
   skip_unrelaxed_for_systems: ['thrombin_solvent_group']
     # List of system name patterns to skip unrelaxed structures for

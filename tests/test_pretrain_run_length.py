@@ -3,11 +3,11 @@
 import pytest
 import torch
 
-from mllf.cb.pretrain_policy import (
-    _run_pair_success,
+from mllf.pretrain.rewards import (
     compute_reward_from_sim_results,
     pair_advantages,
     run_length,
+    run_pair_success,
 )
 
 
@@ -59,17 +59,17 @@ def test_pair_success_uses_the_online_test_for_each_length():
     # 3 crossings, imbalanced: passes the short-run test only.
     short = {'sim_results': _sim(0.104, [90, 10], 3, {'2_3': 3})}
     full = {'sim_results': _sim(1.0, [90, 10], 3, {'2_3': 3})}
-    assert _run_pair_success(short, PAIR_EDGES, cfg).tolist() == [True, True]
-    assert _run_pair_success(full, PAIR_EDGES, cfg).tolist() == [False, False]
+    assert run_pair_success(short, PAIR_EDGES, cfg).tolist() == [True, True]
+    assert run_pair_success(full, PAIR_EDGES, cfg).tolist() == [False, False]
     # A full run passes with >= 10 crossings and minority >= 0.2.
     good = {'sim_results': _sim(1.0, [60, 40], 12, {'2_3': 12})}
-    assert _run_pair_success(good, PAIR_EDGES, cfg).tolist() == [True, True]
+    assert run_pair_success(good, PAIR_EDGES, cfg).tolist() == [True, True]
     # Too few crossings fails even a short run.
     stuck = {'sim_results': _sim(0.104, [99, 1], 1, {'2_3': 1})}
-    assert _run_pair_success(stuck, PAIR_EDGES, cfg).tolist() == [False, False]
+    assert run_pair_success(stuck, PAIR_EDGES, cfg).tolist() == [False, False]
     # No per-pair transitions: unknown.
     bare = {'sim_results': {**_sim(0.104, [50, 50], 3, {}), 'transition_pairs': None}}
-    assert _run_pair_success(bare, PAIR_EDGES, cfg) is None
+    assert run_pair_success(bare, PAIR_EDGES, cfg) is None
 
 
 def test_success_gate_sets_the_sign_of_the_advantage():

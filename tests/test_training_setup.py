@@ -2,7 +2,8 @@
 import json
 import warnings
 
-from mllf.cb.training_setup import WarningSummary, choose_validation
+from mllf.cb.training_setup import choose_validation
+from mllf.cb.warning_summary import WarningSummary
 
 
 def _choose(tmp_path, config, start_epoch=0, deploy=False, active=None):

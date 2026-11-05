@@ -8,7 +8,8 @@ from mllf.cb.pair_weights import (
     compute_pairwise_measured_mask,
     is_finite,
 )
-from mllf.cb.pretrain_policy import _compute_physical_residual_variance, _edge_confidence
+from mllf.pretrain.bayesian_init import _compute_physical_residual_variance
+from mllf.pretrain.trainer import _edge_confidence
 
 PAIRS = build_directed_pairs([3])  # (0,1) (0,2) (1,0) (1,2) (2,0) (2,1)
 
@@ -92,7 +93,7 @@ def test_residuals_use_only_measured_targets():
 
 
 def test_hygiene_loss_scales_with_absolute_weight():
-    from mllf.cb.pretrain_policy import _awr_run_loss
+    from mllf.pretrain.trainer import _awr_run_loss
     logp = -torch.ones(2, 4)
     active = torch.ones(2, 4, dtype=torch.bool)
     strong = torch.ones(2, 4)

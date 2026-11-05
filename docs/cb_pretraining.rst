@@ -66,7 +66,7 @@ Running Pretraining
 
 .. code-block:: bash
 
-   python -m mllf.cb.pretrain_policy --pretraining-dir pretraining/ \
+   python -m mllf.cli.pretrain --pretraining-dir pretraining/ \
        --output-dir models/my_pretrain_run --config examples/workflow_pretrain.yaml \
        --epochs 50 --bayesian-heads
 

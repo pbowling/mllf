@@ -4,12 +4,9 @@ Reading and checking the workflow config, building every system's combo
 pool, the policy and its optimizers, restoring a checkpoint or pretrained
 weights, and choosing the held-out validation combos.
 """
-import collections
 import concurrent.futures
 import json
 import re
-import threading
-import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -77,50 +74,6 @@ def _check_deploy(config: Dict) -> None:
     print(f"Mode: deploy (model {model}; shared model "
           f"{'updated' if deploy_cfg.get('update_shared_model') else 'fixed'}; "
           "per-pair offsets learn)")
-
-
-class WarningSummary:
-    """Collect warnings while active and print one deduplicated summary
-    (count per message, with paths masked) when done."""
-    _PATH_RE = re.compile(r'/[^\s:*?"<>|]+')
-
-    def __init__(self):
-        self.counts = collections.Counter()
-        self.example = {}
-        self._lock = threading.Lock()
-        self._orig = None
-
-    def _collect(self, message, category, filename, lineno, file=None, line=None):
-        text = str(message)
-        key = (category.__name__, self._PATH_RE.sub('<path>', text))
-        with self._lock:
-            self.counts[key] += 1
-            self.example.setdefault(key, (text, filename, lineno))
-
-    def __enter__(self):
-        self._orig = warnings.showwarning
-        warnings.showwarning = self._collect
-        return self
-
-    def __exit__(self, *exc):
-        warnings.showwarning = self._orig
-        if exc[0] is None:
-            self.report()
-        return False
-
-    def report(self) -> None:
-        if not self.counts:
-            return
-        print(f"\n{'='*60}")
-        print(f"Warning Summary ({sum(self.counts.values())} total occurrences, "
-              f"{len(self.counts)} unique types)")
-        print(f"{'='*60}")
-        for (cat, template), count in sorted(self.counts.items(), key=lambda kv: -kv[1]):
-            example_text, ex_file, ex_line = self.example[(cat, template)]
-            short_file = Path(ex_file).name if ex_file else '?'
-            print(f"  [{count:5d}x] {cat} ({short_file}:{ex_line})")
-            print(f"           {example_text[:200]}")
-        print(f"{'='*60}")
 
 
 # ── combo pool ──────────────────────────────────────────────────────────────
