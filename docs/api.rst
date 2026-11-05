@@ -26,7 +26,6 @@ For Uni-Mol embeddings and environment context, see :doc:`unimol_representation`
 
    mllf.cb.unimol_representation
    mllf.cb.environment_consensus
-   mllf.cb.atom_vocab
 
 Policy Modules
 --------------
@@ -36,8 +35,7 @@ For the policy architecture, see :doc:`cb_setup`.
 .. autosummary::
    :toctree: api
 
-   mllf.cb.graph
-   mllf.cb.graph_utils
+   mllf.cb.pairs
    mllf.cb.policy
    mllf.cb.bayesian_head
    mllf.cb.msld_reward

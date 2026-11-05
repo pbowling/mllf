@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 from mllf.cb.epoch_runs import EpochRun, load_graph_data_cache
 from mllf.cb.graph_build import build_graph_and_data
-from mllf.cb.graph_utils import build_directed_pairs
+from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.group_correction import correction_targets, update_group
 from mllf.cb.hindsight import (
     BIAS_DIMS,

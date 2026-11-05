@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 
-from mllf.cb.graph_utils import build_directed_pairs
+from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.pair_weights import (
     compute_pairwise_confidence_weights,
     compute_pairwise_measured_mask,

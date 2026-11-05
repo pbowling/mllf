@@ -15,7 +15,7 @@ import warnings
 import numpy as np
 import torch
 
-from mllf.cb.graph_utils import build_directed_pairs
+from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.policy import fill_site_size
 from mllf.cb.unimol_representation import (
     build_environment_consensus,

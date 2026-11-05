@@ -1,189 +1,30 @@
-"""Write bias coefficient files in the old `.inp` or `.py` style used by the simulator.
+"""Write the ``variables.py`` bias files the simulator reads.
 
-This module provides helpers to write a simple `.inp` or `.py` file with lines of the
-form `set <param> = <value>` so the existing parser can read it back.
+``write_variables_from_actions`` turns policy actions into a combo's
+``variables.py``; ``write_variables_py_from_inp`` converts an old-style
+``.inp`` (``set <param> = <value>`` lines) to that format.
 
 Sign convention: flat ``cs*``/``xs*``/``ss*`` values (what CHARMM receives via
-``ldbv ... @coeff``) are the negatives of the c/x/s matrix / graph coefficients;
+``ldbv ... @coeff``) are the negatives of the c/x/s matrix coefficients;
 ``lams*`` equals b. Every conversion here goes through
 ``read_bias_coeff.FLAT_TO_MATRIX_NONLINEAR``.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import json
 import os
 import re
 
 import numpy as np
 
-from .read_bias_coeff import (  # parse_old kept for tests/debug
+from .read_bias_coeff import (
     FLAT_TO_MATRIX_LINEAR,
     FLAT_TO_MATRIX_NONLINEAR,
     NONLINEAR_SIGN_KEY,
     parse_old,
 )
-
-
-def write_bias_inp_from_graph(graph, filename: str, sub_counts: Optional[Sequence[int]] = None,
-                              mapping: Optional[dict] = None,
-                              header_source: Optional[str] = None) -> None:
-    """Write a `.inp` file from a Graph instance.
-
-    This writes single-sub (lams) and two-sub (cs) entries.
-
-    The graph's edge coefficients are in the matrix convention (what the policy
-    predicts). The flat ``cs``/``xs``/``ss`` values written here are what CHARMM
-    receives, so they are the NEGATIVE of the quadratic/skew/end coefficients;
-    ``lams`` keeps the linear value's sign (see FLAT_TO_MATRIX_NONLINEAR).
-
-    Arguments:
-        graph: instance with `num_nodes` and `edges` mapping (EdgeCoeffs dataclass)
-        filename: output path to write
-        sub_counts: optional sequence of length num_nodes with number of substituents
-            per site. If None, defaults to 1 substituent per site.
-        coeff_key: which EdgeCoeffs attribute to use for pair values
-            (one of 'linear','quadratic','skew','end'). Default 'linear'.
-    """
-    n = graph.num_nodes
-    if sub_counts is None:
-        sub_counts = [1] * n
-    if len(sub_counts) != n:
-        raise ValueError("sub_counts must have length equal to graph.num_nodes")
-
-    # default mapping per user: lams -> linear, cs -> quadratic, xs -> skew, ss -> end
-    # mapping dict maps pair-key to EdgeCoeffs attribute
-    if mapping is None:
-        mapping = {"cs": "quadratic", "ss": "end", "xs": "skew"}
-
-    def edge_coeff_key(i: int, j: int, key: str) -> float:
-        if i == j:
-            return 0.0
-        a, b = (i, j) if i < j else (j, i)
-        e = graph.get_edge(a, b)
-        return float(getattr(e, key, 0.0))
-
-    def flat_value(i: int, j: int, key: str) -> float:
-        """Edge coefficient converted to the flat CHARMM sign for cs/xs/ss."""
-        v = FLAT_TO_MATRIX_NONLINEAR * edge_coeff_key(i, j, key)
-        return v if v != 0.0 else 0.0   # avoid writing '-0.00000000'
-
-    lines = []
-
-    # If a header_source is provided, copy non-bias lines verbatim from it.
-    # Lines considered "bias" start with a 'set ' and a name beginning with
-    # one of the bias prefixes (lams, cs, ss, xs). Those are skipped when
-    # copying so we can append freshly generated bias lines below.
-    if header_source is not None:
-        if not os.path.exists(header_source):
-            raise FileNotFoundError(f"header_source not found: {header_source}")
-        with open(header_source, "r", encoding="utf-8") as hf:
-            for ln in hf:
-                s = ln.strip()
-                if not s:
-                    # preserve blank lines
-                    lines.append(ln if ln.endswith("\n") else ln + "\n")
-                    continue
-                if not s.startswith("set "):
-                    lines.append(ln if ln.endswith("\n") else ln + "\n")
-                    continue
-                # extract parameter name
-                parts = ln.split("=")
-                left = parts[0].strip()
-                try:
-                    _, name = left.split(None, 1)
-                except ValueError:
-                    # unexpected format, copy verbatim
-                    lines.append(ln if ln.endswith("\n") else ln + "\n")
-                    continue
-                # skip bias coefficients (we'll generate them below)
-                if name.startswith(("lams", "cs", "ss", "xs")):
-                    continue
-                lines.append(ln if ln.endswith("\n") else ln + "\n")
-
-    # Single-sub (lams): write one line per substituent per site (example file lists all)
-    for i in range(n):
-        # compute site-level proxy as average of incident edge 'linear' values
-        incident_vals = []
-        for j in range(n):
-            if i == j:
-                continue
-            incident_vals.append(edge_coeff_key(i, j, "linear"))
-        site_val = float(sum(incident_vals) / len(incident_vals)) if incident_vals else 0.0
-        for s in range(1, sub_counts[i] + 1):
-            lines.append(f"set lams{i + 1}s{s} = {FLAT_TO_MATRIX_LINEAR * site_val:12.8f}\n")
-
-    # Pair biases: for each ordered pair of (site,sub) x (site2,sub2) excluding identical
-    # site+sub, write cs/ss/xs using mapped edge coefficient components.
-    for i in range(n):
-        for j in range(i, n):
-            if i < j:
-                # all combinations for different sites
-                for sa in range(1, sub_counts[i] + 1):
-                    for sb in range(1, sub_counts[j] + 1):
-                        cs_val = flat_value(i, j, mapping.get("cs", "quadratic"))
-                        ss_val = flat_value(i, j, mapping.get("ss", "end"))
-                        xs_val = flat_value(i, j, mapping.get("xs", "skew"))
-                        lines.append(f"set cs{i + 1}s{sa}s{j + 1}s{sb} = {cs_val:12.8f}\n")
-                        # ss/xs forward
-                        lines.append(f"set ss{i + 1}s{sa}s{j + 1}s{sb} = {ss_val:12.8f}\n")
-                        lines.append(f"set xs{i + 1}s{sa}s{j + 1}s{sb} = {xs_val:12.8f}\n")
-                        # ss/xs reverse (example contains both orientations for ss/xs)
-                        lines.append(f"set ss{j + 1}s{sb}s{i + 1}s{sa} = {ss_val:12.8f}\n")
-                        lines.append(f"set xs{j + 1}s{sb}s{i + 1}s{sa} = {xs_val:12.8f}\n")
-            else:
-                # same site: only sa < sb (strict upper triangle)
-                for sa in range(1, sub_counts[i] + 1):
-                    for sb in range(sa + 1, sub_counts[j] + 1):
-                        cs_val = flat_value(i, j, mapping.get("cs", "quadratic"))
-                        ss_val = flat_value(i, j, mapping.get("ss", "end"))
-                        xs_val = flat_value(i, j, mapping.get("xs", "skew"))
-                        lines.append(f"set cs{i + 1}s{sa}s{j + 1}s{sb} = {cs_val:12.8f}\n")
-                        # ss/xs forward
-                        lines.append(f"set ss{i + 1}s{sa}s{j + 1}s{sb} = {ss_val:12.8f}\n")
-                        lines.append(f"set xs{i + 1}s{sa}s{j + 1}s{sb} = {xs_val:12.8f}\n")
-                        # ss/xs reverse
-                        lines.append(f"set ss{j + 1}s{sb}s{i + 1}s{sa} = {ss_val:12.8f}\n")
-                        lines.append(f"set xs{j + 1}s{sb}s{i + 1}s{sa} = {xs_val:12.8f}\n")
-
-    # ensure directory exists
-    os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
-    with open(filename, "w", encoding="utf-8") as fh:
-        fh.writelines(lines)
-
-
-def create_variables_py_from_template(
-        template_path: str, out_path: str, minimizeflag: bool = False):
-    """Create a variables#.py file by copying a template and setting minimizeflag.
-
-    This is a simple textual transform: it replaces an assignment like
-    'minimizeflag=True' (possibly with surrounding whitespace) with the
-    requested value. If the template is not a .py file or the token isn't
-    found, the template is copied verbatim with a appended 'minimizeflag'
-    assignment.
-    """
-
-    if not os.path.exists(template_path):
-        raise FileNotFoundError(template_path)
-
-    with open(template_path, 'r', encoding='utf-8') as fh:
-        content = fh.read()
-
-    # replace existing minimizeflag assignment
-    flag_str = 'minimizeflag=True'
-    flag_false = 'minimizeflag=False'
-    # tolerant regex to match minimizeflag = True with optional spaces
-    new_content, nsub = re.subn(r"minimizeflag\s*=\s*True",
-                                flag_false if not minimizeflag else flag_str, content)
-    if nsub == 0:
-        # if not present, append at end
-        new_content = content + f"\n{flag_false if not minimizeflag else flag_str}\n"
-
-    # write out
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or '.', exist_ok=True)
-    with open(out_path, 'w', encoding='utf-8') as fh:
-        fh.write(new_content)
 
 
 def write_variables_py_from_inp(inp_path: str, out_path: str):

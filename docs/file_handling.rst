@@ -69,11 +69,10 @@ x and s, one row and column per substituent, in the order of the λ blocks:
 .. code-block:: python
 
    from mllf.file_handling.read_bias_coeff import read_bias_coeff
-   from mllf.file_handling.write_bias_coeff import write_bias_inp_from_graph
+   from mllf.file_handling.write_bias_coeff import write_variables_py_from_inp
 
    bias = read_bias_coeff('variables.py')       # {'b': [...], 'c': [[...]], 'x': ..., 's': ...}
-   write_bias_inp_from_graph(graph, 'combo_dir/variables.py', sub_counts=[3, 2],
-                             mapping={'cs': 'quadratic', 'ss': 'end', 'xs': 'skew'})
+   write_variables_py_from_inp('variables85.inp', 'combo_dir/variables.py')
 
 ``read_bias_coeff`` also returns the flat CHARMM scalars (``lams``, ``cs``, ``xs``, ``ss``,
 negated relative to the matrix convention) and, when it can find them, the substituents

@@ -4,10 +4,10 @@
 import sys
 import torch
 import yaml
+from types import SimpleNamespace
 import tempfile
 from pathlib import Path
 
-from torch_geometric.data import Data
 from mllf.file_handling.write_bias_coeff import write_variables_from_actions
 
 
@@ -38,7 +38,7 @@ def test_upper_triangular_bias_matrices():
     # Node features (doesn't matter for this test)
     x = torch.randn(N, 10)
 
-    data = Data(x=x, edge_index=edge_index, edge_type=edge_type)
+    data = SimpleNamespace(x=x, edge_index=edge_index, edge_type=edge_type)
 
     # Extras with relation names
     extras = {

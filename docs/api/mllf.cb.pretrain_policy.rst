@@ -8,7 +8,6 @@ mllf.cb.pretrain\_policy
 
    .. autosummary::
    
-      build_fully_connected_graph_for_pretraining
       build_unrelaxed_system_mappings
       compute_coefficient_statistics
       compute_reward_from_sim_results

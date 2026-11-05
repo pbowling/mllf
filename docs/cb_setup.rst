@@ -60,7 +60,7 @@ The ``unimol`` settings must match those of the pretrained model. The driver che
 Graph
 ~~~~~
 
-Each substituent is a node, and ``build_directed_pairs`` (``mllf.cb.graph_utils``) adds an
+Each substituent is a node, and ``build_directed_pairs`` (``mllf.cb.pairs``) adds an
 edge in each direction for every pair of substituents at the same site. There are no
 cross-site edges, so cross-site couplings are not predicted. ``build_graph_and_data``
 (``mllf.cb.graph_build``) parses the combination's RTF and PDB files, builds each site's

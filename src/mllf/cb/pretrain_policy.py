@@ -24,18 +24,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import yaml
-from torch_geometric.data import Data
 
-from mllf.cb import graph_utils
 from mllf.cb.environment_consensus import build_site_consensus
-from mllf.cb.graph import Graph
-from mllf.cb.graph_utils import build_directed_pairs
 from mllf.cb.hindsight import (
     SUCCESS_MIN_FRACTION,
     SUCCESS_MIN_TRANSITIONS,
     pair_succeeded,
     site_nodes,
 )
+from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.pair_weights import (
     compute_pairwise_confidence_weights,
     compute_pairwise_measured_mask,
@@ -649,224 +646,6 @@ def extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         return targets
     except Exception:
         return None
-
-
-def build_fully_connected_graph_for_pretraining(run_dir: Path, toppar_dir=None, toppar_files=None,
-                                                warn_missing_types=True,
-                                                pdb_dir=None, prep_dir=None, solvent_state=None,
-                                                pdb_pattern='site{site}_sub{sub}_frag.pdb'):
-    """Build fully-connected PyG graph for pretraining from saved variables.py.
-
-    Unlike the standard graph builder which only creates edges for non-zero coefficients,
-    this function creates edges for ALL pairs within each site. This provides richer
-    training data for pretraining, especially for linear biases which can be estimated
-    for all pairs.
-
-    **Key differences from standard graph builder:**
-    1. Creates ALL directed pairs within each site (O(N²) edges per site)
-    2. Computes linear coefficients correctly: linear_ij = b[j] - b[i]
-    3. Reads nonlinear coefficients from matrices (may be 0.0 for many pairs)
-
-    **Why this helps pretraining:**
-    - More training data: ~10x more edges for typical systems
-    - Proper linear bias encoding: antisymmetric by construction
-    - Better gradient signal: model learns from all pairwise relationships
-    - Matches pairwise MLP approach: same data representation
-
-    Args:
-        run_dir: Directory containing variables.py and graph_info.json
-        toppar_dir: Path to toppar directory (None uses package default)
-        toppar_files: List of specific toppar filenames to include
-        warn_missing_types: If True, warn when sub RTF files contain atom types not in vocabulary
-        pdb_dir: Directory containing _frag.pdb files (required to construct Uni-Mol
-            representations).
-        prep_dir: Prep directory for MIC/context-aware AEV computation (usually same as pdb_dir).
-        solvent_state: Environment type ('gas'/'vacuum', 'protein', 'solvent'/'water').
-        pdb_pattern: Filename pattern for substituent PDB files
-            (default: site{site}_sub{sub}_frag.pdb).
-
-    Returns:
-        Tuple of (data, targets, extras) where:
-        - data: PyG Data with fully-connected edges within each site
-        - targets: List of [linear, quadratic, skew, end] for each directed edge
-        - extras: Dict with relation_names, base_relation_map, etc.
-    """
-
-    run_dir = Path(run_dir)
-
-    # Load graph_info.json to get node features and site structure
-    graph_info_path = run_dir / "graph_info.json"
-    if not graph_info_path.exists():
-        raise FileNotFoundError(f"graph_info.json not found in {run_dir}")
-
-    with open(graph_info_path, 'r') as f:
-        graph_info = json.load(f)
-
-    # Load node features using existing graph_utils
-    g = Graph.from_graph_info(graph_info)
-
-    data_sparse, extras = graph_utils.build_pyg_graph_from_mllf_graph(
-        g, toppar_dir=toppar_dir, toppar_files=toppar_files,
-        warn_missing_types=warn_missing_types,
-        pdb_dir=pdb_dir,
-        pdb_pattern=pdb_pattern,
-        prep_dir=prep_dir,
-        solvent_state=solvent_state,
-    )
-
-    # Extract site structure
-    nsubs_per_site = graph_info.get('nsubs_per_site', [])
-    if not nsubs_per_site:
-        # Compute from sites data (backward compatibility for old graph_info.json files)
-        site_counts = defaultdict(int)
-        sites_info = graph_info.get('sites', {})
-        for key, node_info in sites_info.items():
-            site = node_info.get('site')
-            if site is not None:
-                site_counts[site] += 1
-        if site_counts:
-            nsubs_per_site = [site_counts[site] for site in sorted(site_counts.keys())]
-        else:
-            raise ValueError(
-                f"Could not determine nsubs_per_site from graph_info.json in {run_dir}")
-
-    # Load bias coefficients from variables.py
-    variables_path = run_dir / "variables.py"
-    if not variables_path.exists():
-        raise FileNotFoundError(f"variables.py not found in {run_dir}")
-
-    with open(variables_path, 'r') as f:
-        content = f.read()
-
-    # Extract YAML string
-    yaml_start = content.find('bias_string = """') + len('bias_string = """')
-    if yaml_start < len('bias_string = """'):
-        yaml_start = content.find('bias_string="""') + len('bias_string="""')
-    if yaml_start < len('bias_string="""'):
-        yaml_start = content.find("bias_string = '''") + len("bias_string = '''")
-    if yaml_start < len("bias_string = '''"):
-        yaml_start = content.find("bias_string='''") + len("bias_string='''")
-
-    yaml_end = content.find('"""', yaml_start)
-    if yaml_end == -1:
-        yaml_end = content.find("'''", yaml_start)
-
-    yaml_str = content[yaml_start:yaml_end]
-    bias_data = yaml.safe_load(yaml_str)
-
-    # Extract bias matrices
-    b_list = bias_data['b']
-    if isinstance(b_list[0], list):
-        b_vector = np.array(b_list[0], dtype=float)
-    else:
-        b_vector = np.array(b_list, dtype=float)
-
-    c_matrix = np.array(bias_data['c'], dtype=float)
-    x_matrix = np.array(bias_data['x'], dtype=float)
-    s_matrix = np.array(bias_data['s'], dtype=float)
-
-    # Sanity-check: bias matrix size must match the node count from graph_info.
-    # A mismatch means the run was simulated with a different number of active
-    # substituents than graph_info.json records (e.g. cmet runs with 6 active
-    # subs but graph_info listing 11).  These runs cannot be used because we
-    # cannot reliably map node indices to bias-matrix rows.
-    n_nodes = sum(nsubs_per_site)
-    if len(b_vector) != n_nodes:
-        raise ValueError(
-            f"Bias matrix size ({len(b_vector)}) does not match node count "
-            f"from nsubs_per_site ({n_nodes} = {nsubs_per_site}). "
-            "Run has inconsistent graph_info / variables data."
-        )
-
-    # Build directed pairs for ALL substituents within each site
-    pairs = build_directed_pairs(nsubs_per_site)
-
-    # Get relation names from extras
-    relation_names = extras['relation_names']
-    base_relation_map = extras['base_relation_map']
-    rel_to_idx = extras['relation_map']
-
-    # Build edge_index, edge_type, and edge_attr for all pairs
-    src_list = []
-    dst_list = []
-    edge_type_list = []
-    edge_attr_list = []
-
-    # For each directed pair, create edges for all 4 bias types
-    pairs_to_process = pairs
-
-    for (i, j) in pairs_to_process:
-        for bias in ['linear', 'quadratic', 'skew', 'end']:
-            fwd_name, bwd_name = base_relation_map[bias]
-
-            # Determine which relation (fwd or bwd) this edge represents
-            # For i<j: use forward relation; for i>j: use backward relation
-            if i < j:
-                rel_name = fwd_name
-            else:
-                rel_name = bwd_name
-
-            rel_idx = rel_to_idx[rel_name]
-
-            src_list.append(i)
-            dst_list.append(j)
-            edge_type_list.append(rel_idx)
-
-            # One-hot edge attribute
-            k = len(relation_names)
-            one_hot = torch.zeros((k,), dtype=torch.get_default_dtype())
-            one_hot[rel_idx] = 1.0
-            edge_attr_list.append(one_hot)
-
-    # Create PyG Data object
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    edge_type = torch.tensor(edge_type_list, dtype=torch.long)
-    edge_attr = torch.stack(
-        edge_attr_list, dim=0) if edge_attr_list else torch.zeros(
-        (0, len(relation_names)), dtype=torch.get_default_dtype())
-
-    data = Data(
-        x=data_sparse.x,  # Use node features from sparse graph
-        edge_index=edge_index,
-        edge_type=edge_type,
-        edge_attr=edge_attr,
-        site_index=data_sparse.site_index,
-    )
-
-    # Build targets for each edge: [linear, quadratic, skew, end]
-    # Each edge should only predict its specific coefficient type
-
-    targets = []
-
-    # Process original pairs
-    for (i, j) in pairs:
-        # Linear: b[j] - b[i] (proper antisymmetric conversion)
-        # This naturally gives antisymmetric values: linear_ji = b[i] - b[j] = -linear_ij
-        linear = float(b_vector[j] - b_vector[i])
-
-        # Quadratic: Symmetric, only upper triangle stored
-        # If i < j: use c[i,j] directly
-        # If i > j: use c[j,i] (use the opposite direction)
-        if i < j:
-            quadratic = float(c_matrix[i, j])
-        else:
-            quadratic = float(c_matrix[j, i])
-
-        # Skew and End: NOT antisymmetric, both directions stored independently
-        skew = float(x_matrix[i, j])
-        end = float(s_matrix[i, j])
-
-        # Create 4 edges per pair, each with ONLY its target coefficient
-        # Edge 0 (linear type): predict [linear, 0, 0, 0]
-        # Edge 1 (quadratic type): predict [0, quadratic, 0, 0]
-        # Edge 2 (skew type): predict [0, 0, skew, 0]
-        # Edge 3 (end type): predict [0, 0, 0, end]
-        targets.append([linear, 0.0, 0.0, 0.0])
-        targets.append([0.0, quadratic, 0.0, 0.0])
-        targets.append([0.0, 0.0, skew, 0.0])
-        targets.append([0.0, 0.0, 0.0, end])
-
-    return data, targets, extras
 
 
 def filter_best_runs_per_system(
@@ -2023,9 +1802,6 @@ def pretrain_epoch(
     runs: List[Dict],
     reward_config: Dict,
     device: torch.device,
-    toppar_dir=None,
-    toppar_files=None,
-    warn_missing_types=True,
     graph_cache: Optional[List] = None,
     groups: Optional[Dict] = None,
     reward_weighted: bool = False,
@@ -2045,9 +1821,6 @@ def pretrain_epoch(
         runs: List of run dicts with 'run_dir', targets, etc.
         reward_config: Reward configuration dict
         device: Torch device
-        toppar_dir: Optional toppar directory
-        toppar_files: Optional toppar files
-        warn_missing_types: Whether to warn about missing atom types
         graph_cache: Optional pre-built graph cache (list of tuples)
         groups: Optional run grouping for grouped updates
         reward_weighted: Whether to use AWR weighting
@@ -3017,15 +2790,11 @@ def pretrain_with_runs(
             print("Try increasing outlier_std_threshold or set filter_outliers=False")
             return
 
-    # Extract toppar configuration
-    vocab_config = config.get('vocabulary', {})
-    toppar_dir = vocab_config.get('toppar_dir')
-    toppar_files = vocab_config.get('toppar_files')
-    warn_missing_types = vocab_config.get('warn_missing_types', True)
+    if 'vocabulary' in config:
+        print("  Note: the 'vocabulary' config block is no longer used and is ignored")
 
     # For Uni-Mol pretraining, schema is fixed: 4 bias types (linear, quadratic, skew, end)
     # with 2 directions each = 8 relations. We don't need to build a sample graph.
-    # (Unlike the old approach which required toppar files and node features.)
 
     relation_names = [
         'linear_ij', 'linear_ji',
@@ -3708,9 +3477,6 @@ def pretrain_with_runs(
 
         stats = pretrain_epoch(
             policy, active_opt, runs, reward_config, device,
-            toppar_dir=toppar_dir,
-            toppar_files=toppar_files,
-            warn_missing_types=warn_missing_types,
             graph_cache=graph_cache,
             groups=epoch_groups,
             reward_weighted=reward_weighted,

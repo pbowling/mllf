@@ -62,7 +62,7 @@ class FakeCluster:
 
     # graph / combo dirs -------------------------------------------------
     def build_graph_and_data(self, combo_dir, system_config, global_config, device='cpu'):
-        from mllf.cb.graph_utils import build_directed_pairs
+        from mllf.cb.pairs import build_directed_pairs
         labels = _labels(Path(combo_dir))
         by_site = {}
         for s, u in labels:

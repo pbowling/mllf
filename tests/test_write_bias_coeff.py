@@ -1,11 +1,10 @@
+"""variables.py written from an old-style .inp: structure and sign convention."""
 from pathlib import Path
-import yaml
+
 import numpy as np
-from mllf.cb.graph import Graph
-from mllf.file_handling.write_bias_coeff import (
-    write_bias_inp_from_graph,
-    write_variables_py_from_inp,
-)
+import yaml
+
+from mllf.file_handling.write_bias_coeff import write_variables_py_from_inp
 
 
 def _get_example_path(filename):
@@ -13,50 +12,6 @@ def _get_example_path(filename):
     test_file = Path(__file__)
     repo_root = test_file.parent.parent
     return repo_root / "tests" / "samples" / filename
-
-
-def _read_set_names(path):
-    names = []
-    with open(path, 'r', encoding='utf-8') as fh:
-        for ln in fh:
-            ln = ln.strip()
-            if not ln:
-                continue
-            if not ln.startswith('set '):
-                continue
-            # extract parameter name (between 'set ' and ' =')
-            parts = ln.split('=')
-            left = parts[0].strip()
-            _, name = left.split(None, 1)
-            # only keep actual bias coefficient names (lams, cs, ss, xs)
-            if name.startswith(('lams', 'cs', 'ss', 'xs')):
-                names.append(name)
-    return names
-
-
-def test_write_matches_example(tmp_path):
-    # Build a simple graph with 5 sites and dummy coeffs (values don't matter for names)
-    g = Graph(5)
-    # arbitrary coeffs
-    for i in range(5):
-        for j in range(i + 1, 5):
-            g.set_edge(i, j, [0.0, 0.0, 0.0, 0.0])
-
-    subs = [3, 4, 8, 8, 8]
-    out = tmp_path / "generated.inp"
-    example = _get_example_path('variables85.inp')
-
-    if not example.exists():
-        import pytest
-        pytest.skip(f"Example file not found: {example}")
-
-    # use the example file as the header source so non-bias lines are copied verbatim
-    write_bias_inp_from_graph(g, str(out), sub_counts=subs, header_source=str(example))
-    gen_names = set(_read_set_names(str(out)))
-    ex_names = set(_read_set_names(str(example)))
-
-    # assert generated parameter names equal the example's parameter names
-    assert gen_names == ex_names
 
 
 def test_variables_py_contains_bias(tmp_path):
@@ -120,50 +75,6 @@ def _load_bias_string(path):
     text = Path(path).read_text(encoding='utf-8')
     m = re.search(r'bias_string\s*=\s*"""(.*?)"""', text, re.S)
     return yaml.safe_load(m.group(1))
-
-
-def _two_site_graph(lin=1.5, quad=2.0, skew=0.5, end=0.3):
-    g = Graph(2)
-    g.set_edge(0, 1, [lin, quad, skew, end])
-    return g
-
-
-def test_inp_writer_negates_nonlinear_terms(tmp_path):
-    """Graph coefficients are matrix convention; the .inp must hold what CHARMM gets."""
-    from mllf.file_handling.read_bias_coeff import parse_old
-    out = tmp_path / "variables.inp"
-    write_bias_inp_from_graph(_two_site_graph(), str(out), sub_counts=[1, 1])
-    d = parse_old(str(out))
-    assert d['lams']['lams1s1'] == 1.5 and d['lams']['lams2s1'] == 1.5    # linear: same sign
-    assert d['cs']['cs1s1s2s1'] == -2.0                                   # quadratic: negated
-    assert d['xs']['xs1s1s2s1'] == -0.5 and d['xs']['xs2s1s1s1'] == -0.5  # skew: negated
-    assert d['ss']['ss1s1s2s1'] == -0.3 and d['ss']['ss2s1s1s1'] == -0.3  # end: negated
-
-
-def test_inp_writer_round_trips_through_collector_reader(tmp_path):
-    """graph -> .inp -> parse_bias_from_inp recovers the original (matrix) coefficients."""
-    from mllf.cli.collect_pretraining_data import parse_bias_from_inp
-    out = tmp_path / "variables.inp"
-    write_bias_inp_from_graph(_two_site_graph(), str(out), sub_counts=[1, 1])
-    r = parse_bias_from_inp(out)
-    assert np.allclose(r['b'], [1.5, 1.5])
-    assert r['c'][0][1] == 2.0
-    assert r['x'][0][1] == 0.5 and r['x'][1][0] == 0.5
-    assert r['s'][0][1] == 0.3 and r['s'][1][0] == 0.3
-
-
-def test_inp_writer_zero_coefficients_not_written_as_negative_zero(tmp_path):
-    out = tmp_path / "variables.inp"
-    write_bias_inp_from_graph(
-        _two_site_graph(
-            quad=0.0,
-            skew=0.0,
-            end=0.0),
-        str(out),
-        sub_counts=[
-            1,
-            1])
-    assert '-0.00000000' not in out.read_text()
 
 
 def test_variables_py_from_inp_uses_matrix_signs(tmp_path):
