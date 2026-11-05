@@ -129,3 +129,17 @@ def test_messages_follow_redirected_stdout():
     with contextlib.redirect_stdout(buf):
         logging.getLogger('mllf.test').info('to the redirected stream')
     assert buf.getvalue() == 'to the redirected stream\n'
+
+
+def test_log_file_records_every_level_once(tmp_path, capsys):
+    from mllf.log import log_to_file
+    log = logging.getLogger('mllf.test')
+    path = tmp_path / 'run.log'
+    with log_to_file(path):
+        with log_to_file(path):          # an enclosing call already records here
+            log.debug('detail')
+            log.info('progress')
+    log.info('after')
+    lines = path.read_text().splitlines()
+    assert [ln.split(' ', 2)[2] for ln in lines] == ['detail', 'progress']
+    assert capsys.readouterr().out.splitlines() == ['progress', 'after']

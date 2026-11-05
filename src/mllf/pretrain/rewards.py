@@ -26,7 +26,7 @@ from mllf.cb.workflow_utils import (
 log = logging.getLogger(__name__)
 
 
-# ── Run length ───────────────────────────────────────────────────────────────
+# Run length
 # Pretraining mixes ALF's short runs (~0.1 ns) with 1 ns production runs. A
 # short run has had a tenth of the time to cross and to balance, so it is
 # judged the way online training judges its short exploratory runs: by the
@@ -101,8 +101,8 @@ def compute_reward_from_sim_results(
     - **0 transitions**: -40.0 penalty (death floor - zero activity)
     - **1 transition**: -32.0 penalty (very low activity)
     - **2 transitions**: -24.0 penalty (very low activity)
-    - **3-9 transitions**: -2.0 - (2.0 × deficit) penalty (climbing ramp, ranges -16 to -4)
-    - **≥10 transitions**: 0.0 penalty, unlocks R_T reward (success zone)
+    - **3-9 transitions**: -2.0 - (2.0 x deficit) penalty (climbing ramp, ranges -16 to -4)
+    - **>=10 transitions**: 0.0 penalty, unlocks R_T reward (success zone)
 
     Default parameters match the updated reward configuration which achieved
     improved gradient signal for low-transition runs (graduated penalties help
@@ -220,7 +220,7 @@ def compute_reward_from_sim_results(
         penalties -= base_penalty
 
     # 2. Coverage requirement
-    # NOTE: adaptive coverage penalty removed — replaced by coverage_factor below
+    # NOTE: adaptive coverage penalty removed; replaced by coverage_factor below
     num_populated = np.count_nonzero(pop_array)
     total_subs = sum(nsubs_per_site)
     coverage_ratio = num_populated / total_subs if total_subs > 0 else 0.0
@@ -298,7 +298,7 @@ def _extract_highest_lambda_counts(populations) -> list:
 
     Each block's counts sub-dict holds MSLD population counts sampled at
     different lambda values (e.g. 0.95 and 0.99).  These are **not** averaged
-    or normalised — only the single highest-lambda count is used (e.g. 0.99
+    or normalised; only the single highest-lambda count is used (e.g. 0.99
     when both 0.95 and 0.99 are present), since it is the most physically
     meaningful value and the values at different lambdas are incommensurable.
 
@@ -329,7 +329,7 @@ def _extract_highest_lambda_counts(populations) -> list:
             continue
         counts = block_info.get('counts', {}) if isinstance(block_info, dict) else {}
         if counts:
-            # Take only the highest-lambda value — do not average across lambdas.
+            # Take only the highest-lambda value; do not average across lambdas.
             max_lambda = max(counts.keys(), key=lambda x: float(x))
             result[node_idx] = counts[max_lambda]
     return result
@@ -513,9 +513,7 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
     pair_reward_cache = [None] * len(runs)
     pair_success_cache = [None] * len(runs)
 
-    log.info(f"\n{'=' * 60}")
     log.info("Building per-pair reward cache for per-edge, per-dimension AWR...")
-    log.info(f"{'=' * 60}")
     n_pair_ok = 0
     for run_idx, run in enumerate(runs):
         try:
@@ -531,7 +529,7 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
         except Exception:
             pass   # the run falls back to its scalar reward
         if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
-            log.info(f"  {run_idx + 1}/{len(runs)} runs ({n_pair_ok} with pair rewards)...")
+            log.debug(f"  {run_idx + 1}/{len(runs)} runs ({n_pair_ok} with pair rewards)...")
 
     if not n_pair_ok:
         return None
@@ -540,10 +538,10 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
         pair_reward_cache, pair_success=pair_success_cache if success_gate else None,
         success_floor=success_floor)
     log.info("\nPer-pair reward baseline computed:")
-    log.info(f"  Runs with per-pair rewards: {n_pair_ok}/{len(runs)}")
-    log.info(f"  Baseline mean [lin, quad, skew, end]: {baseline_mean.numpy()}")
-    log.info(f"  Baseline  std [lin, quad, skew, end]: {baseline_std.numpy()}")
-    log.info(f"  Success floor: {success_floor}")
+    log.debug(f"  Runs with per-pair rewards: {n_pair_ok}/{len(runs)}")
+    log.debug(f"  Baseline mean [lin, quad, skew, end]: {baseline_mean.numpy()}")
+    log.debug(f"  Baseline  std [lin, quad, skew, end]: {baseline_std.numpy()}")
+    log.debug(f"  Success floor: {success_floor}")
     if success_gate:
         for name, short in (('full', False), ('short', True)):
             flags = [ok for ok, sh in zip(pair_success_cache, short_runs)
@@ -560,7 +558,7 @@ def assign_run_rewards(runs: List[Dict], reward_config: Dict) -> int:
     """Set run["_bc_reward"] = max(0, reward) on every run (the scalar AWR
     weight is exp(r / beta)); returns the number of positive-reward runs."""
     filtered_rc = reward_kwargs(reward_config)
-    log.info("\nPre-computing per-run rewards for AWR loss weighting...")
+    log.debug("\nPre-computing per-run rewards for AWR loss weighting...")
     n_pos = 0
     total_pos = 0.0
     for run in runs:

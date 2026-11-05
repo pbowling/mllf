@@ -35,7 +35,7 @@ from mllf.pretrain.config import UnimolSettings
 log = logging.getLogger(__name__)
 
 
-# ── Representation tracking ────────────────────────────────────────────────────
+# Representation tracking
 
 def initialize_representation_tracker(output_dir: Path) -> Path:
     """Initialize CSV file for tracking which representations are used.
@@ -101,9 +101,9 @@ def track_representation_choice(
         })
 
 
-# ── Structure type selection and unrelaxed path detection ───────────────────
+# Structure type selection and unrelaxed path detection
 
-# ── Structure type selection and path detection ────────────────────────────
+# Structure type selection and path detection
 
 
 def _select_structure_type_for_run(
@@ -159,7 +159,7 @@ def _select_structure_type_for_run(
             "'random'.")
 
 
-# ── Uni-Mol embedding computation for pretraining ────────────────────────────
+# Uni-Mol embedding computation for pretraining
 
 def _node_master_sub(site_info: Dict, site_id: int, sub_id: int) -> str:
     """Master substituent ('site1_sub12') whose fragment PDB a graph node uses.
@@ -367,7 +367,7 @@ def compute_unimol_embeddings_and_edges(
             # Get consensus atoms for this site if available.
             # consensus_dict is keyed by [prep_dir_str][site_name] where
             # site_name is per-SITE (e.g. "site1"), NOT per-node like
-            # `site_key` (e.g. "site1_sub1") — derive the site-level lookup
+            # `site_key` (e.g. "site1_sub1"); derive the site-level lookup
             # key from site_id instead of using site_key directly.
             consensus_atoms = None
             if consensus_dict is not None:
@@ -428,7 +428,7 @@ def compute_unimol_embeddings_and_edges(
     return unimol_embeddings, edge_index, nsubs_per_site, representation_source
 
 
-# ── per-system graph cache helpers ──────────────────────────────────────────
+# per-system graph cache helpers
 
 
 def extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
@@ -450,7 +450,7 @@ def extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
             return None
         content = variables_path.read_text()
 
-        # Find the YAML block — try all quoting styles; track the matching closer
+        # Find the YAML block; try all quoting styles; track the matching closer
         yaml_start = -1
         close_delim = None
         for open_d, close_d in (('bias_string = """', '"""'),
@@ -474,7 +474,7 @@ def extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         b_vector = np.array(b_list[0] if isinstance(b_list[0], list) else b_list, dtype=float)
         n_nodes = sum(nsubs_per_site)
         if len(b_vector) != n_nodes:
-            return None  # size mismatch — incompatible run
+            return None  # size mismatch; incompatible run
         c_matrix = np.array(bias_data['c'], dtype=float)
         x_matrix = np.array(bias_data['x'], dtype=float)
         s_matrix = np.array(bias_data['s'], dtype=float)
@@ -492,7 +492,11 @@ def extract_targets_from_variables(run_dir, nsubs_per_site: list, pairs: list):
         return None
 
 
-# ── Inputs for every run ───────────────────────────────────────────────────
+# The prep directories of the systems pretraining built inputs for.
+SYSTEMS_FILE = 'pretraining_systems.json'
+
+
+# Inputs for every run
 
 
 @dataclass
@@ -538,7 +542,7 @@ def build_environment_consensus(systems: List[str], unimol: UnimolSettings,
     """consensus[prep_dir][site name]: the environment atoms shared by every
     substituent of that site (None for vacuum systems or on failure); saved
     to environment_consensus.json."""
-    log.info("\nBuilding environment consensus atoms per system/site...")
+    log.debug("\nBuilding environment consensus atoms per system/site...")
     consensus_dict: Dict = {}
     for prep_dir_str in sorted(systems):
         prep_dir = Path(prep_dir_str)
@@ -554,8 +558,8 @@ def build_environment_consensus(systems: List[str], unimol: UnimolSettings,
         system_label = _system_label(prep_dir)
         # No environment to define in vacuum
         if 'vac' in system_label.lower() or 'vacuum' in system_label.lower():
-            log.info(f"\n[CONSENSUS] Skipping consensus for vacuum system: {system_label} "
-                     "(no environment)")
+            log.debug(f"\nSkipping consensus for vacuum system: {system_label} "
+                      "(no environment)")
             for site_name in sorted(site_to_subs.keys()):
                 consensus_dict[prep_dir_str][site_name] = None
             continue
@@ -571,7 +575,7 @@ def build_environment_consensus(systems: List[str], unimol: UnimolSettings,
                 consensus_dict[prep_dir_str][site_name] = None
 
     if not consensus_dict:
-        log.info('')
+        log.debug('')
         return consensus_dict
     # Saved for reference/debugging (sets of atom tuples as sorted lists)
     consensus_json = {
@@ -582,7 +586,7 @@ def build_environment_consensus(systems: List[str], unimol: UnimolSettings,
         consensus_file = output_dir / 'environment_consensus.json'
         with open(consensus_file, 'w') as f:
             json.dump(consensus_json, f, indent=2)
-        log.info(f"  Saved consensus to {consensus_file.name}\n")
+        log.debug(f"  Saved consensus to {consensus_file.name}\n")
     return consensus_dict
 
 
@@ -628,26 +632,28 @@ def build_run_inputs(runs: List[Dict], unimol: UnimolSettings, output_dir: Path)
         embed_cache_dir.mkdir(parents=True, exist_ok=True)
         log.info(f"  Uni-Mol embedding cache: ENABLED ({embed_cache_dir})")
     else:
-        log.info("  Uni-Mol embedding cache: disabled (set unimol.cache_embeddings: true to "
-                 "enable)")
+        log.debug("  Uni-Mol embedding cache: disabled (set unimol.cache_embeddings: true to "
+                  "enable)")
 
-    log.info(f"\n{'=' * 60}")
     if structure_selection != 'minimized':
         log.info(f"Structure selection: {structure_selection}")
-        log.info("Computing representations per-run (system cache disabled)")
-        log.info(f"Tracking: {tracking_file}")
-        log.info(f"{'=' * 60}\n")
+        log.debug("Computing representations per-run (system cache disabled)")
+        log.debug(f"Tracking: {tracking_file}")
     else:
         log.info(f"Grouping {len(runs)} runs by system and building per-system graphs...")
-        log.info(f"{'=' * 60}")
 
     system_to_runs: Dict[str, List[int]] = {}
     for run_idx, run in enumerate(runs):
         system_to_runs.setdefault(str(_prep_dir(run)), []).append(run_idx)
-    log.info(f"Found {len(system_to_runs)} unique systems")
+    log.debug(f"Found {len(system_to_runs)} unique systems")
+    # the systems pretraining used (read by the replay builder's coverage
+    # selection, mllf replay)
+    (Path(output_dir) / SYSTEMS_FILE).write_text(json.dumps(
+        {'prep_dirs': sorted(system_to_runs)}, indent=1))
 
     consensus_dict: Dict = {}
-    if unimol.use_environment_consensus:
+    if unimol.env_input == 'dual' and unimol.use_environment_consensus:
+        # only the environment embedding reads the per-site environment atoms
         consensus_dict = build_environment_consensus(list(system_to_runs), unimol, output_dir)
 
     system_graph_cache = {}   # prep_dir -> (embeddings, edge_index, nsubs_per_site)
@@ -673,18 +679,18 @@ def build_run_inputs(runs: List[Dict], unimol: UnimolSettings, output_dir: Path)
                 display_name = prep_dir.parent.name
                 if is_combo_dir_name(display_name):
                     display_name = prep_dir.parent.parent.name + '/' + display_name
-                log.info(f"  [{system_idx + 1}/{len(system_to_runs)}] {display_name}: "
-                         f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, {edge_idx.size(1)} "
-                         "edges")
+                log.debug(f"  [{system_idx + 1}/{len(system_to_runs)}] {display_name}: "
+                          f"{len(run_indices)} runs, {unimol_emb.size(0)} subs, "
+                          f"{edge_idx.size(1)} edges")
             except Exception as e:
-                log.info(f"  System {prep_dir_str}: {e}")
+                log.debug(f"  System {prep_dir_str}: {e}")
                 n_systems_fail += 1
         log.info(
             f"\nPer-system graph cache ready: {n_systems_ok} systems built, {n_systems_fail} "
             "failed")
     else:
-        log.info("Skipping system cache (using per-run structure selection)")
-        log.info("Building per-system structure cache (for pairwise weights)...")
+        log.debug("Skipping system cache (using per-run structure selection)")
+        log.debug("Building per-system structure cache (for pairwise weights)...")
         for prep_dir_str, run_indices in sorted(system_to_runs.items()):
             try:
                 gi_path = Path(runs[run_indices[0]]["run_dir"]) / "graph_info.json"
@@ -695,13 +701,11 @@ def build_run_inputs(runs: List[Dict], unimol: UnimolSettings, output_dir: Path)
 
     graph_cache = [None] * len(runs)
     n_ok = n_fail = 0
-    log.info(f"\n{'=' * 60}")
     if use_system_cache:
         log.info("Pre-building per-run targets (using system cache)...")
     else:
         log.info("Pre-building per-run embeddings and targets...")
-        log.info(f"(structure selection: {structure_selection})")
-    log.info(f"{'=' * 60}")
+        log.debug(f"(structure selection: {structure_selection})")
 
     for run_idx, run in enumerate(runs):
         try:
@@ -747,15 +751,15 @@ def build_run_inputs(runs: List[Dict], unimol: UnimolSettings, output_dir: Path)
 
             if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
                 pct = 100 * n_ok / (run_idx + 1) if (run_idx + 1) > 0 else 0
-                log.info(f"  {run_idx + 1}/{len(runs)} runs ({n_ok} cached, {n_fail} failed, "
-                         f"{pct:.0f}%)...")
+                log.debug(f"  {run_idx + 1}/{len(runs)} runs ({n_ok} cached, {n_fail} failed, "
+                          f"{pct:.0f}%)...")
         except Exception as e:
-            log.info(f"  Run {run_idx}: {e}")
+            log.debug(f"  Run {run_idx}: {e}")
             n_fail += 1
 
     log.info(f"\nRun cache ready: {n_ok} runs cached, {n_fail} failed")
     if not use_system_cache:
-        log.info(f"Representation tracking: {tracking_file}")
+        log.debug(f"Representation tracking: {tracking_file}")
     return RunInputs(graph_cache, n_ok, nsubs_by_system, consensus_dict)
 
 
@@ -764,9 +768,7 @@ def build_pairwise_weights(runs: List[Dict], nsubs_by_system: Dict[str, List[int
     """Per-run edge confidence weights (population balance, DDG reliability):
     [E] per run, or [E][4] under data hygiene with a bias type's weight zeroed
     where the run didn't measure what sets that target. None where unavailable."""
-    log.info(f"\n{'=' * 60}")
     log.info("Building per-run pairwise confidence weights...")
-    log.info(f"{'=' * 60}")
     weights_cache = [None] * len(runs)
     n_weights_ok = 0
     kept = np.zeros(4)    # data hygiene: per bias type, edges whose target counts
@@ -791,11 +793,12 @@ def build_pairwise_weights(runs: List[Dict], nsubs_by_system: Dict[str, List[int
         except Exception:
             pass   # this run gets no pairwise weighting
         if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
-            log.info(f"  {run_idx + 1}/{len(runs)} runs ({n_weights_ok} with pairwise weights)...")
+            log.debug(f"  {run_idx + 1}/{len(runs)} runs ({n_weights_ok} with pairwise "
+                      "weights)...")
 
     log.info(f"\nPairwise confidence weights ready: {n_weights_ok} runs with weights")
     if n_weights_ok > 0:
-        log.info("  Pairwise AWR weighting: ENABLED")
+        log.debug("  Pairwise AWR weighting: ENABLED")
     if data_hygiene:
         frac = kept / max(edges_total, 1)
         log.info(f"  Data hygiene: targets kept only where measured (of {edges_total} edges): "

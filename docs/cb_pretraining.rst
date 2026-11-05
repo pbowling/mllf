@@ -77,7 +77,7 @@ to weight runs (below) and the Uni-Mol options, ``unimol.env_input``,
 ``pretrain_metadata.json``, and an online config must use the same values
 (:doc:`unimol_representation`). Filters and optimizer settings are command-line flags.
 
-* ``--no-data-hygiene``, ``--no-per-pair-awr`` and ``--awr-temperature`` (default 0.5) set
+* ``--no-data-hygiene``, ``--no-per-pair-awr`` and ``--awr-temperature`` (default 1.0) set
   the objective (below).
 * ``--use-best-only``, ``--min-transitions``, ``--min-reward-threshold``,
   ``--stratified-negative-fraction`` and ``--no-filter-outliers`` /
@@ -90,10 +90,19 @@ to weight runs (below) and the Uni-Mol options, ``unimol.env_input``,
 
 ``examples/pretrain_with_filtering.sh`` is the SLURM launcher, driven by a per-run script
 such as ``examples/pretrain_wUnimol_Nov02b.sh`` that sets the config, output directory and
-flags. The outputs are ``best_policy.pt`` and ``best_policy_bayesian.pt`` (either can be
-``pretrain.model_path`` in a workflow config), ``pretrain_metadata.json``,
-``training_log.txt``, ``filtering_stats.json`` (which runs were excluded and why) and
-checkpoints. The learning rate follows a cosine schedule down to ``lr / 100``.
+flags. The learning rate follows a cosine schedule down to ``lr / 100``. The output
+directory holds:
+
+* ``best_policy.pt`` and ``best_policy_bayesian.pt``, either of which can be
+  ``pretrain.model_path`` in a workflow config, and ``final_policy*.pt``
+* ``checkpoint_epoch_NNN.pt``, from which ``--resume-checkpoint`` continues
+* ``pretrain_metadata.json``: the Uni-Mol settings the model was trained with
+* ``pretraining_systems.json``: the systems pretraining used, read by ``mllf replay``
+* ``pretrain.log``: every message with time stamps, including the per-run detail and the
+  filter statistics the console leaves out (:doc:`cli`)
+* ``pretraining_representations_used.csv``: the structure each run was embedded from
+* ``environment_consensus.json``, with ``env_input: dual`` only
+  (:doc:`unimol_representation`)
 
 Objective
 ---------

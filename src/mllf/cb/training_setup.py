@@ -37,7 +37,7 @@ from mllf.file_handling.manifests import (
 log = logging.getLogger(__name__)
 
 
-# ── config ──────────────────────────────────────────────────────────────────
+# config
 
 def load_training_config(config_path: str) -> Dict:
     """The workflow config with hindsight defaults filled in; in deploy mode
@@ -80,7 +80,7 @@ def _check_deploy(config: Dict) -> None:
              "per-pair offsets learn)")
 
 
-# ── combo pool ──────────────────────────────────────────────────────────────
+# combo pool
 
 def _effective_max_subs(sys_entry: Dict, default_max: int, large_site_threshold: int,
                         large_site_max_subs: int) -> int:
@@ -91,9 +91,9 @@ def _effective_max_subs(sys_entry: Dict, default_max: int, large_site_threshold:
     found = find_site_sub_files(Path(sys_entry['input_dir']))
     max_site_subs = max((len(subs) for subs in found.values()), default=0)
     if max_site_subs > large_site_threshold:
-        log.info(f"  [{sys_entry.get('name', 'unknown')}] site has {max_site_subs} subs > "
-                 f"{large_site_threshold}; auto-reducing max_subs_per_site to "
-                 f"{large_site_max_subs}")
+        log.debug(f"  [{sys_entry.get('name', 'unknown')}] site has {max_site_subs} subs > "
+                  f"{large_site_threshold}; auto-reducing max_subs_per_site to "
+                  f"{large_site_max_subs}")
         return large_site_max_subs
     return default_max
 
@@ -103,18 +103,18 @@ def build_manifests(config: Dict, systems_cfg: List[Dict]) -> Tuple[Dict[str, Di
     parallel, large ones one at a time to bound memory). Returns
     (combo path -> system entry, all combo paths in system order)."""
     seed = config.get('seed', 42)
-    log.info(f"\n=== Building system manifests ({len(systems_cfg)} systems) ===")
+    log.info(f"\nBuilding system manifests ({len(systems_cfg)} systems)")
     large_threshold = config.get('large_combo_threshold', 10_000)
     creation_workers = config.get('max_manifest_workers', 4)
     manifest_max_subs = config.get('max_subs_per_site', 10)
     large_site_threshold = config.get('large_site_sub_threshold', 12)
     large_site_max_subs = config.get('large_site_max_subs', 6)
     max_combos = config.get('max_combos_per_system', None)
-    log.info(f"  max_subs_per_site : {manifest_max_subs} (default); "
-             f"auto-reduced to {large_site_max_subs} for any site with > {large_site_threshold} "
-             "subs")
+    log.debug(f"  max_subs_per_site : {manifest_max_subs} (default); "
+              f"auto-reduced to {large_site_max_subs} for any site with > {large_site_threshold} "
+              "subs")
     if max_combos is not None:
-        log.info(f"  max_combos_per_system : {max_combos:,} (paths loaded per system)")
+        log.debug(f"  max_combos_per_system : {max_combos:,} (paths loaded per system)")
 
     results: Dict[int, Dict] = {}
     eff_max: Dict[int, int] = {}
@@ -134,8 +134,8 @@ def build_manifests(config: Dict, systems_cfg: List[Dict]) -> Tuple[Dict[str, Di
 
     if small:
         w = min(creation_workers, len(small))
-        log.info(f"  {len(small)} small system(s) (< {large_threshold:,} combos): "
-                 f"creating in parallel ({w} workers)")
+        log.debug(f"  {len(small)} small system(s) (< {large_threshold:,} combos): "
+                  f"creating in parallel ({w} workers)")
         with concurrent.futures.ThreadPoolExecutor(max_workers=w) as ex:
             futures = {ex.submit(create_and_load_system_manifest, s, eff_max[i], max_combos,
                                  seed): i
@@ -144,12 +144,12 @@ def build_manifests(config: Dict, systems_cfg: List[Dict]) -> Tuple[Dict[str, Di
                 results[futures[fut]] = fut.result()
     if large:
         if small:
-            log.info(f"  All {len(small)} small system(s) complete. "
-                     f"Now creating {len(large)} large system(s) one at a time.")
+            log.debug(f"  All {len(small)} small system(s) complete. "
+                      f"Now creating {len(large)} large system(s) one at a time.")
         for i, sys_entry, est in large:
-            log.info(f"  Large system (~{est:,} combos): "
-                     f"{sys_entry.get('name', sys_entry.get('input_dir', 'unknown'))}"
-                     " — creating alone")
+            log.debug(f"  Large system (~{est:,} combos): "
+                      f"{sys_entry.get('name', sys_entry.get('input_dir', 'unknown'))}"
+                      "; creating alone")
             results[i] = create_and_load_system_manifest(sys_entry, max_subs_per_site=eff_max[i],
                                                          max_combos=max_combos, seed=seed)
 
@@ -157,11 +157,11 @@ def build_manifests(config: Dict, systems_cfg: List[Dict]) -> Tuple[Dict[str, Di
     all_combos: List[str] = []
     for i in range(len(systems_cfg)):
         for line in results[i]['log']:
-            log.info('%s', line)
+            log.debug('%s', line)
         for cp in results[i]['combos']:
             combo_system_map[cp] = results[i]['sys_entry']
         all_combos.extend(results[i]['combos'])
-    log.info(f"\n=== Total combos across all systems: {len(all_combos)} ===")
+    log.info(f"\nTotal combos across all systems: {len(all_combos)}")
     return combo_system_map, all_combos
 
 
@@ -179,8 +179,8 @@ def build_all_combo_sets(config: Dict, systems_cfg: List[Dict], combo_system_map
         for paths in sets.values():
             for p in paths:
                 combo_system_map[p] = sys_entry
-        log.info('%s', f"  [{sys_entry.get('name')}] combo sets: "
-                 + ', '.join(f"{k} {len(v)}" for k, v in sets.items()))
+        log.debug('%s', f"  [{sys_entry.get('name')}] combo sets: "
+                  + ', '.join(f"{k} {len(v)}" for k, v in sets.items()))
         for w in warns:
             log.warning(f"    warning: {w}")
     return by_system
@@ -190,15 +190,15 @@ def print_curriculum(curriculum_cfg: Dict) -> None:
     if not curriculum_cfg.get('enabled', False):
         return
     stages = curriculum_cfg.get('stages', [])
-    log.info(f"\n=== Curriculum Learning Enabled: {len(stages)} stages ===")
+    log.info(f"\nCurriculum: {len(stages)} stages")
     for i, s in enumerate(stages, 1):
-        log.info(f"  Stage {i}: {s['name']} — "
+        log.info(f"  Stage {i}: {s['name']}; "
                  f"{s.get('min_subs_per_site', 1)}-{s.get('max_subs_per_site', '?')} subs/site, "
                  f"{s.get('min_sites', 1)}-{s.get('max_sites', '?')} sites, "
                  f"{s['epochs']} epochs")
 
 
-# ── policy ──────────────────────────────────────────────────────────────────
+# policy
 
 NUM_BIAS_TYPES = len(BIAS_DIMS)   # linear, quadratic, skew, end
 
@@ -226,7 +226,7 @@ def freeze_heads(policy: UnimolPolicy, names: List[str]) -> None:
         return
     for name in names:
         if name not in BIAS_DIMS:
-            log.warning(f"  Warning: unknown freeze_heads entry '{name}' — skipping")
+            log.warning(f"  Warning: unknown freeze_heads entry '{name}'; skipping")
             continue
         for p in policy.edge_mlp.mlps[BIAS_DIMS.index(name)].parameters():
             p.requires_grad = False
@@ -254,7 +254,7 @@ def make_context_baseline(train_cfg: Dict, algorithm: str, system_to_idx: Dict[s
         return None, None
     if algorithm == 'hindsight':
         log.warning("  Warning: training.context_baseline.enabled=True but "
-                    "bandit.algorithm == 'hindsight' — context baseline is a "
+                    "bandit.algorithm == 'hindsight'; context baseline is a "
                     "REINFORCE-only concept (the hindsight update has no "
                     "advantage/baseline step); ignoring.")
         return None, None
@@ -297,13 +297,13 @@ def load_pretrained(policy: UnimolPolicy, pretrain_path: str, device: str) -> No
     if policy_weights(checkpoint) is not None:
         missing, unexpected = policy.load_state_dict(policy_weights(checkpoint), strict=False)
         if missing or unexpected:
-            log.warning("  Warning: partial weight load — "
+            log.warning("  Warning: partial weight load; "
                         f"{len(missing)} missing, {len(unexpected)} unexpected keys")
         else:
             log.info("  Loaded policy weights from pretrain checkpoint")
     weight_norm = sum(p.norm().item() ** 2 for p in policy.parameters()) ** 0.5
-    log.info(f"  Policy weight norm: {weight_norm:.4f}")
-    log.info(f"  Scale factors: {policy.scale_factors.tolist()}")
+    log.debug(f"  Policy weight norm: {weight_norm:.4f}")
+    log.debug(f"  Scale factors: {policy.scale_factors.tolist()}")
 
 
 def restore(policy, rl_optimizer, baseline_net, baseline_optimizer, checkpoint_dir: Path,
@@ -335,11 +335,11 @@ def restore(policy, rl_optimizer, baseline_net, baseline_optimizer, checkpoint_d
         else:
             match = re.search(r'checkpoint_(\d+)', latest.name)
             start_epoch = (int(match.group(1)) + 1) if match else 0
-            log.warning("  Warning: 'epoch' key missing from checkpoint — inferred start_epoch="
+            log.warning("  Warning: 'epoch' key missing from checkpoint; inferred start_epoch="
                         f"{start_epoch} from filename")
         return start_epoch, checkpoint.get('current_stage_idx', None)
     except (RuntimeError, KeyError) as err:
-        log.warning(f"  Warning: checkpoint loading failed — {err}")
+        log.warning(f"  Warning: checkpoint loading failed; {err}")
         log.info("  Falling back to pretrained model (training restarts from epoch 0).")
         if pretrain_path and Path(pretrain_path).exists():
             ckpt = torch.load(pretrain_path, map_location=device, weights_only=False)
@@ -349,7 +349,7 @@ def restore(policy, rl_optimizer, baseline_net, baseline_optimizer, checkpoint_d
         return 0, 0
 
 
-# ── validation set ──────────────────────────────────────────────────────────
+# validation set
 
 def _draw_per_system(by_sys: Dict[str, List[str]], k_per_system: int) -> List[str]:
     """Seeded draw of k combos per system (leaving each at least one)."""
@@ -479,15 +479,8 @@ def _fraction_validation(config: Dict, active: List[str],
             json.dump(validation, f)
     except Exception as err:
         log.warning(f"  Warning: could not save validation combo set: {err}")
-    log.info(f"\n{'='*70}")
-    log.info("Held-Out Validation Set (Ground Truth for Policy Quality)")
-    log.info(f"{'='*70}")
-    log.info(f"Validation combos: {len(validation)} (fixed, evaluated deterministically each "
-             "epoch)")
-    log.info(f"Training combos: {len(remaining)} (updated per epoch)")
-    log.info("Purpose: Detect true improvement vs. baseline chasing "
-             "(training batch composition shifts each epoch)")
-    log.info(f"{'='*70}\n")
+    log.info(f"Held-out validation: {len(validation)} combos, fixed and evaluated "
+             f"deterministically each epoch; training pool: {len(remaining)} combos")
     return validation, remaining
 
 
@@ -497,5 +490,5 @@ def check_algorithm(bandit: BanditConfig, use_bayesian_heads: bool) -> None:
                          f"got {bandit.raw.get('algorithm')!r}")
     if use_bayesian_heads and bandit.algorithm != 'hindsight':
         log.warning("  Warning: training.policy.use_bayesian_heads=True but "
-                    "bandit.algorithm != 'hindsight' — the policy will have "
+                    "bandit.algorithm != 'hindsight'; the policy will have "
                     "Bayesian heads but nothing will train them online.")

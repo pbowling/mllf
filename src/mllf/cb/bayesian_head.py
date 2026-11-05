@@ -1,14 +1,14 @@
-"""Bayesian linear regression head for NeuralLinear + Thompson Sampling.
+"""Bayesian linear regression head, sampled for Thompson sampling.
 
-``BayesianLinearHead`` implements the "last layer" of a NeuralLinear model: a
+``BayesianLinearHead`` is the Bayesian last layer of a bias head: a
 closed-form Bayesian linear regression on a fixed feature vector ``z = phi(x)``
 produced by a (frozen or slowly-trained) neural trunk. Unlike the deterministic
 ``nn.Linear`` it replaces, it maintains a full Gaussian posterior over its weight
 vector ``w`` and updates that posterior analytically from observed
-``(z, r)`` pairs — no backward pass, no optimizer.
+``(z, r)`` pairs; no backward pass, no optimizer.
 
-This is the mechanism behind NeuralLinear Thompson Sampling: instead of a policy
-network that outputs an action distribution trained by REINFORCE, each bias head
+This is the mechanism behind Thompson sampling with Bayesian heads: instead of a
+policy network that outputs an action distribution trained by REINFORCE, each bias head
 keeps a posterior ``N(mu, Lambda^-1)`` over its regression weights. Acting is done
 by drawing one weight sample per decision (Thompson sampling) and predicting
 ``a = z @ w_sample``; learning is done by folding the observed reward directly into
@@ -34,7 +34,7 @@ class BayesianLinearHead(nn.Module):
     trick) so the posterior includes an intercept term, letting the head warm
     -start cleanly from a pretrained ``nn.Linear(feat_dim, 1)`` (which has both
     a weight vector and a bias). Callers only ever see/pass the un-augmented
-    ``[N, feat_dim]`` features — the augmentation is an implementation detail.
+    ``[N, feat_dim]`` features; the augmentation is an implementation detail.
 
     Args:
         feat_dim: Dimension of the input feature vector ``z`` (excludes the
@@ -102,7 +102,7 @@ class BayesianLinearHead(nn.Module):
                 (``w = mu + exploration_scale * L @ eps``). 1.0 reproduces
                 standard Thompson sampling from the calibrated posterior;
                 raise (e.g. 2-4) to force wider exploration around the
-                posterior mean without changing the posterior itself — useful
+                posterior mean without changing the posterior itself; useful
                 when the posterior has already narrowed (from pretraining
                 calibration or accumulated online observations) more than
                 desired for continued exploration.
@@ -194,7 +194,7 @@ class BayesianLinearHead(nn.Module):
 
         Sets ``mu`` to ``[weight, bias]`` directly and back-fills ``Lambda_mu``
         consistently (``Lambda_mu = Lambda @ mu``) so the seeded mean survives
-        exactly through the next ``_refresh_posterior()`` — i.e. this seeds the
+        exactly through the next ``_refresh_posterior()``; i.e. this seeds the
         posterior *mean* at the pretrained solution while leaving the posterior
         *uncertainty* at the (uninformed) prior, which is then genuinely
         narrowed by real online observations via :meth:`update`.
@@ -208,21 +208,21 @@ class BayesianLinearHead(nn.Module):
                 calling :meth:`reset` with a different ``prior_precision``,
                 then seeding). This matters a great deal: a fixed
                 ``prior_precision`` (e.g. the constructor default of 1.0)
-                gives every sampled weight component unit variance —
-                Thompson-sampling noise with std 1.0 per dimension — which
+                gives every sampled weight component unit variance;
+                Thompson-sampling noise with std 1.0 per dimension; which
                 completely swamps a well-fitted ``weight`` whose components
                 are typically much smaller than 1 (e.g. a BC-trained
                 deterministic readout's weights are commonly O(0.01-0.1)).
                 Left uncalibrated, ``sample_weights()`` draws are dominated by
                 noise rather than the seeded mean, regardless of fit quality
-                — this is exactly what caused wildly-scaled, near-random
+; this is exactly what caused wildly-scaled, near-random
                 online-training actions from an otherwise well-trained
                 checkpoint. Pass e.g. ``prior_precision / mean(weight**2)``
                 (see ``mllf.pretrain.bayesian_init.initialize_bayesian_heads_from_pretrained``)
                 to scale the prior to this head's own fitted weight
                 magnitude instead of an arbitrary absolute constant.
             precision_floor: Minimum value accepted for ``prior_precision``
-                — floors it away from ~0 (which would make ``Lambda_inv``
+; floors it away from ~0 (which would make ``Lambda_inv``
                 blow up and sampling numerically unstable).
         """
         weight = weight.to(self.mu.dtype).reshape(-1)

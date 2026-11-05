@@ -6,15 +6,40 @@ the 84M-parameter ``unimolv1`` model pretrained on 1.1B PubChem molecules). Uni-
 used as is and never fine-tuned, so pretraining and online training learn only the bias
 heads on top of fixed embeddings (:doc:`cb_setup`). Each substituent is embedded in its 3D
 context rather than as an isolated fragment, because the same group needs different
-biases in different molecules and environments.
+biases in different molecules.
 
-Building the Input
-------------------
+Node Features
+-------------
 
-``construct_full_ligand()`` assembles the atoms Uni-Mol sees, in a fixed order: the
-substituent, the core, the reference substituent (``sub1``) of each other site, and then
-environment atoms. The reference substituents keep a multi-site molecule whole. The
-environment depends on the system's ``solvent_state``.
+``get_substituent_dual_embeddings()`` returns two 512-D halves per substituent, and the
+node feature is their concatenation (1024-D).
+
+1. **Ligand**: the core and substituent, in that order after the substituent itself
+   (``construct_full_ligand()``). With ``unimol.ligand_other_sites: true``, it also holds
+   every other site's reference substituent (``sub1``), so a substituent is embedded in
+   the molecule it belongs to.
+2. **Second half**, set by ``unimol.env_input``:
+
+   * ``phase`` and ``phase_ligmean``: two flags, [condensed, protein] (vacuum [0, 0],
+     solvent [1, 0], protein [1, 1]), read from the system name and followed by zeros.
+     Every current model uses one of these inputs.
+   * ``dual`` (the default when ``env_input`` is not set): a second Uni-Mol embedding of
+     the ligand together with its environment (below).
+
+The policy combines the halves per edge (:doc:`cb_setup`), using the *difference* of the
+ligand halves and the symmetric second half, so the two halves carry different
+information. With ``unimol.site_size_input``, the slot after the phase flags holds each
+substituent's site size for the current run. That value is set per run and is never
+cached, since the same substituent appears in pairs and in groups.
+
+The ``unimol`` settings change what the model sees, so online training and pretraining
+must use the same ones (:doc:`cb_pretraining`).
+
+Environment Embedding (``env_input: dual``)
+-------------------------------------------
+
+The environment embedding adds the atoms around the ligand to the second half. Which atoms
+depends on the system's ``solvent_state``.
 
 * ``solv`` / ``solvent``: water within the cutoff
 * ``protein``: protein atoms (and usually crystallographic waters) within the cutoff
@@ -28,44 +53,16 @@ the ``prep/`` script), so atoms are neither lost nor duplicated across the box e
 Uni-Mol accepts at most 256 atoms, and beyond that the farthest environment atoms are
 dropped.
 
-Environment Consensus
----------------------
-
 Selecting the atoms within the cutoff of *each substituent* would give every substituent a
 slightly different environment, because each has a different shape. Two substituents at
 the same site would then disagree about which waters count, and that difference would
-appear as noise in the shared half of the edge input. We therefore define the environment
-from the **core**, which is identical for every substituent at a site. Atoms within
-``env_cutoff`` (8.0 Å) of the core form one set (the closest 256 if there are more), which
-is reused for every substituent at that site (``build_environment_consensus``,
-``mllf.cb.environment_consensus``). Pretraining, analysis and online training use the same
-consensus, and it is skipped in the gas phase.
-
-Node Features
--------------
-
-``get_substituent_dual_embeddings()`` returns two 512-D halves per substituent, and the
-node feature is their concatenation (1024-D).
-
-1. **Ligand**: the core and substituent. With ``unimol.ligand_other_sites: true``, it also
-   holds every other site's reference substituent, so a substituent is embedded in the
-   molecule it belongs to.
-2. **Second half**, set by ``unimol.env_input``:
-
-   * ``dual``: a context embedding of the core, substituent, reference substituents and
-     consensus environment;
-   * ``phase`` and ``phase_ligmean``: no environment embedding, only two flags,
-     [condensed, protein] (vacuum [0, 0], solvent [1, 0], protein [1, 1]), read from the
-     system name, followed by zeros.
-
-The policy combines the halves per edge (:doc:`cb_setup`), using the *difference* of the
-ligand halves and the symmetric second half, so the two halves carry different
-information. With ``unimol.site_size_input``, the slot after the phase flags holds each
-substituent's site size for the current run. That value is set per run and is never
-cached, since the same substituent appears in pairs and in groups.
-
-The ``unimol`` settings change what the model sees, so online training and pretraining
-must use the same ones (:doc:`cb_pretraining`).
+appear as noise in the shared half of the edge input. The environment is therefore defined
+from the **core**, which is identical for every substituent at a site: atoms within
+``env_cutoff`` (8.0 Å) of the core form one set per site (the closest 256 if there are
+more), reused for every substituent at that site (``build_environment_consensus``,
+``mllf.cb.environment_consensus``). Pretraining writes these sets to
+``environment_consensus.json`` so that analysis and replay use the same atoms. Runs with a
+phase input neither build nor write them.
 
 Caching
 -------
@@ -73,5 +70,6 @@ Caching
 With ``unimol.cache_embeddings: true``, embeddings are cached on disk, keyed by a hash of
 the input structure and settings (``save_embedding`` / ``load_embedding``), in
 ``unimol.cache_dir`` (by default ``<output.base_dir>/embeddings_cache`` in online
-training). The same substituent in the same environment is then embedded once across
-epochs and runs.
+training). The same substituent is then embedded once across epochs and runs. The ligand
+half does not depend on the environment settings, so a ligand embedding cached by a run
+with ``env_input: dual`` is reused by a run with a phase input, and the reverse.

@@ -753,6 +753,8 @@ saves enough state to continue from the last completed epoch.
 * ``regression_online_buffer.pt``: the recent hindsight targets the regression trains on
 * ``cost_ledger.json``: simulated time per run
 * ``epoch_summary.log``: one block per epoch
+* ``training.log``: every message of the run with time stamps, including the per-combo
+  detail the console leaves out (:doc:`cli`)
 * ``best_model.pt``: the best validated model (with the validation gate)
 * ``final_model.pt``: written at the end, from the best validated model when the last
   validation scored lower
@@ -766,11 +768,29 @@ recomputing them or holding every combo in memory.
 Archiving Combinations
 ----------------------
 
-The training driver archives nothing itself, because the per-pair state and the cost
-ledger point into the run directories. Once a run's biases are exported and its costs
-summarized, its combination directories can be archived with
-``archive_combo_dirs(out_dir, pattern='comb_*', remove=False)``
-(``mllf.file_handling.generate_combinations``) or ``examples/14benz/archive_combos.sh``.
+A long run leaves one directory per combination and one subdirectory per run in each
+system's ``out_dir``, often tens of thousands of files per system. The ``archive:`` block
+packs each system's ``out_dir`` into one ``.tar.gz``:
+
+.. code-block:: yaml
+
+   archive:
+     when: end          # end: after training; system: as each system finishes its last
+                        # stage (per-system curricula), the rest at the end
+     dir: archive       # relative to output.base_dir (default), or absolute
+     remove: false      # delete the combination directories once archived
+
+Each archive is written under a temporary name and renamed once it is complete, and with
+``remove: true`` a system's directories are deleted only after its archive has been read
+back and found to hold every file. ``when: system`` is safe in a per-system curriculum
+because a finished system's directories are no longer read: its held-out pairs are
+validated in the epoch it finishes, before its biases are exported, and its pairs leave the
+pool. Analysis that reads run directories directly (for example the ``variables.py`` of
+each run) needs the archive extracted when ``remove`` is on.
+
+``mllf archive CONFIG`` does the same for a finished or stopped run (``--systems`` to limit
+it, ``--dir`` and ``--remove`` to override the block), and ``mllf combos --archive`` packs
+each generated combination directory separately (``archive_combo_dirs``).
 
 .. _Example Configurations:
 

@@ -47,14 +47,11 @@ class WarningSummary:
     def report(self) -> None:
         if not self.counts:
             return
-        log.warning(f"\n{'='*60}")
         log.warning(f"Warning Summary ({sum(self.counts.values())} total occurrences, "
                     f"{len(self.counts)} unique types)")
-        log.warning(f"{'='*60}")
         for (cat, template), count in sorted(self.counts.items(), key=lambda kv: -kv[1]):
             example_text, ex_file, ex_line = self.example[(cat, template)]
             short_file = Path(ex_file).name if ex_file else '?'
             log.warning(f"  [{count:5d}x] {cat} ({short_file}:{ex_line})")
             shown = template if self.show_template else example_text
             log.warning(f"           {shown[:self.width]}")
-        log.warning(f"{'='*60}")

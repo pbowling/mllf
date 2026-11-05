@@ -1,4 +1,4 @@
-"""Tests for UnimolPolicy's NeuralLinear + Thompson Sampling mode
+"""Tests for UnimolPolicy's Bayesian heads with Thompson sampling mode
 (use_bayesian_heads=True): forward_features/predict_uncertainty/
 get_actions_thompson/update_bayesian_posteriors, and that the default
 (use_bayesian_heads=False) REINFORCE path is unaffected.
@@ -54,7 +54,7 @@ class TestBayesianPolicyShapes:
 
     def test_get_actions_thompson_only_routed_column_nonzero(self):
         """Non-routed dims stay exactly 0 (same convention as get_actions'
-        routed path — only the edge's own bias-type column is meaningful)."""
+        routed path; only the edge's own bias-type column is meaningful)."""
         policy = UnimolPolicy(unimol_dim=512, mlp_out_dim=4,
                               use_dual_embeddings=True, use_bayesian_heads=True)
         emb, edge_index, edge_type = _toy_graph()

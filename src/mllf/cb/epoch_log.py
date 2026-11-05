@@ -136,7 +136,7 @@ def format_epoch_block(epoch: int, runs: Dict[str, int], failed: Sequence[str] =
     return '\n'.join(lines)
 
 
-# ── Parsing (analysis scripts) ───────────────────────────────────────────────
+# Parsing (analysis scripts)
 
 _GOOD_RE = re.compile(r"Pair runs good: (.*)")
 _GOOD_PART_RE = re.compile(r"(short|full-length) (\d+)/(\d+)")

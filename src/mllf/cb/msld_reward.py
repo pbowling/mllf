@@ -45,16 +45,16 @@ def compute_msld_reward_improved(
     **Tiered Transition Penalty System:**
     - **Tier 1: "Death Floor" (0-2 transitions)**: Fixed penalty of -40.0
     - **Tier 2: "Climbing Ramp" (3-9 transitions)**: Linear gradient from ~-16 to -4
-      Formula: -2.0 - (2.0 × deficit)
-    - **Tier 3: "Success Zone" (≥10 transitions)**: Penalty = 0.0, unlocks R_T
+      Formula: -2.0 - (2.0 x deficit)
+    - **Tier 3: "Success Zone" (>=10 transitions)**: Penalty = 0.0, unlocks R_T
 
     **Reward Components:**
         R = coverage_factor * (R_P + R_T + R_entropy) + R_penalties
 
     where:
-        R_P: Population balance reward × C_F (confidence-scaled)
-        R_T: Transition reward (gated: only if all sites ≥ min_transitions)
-        coverage_factor: (nonzero_count/total_subs)^2 — smooth partial-coverage multiplier
+        R_P: Population balance reward x C_F (confidence-scaled)
+        R_T: Transition reward (gated: only if all sites >= min_transitions)
+        coverage_factor: (nonzero_count/total_subs)^2; smooth partial-coverage multiplier
         R_entropy: Bonus for high-entropy (uniform) distributions
         R_penalties: Tiered transition penalties + coverage/concentration penalties
 
@@ -303,8 +303,8 @@ def compute_msld_reward_improved(
 
     # ========== FINAL REWARD ==========
 
-    # coverage_factor: smooth quadratic multiplier — full credit at 100% coverage,
-    # proportional partial credit below (e.g. 2/3 → 0.44×, 1/3 → 0.11×).
+    # coverage_factor: smooth quadratic multiplier; full credit at 100% coverage,
+    # proportional partial credit below (e.g. 2/3 -> 0.44x, 1/3 -> 0.11x).
     coverage_factor = (nonzero_count / total_subs) ** 2 if total_subs > 0 else 0.0
     R = coverage_factor * (R_P + R_T + R_entropy) + penalties
     return R

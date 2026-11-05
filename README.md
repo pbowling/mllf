@@ -33,7 +33,12 @@ mllf pretrain --pretraining-dir pretraining/sys --output-dir models/run --config
 mllf train workflow.yaml                  # online training (rerun to resume)
 mllf export workflow.yaml --label checkpoints_dir
 mllf cost checkpoints_dir --pretraining-root pretraining
+mllf archive workflow.yaml                # one .tar.gz of combo directories per system
 ```
+
+The console shows progress and per-epoch summaries; every message, including per-combo
+detail, also goes to a log file in the run's output directory (`training.log`,
+`pretrain.log`).
 
 `-v` / `-q` (before or after the command) give more or less output; `mllf COMMAND -h`
 lists a command's options. See `docs/cli.rst`.

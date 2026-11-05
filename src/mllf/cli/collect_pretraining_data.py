@@ -100,11 +100,11 @@ def parse_bias_from_py(
     * **Flat format** (older, auto-generated pretraining files): ``b`` is a
       1-D list, ``c``/``x``/``s`` are NxN matrices.
     * **Matrix + scalar format** (``variablesflat.py`` from ALF): ``b`` is a
-      2-D ``[[b1, b2, …]]`` row (normalised to 1-D), plus ``c``/``x``/``s``
+      2-D ``[[b1, b2, ...]]`` row (normalised to 1-D), plus ``c``/``x``/``s``
       matrices and redundant individual ``cs*``/``xs*``/``ss*`` scalars.
 
     Only the clean matrix keys (``b``, ``c``, ``x``, ``s``) and
-    ``_nsubs_per_site`` are returned — the raw scalar subdicts are discarded
+    ``_nsubs_per_site`` are returned; the raw scalar subdicts are discarded
     so stored ``variables.py`` files stay compact.
 
     Args:
@@ -334,7 +334,7 @@ PROFILE_FIELDS = (('barrier_pairs', 'barrier'), ('skew_pairs', 'skew'), ('end_pa
 
 def _profile_fields(profile: Dict[Tuple[int, int], Dict[str, Optional[float]]]) -> Dict[str, Dict]:
     """simulation_results.json fields: 'barrier_pairs', 'skew_pairs', 'end_pairs' and
-    'transition_pairs' (per-pair transitions at the λ ≥ 0.99 cutoff)."""
+    'transition_pairs' (per-pair transitions at the λ >= 0.99 cutoff)."""
     return {field: {f"{lo}_{hi}": vals[key] for (lo, hi), vals in profile.items()}
             for field, key in PROFILE_FIELDS}
 
@@ -388,7 +388,7 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
     Mirrors ``backfill_ddg_pairs``. Writes 'barrier_pairs', 'skew_pairs' and
     'end_pairs' (``parse_pair_profile``) -- the quadratic, skew and end pair
     reward signals; runs without them fall back to the legacy signals -- and
-    'transition_pairs' (per-pair transitions at the λ ≥ 0.99 cutoff). Reads
+    'transition_pairs' (per-pair transitions at the λ >= 0.99 cutoff). Reads
     the run directory's own ``output.out`` when present, else the source run
     named by metadata.json's ``source_run_dir`` (nothing is copied). Also writes
     'simulated_ns' (the run's length; pretraining judges short runs by the
@@ -425,7 +425,7 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
                           'error': 'Warning:'}[status]
                 log.info(f"  {prefix} {msg}")
             if n % 1000 == 0:
-                log.info(f"  ... {n}/{total} runs checked")
+                log.debug(f"  ... {n}/{total} runs checked")
 
     if workers > 1:
         with Pool(workers) as pool:
@@ -443,7 +443,7 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
 
 def _source_variables_format(run_dir: Path) -> Optional[str]:
     """'py' or 'inp' for the variables file the collector would have read from
-    this run's source (``metadata.json`` → ``source_run_dir``), else None."""
+    this run's source (``metadata.json`` -> ``source_run_dir``), else None."""
     metadata_path = run_dir / 'metadata.json'
     if not metadata_path.exists():
         return None
@@ -518,7 +518,7 @@ def fix_inp_nonlinear_signs(pretraining_root: Path, dry_run: bool = False) -> Tu
     log.info(f"\n.inp sign fix: {n_fixed} {verb}, {n_ok} already correct (.py source or marked), "
              f"{n_unresolved} unresolved (no source dir/variables file)")
     for ex in unresolved_examples:
-        log.info(f"  unresolved e.g. {ex}")
+        log.debug(f"  unresolved e.g. {ex}")
     return n_fixed, n_ok, n_unresolved
 
 
@@ -808,8 +808,8 @@ def parse_active_subs_from_inp(
         nsubs_per_site: Number of active subs per site, from the bias variables.
 
     Returns:
-        Dict mapping 'site1', 'site2', … to an ordered list of master sub names,
-        e.g. {'site1': ['site1_sub3', 'site1_sub1', …], 'site2': ['site2_sub15', …]}
+        Dict mapping 'site1', 'site2', ... to an ordered list of master sub names,
+        e.g. {'site1': ['site1_sub3', 'site1_sub1', ...], 'site2': ['site2_sub15', ...]}
     """
     exclude = {'lpsites.inp', 'variablesflat.inp'}
     inp_candidates = sorted(
@@ -978,9 +978,9 @@ def collect_run_data(
     graph_info = extract_graph_info(prep_path, solvent_state)
 
     # Build the active-substituent mapping: which master sub carries each
-    # sequential bias position (lams1s1 = position 1, lams1s2 = position 2, …).
+    # sequential bias position (lams1s1 = position 1, lams1s2 = position 2, ...).
     # The BLOCK calls define it (parse_active_subs_from_output); the prep .inp
-    # files are the fallback, and sequential numbering (site1_sub1, …) the last.
+    # files are the fallback, and sequential numbering (site1_sub1, ...) the last.
     # nsubs_per_site_override takes priority (e.g. combo runs where prep/ is full-system).
     #
     # Auto-detect from mapping.json for generated-combo runs: alf_info.py in the
@@ -1002,7 +1002,7 @@ def collect_run_data(
                            or parse_active_subs_from_inp(prep_path, nsubs_per_site))
 
     # Re-key graph_info['sites']:
-    #   sequential key 'site1_sub1' ← master sub at position 0 (e.g. site1_sub3)
+    #   sequential key 'site1_sub1' <- master sub at position 0 (e.g. site1_sub3)
     all_rtf_sites = graph_info['sites']
 
     # Safety net: validate that every master_sub referenced by active_subs_ordered
@@ -1104,7 +1104,7 @@ def create_pretraining_entry(
 
     # Apply minimum-transitions filter before touching the filesystem
     if total_trans < min_transitions:
-        log.info(f"  Skipping {combo_name}: {total_trans} transitions < {min_transitions}")
+        log.debug(f"  Skipping {combo_name}: {total_trans} transitions < {min_transitions}")
         return None
 
     # Create output directory
@@ -1394,6 +1394,16 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace):
+    """Collect (or run a maintenance mode); with --output-dir every message is
+    also recorded in its collect.log."""
+    if args.output_dir is None:
+        return _run(args)
+    from mllf.log import log_to_file
+    with log_to_file(Path(args.output_dir) / 'collect.log'):
+        return _run(args)
+
+
+def _run(args: argparse.Namespace):
     if args.relabel_subs is not None:
         root = args.relabel_subs.resolve()
         if not root.exists():
@@ -1428,7 +1438,7 @@ def run(args: argparse.Namespace):
         backfill_ddg_pairs(root, dry_run=args.dry_run)
         return 0
 
-    # Normal collection mode — base_path and --output-dir are required
+    # Normal collection mode; base_path and --output-dir are required
     if args.base_path is None:
         raise UsageError(
             "base_path is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode is "
@@ -1475,7 +1485,7 @@ def run(args: argparse.Namespace):
             else:
                 combo_name = run_dir.name
 
-        log.info(f"\n[{i}/{len(run_dirs)}] Processing {run_dir.name} -> {combo_name}")
+        log.debug(f"\n[{i}/{len(run_dirs)}] Processing {run_dir.name} -> {combo_name}")
 
         if args.dry_run:
             log.info(f"  Would create: {args.output_dir / combo_name}")
@@ -1494,14 +1504,14 @@ def run(args: argparse.Namespace):
                 if dry_trans < args.min_transitions:
                     log.info(f"  Would skip: {dry_trans} transitions < {args.min_transitions}")
                 else:
-                    log.info(f"  Bias keys: {list(bias_data.keys())}")
-                    log.info(f"  Populations: {len(output_results['populations'])} sites")
+                    log.debug(f"  Bias keys: {list(bias_data.keys())}")
+                    log.debug(f"  Populations: {len(output_results['populations'])} sites")
                     if output_results['transitions']:
-                        log.info(f"  Transition pairs: {len(output_results['transitions'])}")
-                    log.info(f"  Total transitions (highest λ): {dry_trans}")
-                    log.info(f"  Terminated normally: {output_results['terminated_normally']}")
-                    log.info(f"  Solvent state: {graph_info['solvent_state']}")
-                    log.info(f"  Sites found: {len(graph_info['sites'])}")
+                        log.debug(f"  Transition pairs: {len(output_results['transitions'])}")
+                    log.debug(f"  Total transitions (highest lambda): {dry_trans}")
+                    log.debug(f"  Terminated normally: {output_results['terminated_normally']}")
+                    log.debug(f"  Solvent state: {graph_info['solvent_state']}")
+                    log.debug(f"  Sites found: {len(graph_info['sites'])}")
                 success_count += 1
             except Exception as e:
                 log.error(f"  Error: {e}")
@@ -1515,14 +1525,13 @@ def run(args: argparse.Namespace):
                 if entry_dir is None:
                     skipped_count += 1
                 else:
-                    log.info(f"  ✓ Created: {entry_dir}")
+                    log.debug(f"  created {entry_dir}")
                     success_count += 1
             except Exception as e:
-                log.info(f"  ✗ Error: {e}")
+                log.warning(f"  Warning: {run_dir.name} failed: {e}")
                 error_count += 1
 
-    log.info(f"\n{'=' * 60}")
-    log.info(f"Summary: {success_count} successful, {skipped_count} skipped (< "
+    log.info(f"\nSummary: {success_count} successful, {skipped_count} skipped (< "
              f"{args.min_transitions} transitions), {error_count} errors")
 
     if not args.dry_run and success_count > 0:

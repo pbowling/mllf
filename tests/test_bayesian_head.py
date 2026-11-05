@@ -1,4 +1,4 @@
-"""Tests for BayesianLinearHead (NeuralLinear + Thompson Sampling last layer)."""
+"""Tests for BayesianLinearHead (Bayesian heads with Thompson sampling last layer)."""
 import numpy as np
 import pytest
 import torch
@@ -198,7 +198,7 @@ class TestBayesianLinearHeadUtilities:
 
     def test_predict_variance_includes_noise_floor(self):
         """With no observations, predictive variance should be roughly
-        prior variance (z^T Lambda_inv z) plus noise_var — never below noise_var."""
+        prior variance (z^T Lambda_inv z) plus noise_var; never below noise_var."""
         feat_dim = 4
         head = BayesianLinearHead(feat_dim=feat_dim, prior_precision=1.0, noise_var=0.5)
         z = torch.zeros(1, feat_dim)  # z=0 -> only the bias-augmentation column contributes

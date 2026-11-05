@@ -2,7 +2,7 @@
 
 The training itself is ``mllf.cb.training_loop.run_training`` (setup in
 ``mllf.cb.training_setup``, one epoch in ``mllf.cb.reinforce_trainer``); see
-:doc:`workflow` for the configuration reference.
+:doc:`/docs/workflow` for the configuration reference.
 """
 import argparse
 

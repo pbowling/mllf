@@ -12,7 +12,8 @@ Each generated combination directory contains:
 - `info.py`: Configuration dict with nsubs, nblocks, temp, etc.
 - `run.sh`: Executable SLURM submission script for running simulations
 
-Example:
+Example::
+
   input_dir/
     site1_sub1_pres.rtf
     site1_sub1_frag.pdb
@@ -21,23 +22,21 @@ Example:
     site1_sub3_pres.rtf
     site1_sub3_frag.pdb
 
-Running:
-  python -m mllf.file_handling.generate_combinations input_dir --out combos_out
+Running ``mllf combos input_dir --out combos_out`` produces directories like::
 
-Will produce directories like:
   combos_out/comb_0001_site1_subs_1_2/
-    ├── prep/
-    │   ├── site1_sub1_pres.rtf    (renamed if necessary, see mapping.json)
-    │   ├── site1_sub1_frag.pdb
-    │   ├── site1_sub2_pres.rtf    (renamed if necessary, see mapping.json)
-    │   ├── site1_sub2_frag.pdb
-    │   ├── top_all36_msld.rtf     (unchanged from input prep/)
-    │   ├── par_all36_msld.prm     (unchanged from input prep/)
-    │   └── ... (other prep files)
-    ├── msld_flat.py               (if included via --include)
-    ├── mapping.json
-    ├── info.py
-    └── run.sh
+    |-- prep/
+    |   |-- site1_sub1_pres.rtf    (renamed if necessary, see mapping.json)
+    |   |-- site1_sub1_frag.pdb
+    |   |-- site1_sub2_pres.rtf    (renamed if necessary, see mapping.json)
+    |   |-- site1_sub2_frag.pdb
+    |   |-- top_all36_msld.rtf     (unchanged from input prep/)
+    |   |-- par_all36_msld.prm     (unchanged from input prep/)
+    |   `-- ... (other prep files)
+    |-- msld_flat.py               (if included via --include)
+    |-- mapping.json
+    |-- info.py
+    `-- run.sh
 
 Combination Generation Logic:
 
@@ -53,7 +52,7 @@ Combination Generation Logic:
 
   - Each site contributes >= 2 substituents
   - Example: site1 has 75 selections, site2 has 186 selections
-  - Generates 75 × 186 = 13,950 cross-site combinations
+  - Generates 75 x 186 = 13,950 cross-site combinations
 
 - Total combinations grow significantly with multiple sites
 
@@ -144,7 +143,7 @@ def all_site_sub_combinations(found: Dict[int, Dict[int, Dict[str, Path]]],
     - For each combination of sites (pairs, triplets, etc.), generate all valid
       combinations where each site contributes >= 2 subs
     - Uses rotating anchor within each site component
-    - Example: site1[1,2] × site2[3,4] generates multiple ordered combinations
+    - Example: site1[1,2] x site2[3,4] generates multiple ordered combinations
     - Each site's contribution is limited to max_subs_per_site
 
     Args:
@@ -328,7 +327,7 @@ def renumber_pres_tokens(content: str, old_site: int, old_sub: int,
     def _replace_pres_line(m: re.Match) -> str:
         line = m.group(0)
         parts = line.split()
-        # PRES <name> <charge>  — replace whatever the current name is
+        # PRES <name> <charge>; replace whatever the current name is
         if len(parts) >= 2:
             return line.replace(parts[1], new_token, 1)
         return line
@@ -698,7 +697,7 @@ def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Di
 
                     if core_rtf.exists() and core_pdb.exists():
                         if verbose:
-                            log.info(
+                            log.debug(
                                 f"  Augmenting core with site{excluded_site}_sub1 for single-site "
                                 "combo")
                         augment_core_with_excluded_sub1(core_rtf, core_pdb, sub1_rtf, sub1_pdb)
@@ -1002,7 +1001,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                         core_pdb = prep_dest / 'core.pdb'
 
                         if core_rtf.exists() and core_pdb.exists():
-                            log.info(
+                            log.debug(
                                 f"  Augmenting {name} core with site{excluded_site}_sub1 for "
                                 "single-site combo")
                             augment_core_with_excluded_sub1(core_rtf, core_pdb, sub1_rtf, sub1_pdb)

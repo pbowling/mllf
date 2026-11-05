@@ -37,13 +37,13 @@ def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
 
         # Skip if simulation didn't terminate normally
         if not metadata.get("terminated_normally", False):
-            log.info(f"  Skipping {run_dir.name}: did not terminate normally")
+            log.debug(f"  Skipping {run_dir.name}: did not terminate normally")
             return None
 
         # Load simulation results
         results_file = run_dir / "simulation_results.json"
         if not results_file.exists():
-            log.info(f"  Skipping {run_dir.name}: no simulation_results.json")
+            log.debug(f"  Skipping {run_dir.name}: no simulation_results.json")
             return None
 
         with open(results_file, 'r') as f:

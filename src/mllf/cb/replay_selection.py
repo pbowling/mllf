@@ -27,7 +27,7 @@ COVER_QUALITY = 0.5         # a pair is fully covered at this score
 TIE_WEIGHT = 1e-3           # sum of score rises, to break ties between equal coverage
 
 
-# ── Datasets, systems, labels ───────────────────────────────────────────────
+# Datasets, systems, labels
 
 def dataset_of(path) -> str:
     """The pretraining dataset (directory under ``pretraining/``) of a manifest entry."""
@@ -143,7 +143,7 @@ def node_labels(run_dir, index: Optional[FragmentIndex],
     return labels or None
 
 
-# ── Pair quality ─────────────────────────────────────────────────────────────
+# Pair quality
 
 def _top_count(block: Dict) -> float:
     counts = (block or {}).get('counts') or {}
@@ -202,7 +202,7 @@ def run_pair_scores(system: str, run_dir, labels: List[Tuple[int, int]], sim: Di
     return out
 
 
-# ── Greedy coverage ──────────────────────────────────────────────────────────
+# Greedy coverage
 
 def _kth_best(scores: Sequence[float], k: int) -> float:
     s = sorted(scores, reverse=True)
@@ -330,7 +330,7 @@ def select_runs(cand: Dict[str, Dict[str, Dict[str, float]]], budgets: Dict[str,
     return chosen, extra
 
 
-# ── Plan ─────────────────────────────────────────────────────────────────────
+# Plan
 
 def _resolver(manifest):
     bases = [Path.cwd()] + list(Path(manifest).resolve().parents)
@@ -414,8 +414,8 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
             indexes[sysn] = FragmentIndex.from_preps(
                 [p / 'prep' for p in paths if (p / 'prep').is_dir()])
             if verbose:
-                log.info(f"  [replay] {sysn}: no {prep}; substituents numbered from its datasets' "
-                         f"fragments ({indexes[sysn].n_subs})")
+                log.debug(f"  {sysn}: no {prep}; substituents numbered from its datasets' "
+                          f"fragments ({indexes[sysn].n_subs})")
 
     tasks = []
     for sysn, paths in by_system.items():
@@ -463,12 +463,12 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
                                'candidates': n_cand[p]})
         if verbose:
             n_ext = sum(1 for c in runs if c in extra.get(sysn, []))
-            log.info('%s', f"  [replay] {sysn}: {n_subs[sysn]} subs, budget {budgets[sysn]}, "
-                     f"{len(cand[sysn])} candidate runs, {len(runs)} chosen"
-                     + (f" ({n_ext} for the minimum)" if n_ext else '')
-                     + f", {len(own)}/{len(n_cand)} sampled pairs covered "
-                     f"({len(n_cand) - uncovered(cand[sysn], chosen[sysn])} at quality >= "
-                     f"{COVER_QUALITY})")
+            log.debug('%s', f"  {sysn}: {n_subs[sysn]} subs, budget {budgets[sysn]}, "
+                      f"{len(cand[sysn])} candidate runs, {len(runs)} chosen"
+                      + (f" ({n_ext} for the minimum)" if n_ext else '')
+                      + f", {len(own)}/{len(n_cand)} sampled pairs covered "
+                      f"({len(n_cand) - uncovered(cand[sysn], chosen[sysn])} at quality >= "
+                      f"{COVER_QUALITY})")
     if verbose:
-        log.info(f"  [replay] total: {len(plan)} graphs over {len(cand)} systems (target {total})")
+        log.info(f"  total: {len(plan)} graphs over {len(cand)} systems (target {total})")
     return plan, report

@@ -51,9 +51,9 @@
 # each --pretraining-dir basename):
 #   sbatch --export=ALL,EMPHASIZE_SYSTEMS="luis_tyk2_solvent:5.0 luis_thrombin_solvent:5.0" pretrain_with_filtering.sh
 #
-# To also produce a NeuralLinear + Thompson Sampling checkpoint (best_policy_bayesian.pt /
-# final_policy_bayesian.pt) alongside the normal deterministic one, for use with
-# training/workflow_instructions_neurallinear_ts.yaml (bandit.algorithm: neurallinear_ts):
+# To also produce a Bayesian-head checkpoint (best_policy_bayesian.pt /
+# final_policy_bayesian.pt) alongside the deterministic one, for online training
+# with bandit.algorithm: hindsight:
 #   sbatch --export=ALL,BAYESIAN_HEADS=true pretrain_with_filtering.sh
 #   (optionally tune BAYESIAN_PRIOR_PRECISION, default 1.0 — must match the
 #    bandit.prior_precision used in the online-training config)
@@ -160,7 +160,7 @@ fi
 echo "  Early stopping patience: $PATIENCE epochs"
 echo "  Per-pair AWR: $([ "$USE_PER_PAIR_AWR" = "true" ] && echo "ENABLED" || echo "disabled")"
 echo "  AWR temperature: $AWR_TEMPERATURE"
-echo "  NeuralLinear+TS Bayesian-head checkpoint: $([ "$BAYESIAN_HEADS" = "true" ] && echo "ENABLED (prior_precision=$BAYESIAN_PRIOR_PRECISION)" || echo "disabled")"
+echo "  Bayesian-head Bayesian-head checkpoint: $([ "$BAYESIAN_HEADS" = "true" ] && echo "ENABLED (prior_precision=$BAYESIAN_PRIOR_PRECISION)" || echo "disabled")"
 if [ -n "$EMPHASIZE_SYSTEMS" ]; then
     echo "  System emphasis: $EMPHASIZE_SYSTEMS"
 fi
@@ -383,10 +383,10 @@ if [ "$AWR_TEMPERATURE" != "1.0" ]; then
     CMD="$CMD --awr-temperature $AWR_TEMPERATURE"
 fi
 
-# Add NeuralLinear + Thompson Sampling Bayesian-head checkpoint generation
+# Add Bayesian heads with Thompson sampling Bayesian-head checkpoint generation
 if [ "$BAYESIAN_HEADS" = "true" ]; then
     CMD="$CMD --bayesian-heads --bayesian-prior-precision $BAYESIAN_PRIOR_PRECISION"
-    echo "NeuralLinear+TS: ENABLED (will also save best_policy_bayesian.pt / final_policy_bayesian.pt)"
+    echo "Bayesian-head: ENABLED (will also save best_policy_bayesian.pt / final_policy_bayesian.pt)"
 fi
 
 # Add per-system emphasis weighting (one --emphasize-systems flag per entry)
@@ -435,16 +435,15 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "     model_path: $OUTPUT_DIR/best_policy.pt"
     if [ "$BAYESIAN_HEADS" = "true" ]; then
         echo ""
-        echo "   ...or, for NeuralLinear + Thompson Sampling online training"
-        echo "   (training/workflow_instructions_neurallinear_ts.yaml), point at the"
-        echo "   Bayesian-head sibling checkpoint instead:"
+        echo "   ...or, for online training with Bayesian heads (bandit.algorithm:"
+        echo "   hindsight), point at the Bayesian-head checkpoint instead:"
         echo "     pretrain:"
         echo "       model_path: $OUTPUT_DIR/best_policy_bayesian.pt"
         echo "     training:"
         echo "       policy:"
         echo "         use_bayesian_heads: true"
         echo "     bandit:"
-        echo "       algorithm: neurallinear_ts"
+        echo "       algorithm: hindsight"
     fi
     echo "4. Run the training workflow"
 else

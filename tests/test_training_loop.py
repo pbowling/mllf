@@ -110,6 +110,7 @@ def test_run_training_per_system_stages(tmp_path, fake_cluster):
         s['combo_sets'] = {'groups': [{1: [1, 2]}], 'refpairs': {'pairs_of': 'groups'}}
         s['export_combo_set'] = 'groups'
     cfg = _hindsight(_config(tmp_path, [sys_a, sys_b], validation_per_system=1))
+    cfg['archive'] = {'when': 'system'}
     cfg['curriculum'] = {
         'enabled': True, 'per_system': True, 'max_train_combos_per_stage': 4,
         'min_combos_per_system': 1,
@@ -135,6 +136,11 @@ def test_run_training_per_system_stages(tmp_path, fake_cluster):
     # both systems finished their last stage: final biases exported per group
     for name in ('sysA', 'sysB'):
         assert list((ck / 'final_biases' / name).rglob('variables.py'))
+        # each system's combo directories, archived when it finished
+        assert (ck / 'archive' / f'{name}.tar.gz').exists()
+    # every message, including the per-combo detail, is in training.log
+    log_text = (ck / 'training.log').read_text()
+    assert 'Bayesian head update' in log_text and 'Submitted 1/' in log_text
 
 
 def test_run_training_resumes_and_finishes_with_no_epochs_left(tmp_path, fake_cluster):

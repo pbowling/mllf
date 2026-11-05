@@ -1,7 +1,7 @@
 """Tests for the helpers around train_epoch (mllf.cb.epoch_runs,
 mllf.cb.reinforce_trainer):
 
-  - sample_actions  (REINFORCE vs. NeuralLinear+TS dispatch)
+  - sample_actions  (REINFORCE vs. Bayesian-head dispatch)
   - detach_cpu_or_none
   - save_graph_data_cache / load_graph_data_cache (round trip)
   - format_pair_success

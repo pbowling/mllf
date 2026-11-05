@@ -14,7 +14,7 @@ def test_rotating_anchor_constraint():
     """Test that each substituent can serve as anchor in ordered combinations.
 
     With 5 subs, each sub as anchor generates C(4,1) + C(4,2) + C(4,3) + C(4,4) = 15 combinations
-    Total: 5 × 15 = 75 combinations
+    Total: 5 x 15 = 75 combinations
     """
     # Create a mock found dict with a single site having subs 1,2,3,4,5
     mock_found = {1: {i: {} for i in [1, 2, 3, 4, 5]}}
@@ -24,7 +24,7 @@ def test_rotating_anchor_constraint():
     # Extract just the subs lists (handle 3-tuple format)
     subs_lists = [tuple(subs) for sites, subs, _ in combos]
 
-    # Expected count: 5 subs × 15 combinations each = 75
+    # Expected count: 5 subs x 15 combinations each = 75
     expected_count = 75
     assert len(combos) == expected_count, (
         f"Expected {expected_count} combinations, got {len(combos)}")
@@ -54,8 +54,8 @@ def test_two_site_combinations():
     """Test combination generation with two sites (site1 has 5 subs, site2 has 6 subs).
 
     Expected counts with rotating anchor:
-    - Site 1: 5 subs × 15 combinations each = 75
-    - Site 2: 6 subs × 31 combinations each = 186
+    - Site 1: 5 subs x 15 combinations each = 75
+    - Site 2: 6 subs x 31 combinations each = 186
     - Total: 75 + 186 = 261 combinations
     """
     # Site 1: subs 1,2,3,4,5 (each can be anchor)
@@ -76,11 +76,11 @@ def test_two_site_combinations():
     # For n=5: C(4,1) + C(4,2) + C(4,3) + C(4,4) = 4 + 6 + 4 + 1 = 15 per anchor
     # For n=6: C(5,1) + C(5,2) + C(5,3) + C(5,4) + C(5,5) = 5 + 10 + 10 + 5 + 1 = 31 per anchor
     assert len(site1_combos) == 75, (
-        f"Expected 75 combinations for site1 (5×15), got {len(site1_combos)}")
+        f"Expected 75 combinations for site1 (5 x 15), got {len(site1_combos)}")
     assert len(site2_combos) == 186, (
-        f"Expected 186 combinations for site2 (6×31), got {len(site2_combos)}")
+        f"Expected 186 combinations for site2 (6 x 31), got {len(site2_combos)}")
 
-    # Cross-site: 75 × 186 = 13,950
+    # Cross-site: 75 x 186 = 13,950
     assert len(cross_site_combos) == 13950, (
         f"Expected 13,950 cross-site combos, got {len(cross_site_combos)}")
 
@@ -97,9 +97,9 @@ def test_14benz_exact_count():
     """Test that 14benz_solv_5.5 generates correct number of combinations.
 
     With rotating anchor constraint:
-    - Site1: 5 subs × 15 combinations each = 75 within-site
-    - Site2: 6 subs × 31 combinations each = 186 within-site
-    - Cross-site: 75 × 186 = 13,950 combinations
+    - Site1: 5 subs x 15 combinations each = 75 within-site
+    - Site2: 6 subs x 31 combinations each = 186 within-site
+    - Cross-site: 75 x 186 = 13,950 combinations
     - Total: 75 + 186 + 13,950 = 14,211 combinations
 
     Note: site2_sub7 has been removed, so site2 now has 6 subs.
@@ -119,7 +119,7 @@ def test_14benz_exact_count():
     within_site = [(sites, subs) for sites, subs, _ in combos if len(sites) == 1]
     cross_site = [(sites, subs) for sites, subs, _ in combos if len(sites) > 1]
 
-    # Verify within-site count matches formula: Σ(n_site × (2^(n_site-1) - 1))
+    # Verify within-site count matches formula: Σ(n_site x (2^(n_site-1) - 1))
     expected_within = 0
     for site in sorted(eligible.keys()):
         site_combos = [c for c in within_site if c[0] == [site]]
@@ -136,7 +136,7 @@ def test_14benz_exact_count():
 
     # Verify cross-site count
     # For 2 sites: site1 has 75 selections, site2 has 186 selections
-    # Cross-site = 75 × 186 = 13,950
+    # Cross-site = 75 x 186 = 13,950
     assert len(
         cross_site) == 13950, f"Expected 13,950 cross-site combinations, got {len(cross_site)}"
 
@@ -406,7 +406,7 @@ def test_cross_site_combinations():
 
     With 2 sites (site1 has 3 subs, site2 has 3 subs):
     - Within-site combos: site1 has 9, site2 has 9 (total 18)
-    - Cross-site combos: 9 × 9 = 81
+    - Cross-site combos: 9 x 9 = 81
     - Total: 18 + 81 = 99 combinations
     """
     mock_found = {
@@ -420,10 +420,10 @@ def test_cross_site_combinations():
     within_site = [(sites, subs) for sites, subs, _ in combos if len(sites) == 1]
     cross_site = [(sites, subs, counts) for sites, subs, counts in combos if len(sites) > 1]
 
-    # For n=3 subs: 3 anchors × (C(2,1) + C(2,2)) = 3 × 3 = 9 per site
+    # For n=3 subs: 3 anchors x (C(2,1) + C(2,2)) = 3 x 3 = 9 per site
     assert len(within_site) == 18, f"Expected 18 within-site combos, got {len(within_site)}"
 
-    # Cross-site: 9 selections for site1 × 9 selections for site2 = 81
+    # Cross-site: 9 selections for site1 x 9 selections for site2 = 81
     assert len(cross_site) == 81, f"Expected 81 cross-site combos, got {len(cross_site)}"
 
     assert len(combos) == 99, f"Expected 99 total combinations, got {len(combos)}"
@@ -441,9 +441,9 @@ def test_14benz_with_cross_site():
     """Test that 14benz_solv_5.5 generates correct number including cross-site.
 
     With rotating anchor constraint:
-    - Site1: 5 subs × 15 combinations each = 75 within-site
-    - Site2: 6 subs × 31 combinations each = 186 within-site
-    - Cross-site: 75 × 186 = 13,950 combinations
+    - Site1: 5 subs x 15 combinations each = 75 within-site
+    - Site2: 6 subs x 31 combinations each = 186 within-site
+    - Cross-site: 75 x 186 = 13,950 combinations
     - Total: 75 + 186 + 13,950 = 14,211 combinations
     """
     repo_root = Path(__file__).resolve().parents[0]
@@ -471,11 +471,11 @@ def test_14benz_with_cross_site():
     print(f"  Cross-site: {len(cross_site)} combinations")
     print(f"  Total: {len(combos)} combinations")
 
-    # Expected: site1 has 5 subs → 75, site2 has 6 subs → 186
+    # Expected: site1 has 5 subs -> 75, site2 has 6 subs -> 186
     assert len(site1_within) == 75, f"Expected 75 site1 within-site, got {len(site1_within)}"
     assert len(site2_within) == 186, f"Expected 186 site2 within-site, got {len(site2_within)}"
 
-    # Cross-site: 75 × 186 = 13,950
+    # Cross-site: 75 x 186 = 13,950
     assert len(cross_site) == 13950, f"Expected 13,950 cross-site, got {len(cross_site)}"
 
     # Total
@@ -506,9 +506,9 @@ def test_cross_site_file_structure():
         created = create_combination_dirs(input_dir, output_dir, dry_run=False)
 
         # Should have: 2 site1-only + 2 site2-only + 4 cross-site = 8 total
-        # Actually with rotating anchor: site1: 1 combo, site2: 1 combo, cross: 1×1 = 1
+        # Actually with rotating anchor: site1: 1 combo, site2: 1 combo, cross: 1x1 = 1
         # Wait, with 2 subs each: anchor 1 with [2], anchor 2 with [1] = 2 per site
-        # So: 2 + 2 + (2×2) = 8 combinations
+        # So: 2 + 2 + (2x2) = 8 combinations
 
         # Find a cross-site combination directory
         cross_site_dirs = [d for d in created if 'site1' in d.name and 'site2' in d.name]

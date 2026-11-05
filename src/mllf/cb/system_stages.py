@@ -96,7 +96,7 @@ def save_state(path, state: Dict[str, Dict]) -> None:
     Path(path).write_text(json.dumps(state, indent=1))
 
 
-# ── Pairs ────────────────────────────────────────────────────────────────────
+# Pairs
 
 def combo_sites(combo_path) -> List[Tuple[int, List[int]]]:
     """(original site, original subs) per site in a combo: from mapping.json
@@ -407,7 +407,7 @@ def pairs_progress(bandit_state: Optional[Dict], pool_keys: Iterable[str], stage
     return n, len(keys)
 
 
-# ── Combos ───────────────────────────────────────────────────────────────────
+# Combos
 
 def site_balanced(saved_data: Dict, nsubs_per_site: Sequence[int],
                   min_population_ratio: float = 0.5, min_site_transitions: int = 10) -> bool:
@@ -477,7 +477,7 @@ def combos_progress(sys_state: Dict, adv: Dict,
     return sum(bool(v) for v in combos.values()), len(combos)
 
 
-# ── Advancing ────────────────────────────────────────────────────────────────
+# Advancing
 
 def criterion_met(adv: Dict, done: int, considered: int) -> bool:
     if considered <= 0:

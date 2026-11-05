@@ -172,94 +172,37 @@ class TestSiteExtraction:
 
 
 class TestDuplicateDetection:
-    """Test duplicate atom detection and removal."""
+    """Atoms of a substituent that coincide with core atoms."""
 
-    def test_find_duplicate_atoms_exact_match(self):
-        """Test finding exact duplicate coordinates."""
+    @pytest.mark.parametrize('coords2, tol, expected', [
+        ([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0], [4.0, 5.0, 6.0]], 1e-4, [0, 2]),   # exact
+        ([[1.00005, 2.00005, 3.00005]], 1e-4, [0]),                            # within tolerance
+        ([[10.0, 20.0, 30.0]], 1e-4, []),                                      # none
+    ])
+    def test_find_duplicate_atoms(self, coords2, tol, expected):
         coords1 = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
-        coords2 = [[1.0, 2.0, 3.0], [7.0, 8.0, 9.0], [4.0, 5.0, 6.0]]
+        assert find_duplicate_atoms(coords1, coords2, tolerance=tol) == expected
 
-        duplicates = find_duplicate_atoms(coords1, coords2)
-
-        assert duplicates == [0, 2]
-
-    def test_find_duplicate_atoms_within_tolerance(self):
-        """Test finding duplicates within tolerance."""
-        coords1 = [[1.0, 2.0, 3.0]]
-        coords2 = [[1.00005, 2.00005, 3.00005]]  # Within 1e-4 A
-
-        duplicates = find_duplicate_atoms(coords1, coords2, tolerance=1e-4)
-
-        assert len(duplicates) == 1
-        assert 0 in duplicates
-
-    def test_find_duplicate_atoms_no_duplicates(self):
-        """Test when no duplicates exist."""
-        coords1 = [[1.0, 2.0, 3.0]]
-        coords2 = [[10.0, 20.0, 30.0]]
-
-        duplicates = find_duplicate_atoms(coords1, coords2)
-
-        assert duplicates == []
-
-    def test_remove_duplicate_atoms(self):
-        """Test removing duplicate atoms from coords and elements."""
+    @pytest.mark.parametrize('core, kept', [
+        ([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]], ([[4.0, 5.0, 6.0]], ['H'])),
+        ([[10.0, 20.0, 30.0]], ([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+                                ['C', 'H', 'N'])),
+    ])
+    def test_remove_duplicate_atoms(self, core, kept):
         coords = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
-        elements = ['C', 'H', 'N']
-        core_coords = [[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]]
-
-        filtered_coords, filtered_elements = remove_duplicate_atoms(
-            coords, elements, core_coords
-        )
-
-        assert len(filtered_coords) == 1
-        assert len(filtered_elements) == 1
-        assert filtered_coords[0] == [4.0, 5.0, 6.0]
-        assert filtered_elements[0] == 'H'
-
-    def test_remove_duplicate_atoms_no_overlap(self):
-        """Test removing duplicates when there are none."""
-        coords = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
-        elements = ['C', 'H']
-        core_coords = [[10.0, 20.0, 30.0]]
-
-        filtered_coords, filtered_elements = remove_duplicate_atoms(
-            coords, elements, core_coords
-        )
-
-        assert filtered_coords == coords
-        assert filtered_elements == elements
+        assert remove_duplicate_atoms(coords, ['C', 'H', 'N'], core) == kept
 
 
 class TestSpatialFiltering:
-    """Test spatial filtering and distance calculations."""
+    """Distances between structures and the PDBs near a substituent."""
 
-    def test_calculate_min_distance_simple(self):
-        """Test minimum distance calculation."""
-        coords1 = [[0.0, 0.0, 0.0]]
-        coords2 = [[3.0, 4.0, 0.0]]
-
-        min_dist = calculate_min_distance(coords1, coords2)
-
-        assert abs(min_dist - 5.0) < 1e-6  # 3-4-5 triangle
-
-    def test_calculate_min_distance_multiple_atoms(self):
-        """Test minimum distance with multiple atoms."""
-        coords1 = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]
-        coords2 = [[2.0, 0.0, 0.0], [20.0, 0.0, 0.0]]
-
-        min_dist = calculate_min_distance(coords1, coords2)
-
-        assert abs(min_dist - 2.0) < 1e-6  # Closest pair is (0,0,0) to (2,0,0)
-
-    def test_calculate_min_distance_empty(self):
-        """Test distance calculation with empty coordinates."""
-        coords1 = []
-        coords2 = [[1.0, 2.0, 3.0]]
-
-        min_dist = calculate_min_distance(coords1, coords2)
-
-        assert min_dist == float('inf')
+    @pytest.mark.parametrize('coords1, coords2, expected', [
+        ([[0.0, 0.0, 0.0]], [[3.0, 4.0, 0.0]], 5.0),
+        ([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]], [[2.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 2.0),
+        ([], [[1.0, 2.0, 3.0]], float('inf')),
+    ])
+    def test_calculate_min_distance(self, coords1, coords2, expected):
+        assert calculate_min_distance(coords1, coords2) == pytest.approx(expected)
 
     def test_find_nearby_pdbs(self, tmp_path):
         """Test finding PDB files within cutoff distance."""

@@ -26,6 +26,7 @@ COMMANDS = {
     'train': ('mllf.cli.train', 'online training from a workflow config'),
     'export': ('mllf.cli.export', 'export production biases from a trained policy'),
     'cost': ('mllf.cli.cost', 'simulated ns per system: online run vs ALF'),
+    'archive': ('mllf.cli.archive', "archive a run's combo directories, one .tar.gz per system"),
 }
 
 DESCRIPTION = 'Machine-learned bias coefficients for multisite lambda dynamics.'

@@ -11,9 +11,8 @@ Functions:
 - combine_pdb_files(pdb_files) -> tuple: (coordinates, elements, atom_counts)
 - calculate_min_distance(coords1, coords2) -> float: minimum distance between two structures
 - find_nearby_pdbs(target_pdb, candidate_pdbs, cutoff) -> list: PDBs within cutoff distance
-- find_reference_subs_from_other_sites(target_pdb, prep_dir, cutoff) -> list: reference
-  subs from other sites
-- parse_pdb_dir(directory, pattern='*.pdb') -> dict mapping filename -> parsed data
+- find_reference_subs_from_other_sites(target_pdb, prep_dir, cutoff) -> list: reference subs
+- parse_pdb_dir(directory, pattern) -> dict mapping filename -> parsed data
 
 Spatial Filtering for Multi-Site Systems:
 The calculate_min_distance() and find_nearby_pdbs() functions enable automatic detection
@@ -169,8 +168,8 @@ def parse_pdb_file(
 
             # Skip CHARMM pseudo-atoms (lone pairs and dummy atoms).
             # These are not real atoms and must not contribute to AEV computation.
-            #   LP*  – lone pair virtual sites (e.g. LP0A, LP0B, LP0Q)
-            #   DM*  – dummy atoms used in alchemical transformations (e.g. DM01, DM02)
+            #   LP*  - lone pair virtual sites (e.g. LP0A, LP0B, LP0Q)
+            #   DM*  - dummy atoms used in alchemical transformations (e.g. DM01, DM02)
             # They have no physical element and would otherwise be defaulted to 'H',
             # introducing spurious radial/angular terms into the AEV.
             if atom_name.upper().startswith(('LP', 'DM')):

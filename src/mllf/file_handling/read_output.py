@@ -247,8 +247,8 @@ def parse_single_ddg(text: str) -> Dict[Tuple[int, int], Optional[float]]:
     None where the output contained 'NaN' (no crossings occurred at that bias level).
 
     This is more granular than SINGLE TRANSITIONS, which only counts total crossings
-    per site: a site with 5 transitions may have 4 between subs 2↔4 and 1 between
-    2↔3, while 3↔4 never crossed at all.  The DDG NaN pattern captures that directly.
+    per site: a site with 5 transitions may have 4 between subs 2<->4 and 1 between
+    2<->3, while 3<->4 never crossed at all.  The DDG NaN pattern captures that directly.
 
     Block IDs start at 2 in CHARMM MSLD output (block 1 = reference).
     For a sequential 0-based node index i, block_id = i + 2.
@@ -257,9 +257,9 @@ def parse_single_ddg(text: str) -> Dict[Tuple[int, int], Optional[float]]:
         text: Full text of a CHARMM MSLD output file.
 
     Returns:
-        Dict mapping (blk_i, blk_j) → float|None where blk_i < blk_j.
+        Dict mapping (blk_i, blk_j) -> float|None where blk_i < blk_j.
         float : biased DDG at highest lambda (pair had multiple crossings).
-        None  : NaN or Inf in output (no usable crossings — either zero, or
+        None  : NaN or Inf in output (no usable crossings; either zero, or
                 only one transition so no round-trip free energy estimate).
         Empty dict if no SINGLE DDG section is found.
     """
@@ -269,7 +269,7 @@ def parse_single_ddg(text: str) -> Dict[Tuple[int, int], Optional[float]]:
     # Detect number of lambda columns from the DDG header line.
     # Format: "BLK(I)..BLK(J).....> 0.950 ....> 0.990 .....> 0.950 ....> 0.990"
     # Columns alternate: [nobias_λ1, nobias_λ2, bias_λ1, bias_λ2]
-    # We want only the bias half — last n_lambda_cols values after the 2 block IDs.
+    # We want only the bias half; last n_lambda_cols values after the 2 block IDs.
     n_lambda_cols = 2  # default: assume 0.95 and 0.99
     blk_hdr_re = re.compile(r"BLK\(I\).*BLK\(J\)")
     lambda_re = re.compile(r">\s*(\d+\.\d+)")
@@ -289,7 +289,7 @@ def parse_single_ddg(text: str) -> Dict[Tuple[int, int], Optional[float]]:
         blk_j = int(m.group(2))
         raw = m.group(3).strip().split()
 
-        # Parse values — convert 'NaN' and Inf to None.
+        # Parse values; convert 'NaN' and Inf to None.
         # Inf means only one crossing (no round-trip), so DDG is undefined;
         # treat it the same as NaN (no usable crossing data).
         vals: List[Optional[float]] = []
@@ -443,24 +443,24 @@ def _pair_counts(frames, ci: int, cj: int) -> Dict[str, int]:
     return n
 
 
-PHYSICAL_LAMBDA = 0.99   # a site is in a physical state when one substituent has λ ≥ this
+PHYSICAL_LAMBDA = 0.99   # a site is in a physical state when one substituent has λ >= this
 
 
 def _pair_transition_counts(frames, pairs, first_block: int,
                             n_cols: int) -> Dict[Tuple[int, int], int]:
-    """Per-pair transition counts at the λ ≥ PHYSICAL_LAMBDA cutoff.
+    """Per-pair transition counts at the λ >= PHYSICAL_LAMBDA cutoff.
 
     CHARMM's SINGLE TRANSITIONS definition, resolved by pair: at each site,
-    frames where one substituent has λ ≥ 0.99 form a sequence of physical
+    frames where one substituent has λ >= 0.99 form a sequence of physical
     states; every change of state is one transition, credited to the pair it
-    moves between (lo → other → hi counts lo/other and other/hi, not lo/hi).
+    moves between (lo -> other -> hi counts lo/other and other/hi, not lo/hi).
     Sites are the connected components of ``pairs`` (same-site pairs from
     SINGLE DDG).
 
     CHARMM's site total also counts the first entry into a physical state, so
     per site: sum of pair counts + 1 (if the site was ever physical) = CHARMM's
     total. Checked on 35 outputs (2-sub, 3-8-sub, two-site): exact except for a
-    rare ±1 when a printed λ is exactly 0.9900 (the trajectory is printed to 4
+    rare +/-1 when a printed λ is exactly 0.9900 (the trajectory is printed to 4
     decimals; CHARMM compares unrounded values).
     """
     # group blocks into sites via the pair graph
@@ -513,7 +513,7 @@ def parse_pair_profile(
       so this moves by -c/4 per unit c, while the linear bias cancels. Measured
       within-pair slope vs c: -0.233 (theory -0.25); vs b: -0.04.
     * ``transitions`` = transitions between this pair's two substituents at
-      the λ ≥ 0.99 cutoff (CHARMM's SINGLE TRANSITIONS, resolved by pair; see
+      the λ >= 0.99 cutoff (CHARMM's SINGLE TRANSITIONS, resolved by pair; see
       ``_pair_transition_counts``). Per site they sum to CHARMM's total minus
       its count of the first entry into a physical state.
     * ``end`` = K_hi - K_lo, where K is each endpoint's sharpness,

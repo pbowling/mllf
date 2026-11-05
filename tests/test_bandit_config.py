@@ -59,7 +59,7 @@ def test_defaults_are_copies_and_other_algorithms_are_untouched():
     assert with_hindsight_defaults({}) == {}
 
 
-# ── BanditConfig ─────────────────────────────────────────────────────────────
+# BanditConfig
 
 def test_bandit_config_defaults_without_a_bandit_block():
     for cfg in ({}, {'bandit': None}):

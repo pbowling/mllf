@@ -35,7 +35,7 @@ target instead trains a shared model conditioned on the substituents' Uni-Mol
 embeddings, so what is learned on one pair improves the first guess for pairs
 and systems that have never been simulated:
 
-* every target enters the NeuralLinear posterior as an observation weighted by
+* every target enters the Bayesian-head posterior as an observation weighted by
   its own variance, rather than being regularized with fixed constants;
 * per-pair offsets combine a pair's own measurements with the model prediction
   as a Bayesian prior, so a pair the model predicts well needs little
@@ -810,7 +810,7 @@ def preact_weights(policy, targets: torch.Tensor, var: torch.Tensor, dims: Seque
     return w
 
 
-# ── Per-pair offsets and exploration ─────────────────────────────────────────
+# Per-pair offsets and exploration
 
 def combo_node_labels(combo_path) -> Optional[List[Tuple[int, int]]]:
     """(original site, original sub) for each node, in node order."""
@@ -1003,8 +1003,8 @@ def apply_pair_offsets(actions: torch.Tensor, mean: torch.Tensor, state: Optiona
 
 def cap_quadratic(actions: torch.Tensor, mean: torch.Tensor,
                   cap: Optional[Dict[str, float]]) -> Tuple[torch.Tensor, int]:
-    """Keep each edge's c within the model's prediction +- max(floor,
-    fraction x |prediction|) (bandit key c_cap: {floor, fraction}), on a copy.
+    """Keep each edge's c within the model's prediction +/- max(floor,
+    fraction x abs(prediction)) (bandit key c_cap: {floor, fraction}), on a copy.
     Pair offsets and barrier-trap steps (apply_pair_offsets) can otherwise
     push c far from the model where crossings never come (luis_mcl1: c 30 ->
     60-107, no good run); in stage 1, 99% of good runs stayed within

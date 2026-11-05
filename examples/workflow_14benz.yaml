@@ -68,6 +68,10 @@ validation_fraction: 0.0
 # ---------------------------------------------------------------------------
 # Policy architecture (UnimolPolicy -- see :doc:`cb_setup`)
 # ---------------------------------------------------------------------------
+# Node features: ligand embedding + phase flags (docs/unimol_representation.rst)
+unimol:
+  env_input: phase
+
 training:
   policy:
     unimol_dim: 512    # Per-embedding dimension of the pretrained Uni-Mol model

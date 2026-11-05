@@ -187,21 +187,21 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
           'population_sites': site index of each entry in 'populations' (None
                        where the output's SINGLE DDG listing doesn't place it)
           'transitions': list of transition counts per site at highest lambda
-          'ddg_pairs': dict mapping "blk_i_blk_j" → float|None at highest lambda
+          'ddg_pairs': dict mapping "blk_i_blk_j" -> float|None at highest lambda
                        (None = NaN = no crossings between that pair)
           'fraction_physical': float|None, fraction of trajectory spent in a
                        fully-resolved ("physical") ligand state at highest
                        lambda (None if the diagnostic isn't in the output)
-          'barrier_pairs': dict mapping "blk_i_blk_j" → float|None, the biased
+          'barrier_pairs': dict mapping "blk_i_blk_j" -> float|None, the biased
                        midpoint free-energy barrier (kcal/mol) along that pair's
                        lambda path (see ``parse_pair_profile``); empty if the
                        output has no lambda trajectory
-          'skew_pairs', 'end_pairs': same keys → the pair's skew (flank) and end
+          'skew_pairs', 'end_pairs': same keys -> the pair's skew (flank) and end
                        (endpoint-sharpness) asymmetries of the biased profile,
                        kcal/mol (see ``parse_pair_profile``)
-          'transition_pairs': same keys → transitions between that pair's two
-                       substituents at the λ ≥ 0.99 cutoff (int)
-          'endpoint_pairs': same keys → the pair's on-edge frame counts at and
+          'transition_pairs': same keys -> transitions between that pair's two
+                       substituents at the λ >= 0.99 cutoff (int)
+          'endpoint_pairs': same keys -> the pair's on-edge frame counts at and
                        just short of each endpoint ({'edge', 'at_lo',
                        'near_lo', 'near_hi', 'at_hi'}, or None); see
                        ``parse_pair_profile``
@@ -325,7 +325,7 @@ def build_edge_weights(
     """Per-edge weight tensor derived from per-pair DDG transition data.
 
     Edges whose substituent pair had no observed lambda-space transitions
-    (NaN DDG → None in ddg_pairs) get *no_transition_weight*; edges where
+    (NaN DDG -> None in ddg_pairs) get *no_transition_weight*; edges where
     transitions were observed get 1.0.  When *ddg_pairs* is empty (data not
     available for this run) every edge gets 1.0 so the loss is unchanged.
 
@@ -350,9 +350,9 @@ def build_edge_weights(
         lo = min(src + 2, dst + 2)
         hi = max(src + 2, dst + 2)
         entry = ddg_pairs.get(f"{lo}_{hi}", "missing")
-        # None      → NaN or Inf (no usable crossings) → down-weight
-        # finite float → transitions observed            → full weight
-        # "missing" → no DDG data at all                → full weight (don't penalise old data)
+        # None      -> NaN or Inf (no usable crossings) -> down-weight
+        # finite float -> transitions observed            -> full weight
+        # "missing" -> no DDG data at all                -> full weight (don't penalise old data)
         no_crossing = entry is None or (isinstance(entry, float) and math.isinf(entry))
         weights.append(no_transition_weight if no_crossing else 1.0)
 
@@ -424,10 +424,10 @@ def compute_pair_reward(
     each MLP head receives a gradient signal matched to the physical quantity it
     controls.  Dimension assignments mirror the policy output order:
 
-      0  linear    — population balance between substituents.
+      0  linear; population balance between substituents.
                      Signal: ``minority_frac = min(pop_i,pop_j)/(pop_i+pop_j+ε)``
-                     ∈ [0, 0.5].  Higher = more equal sampling = better.
-      1  quadratic — barrier height.  Signal: ``barrier_quality(barrier)`` ∈
+                     in [0, 0.5].  Higher = more equal sampling = better.
+      1  quadratic; barrier height.  Signal: ``barrier_quality(barrier)`` in
                      [0.5, 1.0], where ``barrier`` is this pair's biased midpoint
                      free-energy barrier from the lambda trajectory
                      (``barrier_pairs``; see ``parse_pair_barriers``). It is
@@ -441,23 +441,23 @@ def compute_pair_reward(
                      ``(pair_visited + trans_quality) / 2`` with
                      ``trans_quality = min(n_trans, T_base) / T_base``, which is
                      combo-level and also rewards fixing b.
-      2  skew      — barrier asymmetry from soft-core introduction.
-                     Signal: ``gaussian_quality(skew, 0, skew_width)`` ∈ [0.5, 1],
+      2  skew; barrier asymmetry from soft-core introduction.
+                     Signal: ``gaussian_quality(skew, 0, skew_width)`` in [0.5, 1],
                      where ``skew`` is the pair's flank asymmetry of the biased
                      lambda profile (``skew_pairs``; see ``parse_pair_profile``).
-                     It tracks x[lo][hi] - x[hi][lo] (−0.19/+0.19 per unit) and is
+                     It tracks x[lo][hi] - x[hi][lo] (-0.19/+0.19 per unit) and is
                      insensitive to b, c and s. Target 0: the skew biases should
                      cancel the physical surface's asymmetry, so what the
                      simulation samples is symmetric in that respect.
-                     Fallback: ``combined`` — mean of the population-balance and
+                     Fallback: ``combined``; mean of the population-balance and
                      the legacy transition-based quality proxy.
-      3  end       — entropic / surface-tension cost of creating substituent space.
-                     Signal: ``gaussian_quality(end, 0, end_width)`` ∈ [0.5, 1],
+      3  end; entropic / surface-tension cost of creating substituent space.
+                     Signal: ``gaussian_quality(end, 0, end_width)`` in [0.5, 1],
                      where ``end`` is the difference in how sharply the pair's two
                      endpoints hold their population (``end_pairs``). It tracks
-                     s[lo][hi] - s[hi][lo] (−0.44/+0.46 per unit; x leaks ~0.09;
+                     s[lo][hi] - s[hi][lo] (-0.44/+0.46 per unit; x leaks ~0.09;
                      b, c ~0). Target 0, as for skew.
-                     Fallback: ``min(1.0, fraction_physical * total_pairs)`` — the
+                     Fallback: ``min(1.0, fraction_physical * total_pairs)``; the
                      combo-level FRACTION PHYSICAL LIGAND diagnostic (fraction
                      of the trajectory spent in a fully-resolved, single-
                      substituent-per-site state) scaled by the number of
@@ -481,7 +481,7 @@ def compute_pair_reward(
     Args:
         edge_index: [2, E] node-index tensor.
         ddg_pairs: dict from simulation_results 'ddg_pairs':
-                   keys ``"blk_lo_blk_hi"`` → float | None.
+                   keys ``"blk_lo_blk_hi"`` -> float | None.
         populations: list of raw highest-lambda population counts per block
                      (Block ID = node_idx + block_offset).
         total_transitions: total lambda-space crossings observed for this combo
@@ -494,14 +494,14 @@ def compute_pair_reward(
         fraction_physical: combo-level FRACTION PHYSICAL LIGAND value at the
                     highest lambda (0.990), from ``parse_simulation_metrics``.
                     None if the diagnostic wasn't present in the output.
-        barrier_pairs: dict ``"blk_lo_blk_hi"`` → midpoint barrier (kcal/mol)
+        barrier_pairs: dict ``"blk_lo_blk_hi"`` -> midpoint barrier (kcal/mol)
                     or None, from ``parse_simulation_metrics``. None/empty, or a
                     None entry for a pair, falls back to the legacy quadratic
                     signal for that pair.
         barrier_target, barrier_width: centre and width (kcal/mol) of the
                     barrier-quality Gaussian (``reward.barrier_target`` /
                     ``reward.barrier_width`` in the reward config).
-        skew_pairs, end_pairs: dicts ``"blk_lo_blk_hi"`` → skew / end asymmetry
+        skew_pairs, end_pairs: dicts ``"blk_lo_blk_hi"`` -> skew / end asymmetry
                     (kcal/mol) or None, from ``parse_simulation_metrics``. A
                     missing entry falls back to that dim's legacy signal.
         skew_width, end_width: widths (kcal/mol) of the skew / end Gaussians,
@@ -532,7 +532,7 @@ def compute_pair_reward(
 
         # Per-pair DDG existence: True only when THIS pair was never visited.
         # With 3+ subs, total_transitions may be non-zero while this specific
-        # pair has no DDG — the per-pair check catches that correctly.
+        # pair has no DDG; the per-pair check catches that correctly.
         # Also check for zero populations: if both subs were never sampled,
         # this pair couldn't possibly have been visited (DDG=None).
         no_crossing = (
@@ -547,7 +547,7 @@ def compute_pair_reward(
 
             # Legacy quadratic proxy: per-pair visited binary (1.0, since we
             # are inside the else branch) and combo-level transition quality
-            # → ∈ [0.5, 1.0]. Still feeds the skew proxy below.
+            # -> in [0.5, 1.0]. Still feeds the skew proxy below.
             pair_visited = 1.0
             trans_signal = (pair_visited + trans_quality) / 2.0
 
@@ -581,8 +581,8 @@ def compute_pair_reward(
             if is_finite(end_asym):
                 end_signal = gaussian_quality(float(end_asym), 0.0, end_width)
 
-            rewards[k, 0] = minority_frac   # linear:    population balance ∈ [0, 0.5]
-            # quadratic: barrier quality (or legacy proxy) ∈ [0.5, 1]
+            rewards[k, 0] = minority_frac   # linear:    population balance in [0, 0.5]
+            # quadratic: barrier quality (or legacy proxy) in [0.5, 1]
             rewards[k, 1] = quad_signal
             rewards[k, 2] = skew_signal     # skew:      skew-asymmetry quality (or combined proxy)
             rewards[k, 3] = end_signal      # end:       end-asymmetry quality (or legacy proxy)
@@ -601,13 +601,13 @@ def compute_pair_success_stats(
 ) -> Dict[str, int]:
     """Per-pair (per-edge, undirected) success breakdown for reporting.
 
-    Purely diagnostic — not used anywhere in reward/gradient computation.
+    Purely diagnostic; not used anywhere in reward/gradient computation.
     Gives a pair-level view of sampling quality, since the combo-level
     reward/``Avg Reward`` can look fine while individual pairs within a
     multi-site combo are poorly resolved.
 
     CHARMM's output only exposes per-pair *existence* of a valid DDG
-    (``SINGLE DDG`` — requires bidirectional lambda-space crossings for that
+    (``SINGLE DDG``; requires bidirectional lambda-space crossings for that
     specific pair) plus a per-*site* (not per-pair) total transition count;
     there is no true per-pair transition count to threshold directly. So
     "crossed" combines the most granular signal available for a single pair
@@ -664,10 +664,10 @@ def compute_pair_success_stats(
 
 
 def load_bandit_state(path: Path) -> Dict[str, Dict]:
-    """Load the per-combo NeuralLinear+TS bookkeeping state (retries/deferrals).
+    """Load the per-combo Bayesian-head bookkeeping state (retries/deferrals).
 
     The state tracks, per combo, how many times it has failed for
-    infrastructure/software reasons (not simulator-sampling reasons — those are
+    infrastructure/software reasons (not simulator-sampling reasons; those are
     already filtered out before this function's caller sees them; see
     ``record_combo_failure``) so uncertainty-driven combo selection can stop
     repeatedly re-selecting a combo that simply cannot be simulated.
@@ -690,7 +690,7 @@ def load_bandit_state(path: Path) -> Dict[str, Dict]:
 
 
 def save_bandit_state(path: Path, state: Dict[str, Dict]) -> None:
-    """Persist the per-combo NeuralLinear+TS bookkeeping state to JSON."""
+    """Persist the per-combo Bayesian-head bookkeeping state to JSON."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w') as f:
@@ -701,10 +701,10 @@ def record_combo_failure(state: Dict[str, Dict], combo_key: str, cap: int = 3) -
     """Record one infrastructure/software failure for a combo, deferring it past ``cap``.
 
     Mutates *state* in place. Once a combo has failed ``cap`` or more times it
-    is marked ``deferred`` — excluded from uncertainty-driven selection (see
+    is marked ``deferred``; excluded from uncertainty-driven selection (see
     ``select_combos_by_uncertainty``) without being discarded outright, so the
     active-learning loop doesn't spend its whole budget retrying one broken
-    combo (guardrail from the NeuralLinear+TS design note: a software failure
+    combo (guardrail from the Bayesian-head design note: a software failure
     is a missing observation, not evidence the combo is a bad arm).
 
     Args:
@@ -721,8 +721,8 @@ def record_combo_failure(state: Dict[str, Dict], combo_key: str, cap: int = 3) -
 def bayesian_variance_score(policy, data, device: str) -> float:
     """Score a combo by mean Bayesian posterior predictive variance over its edges.
 
-    Requires ``policy.use_bayesian_heads=True`` (NeuralLinear + Thompson Sampling
-    mode) — this is the epistemic-uncertainty scorer originally used by
+    Requires ``policy.use_bayesian_heads=True`` (Bayesian heads with Thompson sampling
+    mode); this is the epistemic-uncertainty scorer originally used by
     ``select_combos_by_uncertainty``. See ``UnimolPolicy.predict_uncertainty``.
     """
     _, var = policy.predict_uncertainty(data.x, data.edge_index, data.edge_type)
@@ -735,12 +735,12 @@ def action_std_score(policy, data, device: str) -> float:
     Works with the plain (non-Bayesian) REINFORCE policy: reuses the same
     ``(mean, log_std)`` Gaussian the policy already samples actions from, so no
     posterior/extra model state is needed. This is *not* epistemic
-    uncertainty — ``log_std`` is a learned exploration parameter that trades
+    uncertainty; ``log_std`` is a learned exploration parameter that trades
     off against the entropy regularizer, so a combo scoring high here is one
     the policy is currently exploring a lot, not necessarily one it would
     learn the most from. Offered as a lower-cost, REINFORCE-compatible
     alternative to random combo selection; see ``bayesian_variance_score`` for
-    the epistemic-uncertainty version (NeuralLinear + TS only).
+    the epistemic-uncertainty version (Bayesian-head only).
     """
     _, log_std = policy._forward_edges(data.x, data.edge_index, data.edge_type)
     return float(torch.exp(log_std).mean().item())
@@ -768,16 +768,16 @@ def select_combos_by_uncertainty(
     model is least sure about (or, with ``action_std_score``, currently
     exploring the most). Callers are expected to have already applied the
     simulator-tractability gate (the existing curriculum/transition filters)
-    to *candidates* — this function only ranks within whatever pool it's
+    to *candidates*; this function only ranks within whatever pool it's
     given, plus the deferred-backfill fallback below. Callers should also cap
     the size of *candidates* themselves (scoring a combo costs the same as
-    training on it — a full Uni-Mol embedding build — so ranking an entire
+    training on it (a full Uni-Mol embedding build) so ranking an entire
     multi-hundred-thousand-combo curriculum pool every epoch is not
     tractable).
 
     Args:
         candidates: Combo path strings to rank (already curriculum/transition
-            filtered — the "simulator-tractability gate").
+            filtered; the "simulator-tractability gate").
         policy: A ``UnimolPolicy``. Must have ``use_bayesian_heads=True`` when
             using the default (Bayesian variance) *score_fn*; the plain
             deterministic/REINFORCE policy works with ``action_std_score``.
@@ -788,14 +788,14 @@ def select_combos_by_uncertainty(
             deferred combos are skipped unless needed as a last-resort backfill.
         device: torch device string for graph building / inference.
         build_graph_fn: Callable ``(combo_dir_str, sys_cfg, config, device) ->
-            (data, extras)`` — injected rather than imported directly to avoid a
+            (data, extras)``; injected rather than imported directly to avoid a
             circular import with ``training/workflow.py`` (typically
             ``build_graph_and_data``).
         ensure_dir_fn: Optional callable ``(combo_path: Path, sys_cfg, config,
             verbose: bool) -> Path`` (typically ``ensure_combo_dir_exists``
             pre-bound to a metadata lookup for *candidates*). Combo
             directories are created lazily, so most of a large curriculum pool
-            has never been materialized on disk — omitting this means nearly
+            has never been materialized on disk; omitting this means nearly
             every such candidate fails ``build_graph_fn`` with a caught
             ``FileNotFoundError`` and is silently excluded from ranking
             (this was the cause of an epoch selecting far fewer than
@@ -806,12 +806,12 @@ def select_combos_by_uncertainty(
             global top-K otherwise silently starves out systems whose
             combos happen to score lower variance (e.g. small manifests, or
             feature directions the trunk already represents well) in favor
-            of whichever systems dominate the candidate pool by count —
+            of whichever systems dominate the candidate pool by count;
             observed in practice as "exploration" converging onto a handful
             of systems while others are never selected.
         score_fn: Callable ``(policy, data, device) -> float`` scoring one
             combo's built graph; higher scores rank first. Defaults to
-            ``bayesian_variance_score`` (the original NeuralLinear + TS
+            ``bayesian_variance_score`` (the original Bayesian-head
             behavior). Pass ``action_std_score`` to use this function with a
             plain REINFORCE policy instead.
         attention_fn: Optional callable ``(combo_path_str, data) -> float``
@@ -867,7 +867,7 @@ def select_combos_by_uncertainty(
 
     if n_skipped:
         log.info(f"  select_combos_by_uncertainty: {n_skipped}/{len(eligible)} candidates "
-                 "could not be scored (graph build failed) — excluded from ranking")
+                 "could not be scored (graph build failed); excluded from ranking")
 
     scored.sort(key=lambda t: t[0], reverse=True)
 
@@ -928,7 +928,7 @@ def compute_failure_reward(
         is near 0.5 (populations balanced), the linear bias was probably fine and
         receives a near-zero advantage.  If ``minority_frac`` is near 0 (system
         pinned in one state), it receives the full ``failure_advantage``.
-        Formula: ``failure_advantage * (1 - 2 * minority_frac)``  ∈
+        Formula: ``failure_advantage * (1 - 2 * minority_frac)``  in
         [failure_advantage, 0].
 
       - Dim 1 (quadratic): fixed ``failure_advantage``.  No transitions always
@@ -939,7 +939,7 @@ def compute_failure_reward(
         available data, but should not receive the full penalty when the
         population is already balanced.
         Formula: ``(failure_advantage * (1 - 2*minority_frac) + failure_advantage) / 2``
-                  ``= failure_advantage * (1 - minority_frac)``  ∈
+                  ``= failure_advantage * (1 - minority_frac)``  in
         [failure_advantage, failure_advantage/2].
 
     Args:
@@ -964,11 +964,11 @@ def compute_failure_reward(
         minority_frac = min(pop_i, pop_j) / (pop_i + pop_j + 1e-8)
 
         # Dim 0 (linear): penalty scales with population imbalance.
-        # minority_frac ≈ 0.5 → near-zero penalty (linear was fine).
-        # minority_frac ≈ 0.0 → full failure_advantage (linear pinned the system).
+        # minority_frac ~ 0.5 -> near-zero penalty (linear was fine).
+        # minority_frac ~ 0.0 -> full failure_advantage (linear pinned the system).
         rewards[k, 0] = failure_advantage * (1.0 - 2.0 * minority_frac)
 
-        # Dim 1 (quadratic): always full penalty — no transitions = barrier too high.
+        # Dim 1 (quadratic): always full penalty; no transitions = barrier too high.
         rewards[k, 1] = failure_advantage
 
         # Dims 2, 3 (skew/end): average of linear calibration and quadratic penalty.

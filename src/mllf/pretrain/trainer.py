@@ -13,6 +13,7 @@ import torch.optim as optim
 from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.policy import UnimolPolicy
 from mllf.cb.warning_summary import WarningSummary
+from mllf.log import log_to_file
 from mllf.pretrain.bayesian_init import (
     estimate_reward_noise_variance,
     initialize_bayesian_heads_from_pretrained,
@@ -30,6 +31,9 @@ from mllf.pretrain.rewards import assign_run_rewards, build_pair_advantages
 
 
 log = logging.getLogger(__name__)
+
+# Every message of a pretraining run, with time stamps, in its output directory.
+LOG_FILE = 'pretrain.log'
 
 
 def _awr_run_loss(w, logp_per, combined_mask, active_mask, w_sum, data_hygiene):
@@ -358,32 +362,23 @@ def build_policy(config: Dict, unimol: UnimolSettings, device) -> UnimolPolicy:
 
 def _print_setup(unimol: UnimolSettings) -> None:
     # Fixed schema: 4 bias types (linear, quadratic, skew, end), 2 directions each.
-    log.info("\nSchema for Uni-Mol pretraining:")
-    log.info("  Bias types: 4 (linear, quadratic, skew, end)")
-    log.info(f"  Relations: {len(RELATION_NAMES)} (2 directions per type)")
-    log.info(f"  Relation names: {RELATION_NAMES}")
-    log.info(f"Environment input: {unimol.env_input}")
-    log.info(f"Ligand other-site reference substituents: {unimol.ligand_other_sites}")
-    log.info(f"Site-size input: {unimol.site_size_input}")
-    log.info(f"Ligand geometry from minimized.pdb for minimized runs: "
-             f"{unimol.ligand_from_minimized}")
+    log.debug("\nSchema for Uni-Mol pretraining:")
+    log.debug("  Bias types: 4 (linear, quadratic, skew, end)")
+    log.debug(f"  Relations: {len(RELATION_NAMES)} (2 directions per type)")
+    log.debug(f"  Relation names: {RELATION_NAMES}")
+    log.debug(f"Environment input: {unimol.env_input}")
+    log.debug(f"Ligand other-site reference substituents: {unimol.ligand_other_sites}")
+    log.debug(f"Site-size input: {unimol.site_size_input}")
+    log.debug(f"Ligand geometry from minimized.pdb for minimized runs: "
+              f"{unimol.ligand_from_minimized}")
 
 
 def _print_model(policy, unimol: UnimolSettings, opts: PretrainOptions, n_runs: int) -> None:
-    log.info("\nModel architecture:")
-    if unimol.use_environment_difference:
-        log.info("  Policy: UnimolPolicy (dual embeddings: ligand-only + full)")
-        log.info("  Input: [diff_ligand(512D), mean_full(512D)] = 1024D edge features")
-        log.info("  diff_ligand captures substituent variation (sub-dependent)")
-        log.info("  mean_full captures environment effects (environment-dependent)")
-    else:
-        log.info("  Policy: UnimolPolicy (ligand+environment)")
-        log.info("  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
-    log.info(f"  Total parameters: {sum(p.numel() for p in policy.parameters())}")
     lr = opts.learning_rate
-    log.info(f"  Learning rate: {lr} (cosine annealed to {lr / 100:.6f})")
-    log.info(f"  Early stopping patience: {opts.patience} epochs")
-    log.info(f"  Graph caching: all {n_runs} graphs pre-built once, reused across all epochs")
+    log.info(f"\nPolicy: {sum(p.numel() for p in policy.parameters())} parameters, node input "
+             f"{unimol.env_input}; learning rate {lr} (cosine annealed to {lr / 100:.6f}), "
+             f"early stopping after {opts.patience} epochs without improvement")
+    log.debug(f"  Graphs for all {n_runs} runs are built once and reused across epochs")
 
 
 @dataclass
@@ -422,7 +417,6 @@ def _train_epochs(policy, optimizer, scheduler, runs, inputs: RunInputs, weights
     # one run per group: pretrain_epoch's per-group gradient accumulation
     groups = {f"run_{i}": [i] for i in range(len(runs)) if inputs.graph_cache[i] is not None}
     for epoch in range(progress.start_epoch, opts.epochs):
-        log.info(f"Epoch {epoch + 1}/{opts.epochs}")
         stats = pretrain_epoch(
             policy, optimizer, runs, reward_config, device,
             graph_cache=inputs.graph_cache,
@@ -436,20 +430,21 @@ def _train_epochs(policy, optimizer, scheduler, runs, inputs: RunInputs, weights
             system_emphasis=opts.system_emphasis,
             data_hygiene=opts.data_hygiene,
         )
-        log.info(f"  AWR Loss: {stats['loss']:.4f}")
-        log.info(f"  Runs processed: {stats['num_runs']} "
-                 f"({stats.get('num_updates', stats['num_runs'])} grad steps)")
-        log.info(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+        lr = scheduler.get_last_lr()[0]
         scheduler.step()
 
-        if stats['loss'] < progress.best_loss:
+        improved = stats['loss'] < progress.best_loss
+        if improved:
             progress.best_loss = stats['loss']
             progress.epochs_without_improvement = 0
             torch.save({'policy_state': policy.state_dict(), 'epoch': epoch + 1,
                         'loss': stats['loss']}, output_dir / "best_policy.pt")
-            log.info(f"  Saved best model (loss: {progress.best_loss:.4f})")
         else:
             progress.epochs_without_improvement += 1
+        log.info(f"Epoch {epoch + 1}/{opts.epochs}: AWR loss {stats['loss']:.4f}, "
+                 f"{stats['num_runs']} runs ({stats.get('num_updates', stats['num_runs'])} "
+                 f"gradient steps), learning rate {lr:.6f}"
+                 + ("; saved as best" if improved else ""))
 
         torch.save({'policy_state': policy.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
@@ -471,9 +466,7 @@ def _save_bayesian_siblings(policy, config: Dict, unimol: UnimolSettings,
     deterministic readout (``initialize_bayesian_heads_from_pretrained``) and
     its noise variance estimated from the behavior-cloning residuals. The
     deterministic checkpoints are not changed."""
-    log.info(f"\n{'=' * 60}")
-    log.info("NeuralLinear + TS: building Bayesian-head sibling checkpoint(s)")
-    log.info(f"{'=' * 60}")
+    log.info("Building the Bayesian-head checkpoint(s)")
     try:
         hygiene_weights = weights_cache if opts.data_hygiene else None
         noise_vars = estimate_reward_noise_variance(
@@ -537,9 +530,10 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
     arguments) are the command-line settings, see ``PretrainOptions``.
 
     Writes to ``output_dir``: best_policy.pt, checkpoint_epoch_NNN.pt,
-    final_policy.pt, pretrain_metadata.json, environment_consensus.json,
-    pretraining_representations_used.csv and, with ``bayesian_heads``,
-    best/final_policy_bayesian.pt.
+    final_policy.pt, pretrain_metadata.json, pretrain.log (every message),
+    pretraining_systems.json, pretraining_representations_used.csv,
+    environment_consensus.json (env_input 'dual') and, with
+    ``bayesian_heads``, best/final_policy_bayesian.pt.
     """
     if options is not None and kwargs:
         raise TypeError("pass either options or keyword arguments, not both")
@@ -580,22 +574,19 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
                            device)
 
     # Warnings (one per run and file, often) are summarized once at the end.
-    with WarningSummary(show_template=True, width=120):
+    with log_to_file(output_dir / LOG_FILE), WarningSummary(show_template=True, width=120):
         inputs = build_run_inputs(runs, unimol, output_dir)
         weights_cache = build_pairwise_weights(runs, inputs.nsubs_by_system, opts.data_hygiene)
         advantages = (build_pair_advantages(runs, inputs.graph_cache, reward_config)
                       if opts.use_per_pair_awr else None)
         reward_weighted = opts.reward_weighted
         if assign_run_rewards(runs, reward_config) == 0 and reward_weighted:
-            log.warning("  Warning: all rewards zero or negative — disabling reward weighting.")
+            log.warning("  Warning: all rewards zero or negative; disabling reward weighting.")
             reward_weighted = False
 
-        log.info(f"\n{'=' * 60}")
-        log.info(f"Starting behavior cloning for {opts.epochs} epochs")
-        log.info(f"Training on {len(runs)} runs ({inputs.n_ok} with valid graphs)")
-        if reward_weighted:
-            log.info("Reward-weighted loss: ENABLED")
-        log.info(f"{'=' * 60}\n")
+        log.info(f"\nBehavior cloning: {opts.epochs} epochs on {len(runs)} runs "
+                 f"({inputs.n_ok} with valid graphs)"
+                 + ("; reward-weighted loss" if reward_weighted else ""))
         _train_epochs(policy, optimizer, scheduler, runs, inputs, weights_cache, advantages,
                       reward_weighted, unimol, opts, reward_config, output_dir, device,
                       progress)
@@ -606,8 +597,5 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
                                     output_dir, device)
         _write_metadata(config, unimol, opts, len(runs), inputs.n_ok, progress.best_loss,
                         output_dir, device)
-        log.info(f"\n{'=' * 60}")
-        log.info("Behavior cloning complete!")
-        log.info(f"Best MSE loss: {progress.best_loss:.4f}")
-        log.info(f"Saved to: {output_dir}")
-        log.info(f"{'=' * 60}")
+        log.info(f"\nBehavior cloning complete: best loss {progress.best_loss:.4f}; "
+                 f"saved to {output_dir}")

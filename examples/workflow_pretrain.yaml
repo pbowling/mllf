@@ -9,8 +9,14 @@
 # Controls which molecular structures are used to compute Uni-Mol embeddings
 # This allows training with diverse structural conformations (minimized vs unrelaxed)
 unimol:
+  env_input: phase
+    # Second half of each node: 'phase' (phase flags; every current model) or
+    # 'phase_ligmean', or 'dual' for an environment embedding (the default when
+    # unset; the environment options below apply to 'dual' only).
+    # See docs/unimol_representation.rst.
+
   structure_selection: unrelaxed
-    # Options:
+    # Options (the structure the environment is read from, with env_input 'dual'):
     # - 'minimized': environment from the run's prep/minimized.pdb (or .crd) (default)
     # - 'unrelaxed': environment from prep/protein.pdb or solvent.pdb, skipping
     #   minimized.pdb/.crd
@@ -52,10 +58,8 @@ unimol:
     # in one place instead of scattered across thousands of per-combo dirs.
   
   use_environment_consensus: true
-    # If true, build consensus environment atoms for each site using the core scaffold
-    # to define which environment atoms are relevant. This ensures consistent environment
-    # representation across pretraining, analysis, and online training.
-    # Default: true (recommended for consistent environment filtering)
+    # env_input 'dual' only: define each site's environment atoms once from the core
+    # scaffold, so every substituent at the site shares them (default true).
     # 
     # NOTE: Environment is now always defined by core scaffold coordinates (8Å cutoff),
     # not by consensus across substituents. This provides stable, consistent filtering

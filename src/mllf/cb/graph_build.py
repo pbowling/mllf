@@ -54,7 +54,7 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
 
     # Persistent Uni-Mol embedding cache (unimol.cache_embeddings / unimol.cache_dir
     # in the config, same convention as pretraining). Keyed by each
-    # combo's own (site/sub PDB path, core.pdb path, prep dir) — NOT
+    # combo's own (site/sub PDB path, core.pdb path, prep dir); NOT
     # canonicalized back to training/systems/<name>/prep/, because core.pdb
     # can be mutated per-combo for single-site combinations
     # (augment_core_with_excluded_sub1 merges in excluded sites' sub1 atoms),
@@ -134,28 +134,20 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
         else:
             custom_search_paths.append(solvent_pdb)
 
-    # Compute Uni-Mol embeddings for each substituent at each site
-    # Use dual embeddings [ligand_only (512D) + full (512D)] = 1024D
-    # This matches pretraining configuration: edge input = [diff_ligand, mean_full]
-    #
-    # Build a per-site consensus atom set from the CORE scaffold (identical
-    # for every substituent at a site, since the core doesn't change when
-    # swapping substituents). This matches pretraining's approach and
-    # ensures the environment half of the embedding is consistent across
-    # subs at a site, exactly as during pretraining.
-    # In a phase mode (unimol.env_input) the full half is the phase flags: no
-    # environment embedding is computed; the consensus below then only enters
-    # the ligand embedding's cache key.
+    # Each node is [ligand (512) | second half (512)]. With unimol.env_input
+    # 'dual' the second half embeds the ligand in its environment, filtered
+    # per site to the atoms near the core (identical for every substituent at
+    # the site, as in pretraining); with 'phase' / 'phase_ligmean' it holds
+    # the phase flags and no environment is read.
     combo_name = combo_path.name
-    _env_input = global_config.get('unimol', {}).get('env_input', 'dual')
-    _kind = 'dual' if _env_input == 'dual' else f'ligand + {_env_input}'
-    log.info(f"  Computing Uni-Mol embeddings ({_kind}) for {combo_name} (system: "
-             f"{system_config.get('name', 'unknown')}, solvent_state: {solvent_state})")
+    env_input = global_config.get('unimol', {}).get('env_input', 'dual')
+    log.debug(f"embedding {combo_name} ({system_config.get('name', 'unknown')}, "
+              f"{solvent_state}, env_input {env_input})")
     if custom_search_paths:
-        log.info(f"    Custom environment PDB paths: {custom_search_paths}")
+        log.debug(f"  environment PDB paths: {custom_search_paths}")
 
-    site_consensus = {}  # site_idx -> consensus_atoms set
-    if solvent_state and solvent_state.lower() != 'gas':
+    site_consensus = {}  # site_idx -> consensus atoms ('dual' only)
+    if env_input == 'dual' and solvent_state and solvent_state.lower() != 'gas':
         for site_idx in sorted(site_to_sub_map.keys()):
             try:
                 consensus_atoms = build_environment_consensus(
@@ -166,17 +158,13 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                 )
                 if consensus_atoms:
                     site_consensus[site_idx] = consensus_atoms
-                    log.info(f"    Site {site_idx}: consensus contains {len(consensus_atoms)} "
-                             "atoms")
+                    log.debug(f"  site {site_idx}: {len(consensus_atoms)} environment atoms")
                 else:
-                    log.info(
-                        f"    Site {site_idx}: no consensus found, using distance-based fallback")
+                    log.debug(f"  site {site_idx}: no shared environment atoms; "
+                              "using the distance cutoff")
             except Exception as e:
-                log.info(
-                    f"    Site {site_idx}: consensus building failed ({e}), using distance-based "
-                    "fallback")
-    else:
-        log.info("    Skipping consensus building for gas-phase system (no environment)")
+                log.debug(f"  site {site_idx}: environment atoms failed ({e}); "
+                          "using the distance cutoff")
 
     unimol_embeddings = []
     for site_idx in sorted(site_to_sub_map.keys()):
@@ -187,8 +175,7 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
         for sub_idx in sorted(sub_dict.keys()):
             sub_pdb_path = sub_dict[sub_idx]
             try:
-                # Use dual embedding mode: [ligand_only (512D) + full (512D)]
-                # Skip minimized.pdb since online training uses unrelaxed structures only
+                # online training uses the unrelaxed structures (skip minimized.pdb)
                 emb_ligand, emb_full = get_substituent_dual_embeddings(
                     sub_pdb=sub_pdb_path,
                     core_pdb=core_pdb,
@@ -202,15 +189,13 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                     consensus_atoms=site_consensus_atoms,  # Filter by site consensus
                     cache_dir=embed_cache_dir,
                     save_cache=(embed_cache_dir is not None),
-                    # unimol.env_input 'phase': phase flags in the full half (UnimolPolicy)
-                    env_input=global_config.get('unimol', {}).get('env_input', 'dual'),
+                    env_input=env_input,
                     # unimol.ligand_other_sites: other sites' reference subs in the ligand half
                     ligand_other_sites=bool(
                         global_config.get(
                             'unimol', {}).get(
                             'ligand_other_sites', False)),
                 )
-                # Concatenate dual embeddings: [512 ligand + 512 full] = 1024D
                 sub_emb = np.concatenate([emb_ligand, emb_full])  # [1024]
                 if sub_emb.ndim == 1:
                     sub_emb = sub_emb[np.newaxis, :]  # [1024] -> [1, 1024]

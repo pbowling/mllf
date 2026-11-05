@@ -118,7 +118,7 @@ class EpochOptions:
     replay_cache: Dict[str, list] = field(default_factory=dict)
 
 
-# ── small helpers ───────────────────────────────────────────────────────────
+# small helpers
 
 def sample_actions(policy, x, edge_index, edge_type, deterministic: bool = False,
                    exploration_scale: float = 1.0):
@@ -211,7 +211,7 @@ class _Job:
     retries: int = 0
 
 
-# ── the epoch ───────────────────────────────────────────────────────────────
+# the epoch
 
 class EpochRun:
     """State shared by the phases of one ``train_epoch`` call."""
@@ -387,7 +387,7 @@ class EpochRun:
                                       parse_simulation_metrics(prev_output), self.run_id),
                        epoch_dir / 'epoch_results.pt')
             if self.opts.verbose:
-                log.info(f"  Recovered from existing output.out: reward={reward:.4f}")
+                log.debug(f"  Recovered from existing output.out: reward={reward:.4f}")
             return reward
         except Exception as e:
             warnings.warn(f"Recovery from output.out failed for {combo_path.name}: {e}")
@@ -405,23 +405,23 @@ class EpochRun:
             cached_reward_config = cached.get('reward_config', {})
             if any(cached_reward_config.get(k) != self.reward_cfg.get(k) for k in REWARD_DEFAULTS):
                 if verbose:
-                    log.info("  Reward config changed - recomputing reward")
+                    log.debug("  Reward config changed - recomputing reward")
                 try:
                     reward = msld_reward(epoch_results_file.parent, self.reward_cfg, verbose)
                     if verbose:
-                        log.info(f"  Old reward: {cached.get('reward', 'N/A')} -> "
-                                 f"New reward: {reward:.4f}")
+                        log.debug(f"  Old reward: {cached.get('reward', 'N/A')} -> "
+                                  f"New reward: {reward:.4f}")
                 except Exception as _e:
                     warnings.warn(f"Could not recompute reward for {combo_path.name}: {_e}")
                     reward = cached['reward']
             else:
                 reward = cached['reward']
             if verbose:
-                log.info(f"  Using cached reward: {reward:.4f}")
+                log.debug(f"  Using cached reward: {reward:.4f}")
             return reward
         except LookupError as e:
             if verbose:
-                log.info(f"  Not reusing {epoch_results_file}: {e}")
+                log.debug(f"  Not reusing {epoch_results_file}: {e}")
         except Exception as e:
             warnings.warn(f"Failed to load cached results for {combo_path.name}: {e}")
         return None
@@ -482,11 +482,11 @@ class EpochRun:
                                      linear_var=lin_var)
         if not self.config.get('run_sims', True):
             if self.opts.verbose:
-                log.info("  Skipping simulation (run_sims=False)")
+                log.debug("  Skipping simulation (run_sims=False)")
             return ('skip', combo_idx)
         if self.opts.verbose:
-            log.info(f"  Prepared {combo_idx + 1}/{len(self.combos)}: "
-                     f"{sys_cfg.get('name', 'unknown')}/{combo_path.name}")
+            log.debug(f"  Prepared {combo_idx + 1}/{len(self.combos)}: "
+                      f"{sys_cfg.get('name', 'unknown')}/{combo_path.name}")
         return ('pending', combo_idx, combo_path, epoch_dir, actions, logp, sys_cfg)
 
     def prepare_all(self):
@@ -500,8 +500,7 @@ class EpochRun:
                            **build_combo_dir_lookup(self.combos, self.combo_system_map,
                                                     explicit=self.opts.explicit_combos)}
         n_workers = self.config.get('phase1_workers', 2)
-        log.info(f"\n=== Phase 1: preparing {len(self.combos)} combos "
-                 f"({n_workers} workers) ===")
+        log.info(f"\nPhase 1: preparing {len(self.combos)} combos ({n_workers} workers)")
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as ex:
             results = list(ex.map(self.prepare_combo, enumerate(self.combos)))
         pending = []
@@ -545,7 +544,7 @@ class EpochRun:
                 rep_epoch_dir = rep_path / f"run_{self.epoch:03d}"
                 rep_epoch_dir.mkdir(exist_ok=True, parents=True)
                 if (rep_epoch_dir / 'epoch_results.pt').exists():
-                    break  # already cached — counts as done
+                    break  # already cached; counts as done
                 rep_data, rep_extras = build_graph_and_data(str(rep_path), rep_sys, self.config,
                                                             self.device)
                 save_graph_data_cache(rep_epoch_dir, rep_data)
@@ -562,11 +561,11 @@ class EpochRun:
                     str(rep_path), str(rep_epoch_dir), config=self.config,
                     solvent_state=rep_sys.get('solvent_state', 'solv'))
                 job_queue.append(_Job(rep_path, rep_epoch_dir, rep_job_id, rep_act, rep_lp))
-                log.info(f"  Replacement: {rep_sys.get('name', 'unknown')}/{rep_path.name}"
-                         f"  →  job {rep_job_id}")
+                log.debug(f"  Replacement: {rep_sys.get('name', 'unknown')}/{rep_path.name}"
+                          f"  ->  job {rep_job_id}")
                 break
             except Exception as rep_e:
-                log.info(f"  Replacement {rep_path.name} failed: {rep_e} — trying next")
+                log.debug(f"  Replacement {rep_path.name} failed: {rep_e}; trying next")
 
     def _finish_job(self, job: _Job, job_queue: List[_Job], reserve: List[str]) -> None:
         """A submitted job left the queue: retry it, give it up (and replace
@@ -575,8 +574,8 @@ class EpochRun:
         output_file = job.epoch_dir / 'output.out'
         success = check_simulation_success(output_file)
         if not success and job.retries < max_retries:
-            log.info(f"  Simulation failed for {job.combo_path.name}, retrying "
-                     f"(attempt {job.retries + 2}/{max_retries + 1})...")
+            log.debug(f"  Simulation failed for {job.combo_path.name}, retrying "
+                      f"(attempt {job.retries + 2}/{max_retries + 1})...")
             try:
                 # nodes added to slurm.exclude_file since the first attempt apply
                 refresh_exclude(job.epoch_dir / 'run_epoch.sh', self.config.get('slurm'))
@@ -587,12 +586,12 @@ class EpochRun:
                                       result.stdout.strip().split()[-1],
                                       job.actions, job.logp, job.retries + 1))
             except Exception as e:
-                log.error(f"  Error resubmitting: {e} — skipping {job.combo_path.name}")
+                log.error(f"  Error resubmitting: {e}; skipping {job.combo_path.name}")
             return
         if not success:
             failed_sys = self.sys_name(job.combo_path)
             log.warning(f"  SKIP: {failed_sys}/{job.combo_path.name} permanently failed "
-                        f"after {max_retries + 1} attempt(s) — continuing without it")
+                        f"after {max_retries + 1} attempt(s); continuing without it")
             self.permanently_failed.append(f"{failed_sys}/{job.combo_path.name}")
             self.failed_run_dirs.append((failed_sys, str(job.epoch_dir), False))
             if self.bandit_state is not None:
@@ -605,7 +604,7 @@ class EpochRun:
             self._submit_replacement(reserve, job_queue)
             return
 
-        log.info(f"  {self.sys_name(job.combo_path)}/{job.combo_path.name}:")
+        log.debug(f"  {self.sys_name(job.combo_path)}/{job.combo_path.name}:")
         try:
             reward = msld_reward(job.epoch_dir, self.reward_cfg, self.opts.verbose)
         except Exception as e:
@@ -613,10 +612,10 @@ class EpochRun:
             reward = -100.0
         self.epoch_rewards.append(reward)
         raw_metrics = parse_simulation_metrics(output_file)
-        log.info(f"  {format_coverage_line(raw_metrics)}")
+        log.debug(f"  {format_coverage_line(raw_metrics)}")
         crossing = format_crossing_line(raw_metrics)
         if crossing:
-            log.info(f"  {crossing}")
+            log.debug(f"  {crossing}")
         torch.save(results_record(reward, job.actions, detach_cpu_or_none(job.logp),
                                   self.reward_cfg,
                                   raw_metrics, self.run_id), job.epoch_dir / 'epoch_results.pt')
@@ -630,9 +629,10 @@ class EpochRun:
         reserve = list(self.opts.reserve_pool) if self.opts.reserve_pool else []
         job_queue: List[_Job] = []
         n_submitted = 0
+        live_status = sys.stdout.isatty() and log.isEnabledFor(logging.INFO)
         if pending:
-            log.info(f"\n=== Phase 2: submitting {counts['pending']} simulations "
-                     f"(max {max_concurrent} concurrent SLURM jobs) ===")
+            log.info(f"\nPhase 2: submitting {counts['pending']} simulations "
+                     f"(max {max_concurrent} concurrent SLURM jobs)")
         while job_queue or pending:
             sq = subprocess.run(['squeue', '--me', '--noheader', '--format=%i'],
                                 capture_output=True, text=True)
@@ -651,8 +651,8 @@ class EpochRun:
                                                                              'solv'))
                     job_queue.append(_Job(p_combo, p_edir, job_id, p_act, p_lp))
                     n_submitted += 1
-                    log.info(f"  Submitted {n_submitted}/{counts['pending']}: "
-                             f"{p_sys_name}/{p_combo.name}  →  job {job_id}")
+                    log.debug(f"  Submitted {n_submitted}/{counts['pending']}: "
+                              f"{p_sys_name}/{p_combo.name}  ->  job {job_id}")
                     slots -= 1
                 except Exception as e:
                     # Usually a cluster/config problem (e.g. missing slurm:
@@ -666,11 +666,12 @@ class EpochRun:
 
             if job_queue or pending:
                 n_active = len([j for j in job_queue if str(j.job_id) in active_ids])
-                if log.isEnabledFor(logging.INFO):   # live status line, rewritten in place
+                if live_status:   # rewritten in place; a log file would keep every copy
                     print(f"  [running={n_active} | finishing={len(job_queue) - n_active} | "
                           f"queued={len(pending)}]", end='\r', flush=True)
                 time.sleep(poll_interval)
-        log.info('')  # newline after the \r status line
+        if live_status:
+            print()   # end the status line
         log.info(f"  Complete: {n_submitted} submitted, {counts['cached']} cached, "
                  f"{counts['skip']} skipped, {counts['error']} errors")
         return n_submitted

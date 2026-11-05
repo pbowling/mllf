@@ -39,7 +39,7 @@ def _applied(n, b=None):
     return {'b': b or [0.0] * n, 'c': z, 'x': z, 's': z}
 
 
-# ── Item 1: pairs that exchange through other substituents ──────────────────
+# Item 1: pairs that exchange through other substituents
 
 def test_linear_measured_through_other_substituents():
     # Both sampled, no direct transitions, but each exchanged with the site.
@@ -90,7 +90,7 @@ def test_pair_succeeded_uses_node_transitions_on_larger_site():
     assert not pair_succeeded(saved, 1, 2)          # direct count alone: 0
 
 
-# ── Item 2: pinned / stranded on larger sites ───────────────────────────────
+# Item 2: pinned / stranded on larger sites
 
 def test_pinned_only_for_pairs_with_the_starting_substituent():
     ep = {'edge': 1000, 'at_lo': 1000, 'near_lo': 0, 'near_hi': 0, 'at_hi': 0}
@@ -116,7 +116,7 @@ def test_two_sub_pinned_and_stranded_unchanged():
     assert stranded.all()
 
 
-# ── Item 3: b from every within-site edge ───────────────────────────────────
+# Item 3: b from every within-site edge
 
 def test_fit_site_b_consistent_differences_exact():
     lin = {(0, 1): 1.0, (1, 0): -1.0, (0, 2): 3.0, (2, 0): -3.0, (1, 2): 2.0, (2, 1): -2.0}
@@ -164,7 +164,7 @@ def test_linear_edge_variance_uses_pair_observations():
     assert float(v[3]) < 0.25 and float(v[0]) == pytest.approx(9.0)
 
 
-# ── Item 12: cost ledger ────────────────────────────────────────────────────
+# Item 12: cost ledger
 
 _OUT = """ header
    NSTEP =   125000    NSAVC =     1000    NSAVV =       10
@@ -205,7 +205,7 @@ def test_alf_cost_follows_metadata_source(tmp_path):
     assert cost == {'runs': 1, 'ns': pytest.approx(1.0), 'missing': 1}
 
 
-# ── Items 4-5: per-system stages ────────────────────────────────────────────
+# Items 4-5: per-system stages
 
 STAGES = [
     {'name': 'pairs', 'epochs': 5, 'systems': ['a'],
@@ -275,7 +275,7 @@ def test_criterion_met_respects_min_combos():
     assert not ss.criterion_met({}, 0, 0)
 
 
-# ── Item 13: export labels for a system input dir ───────────────────────────
+# Item 13: export labels for a system input dir
 
 def test_input_dir_labels_sorted_numerically(tmp_path):
     prep = tmp_path / 'prep'
@@ -286,7 +286,7 @@ def test_input_dir_labels_sorted_numerically(tmp_path):
     assert input_dir_labels(tmp_path) == [(1, 1), (1, 2), (1, 10), (2, 1)]
 
 
-# ── Item 7: explicit combo sets from ALF groups ─────────────────────────────
+# Item 7: explicit combo sets from ALF groups
 
 def _rtf(path, source, atoms):
     lines = ['* stream', f'* (fragment from {source})', '*', 'PRES S1S1 0.0']
@@ -384,7 +384,7 @@ def test_explicit_groups_and_their_pairs(tmp_path):
     assert len(sets['groups']) == 1
 
 
-# ── Short exploratory runs + full-length confirmation ───────────────────────
+# Short exploratory runs + full-length confirmation
 
 _MSLD = """timestep = 0.002            # ps
 esteps = 125000             # number of time steps for equilibration
@@ -430,7 +430,7 @@ def test_combo_pair_flags_and_resolved():
     assert not ss.combo_resolved(state, 's', '/x/pair01_site1_subs_1_2', 'p', {'successes': 1})
 
 
-# ── Groups run when ready, retire once every substituent is sampled ─────────
+# Groups run when ready, retire once every substituent is sampled
 
 def test_group_test_every_sub_sampled():
     sampled = {'populations': [5, 900, 1, 40, 2000], 'transitions': [0, 1]}
@@ -501,7 +501,7 @@ def test_label_group_export_renames_unconverged(tmp_path):
     assert out2.name == 'group01_site1_subs_1_2_3' and (out2 / 'confidence.json').exists()
 
 
-# ── Retirement, group holds, reversed partners ──────────────────────────────
+# Retirement, group holds, reversed partners
 
 def _st(successes=0, epochs=0):
     return {'stages': {'p': {'visits': epochs, 'successes': successes, 'epochs': epochs}}}
@@ -576,7 +576,7 @@ def test_reversed_pair_partner(tmp_path):
     assert cs.reversed_pair(tmp_path / 'group01_site1_subs_1_2_3') is None
 
 
-# ── Retirement rules, partial resolving, scouting, long runs, group window ──
+# Retirement rules, partial resolving, scouting, long runs, group window
 
 def test_retire_terms_reference_rule_applies_to_reference_pairs_only():
     rule = {'keys': {'s|s1|1|2'}, 'after_epochs': 10, 'min_successes': 0}

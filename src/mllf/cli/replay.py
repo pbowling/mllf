@@ -68,8 +68,11 @@ def run(args: argparse.Namespace) -> int:
     if Path(cfg['replay_cache']).exists():
         log.error(f"{cfg['replay_cache']} exists; remove it or choose another --cache")
         return 1
-    data = build_replay_set(cfg, seed=0)
-    log.info(f"replay runs: {len(data)}")
+    from mllf.log import log_to_file
+    with log_to_file(Path(cfg['replay_cache']).with_suffix('.log')) as log_file:
+        log.info(f"Log: {log_file}")
+        data = build_replay_set(cfg, seed=0)
+        log.info(f"replay runs: {len(data)}")
     return 0
 
 

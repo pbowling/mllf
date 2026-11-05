@@ -9,13 +9,13 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from unimol_tools import UniMolRepr
 
 from mllf.cb.policy import ENV_INPUTS, PHASE_DIM, PHASE_NODE_INPUTS
 from mllf.file_handling.generate_combinations import is_combo_dir_name
@@ -24,9 +24,29 @@ from mllf.file_handling.read_pdb import (
     find_reference_subs_from_other_sites,
     parse_pdb_file,
 )
+from mllf.log import quiet_unimol_tools
 
 
 log = logging.getLogger(__name__)
+
+
+def _import_unimol_repr():
+    """Import UniMolRepr without the empty logs/ directory unimol_tools
+    creates in the working directory on import, and with its logger kept to
+    warnings."""
+    logs = Path.cwd() / 'logs'
+    existed = logs.exists()
+    if not sys.stderr.isatty():
+        # per-call progress bars only clutter a job's output file
+        os.environ.setdefault('TQDM_DISABLE', '1')
+    from unimol_tools import UniMolRepr
+    if not existed and logs.is_dir() and not any(logs.iterdir()):
+        logs.rmdir()
+    quiet_unimol_tools()
+    return UniMolRepr
+
+
+UniMolRepr = _import_unimol_repr()
 
 
 @functools.lru_cache(maxsize=None)
@@ -47,7 +67,7 @@ def _get_unimol_model(use_cuda: bool = False) -> UniMolRepr:
 def _read_atom_names_from_pdb(pdb_path: Path) -> List[str]:
     """Return ordered list of atom names from ATOM/HETATM records in a PDB file.
 
-    Uses fixed-column parsing (PDB cols 13–16, 0-indexed 12:16) which is
+    Uses fixed-column parsing (PDB cols 13-16, 0-indexed 12:16) which is
     reliable for CHARMM-generated PDB files. Names are normalized to
     uppercase so that mixed-case frag.pdb names (e.g., ``Br0B``) match the
     all-uppercase names written by CHARMM into minimized.pdb (``BR0B``).
@@ -154,7 +174,7 @@ def _convert_crd_to_tmp_pdb(crd_path: Path) -> Path:
                 y = float(line[60:80])
                 z = float(line[80:100])
                 segid = line[102:110].strip() if len(line) > 110 else ''
-                # Derive single-char PDB chain from segid (PROA→A, PROB→B …)
+                # Derive single-char PDB chain from segid (PROA->A, PROB->B ...)
                 chain = segid[-1] if segid and segid[-1].isalpha() else 'A'
                 atoms.append((atom_no, res_no, resname, atomname, x, y, z, chain))
             except (ValueError, IndexError):
@@ -213,7 +233,7 @@ def _extract_atom_identifiers_from_pdb(
     Each atom is identified by its (file_index, residue_number, chain_id, atom_name)
     tuple, where file_index is the atom's 0-based position among ATOM/HETATM records
     in the file. The file_index is required for uniqueness: (resnum, chain, atomname)
-    alone is NOT guaranteed unique — CHARMM PDB output wraps residue numbers for large
+    alone is NOT guaranteed unique; CHARMM PDB output wraps residue numbers for large
     solvent boxes (fixed-width column limit), so many distinct water molecules can
     share the same (resnum, chain, atomname). Since consensus atoms are always built
     from and matched against the SAME physical environment file, the file index is a
@@ -294,7 +314,7 @@ def _default_protein_pdb_candidates(base_dir: Path) -> List[Path]:
     This matters because consensus atom identifiers are (file_index, resnum,
     chain, atomname) tuples that are only meaningful when built from and matched
     against the identical file. Includes the ``proa_*.pdb`` glob pattern used for
-    mutant/variant-labeled protein files (e.g. ``proa_i315.pdb``) — previously
+    mutant/variant-labeled protein files (e.g. ``proa_i315.pdb``); previously
     only ``_load_environment_pdb`` searched for this pattern, while
     ``build_environment_consensus`` only checked the exact name ``proa.pdb``,
     causing consensus to be built from an unrelated (usually much smaller)
@@ -407,7 +427,7 @@ def build_environment_consensus(
         # Get core coordinates
         core_coords, _ = parse_pdb_file(str(core_pdb))
         if not core_coords:
-            log.info(f"      [CONSENSUS] No coordinates found in core: {Path(core_pdb).name}")
+            log.debug(f"      No coordinates found in core: {Path(core_pdb).name}")
             return None
 
         core_coords = np.array(core_coords, dtype=np.float32)
@@ -423,7 +443,7 @@ def build_environment_consensus(
 
         if env_pdb_path is None:
             # Try default locations in prep_dir first
-            # Priority: protein variants → solvent variants → minimized (fallback)
+            # Priority: protein variants -> solvent variants -> minimized (fallback)
             # Uses the SAME candidate helpers as _load_environment_pdb() to
             # guarantee both functions resolve to the identical physical file.
             # A solvent leg skips protein files (_environment_protein_candidates).
@@ -450,8 +470,8 @@ def build_environment_consensus(
         if env_pdb_path is None:
             # Debug: print available files in prep_dir
             available = list(prep_dir.glob("*.pdb"))
-            log.info(
-                f"      [CONSENSUS] No environment file found in {prep_dir.name} (available: "
+            log.debug(
+                f"      No environment file found in {prep_dir.name} (available: "
                 f"{[p.name for p in available[:3]]}...)")
             return None
 
@@ -464,8 +484,8 @@ def build_environment_consensus(
         )
 
         if not atom_dist_dict:
-            log.info(f"      [CONSENSUS] No atoms within {env_cutoff}Å of core in "
-                     f"{env_pdb_path.name}")
+            log.debug(f"      No atoms within {env_cutoff} Angstrom of core in "
+                      f"{env_pdb_path.name}")
             return None
 
         # Convert dict to set of atom identifiers
@@ -476,16 +496,16 @@ def build_environment_consensus(
             # Sort by distance and keep 256 closest
             sorted_atoms = sorted(consensus_atoms, key=lambda a: atom_dist_dict[a])
             consensus_atoms = set(sorted_atoms[:256])
-            log.info(f"      [CONSENSUS] Built core consensus: {len(consensus_atoms)} atoms "
-                     "(capped "
-                     "at 256)")
+            log.debug(f"      Built core consensus: {len(consensus_atoms)} atoms "
+                      "(capped "
+                      "at 256)")
         else:
-            log.info(f"      [CONSENSUS] Built core consensus: {len(consensus_atoms)} atoms")
+            log.debug(f"      Built core consensus: {len(consensus_atoms)} atoms")
 
         return consensus_atoms
 
     except Exception as e:
-        log.info(f"      [CONSENSUS] Exception building core consensus: {e}")
+        log.debug(f"      Exception building core consensus: {e}")
         return None
 
 
@@ -602,12 +622,12 @@ def _generate_embedding_cache_key(
         custom_search_paths: Optional custom PDB search paths for environment
         consensus_atoms: Optional set of (resnum, chain, atomname)-style tuples
             used for consensus environment filtering. Must be included in the
-            key — the same sub/core/prep_dir/env_cutoff combination produces a
+            key; the same sub/core/prep_dir/env_cutoff combination produces a
             *different* embedding depending on which consensus atoms are kept,
             so omitting this would let one system's cached embedding be
             silently served for a different system's consensus filter.
         variant: Optional tag distinguishing multiple cached representations
-            for the same underlying (sub, core, prep_dir) — e.g. dual
+            for the same underlying (sub, core, prep_dir); e.g. dual
             embeddings cache a 'ligand'-only and a 'full' (ligand+environment)
             representation for the same substituent under distinct keys.
 
@@ -665,7 +685,7 @@ def save_embedding(
                         {cache_key}_metadata.json  # configuration metadata
 
     ``system_label`` (see ``_system_label_from_prep_dir``) keeps each system's
-    substituents in their own directory — without it, every system that
+    substituents in their own directory; without it, every system that
     happens to have a "site1_sub3" (i.e. most of them) would dump their
     embeddings into one shared ``embeddings/site1_sub3/`` directory,
     identifiable only by opening each entry's metadata JSON, and that
@@ -682,7 +702,7 @@ def save_embedding(
         include_other_sites: Whether ref subs from other sites were included
         custom_search_paths: Custom search paths used for environment
         consensus_atoms: Consensus environment atoms used, if any (see
-            ``_generate_embedding_cache_key`` — must match what was used to
+            ``_generate_embedding_cache_key``; must match what was used to
             actually compute ``embedding``, or the cache entry is invalid).
         variant: Optional tag distinguishing this from other cached
             representations of the same substituent (e.g. 'ligand' vs 'full').
@@ -743,7 +763,7 @@ def save_embedding(
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    log.info(f"      [CACHE] Saved embedding to {embedding_path}")
+    log.debug(f"cached embedding {embedding_path}")
 
     return embedding_path
 
@@ -773,7 +793,7 @@ def load_embedding(
         env_cutoff: Environment cutoff parameter
         include_other_sites: Whether ref subs from other sites are included
         custom_search_paths: Custom search paths for environment
-        consensus_atoms: Consensus environment atoms in use, if any — must
+        consensus_atoms: Consensus environment atoms in use, if any; must
             match what was passed to ``save_embedding`` for a hit (see
             ``_generate_embedding_cache_key``).
         variant: Optional tag distinguishing this from other cached
@@ -807,14 +827,39 @@ def load_embedding(
         embedding_path = cache_dir / 'embeddings' / sub_name / f'{cache_key}.npy'
 
     if embedding_path.exists():
-        embedding = np.load(embedding_path)
-        if verbose:
-            log.info(f"      [CACHE] Loaded embedding from {embedding_path}")
-        return embedding
+        log.debug(f"loaded cached embedding {embedding_path}")
+        return np.load(embedding_path)
 
-    if verbose:
-        log.info(f"      [CACHE] No cached embedding found for {sub_name}")
+    if variant and variant.startswith('ligand'):
+        # The ligand half does not depend on the environment settings, but
+        # earlier keys included them (e.g. the per-site environment atoms):
+        # reuse an entry for the same substituent, core, prep dir and variant.
+        found = _matching_ligand_entry(cache_dir / 'embeddings' / system_label / sub_name,
+                                       sub_pdb, core_pdb, prep_dir, variant)
+        if found is not None:
+            log.debug(f"loaded cached embedding {found}")
+            return np.load(found)
 
+    log.debug(f"no cached embedding for {sub_name} ({variant})")
+    return None
+
+
+def _matching_ligand_entry(sub_dir: Path, sub_pdb: str, core_pdb: str, prep_dir: str,
+                           variant: str) -> Optional[Path]:
+    """A cached embedding in ``sub_dir`` whose metadata names the same
+    substituent, core, prep dir and variant, whatever its other settings."""
+    if not sub_dir.is_dir():
+        return None
+    want = {'sub_pdb': str(Path(sub_pdb).resolve()), 'core_pdb': str(Path(core_pdb).resolve()),
+            'prep_dir': str(Path(prep_dir).resolve()), 'variant': variant}
+    for meta in sorted(sub_dir.glob('*_metadata.json')):
+        try:
+            m = json.loads(meta.read_text())
+        except (OSError, ValueError):
+            continue
+        npy = meta.with_name(meta.name.replace('_metadata.json', '.npy'))
+        if all(m.get(k) == v for k, v in want.items()) and npy.exists():
+            return npy
     return None
 
 
@@ -1050,8 +1095,8 @@ def _filter_and_truncate_environment_atoms(
     if not env_mask.any() or np.sum(env_mask) < 10:
         # If exactly 0 atoms initially, this is suspicious - print diagnostic
         if not env_mask.any():
-            log.info(
-                f"        [ENV] {source_name}: 0 atoms within {ligand_cutoff} Å (ligand may be "
+            log.debug(
+                f"        {source_name}: 0 atoms within {ligand_cutoff} Angstrom (ligand may be "
                 "outside box), attempting PBC wrapping...")
 
         try:
@@ -1070,27 +1115,27 @@ def _filter_and_truncate_environment_atoms(
             if env_mask.any():
                 pbc_atoms = np.sum(env_mask)
                 if initial_atoms == 0:
-                    log.info(
-                        f"        [ENV] PBC wrapping recovered {pbc_atoms} atoms within "
-                        f"{ligand_cutoff} Å")
+                    log.debug(
+                        f"        PBC wrapping recovered {pbc_atoms} atoms within "
+                        f"{ligand_cutoff} Angstrom")
                 else:
-                    log.info(
-                        f"        [ENV] PBC (estimated cubic) found {pbc_atoms} atoms within "
-                        f"{ligand_cutoff} Å")
+                    log.debug(
+                        f"        PBC (estimated cubic) found {pbc_atoms} atoms within "
+                        f"{ligand_cutoff} Angstrom")
         except Exception as e:
-            log.info(f"        [ENV] PBC wrapping failed: {e}, using direct distance filtering")
+            log.debug(f"        PBC wrapping failed: {e}, using direct distance filtering")
 
     if not env_mask.any():
         # 0 atoms even after PBC - this is a structural issue
         if initial_atoms == 0:
-            log.info(
-                f"        [ENV] ERROR: {source_name} has 0 atoms within {ligand_cutoff} Å even "
+            log.debug(
+                f"        ERROR: {source_name} has 0 atoms within {ligand_cutoff} Angstrom even "
                 "after PBC wrapping")
-            log.info("        [ENV]   This suggests a structure preparation issue (ligand/box "
-                     "mismatch)")
+            log.debug("          This suggests a structure preparation issue (ligand/box "
+                      "mismatch)")
             return None
         else:
-            log.info(f"        [ENV] {source_name}: no atoms within {ligand_cutoff} Å of ligand")
+            log.debug(f"        {source_name}: no atoms within {ligand_cutoff} Angstrom of ligand")
             return None
 
     # Filter by distance mask
@@ -1111,8 +1156,8 @@ def _filter_and_truncate_environment_atoms(
 
     n_total = len(coords_arr)
     n_kept = len(filtered_coords)
-    log.info(f"        [ENV] {source_name}: filtered to {n_kept}/{n_total} atoms (distance <= "
-             f"{ligand_cutoff} Å, sorted closest-first, capped at {atom_limit})")
+    log.debug(f"        {source_name}: filtered to {n_kept}/{n_total} atoms (distance <= "
+              f"{ligand_cutoff} Angstrom, sorted closest-first, capped at {atom_limit})")
 
     return (filtered_coords, filtered_elements)
 
@@ -1130,7 +1175,7 @@ def _select_environment_atoms(
     """Select environment atoms for a substituent's embedding.
 
     When ``consensus_atoms`` is provided, atoms are selected purely by
-    consensus-set membership (identifier match) — NOT intersected with a
+    consensus-set membership (identifier match); NOT intersected with a
     separate distance-to-substituent filter. The consensus set is already
     built from distance-to-CORE and capped at ``atom_limit`` atoms (see
     ``build_environment_consensus``), and is intentionally the SAME set for
@@ -1152,17 +1197,17 @@ def _select_environment_atoms(
         filtered = _filter_environment_by_consensus(
             coords, elements, pdb_file_path, consensus_atoms)
         if filtered is None:
-            log.info(f"        [CONSENSUS] {source_name}: no atoms matched consensus set")
+            log.debug(f"        {source_name}: no atoms matched consensus set")
             return None
         filtered_coords, filtered_elements = filtered
-        log.info(f"        [CONSENSUS] {source_name}: selected {len(filtered_coords)} consensus "
-                 "atoms")
+        log.debug(f"        {source_name}: selected {len(filtered_coords)} consensus "
+                  "atoms")
         return (filtered_coords, filtered_elements)
 
-    log.info(f"        [CONSENSUS] {source_name}: NOT using core consensus (none built/provided "
-             "for "
-             "this site) — "
-             "falling back to distance-to-substituent filtering")
+    log.debug(f"        {source_name}: NOT using core consensus (none built/provided "
+              "for "
+              "this site); "
+              "falling back to distance-to-substituent filtering")
     return _filter_and_truncate_environment_atoms(
         coords=coords,
         elements=elements,
@@ -1237,18 +1282,18 @@ def _load_environment_pdb(
             )
             if filtered is not None:
                 filtered_coords, filtered_elements = filtered
-                log.info(
-                    f"        [CONSENSUS] Filtered to {len(filtered_coords)}/{len(coords_result)} "
+                log.debug(
+                    f"        Filtered to {len(filtered_coords)}/{len(coords_result)} "
                     "atoms by consensus")
                 return (filtered_coords, filtered_elements)
             else:
                 # No atoms pass consensus filter
-                log.info("        [CONSENSUS] No atoms matched consensus set, skipping this "
-                         "source")
+                log.debug("        No atoms matched consensus set, skipping this "
+                          "source")
                 return None
-        log.info(f"        [CONSENSUS] {Path(pdb_file_path).name}: NOT using core consensus (none "
-                 "built/provided "
-                 "for this site) — using unfiltered atoms from this source")
+        log.debug(f"        {Path(pdb_file_path).name}: NOT using core consensus (none "
+                  "built/provided "
+                  "for this site); using unfiltered atoms from this source")
         return (coords_result, elements_result)
 
     # Try custom search paths first (from yaml config)
@@ -1258,9 +1303,9 @@ def _load_environment_pdb(
             if pdb_path.exists():
                 try:
                     coords, elements = parse_pdb_file(str(pdb_path))
-                    log.info(f"        [ENV] {pdb_path.relative_to(prep_dir)}: loaded "
-                             f"{len(coords)} "
-                             "atoms (custom/configured)")
+                    log.debug(f"        {pdb_path.relative_to(prep_dir)}: loaded "
+                              f"{len(coords)} "
+                              "atoms (custom/configured)")
                     return _apply_consensus_if_needed(
                         coords, elements, str(pdb_path)) or (coords, elements)
                 except Exception as e:
@@ -1307,9 +1352,9 @@ def _load_environment_pdb(
                 if len(env_coords) > 256:
                     env_coords = env_coords[:256]
                     env_elements = env_elements[:256]
-                log.info(f"        [ENV] minimized.pdb (environment): loaded {len(env_coords)} "
-                         "atoms "
-                         "(no distance filtering, capped at 256)")
+                log.debug(f"        minimized.pdb (environment): loaded {len(env_coords)} "
+                          "atoms "
+                          "(no distance filtering, capped at 256)")
                 result = _apply_consensus_if_needed(env_coords, env_elements, str(minimized_pdb))
                 return result if result[0] is not None else None
         except Exception as e:
@@ -1358,9 +1403,9 @@ def _load_environment_pdb(
                 if len(env_coords) > 256:
                     env_coords = env_coords[:256]
                     env_elements = env_elements[:256]
-                log.info(f"        [ENV] minimized.crd (environment): loaded {len(env_coords)} "
-                         "atoms "
-                         "(no distance filtering, capped at 256)")
+                log.debug(f"        minimized.crd (environment): loaded {len(env_coords)} "
+                          "atoms "
+                          "(no distance filtering, capped at 256)")
                 result = _apply_consensus_if_needed(env_coords, env_elements, str(crd_pdb))
                 return result if result[0] is not None else None
         except Exception as e:
@@ -1395,8 +1440,8 @@ def _load_environment_pdb(
                     if len(coords) > 256:
                         coords = coords[:256]
                         elements = elements[:256]
-                    log.info(f"        [ENV] {rel_path}: loaded {len(coords)} atoms (no distance "
-                             "filtering, capped at 256)")
+                    log.debug(f"        {rel_path}: loaded {len(coords)} atoms (no distance "
+                              "filtering, capped at 256)")
                     return (coords, elements)
             except Exception as e:
                 warnings.warn(f"Could not load {protein_pdb.name}: {e}, trying next source")
@@ -1429,8 +1474,8 @@ def _load_environment_pdb(
                     if len(coords) > 256:
                         coords = coords[:256]
                         elements = elements[:256]
-                    log.info(f"        [ENV] {solvent_pdb.name}: loaded {len(coords)} atoms (no "
-                             "distance filtering, capped at 256)")
+                    log.debug(f"        {solvent_pdb.name}: loaded {len(coords)} atoms (no "
+                              "distance filtering, capped at 256)")
                     result = _apply_consensus_if_needed(coords, elements, str(solvent_pdb))
                     if result and result[0] is not None:
                         return result
@@ -1443,8 +1488,8 @@ def _load_environment_pdb(
         minimized_pdb = prep_dir / "minimized.pdb"
         if minimized_pdb.exists():
             try:
-                log.info(
-                    "        [ENV] Solvent files found but returned 0 atoms, falling back to "
+                log.debug(
+                    "        Solvent files found but returned 0 atoms, falling back to "
                     "minimized structure")
                 coords, elements = parse_pdb_file(str(minimized_pdb))
 
@@ -1461,9 +1506,9 @@ def _load_environment_pdb(
                     if len(coords) > 256:
                         coords = coords[:256]
                         elements = elements[:256]
-                    log.info(f"        [ENV] minimized.pdb: loaded {len(coords)} atoms (no "
-                             "distance "
-                             "filtering, capped at 256)")
+                    log.debug(f"        minimized.pdb: loaded {len(coords)} atoms (no "
+                              "distance "
+                              "filtering, capped at 256)")
                     result = _apply_consensus_if_needed(coords, elements, str(minimized_pdb))
                     if result and result[0] is not None:
                         return result
@@ -1473,11 +1518,11 @@ def _load_environment_pdb(
 
     # No environment found from solvent or fallback
     if solvent_files_found:
-        log.info(
-            f"        [ENV] WARNING: Environment files exist but no atoms within {ligand_cutoff} "
-            "Å found")
+        log.debug(
+            f"        WARNING: Environment files exist but no atoms within {ligand_cutoff} "
+            " Angstrom found")
     else:
-        log.info(f"        [ENV] no environment file found in {prep_dir.name}")
+        log.debug(f"        no environment file found in {prep_dir.name}")
     return None
 
 
@@ -1905,7 +1950,7 @@ def get_substituent_unimol_with_environment(
         if cached_embedding is not None:
             return cached_embedding
 
-    log.info(f"      [UNIMOL] Computing for {sub_name} (cutoff={env_cutoff}Å)")
+    log.debug(f"      Computing for {sub_name} (cutoff={env_cutoff} Angstrom)")
 
     # Parse core and sub to get coordinates
     core_coords, core_elements = parse_pdb_file(str(core_pdb))
@@ -1953,8 +1998,8 @@ def get_substituent_unimol_with_environment(
     is_vacuum_system = 'vac' in system_name or 'vacuum' in system_name
 
     if is_vacuum_system:
-        log.info(f"      [ENV] Vacuum system detected ({system_name}), skipping environment "
-                 "loading")
+        log.debug(f"      Vacuum system detected ({system_name}), skipping environment "
+                  "loading")
         env_data = None
     else:
         # Load environment with intelligent fallback chain
@@ -2142,8 +2187,8 @@ def get_substituent_dual_embeddings(
             lig_core, lig_sub, lig_refs = copies[0], copies[1], copies[2:]
             ligand_variant += '_min'
         else:
-            log.info(f"      [MINIMIZED] {Path(sub_pdb).name}: no usable minimized ligand in "
-                     f"{prep_dir}; " "unrelaxed coordinates")
+            log.debug(f"      {Path(sub_pdb).name}: no usable minimized ligand in "
+                      f"{prep_dir}; " "unrelaxed coordinates")
     embedding_ligand_only = None
     if cache_dir is not None:
         embedding_ligand_only = load_embedding(

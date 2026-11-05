@@ -60,7 +60,7 @@ def _write_variables(run_dir, s01, s10):
     (run_dir / 'variables.py').write_text(VARIABLES.format(s01=s01, s10=s10))
 
 
-# ── skew / end / held-off endpoints ──────────────────────────────────────────
+# skew / end / held-off endpoints
 
 def test_skew_step_removes_asymmetry_split_by_direction():
     (x_lh, v1), (x_hl, v2) = skew_hindsight(1.0, 0.5, skew=0.2)
@@ -133,7 +133,7 @@ def test_hindsight_targets_skew_end_per_direction(tmp_path):
     assert torch.isfinite(v).all()
 
 
-# ── offsets for x / s, sampling, exploration ─────────────────────────────────
+# offsets for x / s, sampling, exploration
 
 def test_skew_end_offsets_recorded_per_direction():
     state = {}

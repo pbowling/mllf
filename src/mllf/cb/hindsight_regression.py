@@ -71,7 +71,7 @@ def regression_config(bandit_cfg: Dict) -> Dict:
     return cfg
 
 
-# ── Replay set (pretraining runs) ────────────────────────────────────────────
+# Replay set (pretraining runs)
 
 def _manifest_resolver(manifest):
     """Resolve a pretraining path as written (relative to where pretraining
@@ -119,6 +119,24 @@ def _load_consensus(path: Optional[str], prep_dirs: Optional[set] = None,
     return out
 
 
+def _pretraining_systems(cfg: Dict, manifest) -> Optional[set]:
+    """The combo directories pretraining built graphs for (resolved), or None
+    (no restriction): from the pretrained model's pretraining_systems.json
+    next to ``replay_manifest``, or from the keys of its
+    environment_consensus.json (``replay_consensus``, models pretrained
+    before that file was written)."""
+    from mllf.pretrain.features import SYSTEMS_FILE
+    resolve = _manifest_resolver(manifest) if manifest else (lambda d: Path(d).resolve())
+    systems = Path(cfg['replay_manifest']).parent / SYSTEMS_FILE if cfg.get('replay_manifest') \
+        else None
+    if systems is not None and systems.exists():
+        preps = json.loads(systems.read_text()).get('prep_dirs', [])
+        found = (resolve(str(Path(p).parent)) for p in preps)
+        return {str(c) for c in found if c is not None}
+    cons = _load_consensus(cfg.get('replay_consensus'), manifest=manifest)
+    return {str(Path(k).parent) for k in cons} if cons else None
+
+
 def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
     """(run, nsubs, pairs, weights) for ``replay_selection: coverage``: the
     planned runs (``replay_selection.plan_replay``), each with its hygiene
@@ -126,14 +144,10 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
     per-pair report next to the replay cache (``*_pairs.csv``)."""
     if not cfg.get('replay_systems_root'):
         raise ValueError("replay_selection: coverage needs bandit.regression.replay_systems_root")
-    # Candidates: the directories pretraining built graphs for (the keys of
-    # its consensus file); the rest of the manifest was filtered out before
-    # training, so the model never saw them and their embeddings were never
-    # cached.
-    used = None
-    cons = _load_consensus(cfg.get('replay_consensus'), manifest=manifest)
-    if cons:
-        used = {str(Path(k).parent) for k in cons}
+    # Candidates: the directories pretraining built graphs for; the rest of
+    # the manifest was filtered out before training, so the model never saw
+    # them and their embeddings were never cached.
+    used = _pretraining_systems(cfg, manifest)
     plan, report = plan_replay(manifest, cfg['replay_systems_root'], int(cfg['replay_runs']),
                                int(cfg.get('replay_min_per_system', 3)),
                                include_tagged=not cfg.get('replay_pretraining_only', True),
@@ -147,7 +161,7 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
             w.writeheader()
             w.writerows(report)
         if verbose:
-            log.info(f"  [regression] replay pair report: {out}")
+            log.info(f"  replay pair report: {out}")
     chosen = []
     for item in plan:
         run_dir = Path(item['run_dir'])
@@ -218,7 +232,7 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
         _check_replay_env_input(data, cfg.get('env_input', 'dual'), cache)
         _check_replay_ligand(cfg, cache)
         if verbose:
-            log.info(f"  [regression] replay set loaded from {cache}: {len(data)} runs")
+            log.info(f"  replay set loaded from {cache}: {len(data)} runs")
         return data
 
     # Deferred: the pretraining module (Uni-Mol embeddings, run loading) is
@@ -292,7 +306,9 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
     if cfg.get('replay_selection') != 'coverage':
         chosen = chosen[:cfg['replay_runs']]
     prep_dirs = {str(Path(r['run_dir']).parent / 'prep') for r, *_ in chosen}
-    consensus = _load_consensus(cfg.get('replay_consensus'), prep_dirs, manifest=manifest)
+    # only the environment embedding (env_input 'dual') reads the environment atoms
+    consensus = (_load_consensus(cfg.get('replay_consensus'), prep_dirs, manifest=manifest)
+                 if cfg.get('env_input', 'dual') == 'dual' else None)
 
     data = []
     for n, (run, ns, pairs, weights) in enumerate(chosen):
@@ -313,7 +329,7 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
         except Exception:
             continue
         if verbose and (n + 1) % 200 == 0:
-            log.info(f"  [regression] replay: built {len(data)}/{n + 1}")
+            log.debug(f"  replay: built {len(data)}/{n + 1}")
     if cache:
         Path(cache).parent.mkdir(parents=True, exist_ok=True)
         torch.save(data, cache)
@@ -322,12 +338,12 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
              'ligand_other_sites': bool(cfg.get('ligand_other_sites', False)),
              'site_size_input': bool(cfg.get('site_size_input', False))}))
     if verbose:
-        log.info('%s', f"  [regression] replay set built: {len(data)} runs"
+        log.info('%s', f"  replay set built: {len(data)} runs"
                  + (f", saved to {cache}" if cache else ""))
     return data
 
 
-# ── Online buffer ────────────────────────────────────────────────────────────
+# Online buffer
 
 def online_item(x: torch.Tensor, edge_index: torch.Tensor, targets: torch.Tensor,
                 var: torch.Tensor) -> Optional[Tuple]:
@@ -339,7 +355,7 @@ def online_item(x: torch.Tensor, edge_index: torch.Tensor, targets: torch.Tensor
             targets.detach().cpu().float(), w.cpu().float())
 
 
-# ── Regression step ──────────────────────────────────────────────────────────
+# Regression step
 
 def _predict(policy, x, edge_index, ws):
     """Physical-unit means [E, D] from trunks + trainable output weights ``ws``."""

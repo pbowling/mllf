@@ -73,8 +73,9 @@ class UnimolSettings:
         substituents at the edge's site (policy.fill_site_size).
     ligand_from_minimized: runs given the minimized structure embed the ligand
         in its minimized.pdb geometry, not the unrelaxed fragment files.
-    use_environment_consensus: filter each site's environment to the atoms
-        shared by all its substituents (``environment_consensus``).
+    use_environment_consensus: with env_input 'dual', filter each site's
+        environment to the atoms shared by all its substituents
+        (``environment_consensus``); unused by the phase inputs.
     cache_embeddings / cache_dir: persistent on-disk embedding cache (default
         <output_dir>/embeddings_cache).
     """

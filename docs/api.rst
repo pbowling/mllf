@@ -85,6 +85,7 @@ For the workflow system, see :doc:`workflow`.
    mllf.cb.slurm
    mllf.file_handling.manifests
    mllf.file_handling.combo_sets
+   mllf.file_handling.archive
 
 Command Line and Logging
 ------------------------
@@ -103,5 +104,6 @@ For the ``mllf`` command, see :doc:`cli`.
    mllf.cli.train
    mllf.cli.export
    mllf.cli.cost
+   mllf.cli.archive
    mllf.log
    mllf.slurm

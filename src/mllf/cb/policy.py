@@ -17,12 +17,12 @@ class BiasHeadMLP(nn.Module):
 
     Takes the full edge input and produces a (mean, log_std) pair
     for one bias coefficient.  Because each bias type has its own complete
-    stack — input → hidden → output — gradient from one type cannot
+    stack (input -> hidden -> output) gradient from one type cannot
     physically corrupt the weights used by any other type.
 
-    In **Bayesian mode** (``bayesian=True``, for NeuralLinear + Thompson
-    Sampling) the same ``trunk`` feature extractor is kept, but the final
-    deterministic ``Linear(64, 2)`` readout is replaced by a
+    In **Bayesian mode** (``bayesian=True``, for Thompson sampling) the same
+    ``trunk`` feature extractor is kept, but the final deterministic
+    ``Linear(64, 2)`` readout is replaced by a
     :class:`~mllf.cb.bayesian_head.BayesianLinearHead`: a closed-form Bayesian
     linear regression on the trunk's 64-D output. ``forward()`` still returns
     an ``[E, 2]`` tensor for drop-in compatibility with existing callers
@@ -39,14 +39,14 @@ class BiasHeadMLP(nn.Module):
         # Every single bias head gets its own private projection layers.
         # No cross-talk or gradient pollution can occur between bias types.
         # This trunk ("phi") is shared by both the legacy deterministic
-        # readout and the Bayesian last layer — it is the feature extractor
-        # a NeuralLinear model sits its Bayesian linear regression on top of.
+        # readout and the Bayesian last layer; it is the feature extractor
+        # that the Bayesian linear regression sits on top of.
         self.trunk = nn.Sequential(
-            nn.Linear(in_dim, in_dim // 2),           # 1024 → 512
+            nn.Linear(in_dim, in_dim // 2),           # 1024 -> 512
             nn.ReLU(),
-            nn.Linear(in_dim // 2, in_dim // 4),       # 512 → 256
+            nn.Linear(in_dim // 2, in_dim // 4),       # 512 -> 256
             nn.ReLU(),
-            nn.Linear(in_dim // 4, self.feat_dim),    # 256 → 64
+            nn.Linear(in_dim // 4, self.feat_dim),    # 256 -> 64
             nn.ReLU(),
         )
         if self.bayesian:
@@ -55,7 +55,7 @@ class BiasHeadMLP(nn.Module):
             self.readout = None
         else:
             self.bayesian_head = None
-            self.readout = nn.Linear(self.feat_dim, 2)  # 64 → 2 (mean, log_std)
+            self.readout = nn.Linear(self.feat_dim, 2)  # 64 -> 2 (mean, log_std)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Return ``[E, 64]`` trunk features ``z = phi(x)`` (pre-readout)."""
@@ -106,11 +106,11 @@ class EdgeValueMLP(nn.Module):
             x: ``[E, in_dim]`` edge input features.
             edge_type: ``[E]`` integer relation-type index. When provided,
                 each edge is routed to ``mlps[edge_type // 2]`` (matches
-                ``forward``'s routed path — used by the pretraining
+                ``forward``'s routed path; used by the pretraining
                 fully-connected 4x-edges-per-pair graph structure). When
                 ``None`` (the online-training graph structure: one edge per
                 pair, every bias type independently meaningful for every
-                edge — matches ``forward``'s legacy no-routing path), every
+                edge; matches ``forward``'s legacy no-routing path), every
                 edge gets a feature vector from **each** of the ``D`` trunks.
 
         Returns:
@@ -260,11 +260,11 @@ class UnimolPolicy(nn.Module):
 
     Each edge is passed as 1024D directly to EdgeValueMLP, which contains four
     independent BiasHeadMLPs (one per bias type). Each BiasHeadMLP learns its
-    own feature extraction: 1024D → 512D → 256D → 64D → 2D (mean, log_std).
+    own feature extraction: 1024D -> 512D -> 256D -> 64D -> 2D (mean, log_std).
     This allows each bias type to independently discover what information is
     important for its prediction, without a shared projection bottleneck.
 
-    No RGCN encoder, no site pooling, no shared projection — purely feed-forward
+    No RGCN encoder, no site pooling, no shared projection; purely feed-forward
     edge classification based on pre-trained molecular representations.
 
     Args:
@@ -273,7 +273,7 @@ class UnimolPolicy(nn.Module):
         mlp_out_dim: Number of bias types / output coefficients (default: 4).
         use_dual_embeddings: If True, use dual embedding mode; if False, use standard
             mode (default: False).
-        use_bayesian_heads: If True (NeuralLinear + Thompson Sampling mode), each
+        use_bayesian_heads: If True (Bayesian heads with Thompson sampling mode), each
             bias head's final layer is a :class:`~mllf.cb.bayesian_head.BayesianLinearHead`
             instead of a deterministic ``Linear(64, 2)``. The trunk feature extractor
             (shared with the deterministic mode) is unchanged. Default False keeps the
@@ -364,7 +364,7 @@ class UnimolPolicy(nn.Module):
         """Build the raw ``[E, in_dim]`` per-edge input from node embeddings.
 
         Shared by ``_forward_edges`` (legacy deterministic/REINFORCE path) and
-        ``forward_features`` (NeuralLinear path) so the edge-input construction
+        ``forward_features`` (Bayesian-head path) so the edge-input construction
         logic exists in exactly one place.
 
         Args:
@@ -465,7 +465,7 @@ class UnimolPolicy(nn.Module):
         return mean, log_std
 
     # ------------------------------------------------------------------
-    # NeuralLinear + Thompson Sampling API (only meaningful when
+    # Bayesian heads with Thompson sampling API (only meaningful when
     # use_bayesian_heads=True; each method routes every edge to its own
     # bias type's BayesianLinearHead via edge_type // 2, exactly like the
     # deterministic routing above).
@@ -482,9 +482,9 @@ class UnimolPolicy(nn.Module):
             edge_type: [E] integer relation index. When given, routes each
                 edge to its own bias type's trunk (the pretraining
                 fully-connected 4x-edges-per-pair graph structure). When
-                ``None`` (the online-training graph structure — one edge per
+                ``None`` (the online-training graph structure; one edge per
                 pair, every bias type independently meaningful for every
-                edge — this is what ``build_graph_and_data`` in
+                edge; this is what ``build_graph_and_data`` in
                 ``training/workflow.py`` always produces), every edge gets
                 features from **every** bias type's trunk.
 
@@ -503,11 +503,11 @@ class UnimolPolicy(nn.Module):
         deterministic head's raw output, and it's why ``BayesianLinearHead``
         is seeded from the deterministic readout's raw (pre-transform)
         weights (see ``mllf.pretrain.bayesian_init.initialize_bayesian_heads_from_pretrained``)
-        — the posterior lives in the *same* pre-activation space, so its
+; the posterior lives in the *same* pre-activation space, so its
         output needs the same transform applied before it's a valid action.
         Skipping this (as an earlier version of this code did) produces raw,
         effectively-unbounded linear-regression outputs used directly as bias
-        coefficients — silently wrong-scale actions that pin combos into
+        coefficients; silently wrong-scale actions that pin combos into
         degenerate, low-transition states.
         """
         return F.softsign(x) * self.scale_factors[dim]
@@ -519,9 +519,9 @@ class UnimolPolicy(nn.Module):
         quantity ``sample_weights()``/``mu`` predict.
 
         ``softsign(x) = x / (1 + |x|)`` inverts to ``x = s / (1 - |s|)`` for
-        ``s = y / scale`` (clamped away from ``±1`` for numerical stability —
+        ``s = y / scale`` (clamped away from ``+/-1`` for numerical stability;
         an observed action at or beyond the scale bound would otherwise
-        invert to ``±inf``).
+        invert to ``+/-inf``).
         """
         s = (y / self.scale_factors[dim]).clamp(-1.0 + eps, 1.0 - eps)
         return s / (1.0 - s.abs())
@@ -538,7 +538,7 @@ class UnimolPolicy(nn.Module):
         Returns:
             ``mean`` is in **physical bias-coefficient units**
             (``scale_factors[d] * softsign(raw_mean)``, matching what
-            ``_forward_edges``/the analysis script report — see
+            ``_forward_edges``/the analysis script report; see
             ``_preact_to_action``). ``var`` stays in the posterior's native
             pre-activation space (variance doesn't transform simply through a
             nonlinearity); it's only ever used for *relative* combo ranking
@@ -546,9 +546,9 @@ class UnimolPolicy(nn.Module):
             (softsign is monotonic, so relative ordering by pre-activation
             uncertainty tracks relative physical-space uncertainty).
 
-            Routed (``edge_type`` given): ``mean [E]``, ``var [E]`` — the
+            Routed (``edge_type`` given): ``mean [E]``, ``var [E]``; the
             edge's own routed head's posterior predictive mean/variance.
-            Unrouted (``edge_type=None``): ``mean [E, D]``, ``var [E, D]`` —
+            Unrouted (``edge_type=None``): ``mean [E, D]``, ``var [E, D]``;
             every head's prediction for every edge (matches ``_forward_edges``'s
             legacy-path shape).
         """
@@ -587,7 +587,7 @@ class UnimolPolicy(nn.Module):
         """Sample actions via Thompson sampling from each bias head's posterior.
 
         One weight vector is sampled per bias type per call (i.e. one Thompson
-        sample per decision/combo — not per edge), matching how a single
+        sample per decision/combo; not per edge), matching how a single
         REINFORCE ``get_actions`` call produces one policy query per combo.
 
         Args:
@@ -597,9 +597,9 @@ class UnimolPolicy(nn.Module):
                 for the routed vs. unrouted (``None``, the online-training
                 default) distinction.
             deterministic: If True, use the posterior mean ``mu`` instead of a
-                sample (no exploration — for eval/replay).
+                sample (no exploration; for eval/replay).
             exploration_scale: Passed to ``BayesianLinearHead.sample_weights``
-                (see its docstring) — a runtime multiplier on Thompson-sample
+                (see its docstring); a runtime multiplier on Thompson-sample
                 spread around the posterior mean, independent of the
                 posterior's own (pretraining-calibrated or online-narrowed)
                 covariance. 1.0 = standard Thompson sampling. Unused when
@@ -608,7 +608,7 @@ class UnimolPolicy(nn.Module):
         Returns:
             actions: [E, mlp_out_dim] bias coefficients, in the same physical
                 units as REINFORCE's ``get_actions``/``_forward_edges``
-                (``scale_factors[d] * softsign(raw_sample)`` — see
+                (``scale_factors[d] * softsign(raw_sample)``; see
                 ``_preact_to_action``; the posterior itself lives in raw
                 pre-activation space, seeded from the deterministic readout's
                 pre-transform weights, so this transform is required to turn
@@ -662,7 +662,7 @@ class UnimolPolicy(nn.Module):
                                    weights: Optional[torch.Tensor] = None) -> None:
         """Fold observed ``(z, target)`` pairs into each bias head's posterior.
 
-        No gradient, no optimizer — this is the closed-form replacement for
+        No gradient, no optimizer; this is the closed-form replacement for
         ``policy_loss.backward(); optimizer.step()``.
 
         Args:
@@ -671,13 +671,13 @@ class UnimolPolicy(nn.Module):
             edge_type: [E] integer relation index. See ``forward_features``
                 for the routed vs. unrouted (``None``, the online-training
                 default) distinction. Unrouted: every edge updates every head
-                (using that head's own target column) — no masking, since
+                (using that head's own target column); no masking, since
                 every column is independently meaningful for every edge.
-            targets: [E] or [E, mlp_out_dim] regression targets — the observed
+            targets: [E] or [E, mlp_out_dim] regression targets; the observed
                 action (bias coefficient, in physical units) each edge
                 actually submitted. Internally inverse-transformed
                 (``_action_to_preact``) into the posterior's native
-                pre-activation space before regressing — the posterior was
+                pre-activation space before regressing; the posterior was
                 seeded from the deterministic readout's pre-transform
                 weights (see
                 ``mllf.pretrain.bayesian_init.initialize_bayesian_heads_from_pretrained``)
@@ -687,9 +687,9 @@ class UnimolPolicy(nn.Module):
             weights: Optional per-edge confidence weight for the update (e.g.
                 reward-derived AWR weight combined with the existing
                 DDG-transition confidence weight). Either [E] (same weight
-                reused for every head — the only sensible shape when
+                reused for every head; the only sensible shape when
                 ``edge_type`` routes each edge to one head anyway) or
-                [E, mlp_out_dim] (a genuinely per-head weight per edge — e.g.
+                [E, mlp_out_dim] (a genuinely per-head weight per edge; e.g.
                 each bias type has its own AWR weight since
                 ``compute_pair_reward`` gives each dimension its own reward).
                 Defaults to all-ones.

@@ -5,7 +5,7 @@ from typing import List, Tuple
 def build_directed_pairs(nsubs_per_site: List[int]) -> List[Tuple[int, int]]:
     """Build list of directed pairs for all substituents within each site.
 
-    Generates BOTH directions (i→j and j→i) within each site to allow
+    Generates BOTH directions (i->j and j->i) within each site to allow
     independent predictions for skew and end biases.
     No cross-site pairs are generated.
 

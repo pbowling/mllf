@@ -254,10 +254,10 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions,
     This function maps directed relation actions back to base biases (quadratic, skew,
     end, linear). Quadratic (symmetric) uses upper triangle only (i < j). Skew and
     end (NOT symmetric) store BOTH directions independently - each directed edge
-    (i→j) has its own value. Linear predictions are antisymmetric (edge (i,j)
+    (i->j) has its own value. Linear predictions are antisymmetric (edge (i,j)
     approximates b[j] - b[i], matching the pretraining target) and are inverted
     relative to each site's reference substituent (b[ref] = 0) to recover the
-    per-node 'b' vector — they must NOT be averaged as if symmetric.
+    per-node 'b' vector; they must NOT be averaged as if symmetric.
 
     Args:
         combo_dir: Path to combo directory where variables.py will be written.
@@ -385,7 +385,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions,
             val = action_vals.get(base, 0.0)
 
             if base in ['skew', 'end', 'linear']:
-                # Skew, end, and linear are NOT symmetric — store directed pairs
+                # Skew, end, and linear are NOT symmetric; store directed pairs
                 # (preserve both directions independently). Linear predictions
                 # approximate b[dst] - b[src] (antisymmetric), so averaging
                 # forward/backward values here would wipe out the signal.
@@ -393,7 +393,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions,
             else:
                 # Quadratic: undirected canonical pairs.
                 # This is a genuinely symmetric matrix, so predictions from BOTH
-                # directions (i→j and j→i) are averaged together. This matches
+                # directions (i->j and j->i) are averaged together. This matches
                 # pretraining where both edges share the same target value.
                 pair = (min(src, dst), max(src, dst))
 
@@ -460,7 +460,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions,
     # Derive per-node linear bias 'b' from directed per-edge linear predictions.
     #
     # During pretraining the linear target for directed edge (i, j) is
-    # b[j] - b[i] — an ANTISYMMETRIC quantity (edge (j,i) targets b[i] - b[j] =
+    # b[j] - b[i]; an ANTISYMMETRIC quantity (edge (j,i) targets b[i] - b[j] =
     # -(b[j]-b[i])), unlike quadratic which is genuinely symmetric. Reconstructing
     # 'b' therefore requires inverting this difference relative to each site's
     # reference substituent (b[ref] = 0), NOT averaging raw forward/backward
@@ -563,7 +563,7 @@ def write_variables_from_actions(combo_dir: str, data, extras: dict, actions,
             lines.append(f'  - {val}')
 
     yaml_block = '\n'.join(lines)
-    content = f"""# Auto-generated variables.py — bias_string contains YAML for bias matrices
+    content = f"""# Auto-generated variables.py; bias_string contains YAML for bias matrices
 bias_string = '''
 {yaml_block}
 

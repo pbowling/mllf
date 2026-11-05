@@ -92,7 +92,7 @@ def compute_pairwise_confidence_weights(
 
         # Check DDG value for this pair
         # DDG key format: "{i+2}_{j+2}" (convert node indices back to block IDs)
-        # For reverse pairs: ΔG(j→i) = -ΔG(i→j), so if forward key missing,
+        # For reverse pairs: ΔG(j->i) = -ΔG(i->j), so if forward key missing,
         # look for reverse key and negate its value
         ddg_key_fwd = f"{i+2}_{j+2}"
         ddg_key_rev = f"{j+2}_{i+2}"

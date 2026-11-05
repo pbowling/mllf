@@ -29,7 +29,7 @@ def _extract_nsubs(content: str, prep_dir: Optional[Path] = None) -> Optional[Li
 
     Tries in order:
       1. ``alf_info_string`` YAML block embedded in *content*.
-      2. ``prep_dir/alf_info.py`` — ``alf_info['nsubs'] = [...]`` assignment.
+      2. ``prep_dir/alf_info.py``; ``alf_info['nsubs'] = [...]`` assignment.
       3. Module-level ``nsubs = [...]`` assignment in *content*.
     """
     # 1. alf_info_string YAML block
@@ -97,7 +97,7 @@ def parse_new(filename, prep_dir=None):
     """Parse the newer variables#.py style file.
 
     The file contains a bias_string with YAML-formatted data including:
-    - b: nested list (single row vector, or 2-D ``[[b1, b2, …]]`` — normalised to 1-D)
+    - b: nested list (single row vector, or 2-D ``[[b1, b2, ...]]``; normalised to 1-D)
     - c, x, s: NxN matrices
     - scalar entries: lams*, cs*, xs*, ss* as YAML scalars
 
@@ -155,7 +155,7 @@ def parse_new(filename, prep_dir=None):
             # Fall through to line-by-line parsing
             pass
         else:
-            # Normalise b: "variablesflat" format stores b as [[b1, b2, …]] (2-D).
+            # Normalise b: "variablesflat" format stores b as [[b1, b2, ...]] (2-D).
             b = data.get('b', [])
             if b and isinstance(b[0], list):
                 data['b'] = b[0]

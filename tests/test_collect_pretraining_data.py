@@ -2,15 +2,14 @@
 
 Covers:
   - find_run_directories      (flat MSLD and nested combo structures)
-  - parse_bias_from_py        (variables*.py → matrix keys only)
-  - parse_bias_from_inp       (variables*.inp → matrix format)
+  - parse_bias_from_py        (variables*.py -> matrix keys only)
+  - parse_bias_from_inp       (variables*.inp -> matrix format)
   - detect_solvent_state      (path-based heuristic)
   - _extract_nsubs (indirectly via read_bias_coeff.parse_new)
   - _read_box_from_prep_script (box= extraction from prep .py file)
   - filter_best_runs_per_system (grouping & best-reward selection)
 """
 import json
-import math
 import re
 import textwrap
 from pathlib import Path
@@ -70,128 +69,75 @@ def _variables_py_content(n: int = 3) -> str:
     return '\n'.join(lines) + '\n'
 
 
-# ---------------------------------------------------------------------------
-# TestFindRunDirectories
-# ---------------------------------------------------------------------------
+# find_run_directories
 
-class TestFindRunDirectories:
-    """Test find_run_directories for flat and nested combo structures."""
-
-    def test_flat_structure_returns_run_dirs(self, tmp_path):
-        """Finds run# directories at the top level."""
-        _make_run_dir(tmp_path, 'run1')
-        _make_run_dir(tmp_path, 'run2')
-        _make_run_dir(tmp_path, 'run3')
-        result = find_run_directories(tmp_path)
-        assert len(result) == 3
-        assert all(d.name.startswith('run') for d in result)
-
-    def test_flat_sorted_numerically(self, tmp_path):
-        """Flat structure is sorted by run number, not lexicographically."""
-        _make_run_dir(tmp_path, 'run10')
-        _make_run_dir(tmp_path, 'run2')
-        _make_run_dir(tmp_path, 'run1')
-        result = find_run_directories(tmp_path)
-        nums = [int(d.name.replace('run', '')) for d in result]
-        assert nums == sorted(nums)
-
-    def test_flat_excludes_failed(self, tmp_path):
-        """Directories containing '_failed' in the name are excluded."""
-        _make_run_dir(tmp_path, 'run1')
-        _make_run_dir(tmp_path, 'run2_failed')
-        result = find_run_directories(tmp_path)
-        names = [d.name for d in result]
-        assert 'run1' in names
-        assert 'run2_failed' not in names
-
-    def test_flat_excludes_dirs_without_data(self, tmp_path):
-        """Directories without variables or output files are skipped."""
-        _make_run_dir(tmp_path, 'run1')
-        empty_run = tmp_path / 'run2'
-        empty_run.mkdir()
-        result = find_run_directories(tmp_path)
-        assert len(result) == 1
-        assert result[0].name == 'run1'
-
-    def test_combo_structure_returns_run_dirs(self, tmp_path):
-        """Nested comb_*/run_*/ structure: run dirs from inside each combo."""
-        for combo in ('comb_001', 'comb_002'):
-            for run in ('run_001', 'run_002'):
-                _make_run_dir(tmp_path / combo, run)
-        result = find_run_directories(tmp_path)
-        assert len(result) == 4
-        assert all(d.name.startswith('run_') for d in result)
-
-    def test_combo_excludes_failed(self, tmp_path):
-        """Failed run dirs inside combo dirs are skipped."""
-        _make_run_dir(tmp_path / 'comb_001', 'run_001')
-        _make_run_dir(tmp_path / 'comb_001', 'run_002_failed')
-        result = find_run_directories(tmp_path)
-        assert len(result) == 1
-        assert result[0].name == 'run_001'
-
-    def test_returns_empty_for_empty_dir(self, tmp_path):
-        """Empty directory → empty list (no crash)."""
-        assert find_run_directories(tmp_path) == []
+def test_find_run_directories_flat_layout(tmp_path):
+    """run# directories, sorted by number; failed and empty ones skipped."""
+    for name in ('run10', 'run2', 'run1', 'run3_failed'):
+        _make_run_dir(tmp_path, name)
+    (tmp_path / 'run4').mkdir()                      # no variables or output
+    assert [d.name for d in find_run_directories(tmp_path)] == ['run1', 'run2', 'run10']
 
 
-# ---------------------------------------------------------------------------
-# TestParseBiasFromPy
-# ---------------------------------------------------------------------------
+def test_find_run_directories_combo_layout(tmp_path):
+    """comb_*/run_* directories, failed ones skipped; an empty root gives none."""
+    assert find_run_directories(tmp_path) == []
+    for combo in ('comb_001', 'comb_002'):
+        _make_run_dir(tmp_path / combo, 'run_001')
+    _make_run_dir(tmp_path / 'comb_001', 'run_002_failed')
+    found = find_run_directories(tmp_path)
+    assert len(found) == 2 and all(d.name == 'run_001' for d in found)
 
-class TestParseBiasFromPy:
-    """Test parse_bias_from_py: delegates to read_bias_coeff & strips scalar dicts."""
 
-    def test_returns_matrix_keys(self, tmp_path):
-        """Result contains b, c, x, s keys."""
-        f = tmp_path / 'variables.py'
-        f.write_text(_variables_py_content(3))
-        result = parse_bias_from_py(f)
-        assert set(result.keys()) >= {'b', 'c', 'x', 's'}
+# parse_bias_from_py / parse_bias_from_inp
 
-    def test_b_is_flat_list(self, tmp_path):
-        """b vector is a flat 1-D Python list after normalization."""
-        f = tmp_path / 'variables.py'
-        f.write_text(_variables_py_content(4))
-        result = parse_bias_from_py(f)
-        b = result['b']
-        assert isinstance(b, list)
-        assert len(b) == 4
-        assert all(isinstance(v, float) for v in b)
+def test_parse_bias_from_py_returns_matrices_only(tmp_path):
+    f = tmp_path / 'variables.py'
+    f.write_text(_variables_py_content(4))
+    r = parse_bias_from_py(f)
+    assert len(r['b']) == 4 and all(isinstance(v, float) for v in r['b'])
+    assert len(r['c']) == 4 and all(len(row) == 4 for row in r['c'])
+    assert not {'lams', 'cs', 'xs', 'ss'} & set(r)
+    assert parse_bias_from_py(Path(__file__).parent / 'samples' / 'variables.py')['b']
 
-    def test_c_matrix_dimensions(self, tmp_path):
-        """c matrix is n×n for an n-substituent system."""
-        n = 5
-        f = tmp_path / 'variables.py'
-        f.write_text(_variables_py_content(n))
-        result = parse_bias_from_py(f)
-        c = result['c']
-        assert len(c) == n
-        assert all(len(row) == n for row in c)
 
-    def test_scalar_subdicts_stripped(self, tmp_path):
-        """lams/cs/xs/ss scalar subdicts are NOT present in the returned dict."""
-        f = tmp_path / 'variables.py'
-        f.write_text(_variables_py_content(3))
-        result = parse_bias_from_py(f)
-        for key in ('lams', 'cs', 'xs', 'ss'):
-            assert key not in result
+def test_parse_bias_from_py_raises_without_bias_string(tmp_path):
+    f = tmp_path / 'variables.py'
+    f.write_text('# no bias_string here\nx = 1\n')
+    with pytest.raises(ValueError, match="Could not parse bias vector"):
+        parse_bias_from_py(f)
 
-    def test_raises_when_b_missing(self, tmp_path):
-        """Raises ValueError when no bias_string can be parsed."""
-        f = tmp_path / 'variables.py'
-        f.write_text('# no bias_string here\nx = 1\n')
-        with pytest.raises(ValueError, match="Could not parse bias vector"):
-            parse_bias_from_py(f)
 
-    def test_parses_real_example_file(self):
-        """Parses the checked-in tests/fixtures/variables.py without error."""
-        example = Path(__file__).parent / 'samples' / 'variables.py'
-        if not example.exists():
-            pytest.skip('tests/samples/variables.py not found')
-        result = parse_bias_from_py(example)
-        assert 'b' in result and isinstance(result['b'], list)
-        assert len(result['b']) > 0
+def test_parse_bias_from_inp_shapes(tmp_path):
+    """One b entry per block and a square c (2 sites x 2 subs here)."""
+    lines = [f'set lams{s}s{u} = {(s - 1) * 2 + u - 1:.2f}' for s in (1, 2) for u in (1, 2)]
+    lines += [f'set cs{s}s{i}s{s}s{j} = {(s * 10 + i + j) * 0.1:.4f}'
+              for s in (1, 2) for i in (1, 2) for j in (1, 2)]
+    f = tmp_path / 'variables.inp'
+    f.write_text('\n'.join(lines) + '\n')
+    r = parse_bias_from_inp(f)
+    assert '_nsubs_per_site' in r and len(r['b']) == 4
+    assert len(r['c']) == 4 and all(len(row) == 4 for row in r['c'])
+    assert parse_bias_from_inp(Path(__file__).parent / 'samples' / 'variables85.inp')['b']
+
+
+def test_parse_bias_from_inp_nonlinear_signs_match_matrix_convention(tmp_path):
+    """Flat cs/xs/ss values are -matrix (ALF convention); lams is b unchanged.
+
+    Mirrors an ALF variablesflat.py that stores both forms: c[0][1] = +19.53
+    with cs1s1s1s2 = -19.53, x[0][1] = -0.49 with xs1s1s1s2 = +0.49, and so on.
+    """
+    f = tmp_path / 'variables.inp'
+    f.write_text('\n'.join([
+        'set lams1s1 = 0.00', 'set lams1s2 = -7.94', 'set cs1s1s1s2 = -19.53',
+        'set xs1s1s1s2 = 0.49', 'set xs1s2s1s1 = -1.60',
+        'set ss1s1s1s2 = -1.11', 'set ss1s2s1s1 = 0.25',
+    ]) + '\n')
+    r = parse_bias_from_inp(f)
+    assert r['b'] == pytest.approx([0.0, -7.94])
+    assert r['c'][0][1] == pytest.approx(19.53)
+    assert (r['x'][0][1], r['x'][1][0]) == pytest.approx((-0.49, 1.60))
+    assert (r['s'][0][1], r['s'][1][0]) == pytest.approx((1.11, -0.25))
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +168,16 @@ class TestParseBiasFromInp:
         assert set(result.keys()) >= {'b', 'c', 'x', 's', '_nsubs_per_site'}
 
     def test_b_length_matches_total_subs(self, tmp_path):
-        """b has one entry per substituent block (n_sites × n_subs)."""
+        """b has one entry per substituent block (n_sites x n_subs)."""
         n = 2
         f = tmp_path / 'variables.inp'
         self._write_inp(f, n=n)
         result = parse_bias_from_inp(f)
-        # 2 sites × 2 subs = 4 blocks
+        # 2 sites x 2 subs = 4 blocks
         assert len(result['b']) == n * n
 
     def test_c_matrix_square(self, tmp_path):
-        """c is a square (n_blocks × n_blocks) matrix."""
+        """c is a square (n_blocks x n_blocks) matrix."""
         n = 2
         f = tmp_path / 'variables.inp'
         self._write_inp(f, n=n)
@@ -482,7 +428,7 @@ class TestExtractNsubsViaReadBiasCoeff:
         f = tmp_path / 'variables.py'
         self._write_vars(f)   # no alf_info, no nsubs line, no alf_info_string
         data = read_bias_coeff(str(f))
-        # No nsubs information in the file → key absent or None
+        # No nsubs information in the file -> key absent or None
         assert data.get('_nsubs_per_site') is None
 
 
@@ -490,37 +436,18 @@ class TestExtractNsubsViaReadBiasCoeff:
 # TestReadBoxFromPrepScript
 # ---------------------------------------------------------------------------
 
-class TestReadBoxFromPrepScript:
-    """Test _read_box_from_prep_script via the public extract_environment path."""
-
-    def test_reads_box_from_py_file(self, tmp_path):
-        """Parses `box = 40.0` from a prep .py file."""
-        (tmp_path / 'prep.py').write_text('box = 40.0\n# comment\n')
-        box = _read_box_from_prep_script(tmp_path)
-        assert box is not None
-        assert math.isclose(box, 40.0, rel_tol=1e-9)
-
-    def test_reads_box_integer_value(self, tmp_path):
-        """Parses `box = 35` (integer, no decimal point) correctly."""
-        (tmp_path / 'prep.py').write_text('box = 35\n')
-        box = _read_box_from_prep_script(tmp_path)
-        assert box is not None
-        assert math.isclose(box, 35.0, rel_tol=1e-9)
-
-    def test_returns_none_when_no_py_file(self, tmp_path):
-        """Returns None when no .py files are present."""
-        assert _read_box_from_prep_script(tmp_path) is None
-
-    def test_skips_alf_info_py(self, tmp_path):
-        """alf_info.py is excluded; returns None when it is the only .py."""
-        (tmp_path / 'alf_info.py').write_text("alf_info['nsubs'] = [3]\nbox = 99.0\n")
-        # Only alf_info.py present; should be skipped
-        assert _read_box_from_prep_script(tmp_path) is None
-
-    def test_returns_none_when_box_line_absent(self, tmp_path):
-        """Returns None when a .py file exists but contains no `box = ...` line."""
-        (tmp_path / 'prep.py').write_text('nsubs = [3]\n# no box assignment\n')
-        assert _read_box_from_prep_script(tmp_path) is None
+@pytest.mark.parametrize('files, box', [
+    ({'prep.py': 'box = 40.0\n# comment\n'}, 40.0),
+    ({'prep.py': 'box = 35\n'}, 35.0),                              # integer value
+    ({}, None),                                                     # no .py file
+    ({'alf_info.py': "alf_info['nsubs'] = [3]\nbox = 99.0\n"}, None),  # alf_info.py is skipped
+    ({'prep.py': 'nsubs = [3]\n'}, None),                           # no box line
+])
+def test_read_box_from_prep_script(tmp_path, files, box):
+    for name, text in files.items():
+        (tmp_path / name).write_text(text)
+    got = _read_box_from_prep_script(tmp_path)
+    assert got == (pytest.approx(box) if box is not None else None)
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +462,7 @@ def _make_pretraining_run(tmp_path: Path, parent_parts: tuple, run_name: str,
         run_dir = run_dir / part
     run_dir = run_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    # graph_info.json with 1 site × 3 subs
+    # graph_info.json with 1 site x 3 subs
     graph_info = {
         'sites': {f'site1_sub{i}': {'site': 1, 'sub': i}
                   for i in range(1, 4)},
@@ -562,7 +489,7 @@ class TestFilterBestRunsPerSystem:
     """Test filter_best_runs_per_system grouping and best-run selection."""
 
     def test_single_run_per_system_always_selected(self, tmp_path):
-        """One run per system → all runs returned unchanged."""
+        """One run per system -> all runs returned unchanged."""
         runs = [
             _make_pretraining_run(tmp_path, ('14benz_solv',), 'run_001'),
             _make_pretraining_run(tmp_path, ('indole_solv',), 'run_001'),
@@ -571,7 +498,7 @@ class TestFilterBestRunsPerSystem:
         assert len(result) == 2
 
     def test_best_run_selected_per_flat_system(self, tmp_path):
-        """Two runs from the same flat parent dir → only the best-reward one kept."""
+        """Two runs from the same flat parent dir -> only the best-reward one kept."""
         # Use a neutral grandparent name that doesn't contain 'best' or 'combo'
         # (those keywords trigger special legacy-combo grouping in the function).
         base = tmp_path / 'pretraining'
@@ -590,11 +517,11 @@ class TestFilterBestRunsPerSystem:
         run_b = _make_pretraining_run(tmp_path, ('dataset', 'comb_002'), 'run_001',
                                       n_transitions=50)
         result = filter_best_runs_per_system([run_a1, run_a2, run_b])
-        # 2 distinct combos → 2 runs selected (best from comb_001 + only from comb_002)
+        # 2 distinct combos -> 2 runs selected (best from comb_001 + only from comb_002)
         assert len(result) == 2
 
     def test_empty_input_returns_empty(self):
-        """Empty run list → empty result (no crash)."""
+        """Empty run list -> empty result (no crash)."""
         assert filter_best_runs_per_system([]) == []
 
 
@@ -602,123 +529,30 @@ class TestFilterBestRunsPerSystem:
 # TestBuildEdgeWeights
 # ---------------------------------------------------------------------------
 
-class TestBuildEdgeWeights:
-    """Tests for build_edge_weights in mllf.cb.workflow_utils."""
-
-    def setup_method(self):
-        from mllf.cb.workflow_utils import build_edge_weights
-        self.build_edge_weights = build_edge_weights
-        self.device = torch.device('cpu')
-
-    def _edge_index(self, edges):
-        """Build a [2, E] tensor from a list of (src, dst) tuples."""
-        return torch.tensor(edges, dtype=torch.long).T
-
-    def test_empty_ddg_pairs_returns_all_ones(self):
-        """When ddg_pairs is empty, every edge gets weight 1.0."""
-        ei = self._edge_index([(0, 1), (1, 0), (0, 2)])
-        w = self.build_edge_weights(ei, {}, 0.2, self.device)
-        assert w.shape == (3,)
-        assert torch.all(w == 1.0)
-
-    def test_none_entry_gets_no_transition_weight(self):
-        """Pair with None in ddg_pairs (NaN DDG) receives no_transition_weight."""
-        # node 0 → block 2, node 1 → block 3; key "2_3"
-        ei = self._edge_index([(0, 1)])
-        w = self.build_edge_weights(ei, {"2_3": None}, 0.2, self.device)
-        assert torch.isclose(w[0], torch.tensor(0.2))
-
-    def test_finite_entry_gets_full_weight(self):
-        """Pair with a finite float (transitions observed) receives weight 1.0."""
-        ei = self._edge_index([(0, 1)])
-        w = self.build_edge_weights(ei, {"2_3": -1.23}, 0.2, self.device)
-        assert torch.isclose(w[0], torch.tensor(1.0))
-
-    def test_missing_key_treated_as_full_weight(self):
-        """Pair absent from ddg_pairs (old data) receives weight 1.0."""
-        ei = self._edge_index([(0, 1)])
-        # no "2_3" key in dict
-        w = self.build_edge_weights(ei, {"3_4": None}, 0.2, self.device)
-        assert torch.isclose(w[0], torch.tensor(1.0))
-
-    def test_direction_independent(self):
-        """Edge (1, 0) and (0, 1) should produce the same weight (lo/hi normalised)."""
-        ddg = {"2_3": None}
-        w_fwd = self.build_edge_weights(self._edge_index([(0, 1)]), ddg, 0.3, self.device)
-        w_rev = self.build_edge_weights(self._edge_index([(1, 0)]), ddg, 0.3, self.device)
-        assert torch.isclose(w_fwd[0], w_rev[0])
-
-    def test_mixed_edges(self):
-        """Multiple edges with different ddg_pairs entries are weighted correctly."""
-        # node 0→blk2, node 1→blk3, node 2→blk4
-        ddg = {"2_3": None, "2_4": -0.5}
-        ei = self._edge_index([(0, 1), (0, 2), (1, 2)])
-        w = self.build_edge_weights(ei, ddg, 0.1, self.device)
-        assert torch.isclose(w[0], torch.tensor(0.1))   # 2_3 → None
-        assert torch.isclose(w[1], torch.tensor(1.0))   # 2_4 → finite
-        assert torch.isclose(w[2], torch.tensor(1.0))   # 3_4 → missing → 1.0
-
-    def test_custom_no_transition_weight(self):
-        """Respects the caller-supplied no_transition_weight."""
-        ei = self._edge_index([(0, 1)])
-        w = self.build_edge_weights(ei, {"2_3": None}, 0.5, self.device)
-        assert torch.isclose(w[0], torch.tensor(0.5))
-
-    def test_output_dtype_float32(self):
-        """Output tensor has dtype float32."""
-        ei = self._edge_index([(0, 1)])
-        w = self.build_edge_weights(ei, {}, 0.2, self.device)
-        assert w.dtype == torch.float32
+def test_build_edge_weights():
+    """Weight 1 for a pair with transitions or no DDG entry (old data);
+    no_transition_weight for a pair with a None DDG, in either direction."""
+    from mllf.cb.workflow_utils import build_edge_weights
+    cpu = torch.device('cpu')
+    # nodes 0, 1, 2 are blocks 2, 3, 4
+    ei = torch.tensor([(0, 1), (1, 0), (0, 2), (1, 2)], dtype=torch.long).T
+    w = build_edge_weights(ei, {"2_3": None, "2_4": -0.5}, 0.3, cpu)
+    assert w.dtype == torch.float32
+    assert w.tolist() == pytest.approx([0.3, 0.3, 1.0, 1.0])
+    assert build_edge_weights(ei, {}, 0.3, cpu).tolist() == [1.0] * 4
 
 
-# ---------------------------------------------------------------------------
-# TestParseSimulationMetrics
-# ---------------------------------------------------------------------------
-
-class TestParseSimulationMetrics:
-    """Tests for parse_simulation_metrics in mllf.cb.workflow_utils."""
-
-    def setup_method(self):
-        from mllf.cb.workflow_utils import parse_simulation_metrics
-        self.parse_simulation_metrics = parse_simulation_metrics
-
-    def test_returns_ddg_pairs_key(self, tmp_path):
-        """Result dict always contains 'ddg_pairs' key."""
-        # Write a minimal output file with no DDG content
-        f = tmp_path / 'output.out'
-        f.write_text('nothing here\n')
-        result = self.parse_simulation_metrics(f)
-        assert 'ddg_pairs' in result
-
-    def test_ddg_pairs_empty_for_no_section(self, tmp_path):
-        """ddg_pairs is empty dict when output has no SINGLE DDG section."""
-        f = tmp_path / 'output.out'
-        f.write_text('nothing here\n')
-        result = self.parse_simulation_metrics(f)
-        assert result['ddg_pairs'] == {}
-
-    def test_ddg_pairs_populated_from_real_sample(self):
-        """ddg_pairs from the sample file contains the expected pairs."""
-        sample = Path(__file__).parent / 'samples' / '14benz_solv_5.5' / 'output.txt'
-        if not sample.exists():
-            pytest.skip('Sample output file not found')
-        result = self.parse_simulation_metrics(sample)
-        assert 'ddg_pairs' in result
-        # Sample file has NaN/Inf for all pairs → all None
-        assert len(result['ddg_pairs']) > 0
-        assert all(v is None for v in result['ddg_pairs'].values())
-
-    def test_ddg_pairs_keys_are_strings(self, tmp_path):
-        """ddg_pairs keys follow "lo_hi" string format (JSON-serialisable)."""
-        sample = Path(__file__).parent / 'samples' / '14benz_solv_5.5' / 'output.txt'
-        if not sample.exists():
-            pytest.skip('Sample output file not found')
-        result = self.parse_simulation_metrics(sample)
-        for key in result['ddg_pairs']:
-            assert isinstance(key, str)
-            parts = key.split('_')
-            assert len(parts) == 2
-            assert all(p.isdigit() for p in parts)
+def test_parse_simulation_metrics_ddg_pairs(tmp_path):
+    """ddg_pairs is always present, keyed "lo_hi"; empty without a SINGLE DDG section."""
+    from mllf.cb.workflow_utils import parse_simulation_metrics
+    f = tmp_path / 'output.out'
+    f.write_text('nothing here\n')
+    assert parse_simulation_metrics(f)['ddg_pairs'] == {}
+    sample = Path(__file__).parent / 'samples' / '14benz_solv_5.5' / 'output.txt'
+    ddg = parse_simulation_metrics(sample)['ddg_pairs']
+    # the sample has NaN/Inf for every pair
+    assert ddg and all(v is None for v in ddg.values())
+    assert all(re.fullmatch(r'\d+_\d+', k) for k in ddg)
 
 
 # ---------------------------------------------------------------------------
@@ -757,61 +591,22 @@ class TestBackfillDdgPairs:
             "SINGLE DDG>       2      3         NaN         NaN         NaN         NaN\n"
         )
 
-    def test_updates_runs_without_ddg_pairs(self, tmp_path):
-        """Runs missing 'ddg_pairs' in simulation_results.json are updated."""
+    def test_updates_only_runs_without_ddg_pairs(self, tmp_path):
+        """Runs without ddg_pairs get them (NaN -> None, keys "lo_hi"); runs
+        that have them, or have no metadata.json, are skipped."""
         self._make_run(tmp_path, 'run1', self._simple_ddg_output())
-        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
-        assert n_updated == 1
-        assert n_skipped == 0
+        self._make_run(tmp_path, 'run2', self._simple_ddg_output(), already_has_ddg=True)
+        (tmp_path / 'run3').mkdir()
+        (tmp_path / 'run3' / 'simulation_results.json').write_text('{}')
+        assert self.backfill_ddg_pairs(tmp_path) == (1, 2)
         sim = json.loads((tmp_path / 'run1' / 'simulation_results.json').read_text())
-        assert 'ddg_pairs' in sim
-
-    def test_skips_runs_already_having_ddg_pairs(self, tmp_path):
-        """Runs that already have 'ddg_pairs' are not reprocessed."""
-        self._make_run(tmp_path, 'run1', self._simple_ddg_output(), already_has_ddg=True)
-        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
-        assert n_updated == 0
-        assert n_skipped == 1
+        assert sim['ddg_pairs'] == {'2_3': None}
 
     def test_dry_run_does_not_modify_files(self, tmp_path):
-        """With dry_run=True, simulation_results.json is not modified."""
         self._make_run(tmp_path, 'run1', self._simple_ddg_output())
         original = (tmp_path / 'run1' / 'simulation_results.json').read_text()
         self.backfill_ddg_pairs(tmp_path, dry_run=True)
-        after = (tmp_path / 'run1' / 'simulation_results.json').read_text()
-        assert original == after
-
-    def test_skips_run_without_metadata(self, tmp_path):
-        """A run directory with no metadata.json is counted as skipped."""
-        run_dir = tmp_path / 'run1'
-        run_dir.mkdir()
-        sim = {'populations': [], 'transitions': []}
-        (run_dir / 'simulation_results.json').write_text(json.dumps(sim))
-        # No metadata.json
-        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
-        assert n_updated == 0
-        assert n_skipped >= 1
-
-    def test_ddg_values_in_updated_file(self, tmp_path):
-        """After backfill, ddg_pairs keys follow 'lo_hi' format."""
-        self._make_run(tmp_path, 'run1', self._simple_ddg_output())
-        self.backfill_ddg_pairs(tmp_path)
-        sim = json.loads((tmp_path / 'run1' / 'simulation_results.json').read_text())
-        ddg = sim['ddg_pairs']
-        assert isinstance(ddg, dict)
-        # NaN → None round-trips through JSON as null
-        for key, val in ddg.items():
-            parts = key.split('_')
-            assert len(parts) == 2 and all(p.isdigit() for p in parts)
-            assert val is None  # NaN DDG → None
-
-    def test_mixed_runs_updated_and_skipped(self, tmp_path):
-        """Correctly counts updated vs skipped in a mixed batch."""
-        self._make_run(tmp_path, 'run1', self._simple_ddg_output())
-        self._make_run(tmp_path, 'run2', self._simple_ddg_output(), already_has_ddg=True)
-        n_updated, n_skipped = self.backfill_ddg_pairs(tmp_path)
-        assert n_updated == 1
-        assert n_skipped == 1
+        assert (tmp_path / 'run1' / 'simulation_results.json').read_text() == original
 
 
 # ---------------------------------------------------------------------------

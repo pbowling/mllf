@@ -1,7 +1,7 @@
 """Policy updates from one epoch's finished runs (``mllf.cb.epoch_runs``).
 
 * ``behavior_cloning_epoch``: regress toward saved actions instead of running.
-* ``hindsight_update``: NeuralLinear + Thompson sampling -- per-pair offsets,
+* ``hindsight_update``: Bayesian heads with Thompson sampling -- per-pair offsets,
   exploration and outcomes, then the shared model's closed-form posterior
   update or hindsight regression (``bandit.shared_update``).
 * ``reinforce_update``: one REINFORCE step on the epoch's batch (plus the
@@ -71,7 +71,7 @@ def empty_pair_stats() -> Dict[str, int]:
     return dict.fromkeys(PAIR_STAT_KEYS, 0)
 
 
-# ── reading a finished run ──────────────────────────────────────────────────
+# reading a finished run
 
 def _trans_values(saved_data: Dict) -> List[float]:
     trans = saved_data.get('transitions', [])
@@ -166,7 +166,7 @@ def _add(total: Dict[str, int], part: Dict[str, int]) -> None:
         total[k] += part[k]
 
 
-# ── behavioral cloning ──────────────────────────────────────────────────────
+# behavioral cloning
 
 def bc_target_norm(run: EpochRun) -> torch.Tensor:
     """Per-dimension scale of the BC targets: the std of bc_source_epoch's
@@ -186,8 +186,8 @@ def bc_target_norm(run: EpochRun) -> torch.Tensor:
             target_norm = torch.cat(norm_list, dim=0).std(dim=0).clamp(min=1.0).to(device)
         else:
             target_norm = policy.scale_factors.to(device)
-        log.info("  BC target_norm (per-dim std, min=1): "
-                 f"{[f'{v:.3f}' for v in target_norm.tolist()]}")
+        log.debug("  BC target_norm (per-dim std, min=1): "
+                  f"{[f'{v:.3f}' for v in target_norm.tolist()]}")
         return target_norm
     return policy.scale_factors.to(device)
 
@@ -290,8 +290,8 @@ def behavior_cloning_epoch(run: EpochRun, rl_optimizer) -> Dict:
                 bc_loss.backward()
                 epoch_loss += bc_loss.item()
                 n_bc += 1
-                log.info(f"  BC update {combo_path.name}: loss={bc_loss.item():.4f}  "
-                         f"reward={reward_bc:.2f}")
+                log.debug(f"  BC update {combo_path.name}: loss={bc_loss.item():.4f}  "
+                          f"reward={reward_bc:.2f}")
         except Exception as e:
             log.warning(f"  Warning: BC update failed for {combo_path.name}: {e}")
     if n_bc > 0:
@@ -311,7 +311,7 @@ def behavior_cloning_epoch(run: EpochRun, rl_optimizer) -> Dict:
     }
 
 
-# ── hindsight / NeuralLinear + Thompson sampling ───────────────────────────
+# hindsight / Bayesian heads with Thompson sampling
 
 class _HindsightCounts:
     """What the hindsight update did this epoch (for the summary line)."""
@@ -515,7 +515,7 @@ def _regression_update(run: EpochRun, items: list) -> None:
 
 
 def hindsight_update(run: EpochRun, pair_stats: Dict[str, Dict[str, int]]) -> int:
-    """NeuralLinear + TS update from every crash-free run of the epoch.
+    """Bayesian-head update from every crash-free run of the epoch.
     Unlike REINFORCE there is no baseline, success floor or failure batch:
     compute_pair_reward's -1 for an unvisited pair already makes a poorly
     sampled run a real, low-weight observation. Returns n_success (runs with
@@ -588,13 +588,13 @@ def hindsight_update(run: EpochRun, pair_stats: Dict[str, Dict[str, int]]) -> in
                 n_success += 1
             r_relevant_all.append(r_relevant)
         except Exception as e:
-            log.warning(f"  Warning: NeuralLinear+TS update failed for {combo_path_u.name}: {e}")
+            log.warning(f"  Warning: Bayesian head update failed for {combo_path_u.name}: {e}")
 
     if r_relevant_all:
         all_r = torch.cat(r_relevant_all)
         n_obs = ', '.join(f"{name}:{int(policy.edge_mlp.mlps[d].bayesian_head.n_obs.item())}"
                           for d, name in enumerate(BIAS_DIMS))
-        msg = (f"  NeuralLinear+TS posterior update: {n_updated}/{len(run.deferred_updates)} "
+        msg = (f"  Bayesian head update: {n_updated}/{len(run.deferred_updates)} "
                f"combos ({n_success} meeting transition floor), "
                f"{all_r.shape[0]} edges, reward mean={all_r.mean().item():.3f} "
                f"std={all_r.std().item():.3f}, n_obs per head=[{n_obs}]")
@@ -630,7 +630,7 @@ def hindsight_update(run: EpochRun, pair_stats: Dict[str, Dict[str, int]]) -> in
     return n_success
 
 
-# ── REINFORCE ───────────────────────────────────────────────────────────────
+# REINFORCE
 
 def sample_replay_items(combos: List[str], current_epoch: int, k_total: int,
                         max_lookback: Optional[int], rng: np.random.RandomState) -> List[tuple]:
@@ -759,7 +759,7 @@ def _reward_baseline(run: EpochRun, raw_batch, n_partial: int, no_transition_wei
     r_var_batch = (all_w.unsqueeze(-1) * (all_r - r_mean_batch) ** 2).sum(dim=0) / w_sum
     r_std_batch = r_var_batch.clamp(min=1e-12).sqrt().clamp(min=1e-6)
     n_downweighted = int((all_w < 1.0 - 1e-6).sum().item())
-    stats_str = ', '.join(f'{name}: {r_mean_batch[i]:.3f}±{r_std_batch[i]:.3f}'
+    stats_str = ', '.join(f'{name}: {r_mean_batch[i]:.3f} +/- {r_std_batch[i]:.3f}'
                           for i, name in enumerate(BIAS_DIMS))
     if ema_baseline is not None:
         if len(ema_baseline) == 0:

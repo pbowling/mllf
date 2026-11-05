@@ -34,7 +34,7 @@ def load_manifest(manifest_path: str) -> List[str]:
 
 
 def count_combinations_fast(sys_entry: Dict, max_subs_per_site: int = 10) -> int:
-    """Count combinations for a system using arithmetic only — O(1) memory.
+    """Count combinations for a system using arithmetic only; O(1) memory.
 
     Calls find_site_sub_files (a directory scan) then counts via combinatorics
     without ever building the combination list.  Used to classify systems as
@@ -58,7 +58,7 @@ def count_combinations_fast(sys_entry: Dict, max_subs_per_site: int = 10) -> int
     for site, subs in eligible.items():
         n = len(subs)
         max_tail = min(n - 1, max_subs - 1)
-        # n anchors × sum_r C(n-1, r)  for r in 1..max_tail
+        # n anchors x sum_r C(n-1, r)  for r in 1..max_tail
         per_site[site] = n * sum(_comb(n - 1, r) for r in range(1, max_tail + 1))
 
     total = sum(per_site.values())  # within-site totals
@@ -92,7 +92,7 @@ def build_system_manifest(sys_entry: Dict, max_combos: Optional[int] = None,
     out_dir = Path(sys_entry['out_dir'])
 
     lines = [
-        f"\n=== System: {sys_name} ===",
+        f"\nSystem {sys_name}",
         f"  input_dir : {input_dir}",
         f"  out_dir   : {out_dir}",
         f"  solvent   : {sys_entry.get('solvent_state', 'solv')}",
@@ -132,7 +132,7 @@ def create_and_load_system_manifest(sys_entry: Dict, max_subs_per_site: int = 10
     out_dir = Path(sys_entry['out_dir'])
 
     lines = [
-        f"\n=== System: {sys_name} ===",
+        f"\nSystem {sys_name}",
         f"  input_dir : {input_dir}",
         f"  out_dir   : {out_dir}",
         f"  solvent   : {sys_entry.get('solvent_state', 'solv')}",
@@ -175,11 +175,11 @@ def iter_json_array_streaming(path, chunk_size: int = 1 << 20):
     combo_metadata.json is written as ``json.dump(list_of_dicts, f)``. For
     large systems (e.g. 12fuzed at ~1.3 GB / 4M+ entries on disk) a plain
     ``json.load()`` inflates to several GB of Python objects for a single
-    call — enough to OOM a constrained SLURM allocation on its own. This
+    call; enough to OOM a constrained SLURM allocation on its own. This
     reads the file in fixed-size chunks and incrementally decodes one
     top-level array element at a time via ``json.JSONDecoder.raw_decode``
     (the real JSON parser, so it's robust to braces/commas inside string
-    values) — peak memory is O(chunk_size + one element), not O(file size).
+    values); peak memory is O(chunk_size + one element), not O(file size).
     """
     decoder = json.JSONDecoder()
     buf = ''
@@ -211,7 +211,7 @@ def iter_json_array_streaming(path, chunk_size: int = 1 << 20):
                     obj, end = decoder.raw_decode(buf, i)
                 except json.JSONDecodeError:
                     buf = buf[i:]
-                    break  # incomplete element — read more data
+                    break  # incomplete element; read more data
                 yield obj
                 buf = buf[end:]
             if not chunk:
@@ -234,12 +234,12 @@ def build_combo_dir_lookup(
     extracting only the entries needed.
 
     Memory profile:
-      - Peak during scan of one system: O(chunk_size)  →  effectively constant
-      - Retained after all scans: O(n_missing_combos × entry_size)  →  tiny
+      - Peak during scan of one system: O(chunk_size)  ->  effectively constant
+      - Retained after all scans: O(n_missing_combos x entry_size)  ->  tiny
 
     This avoids the catastrophic memory pattern of loading all metadata for
-    a system at once (12fuzed has 4.18 M combos ≈ 1.3 GB on disk, several GB
-    once parsed into Python dicts — enough on its own to OOM constrained
+    a system at once (12fuzed has 4.18 M combos ~ 1.3 GB on disk, several GB
+    once parsed into Python dicts; enough on its own to OOM constrained
     SLURM nodes).
     """
     # Group missing combos by their system's input_dir.
@@ -261,8 +261,8 @@ def build_combo_dir_lookup(
 
     n_systems = len(missing_by_system)
     n_missing = sum(len(v) for v in missing_by_system.values())
-    log.info(f"  [dir lookup] {n_missing} combos need creation across "
-             f"{n_systems} system(s) — scanning metadata ...")
+    log.debug(f"  {n_missing} combos need creation across "
+              f"{n_systems} system(s); scanning metadata ...")
 
     lookup: Dict[str, Any] = {}
     for idir, needed_paths in missing_by_system.items():
@@ -277,7 +277,7 @@ def build_combo_dir_lookup(
                 if not remaining:
                     break
 
-    log.info(f"  [dir lookup] found {len(lookup)}/{n_missing} entries")
+    log.debug(f"  found {len(lookup)}/{n_missing} entries")
     lookup.update(found)
     return lookup
 
@@ -327,7 +327,7 @@ def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
     output_dir = Path(system_config['out_dir'])
 
     if verbose:
-        log.info(f"  Creating combo directory on-demand: {combo_path.name}")
+        log.debug(f"  Creating combo directory on-demand: {combo_path.name}")
     created_path = create_single_combination_dir(
         input_dir, output_dir, combo_info, include_patterns=include_patterns,
         verbose=verbose, slurm=global_config.get('slurm'),

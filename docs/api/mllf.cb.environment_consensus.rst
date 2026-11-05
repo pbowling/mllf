@@ -9,7 +9,4 @@ mllf.cb.environment\_consensus
    .. autosummary::
    
       build_site_consensus
-      compute_run_embeddings_with_consensus
-      load_consensus_atoms
-      save_consensus_atoms
    

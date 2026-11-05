@@ -30,10 +30,10 @@ def parse_rtf_file(path: str) -> Dict[str, object]:
 
     Returns a dict:
       - "site": int, "sub": int
-      - "atom_names": [str]  — ordered ATOM names (matches PDB atom ordering)
-      - "atom_types": [str]  — CHARMM atom types (same order)
+      - "atom_names": [str]; ordered ATOM names (matches PDB atom ordering)
+      - "atom_types": [str]; CHARMM atom types (same order)
       - "charges": [float], "total_charge": float
-      - "bonds": List[Tuple[str,str]]  — atom-name pairs from BOND lines
+      - "bonds": List[Tuple[str,str]]; atom-name pairs from BOND lines
 
     If the filename doesn't contain site/sub, site/sub will be None.
 

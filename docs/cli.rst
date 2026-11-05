@@ -15,6 +15,7 @@ of the pipeline (``python -m mllf`` is the same command):
    train      online training from a workflow config
    export     export production biases from a trained policy
    cost       simulated ns per system: online run vs ALF
+   archive    archive a run's combo directories, one .tar.gz per system
 
 ``mllf COMMAND -h`` lists a command's options. For example:
 
@@ -27,23 +28,37 @@ of the pipeline (``python -m mllf`` is the same command):
    mllf train examples/workflow_14benz.yaml
    mllf export online_1.yaml --label checkpoints_online_1
    mllf cost checkpoints_online_1 --pretraining-root pretraining
+   mllf archive online_1.yaml --remove
 
 Output and verbosity
 --------------------
 
-Progress, warnings and errors go to standard output as plain text (through Python's
-``logging``, under the ``mllf`` logger). ``-q`` and ``-v`` may come before or after the
-command:
+Each run writes two streams. The console (standard output, and so a SLURM job's output
+file) shows progress at the level of phases and epochs: setup totals, the per-epoch
+summary that also goes to ``epoch_summary.log``, stage changes, warnings and errors. A log
+file in the run's output directory records every message with a time stamp, including the
+per-combo, per-run and per-embedding detail (cache hits, job submissions, retries,
+coverage lines):
+
+* ``mllf train``: ``training.log`` in ``output.base_dir`` (appended to on resume)
+* ``mllf pretrain``: ``pretrain.log`` in ``--output-dir``
+* ``mllf collect``: ``collect.log`` in ``--output-dir``
+* ``mllf replay``: the replay cache path with the suffix ``.log``
+
+``-q`` and ``-v`` set the console level and may come before or after
+the command:
 
 * ``-q``: warnings and errors only.
 * default: progress messages.
 * ``-v``: verbose detail as well; for ``mllf train`` this is the config's
   ``verbose: true``.
-* ``-vv``: debug messages, prefixed with the level and the module they come from.
+* ``-vv``: every message, prefixed with its level and module.
 
-When mllf is used as a library (a notebook, a job script), the same messages are shown
-by default; ``mllf.log.setup_logging(-1)`` keeps only warnings, and the ``mllf`` logger
-can be given other handlers like any Python logger.
+The live job status line (``[running=... | queued=...]``) and Uni-Mol's progress bars
+appear only in an interactive terminal. When mllf is used as a library (a notebook, a job
+script), the console messages are shown by default; ``mllf.log.setup_logging(-1)`` keeps
+only warnings, ``mllf.log.log_to_file(path)`` records everything in a file, and the
+``mllf`` logger can be given other handlers like any Python logger.
 
 Older entry points
 ------------------

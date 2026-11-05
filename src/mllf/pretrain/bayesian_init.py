@@ -1,4 +1,4 @@
-"""Bayesian-head warm start (NeuralLinear + Thompson sampling) from a
+"""Bayesian-head warm start (Bayesian heads with Thompson sampling) from a
 behavior-cloned deterministic policy.
 """
 import logging
@@ -13,7 +13,7 @@ from mllf.cb.policy import UnimolPolicy
 log = logging.getLogger(__name__)
 
 
-# ── NeuralLinear + Thompson Sampling: Bayesian head warm-start ──────────────
+# Bayesian heads with Thompson sampling: Bayesian head warm-start
 
 def _compute_physical_residual_variance(
     policy_det, graph_cache: List, device, max_runs: int = 200,
@@ -23,7 +23,7 @@ def _compute_physical_residual_variance(
 
     Shared low-level pass used by both ``estimate_reward_noise_variance``
     (observation noise) and ``initialize_bayesian_heads_from_pretrained``
-    (exploration-precision calibration) — both need "how much do real bias
+    (exploration-precision calibration); both need "how much do real bias
     coefficients actually scatter around the deterministic model's
     prediction, per bias type", just for different purposes.
 
@@ -32,7 +32,7 @@ def _compute_physical_residual_variance(
     without an entry; without it every target counts.
 
     Returns:
-        (residuals, n_used) — residuals is a list of 4 lists of floats (one
+        (residuals, n_used); residuals is a list of 4 lists of floats (one
         per bias type, in physical bias-coefficient units), n_used is how
         many cached runs actually contributed.
     """
@@ -79,12 +79,12 @@ def _compute_typical_z_norm_sq(
     """Estimate ``E[||z||^2]`` per bias type from real BC-pretraining edge features.
 
     ``z`` is each trunk's feature vector (see ``UnimolPolicy.forward_features``)
-    — the input the Bayesian head's linear regression actually sees. Needed to
+; the input the Bayesian head's linear regression actually sees. Needed to
     correctly calibrate ``BayesianLinearHead``'s prior precision: a precision
     calibrated only from the deterministic weights' own magnitude (as an
     earlier version of this code did) implicitly assumes ``||z|| ~ 1``, which
     is not remotely true for a real trunk on real Uni-Mol embeddings (``||z||``
-    of 5-10+ is typical) — so the resulting Thompson-sampling noise can still
+    of 5-10+ is typical); so the resulting Thompson-sampling noise can still
     swamp the signal even when the weight-based calibration alone looks tight.
     See ``initialize_bayesian_heads_from_pretrained``.
 
@@ -131,7 +131,7 @@ def estimate_reward_noise_variance(
     Runs the trained deterministic policy's forward pass over a sample of
     cached pretraining graphs and computes the residual variance between its
     mean prediction and the actual BC target, per bias type. This becomes each
-    ``BayesianLinearHead``'s ``noise_var`` (sigma^2) — NeuralLinear's posterior
+    ``BayesianLinearHead``'s ``noise_var`` (sigma^2); the Bayesian head's posterior
     update needs this to correctly weigh how much a new observation should move
     the mean vs. how much predictive uncertainty should remain.
 
@@ -142,7 +142,7 @@ def estimate_reward_noise_variance(
         device: torch device.
         weights_cache: Optional data-hygiene [E][4] pairwise weights (indexed
             like ``graph_cache``); when given, only measured targets count.
-        max_runs: Cap on how many cached runs to sample — residual-variance
+        max_runs: Cap on how many cached runs to sample; residual-variance
             estimation doesn't need the full dataset; keeps this fast.
         floor: Minimum returned variance, so a small/lucky sample can't make the
             posterior overconfident with a near-zero sigma^2.
@@ -156,7 +156,7 @@ def estimate_reward_noise_variance(
     # Residuals above are in *physical* bias-coefficient units (both `mean`
     # and `targets` are), but BayesianLinearHead.noise_var is consumed in the
     # posterior's native *pre-activation* space (see UnimolPolicy
-    # ._preact_to_action / ._action_to_preact — the posterior is seeded from,
+    # ._preact_to_action / ._action_to_preact; the posterior is seeded from,
     # and regresses toward, the deterministic readout's pre-softsign+scale
     # output). Convert via the local-linear approximation d(scale*softsign(x))/dx
     # = scale/(1+|x|)^2 -> near x=0 this is ~scale, so Var(physical) ~
@@ -170,7 +170,7 @@ def estimate_reward_noise_variance(
         if len(residuals[d]) >= 5:
             noise_var_physical = max(float(np.var(residuals[d])), floor)
         else:
-            noise_var_physical = 1.0  # too little data — fall back to a neutral hyperparameter
+            noise_var_physical = 1.0  # too little data; fall back to a neutral hyperparameter
         noise_vars.append(noise_var_physical / float(scale_factors[d]) ** 2)
     dim_names = ['linear', 'quadratic', 'skew', 'end']
     log.info('%s', "  Estimated reward noise variance (sigma^2, pre-activation space) "
@@ -187,8 +187,8 @@ def initialize_bayesian_heads_from_pretrained(
 ):
     """Build a ``use_bayesian_heads=True`` sibling of a trained deterministic policy.
 
-    Copies each bias type's trunk (feature extractor) weights 1:1 — the trunk
-    architecture is identical between the two modes — and warm-starts each
+    Copies each bias type's trunk (feature extractor) weights 1:1; the trunk
+    architecture is identical between the two modes; and warm-starts each
     ``BayesianLinearHead``'s posterior *mean* at the deterministic head's
     trained readout weight/bias, leaving posterior *uncertainty* at a
     calibrated prior (see below) so it is genuinely narrowed by real online
@@ -212,7 +212,7 @@ def initialize_bayesian_heads_from_pretrained(
             Thompson-sampling exploration variance, in **physical**
             bias-coefficient units, as a fraction of the real physical-space
             residual variance already estimated for that dimension (see
-            ``estimate_reward_noise_variance``) — i.e. "let sampling wiggle
+            ``estimate_reward_noise_variance``); i.e. "let sampling wiggle
             the action by roughly this fraction of how much real bias
             coefficients for this type actually vary." 0.3 gives visible but
             not overwhelming exploration; raise to explore more aggressively,
@@ -224,7 +224,7 @@ def initialize_bayesian_heads_from_pretrained(
         assuming trunk features ``z`` have norm ~1. Real Uni-Mol-derived
         trunk features don't (``||z||`` of 5-10+ is typical), and scale
         factors vary hugely across bias types (quadratic's is 520, end's is
-        30) — so even a "tight-looking" weight-only calibration can leave
+        30); so even a "tight-looking" weight-only calibration can leave
         Thompson-sampling noise, in *physical* units near the origin
         (``scale_factor * raw_noise``), swamping the signal for
         high-scale_factor dimensions. This was caught against a real
@@ -234,7 +234,7 @@ def initialize_bayesian_heads_from_pretrained(
 
         With ``graph_cache``, precision is instead set so the *physical-unit*
         exploration variance directly targets a fraction of the *physical*
-        residual variance real BC data actually shows for that dimension —
+        residual variance real BC data actually shows for that dimension;
         using the real trunk's ``E[||z||^2]`` (``_compute_typical_z_norm_sq``)
         and the real physical-space residual variance
         (``_compute_physical_residual_variance``, shared with
@@ -279,7 +279,7 @@ def initialize_bayesian_heads_from_pretrained(
         bayes_mlp = policy_bayes.edge_mlp.mlps[d]
         bayes_mlp.trunk.load_state_dict(det_mlp.trunk.state_dict())
         # readout: Linear(64, 2) -> row 0 is the mean branch (row 1 is log_std,
-        # which has no Bayesian-mode analogue — uncertainty now comes from the
+        # which has no Bayesian-mode analogue; uncertainty now comes from the
         # posterior instead).
         weight = det_mlp.readout.weight.data[0]  # [64]
         bias = float(det_mlp.readout.bias.data[0])

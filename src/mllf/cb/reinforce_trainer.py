@@ -2,7 +2,7 @@
 
 ``train_epoch`` proposes biases for each combo, simulates them
 (``mllf.cb.epoch_runs``), then updates the policy from the finished runs
-(``mllf.cb.epoch_updates``): REINFORCE, or NeuralLinear + Thompson sampling
+(``mllf.cb.epoch_updates``): REINFORCE, or Bayesian heads with Thompson sampling
 with per-pair offsets and a posterior or hindsight-regression update of the
 shared model (``bandit.algorithm`` / ``bandit.shared_update``). Behavioral
 cloning toward saved actions replaces the simulations in ``bc_mode``.

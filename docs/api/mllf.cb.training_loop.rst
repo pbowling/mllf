@@ -13,6 +13,7 @@ mllf.cb.training\_loop
       advance_curriculum
       advance_system_stages
       apply_scouting
+      archive_finished
       export_final
       finish
       plan_per_system

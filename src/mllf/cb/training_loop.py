@@ -51,11 +51,17 @@ from mllf.cb.workflow_utils import (
     save_bandit_state,
     select_combos_by_uncertainty,
 )
+from mllf.file_handling.archive import archive_config, archive_systems
 from mllf.file_handling.combo_sets import reversed_pair
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
+from mllf.log import log_to_file
 
 
 log = logging.getLogger(__name__)
+
+# Every message of a run, with time stamps, in output.base_dir (the console
+# shows progress, the epoch summaries, warnings and errors).
+LOG_FILE = 'training.log'
 
 
 # Stage keys that set the whole epoch's training; one batch mixes systems, so
@@ -121,6 +127,9 @@ class TrainingRun:
     ema_baseline: Dict = field(default_factory=dict)
     replay_cache: Dict[str, list] = field(default_factory=dict)
     gate: ValidationGate = field(default_factory=ValidationGate)
+    # archive: block (mllf.file_handling.archive); systems archived so far
+    archive: Optional[Dict] = None
+    archived: Set[str] = field(default_factory=set)
     _pool_cache: Dict[tuple, List[str]] = field(default_factory=dict)
     _scout_tiers: Dict[str, Dict[str, int]] = field(default_factory=dict)
     _scout_summaries: Dict[str, Dict] = field(default_factory=dict)
@@ -206,7 +215,7 @@ class EpochRecord:
     gate: Optional[str] = None
 
 
-# ── setup ───────────────────────────────────────────────────────────────────
+# setup
 
 def setup_run(config: Dict) -> TrainingRun:
     """Build the run's combo pool, policy, optimizers and curriculum state,
@@ -223,10 +232,10 @@ def setup_run(config: Dict) -> TrainingRun:
     curriculum_cfg = config.get('curriculum', {})
     setup.print_curriculum(curriculum_cfg)
 
-    log.info("\n=== Initializing Uni-Mol CB Policy ===")
+    log.info("\nInitializing the policy")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     log.info(f"Using device: {device}")
-    log.info("Using pretrained Uni-Mol representation...")
+    log.debug("Using pretrained Uni-Mol representation...")
     train_cfg = config.get('training', {})
     policy_cfg = train_cfg.get('policy', {})
     bandit = BanditConfig.from_config(config)
@@ -235,9 +244,9 @@ def setup_run(config: Dict) -> TrainingRun:
     setup.freeze_heads(policy, policy_cfg.get('freeze_heads', []))
     rl_optimizer, rl_scheduler = setup.make_rl_optimizer(
         policy, train_cfg.get('optimizer', {}).get('lr', 0.001))
-    log.info(f"Uni-Mol policy: {sum(p.numel() for p in policy.parameters())} params")
-    log.info(f"Uni-Mol dimension: {policy_cfg.get('unimol_dim', 512)}")
-    log.info(f"MLP hidden dimension: {policy_cfg.get('mlp_hidden', 64)}")
+    log.debug(f"Uni-Mol policy: {sum(p.numel() for p in policy.parameters())} params")
+    log.debug(f"Uni-Mol dimension: {policy_cfg.get('unimol_dim', 512)}")
+    log.debug(f"MLP hidden dimension: {policy_cfg.get('mlp_hidden', 64)}")
     system_to_idx = build_system_index(systems_cfg)
     baseline_net, baseline_optimizer = setup.make_context_baseline(train_cfg, bandit.algorithm,
                                                                    system_to_idx,
@@ -245,7 +254,7 @@ def setup_run(config: Dict) -> TrainingRun:
     history_replay_cfg = config.get('replay', {})
     if history_replay_cfg.get('enabled', False) and bandit.algorithm == 'hindsight':
         log.warning("  Warning: replay.enabled=True but bandit.algorithm == "
-                    "'hindsight' — history replay folds an extra REINFORCE-"
+                    "'hindsight'; history replay folds an extra REINFORCE-"
                     "style loss into a gradient step hindsight doesn't take; ignoring.")
         history_replay_cfg = {}
 
@@ -258,7 +267,7 @@ def setup_run(config: Dict) -> TrainingRun:
                                                  baseline_optimizer,
                                                  checkpoint_dir, pretrain_path, device)
 
-    log.info("\n=== Training ===")
+    log.info("\nTraining")
     curriculum_enabled = curriculum_cfg.get('enabled', False)
     stages = curriculum_cfg.get('stages', []) if curriculum_enabled else []
     if curriculum_enabled:
@@ -269,6 +278,7 @@ def setup_run(config: Dict) -> TrainingRun:
         log.info(f"Training for {num_epochs} epochs")
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
     run = TrainingRun(
+        archive=archive_config(config),
         config=config, bandit=bandit, device=device, deploy=deploy, systems_cfg=systems_cfg,
         combo_system_map=combo_system_map, train_combos=all_combos,
         combo_sets_by_system=combo_sets_by_system, explicit_combos=explicit_combos,
@@ -329,8 +339,8 @@ def _init_curriculum(run: TrainingRun, start_stage_idx: Optional[int]) -> None:
                                                         for si in range(run.current_stage_idx))
     stage = run.current_stage
     resumed = run.start_epoch > 0
-    log.info(f"\n=== Stage {run.current_stage_idx+1}/{len(stages)}: {stage['name']}"
-             f"{' (resumed)' if resumed else ''} ===")
+    log.info(f"\nStage {run.current_stage_idx+1}/{len(stages)}: {stage['name']}"
+             f"{' (resumed)' if resumed else ''}")
     # A combo_set stage (per-system only) has no manifest filter; per-system
     # pools are rebuilt every epoch.
     if stage.get('combo_set'):
@@ -377,7 +387,7 @@ def _init_per_system(run: TrainingRun) -> None:
         log.info(f"  {name}: {where}")
 
 
-# ── per-system pools ────────────────────────────────────────────────────────
+# per-system pools
 
 def _system_stage(run: TrainingRun, sys_name: str) -> Optional[Dict]:
     st = run.stage_state.get(sys_name)
@@ -395,7 +405,7 @@ def system_stage_pool(run: TrainingRun, sys_name: str) -> List[str]:
     if key not in run._pool_cache:
         stage = dict(run.stages[st['stage']])
         stage.pop('systems', None)
-        log.info(f"  [{sys_name}] stage {stage['name']}:")
+        log.debug(f"  [{sys_name}] stage {stage['name']}:")
         if stage.get('combo_set'):
             # An explicit set (e.g. ALF's groups); the stage's site/sub
             # filters, if given, still apply to it.
@@ -403,7 +413,7 @@ def system_stage_pool(run: TrainingRun, sys_name: str) -> List[str]:
             run._pool_cache[key] = (apply_stage_combo_filter(
                 cands, stage, run.curriculum_cfg, stage_idx=st['stage'], seed=run.seed,
                 apply_transition_filter=False) if 'min_sites' in stage else list(cands))
-            log.info(f"  combo set {stage['combo_set']}: {len(run._pool_cache[key])} combos")
+            log.debug(f"  combo set {stage['combo_set']}: {len(run._pool_cache[key])} combos")
         else:
             run._pool_cache[key] = apply_stage_combo_filter(
                 run.combos_by_system.get(sys_name, []), stage, run.curriculum_cfg,
@@ -467,18 +477,33 @@ def export_final(run: TrainingRun, sys_name: str) -> None:
             path = export_final_biases(run.policy, sys_cfg, run.config, run.bandit_state,
                                        out / sub if sub else out, device=run.device,
                                        combo_dir=cdir)
-            log.info(f"  [EXPORT] {sys_name}: final biases written to {path}")
+            log.info(f"  {sys_name}: final biases written to {path}")
         except Exception as err:
-            log.info(f"  [EXPORT] {sys_name}{'/' + sub if sub else ''}: export failed: {err}")
+            log.warning(f"  Warning: {sys_name}{'/' + sub if sub else ''}: export failed: {err}")
     # The labels read system_stages.json, so save it first (scouting exports
     # before the epoch's save).
     try:
         system_stages.save_state(run.stage_state_path, run.stage_state)
         n = label_final_biases(run.checkpoint_dir, run.config, [sys_name])
         if n:
-            log.info(f"  [EXPORT] {sys_name}: confidence labels for {n} group(s)")
+            log.info(f"  {sys_name}: confidence labels for {n} group(s)")
     except Exception as err:
-        log.info(f"  [EXPORT] {sys_name}: labelling failed: {err}")
+        log.warning(f"  Warning: {sys_name}: labelling failed: {err}")
+    if run.archive and run.archive['when'] == 'system':
+        archive_finished(run, [sys_name])
+
+
+def archive_finished(run: TrainingRun, names: Optional[List[str]] = None) -> None:
+    """Archive these systems' combo directories (default: every system not
+    archived yet), per the config's archive: block."""
+    todo = [n for n in (names if names is not None
+                        else [s.get('name') for s in run.systems_cfg])
+            if n not in run.archived]
+    if not todo:
+        return
+    written = archive_systems(run.systems_cfg, run.archive['dir'], names=todo,
+                              remove=run.archive['remove'])
+    run.archived.update(Path(p).name[:-len('.tar.gz')] for p in written)
 
 
 def _scout_tiers(run: TrainingRun, path) -> Dict[str, int]:
@@ -530,7 +555,7 @@ def apply_scouting(run: TrainingRun, sn: str, epoch: int) -> Tuple[str, Dict]:
                   'converged': converged, 'dir': sdir}
 
 
-# ── 1. plan the epoch ───────────────────────────────────────────────────────
+# 1. plan the epoch
 
 def _skip_empty_stages(run: TrainingRun, epoch: int, held_out: Set[str]) -> None:
     """A stage with no combos for a system (filters leave none) is skipped."""
@@ -655,9 +680,7 @@ def advance_curriculum(run: TrainingRun) -> None:
     run.current_stage_idx += 1
     run.current_stage_epoch = 0
     stage = run.current_stage
-    log.info(f"\n{'='*60}")
-    log.info(f"=== Stage {run.current_stage_idx+1}/{len(stages)}: {stage['name']} ===")
-    log.info(f"{'='*60}")
+    log.info(f"\nStage {run.current_stage_idx+1}/{len(stages)}: {stage['name']}")
     held_out = set(run.validation_combos)
     run.active_train_combos = [c for c in apply_stage_combo_filter(
         run.train_combos, stage, run.curriculum_cfg, stage_idx=run.current_stage_idx,
@@ -682,12 +705,10 @@ def print_epoch_header(run: TrainingRun, plan: EpochPlan) -> None:
                  f"epoch {run.current_stage_epoch+1}/{run.current_stage['epochs']}")
     else:
         label = f"epoch {plan.epoch}"
-    log.info(f"\n{'='*80}")
-    log.info(f"EPOCH {plan.epoch}/{run.num_epochs-1}  [{label}]")
-    log.info(f"{'='*80}")
+    log.info(f"\nEPOCH {plan.epoch}/{run.num_epochs-1}  [{label}]")
 
 
-# ── 2. select the epoch's combos ────────────────────────────────────────────
+# 2. select the epoch's combos
 
 def _reference_quota(run: TrainingRun, plan: EpochPlan) -> None:
     """curriculum.combos_per_system: reference_pairs -- each system's share of
@@ -704,7 +725,7 @@ def _reference_quota(run: TrainingRun, plan: EpochPlan) -> None:
     plan.system_quota = {s: max(qmin, int(round(plan.max_combos * n / tot)))
                          for s, n in nref.items()}
     plan.max_combos = max(plan.max_combos, sum(plan.system_quota.values()))
-    log.info('%s', "  Per-system shares (reference pairs): " + ', '.join(
+    log.debug('%s', "  Per-system shares (reference pairs): " + ', '.join(
         f"{s} {q}" for s, q in sorted(plan.system_quota.items())))
 
 
@@ -719,8 +740,8 @@ def _use_uncertainty_selection(run: TrainingRun) -> bool:
         min_obs = run.bandit.min_observations_before_confident
         n_obs = [mlp.bayesian_head.n_obs.item() for mlp in run.policy.edge_mlp.mlps]
         if min(n_obs) < min_obs:
-            log.info("  NeuralLinear+TS: posterior not yet confident "
-                     f"(min n_obs={min(n_obs):.0f} < {min_obs}) — "
+            log.info("  Bayesian heads: posterior not yet confident "
+                     f"(min n_obs={min(n_obs):.0f} < {min_obs}); "
                      "falling back to random combo selection for this epoch")
             use = False
     return use
@@ -796,7 +817,7 @@ def select_epoch_combos(run: TrainingRun, plan: EpochPlan) -> None:
                  f"combos selected (min_per_system={min_per_sys}, seed={run.seed + epoch})")
         alloc = ', '.join(f"{s}:{sum(1 for c in plan.combos if run.system_of(c) == s)}"
                           for s in sorted(pools))
-        log.info(f"  Allocation per system: {alloc}")
+        log.debug(f"  Allocation per system: {alloc}")
     elif over_budget:
         rng = np.random.RandomState(run.seed + epoch)
         plan.combos = list(rng.choice(active, size=plan.max_combos, replace=False))
@@ -965,7 +986,7 @@ def reserve_pool(run: TrainingRun, plan: EpochPlan) -> List[str]:
     return list(rng.choice(cands, size=min(size, len(cands)), replace=False))
 
 
-# ── 4. group runs and per-system stages ─────────────────────────────────────
+# 4. group runs and per-system stages
 
 def _block_label(labels, block) -> str:
     n = int(block) - 2
@@ -1174,7 +1195,7 @@ def advance_system_stages(run: TrainingRun, plan: EpochPlan, epoch: int, rec: Ep
     system_stages.save_state(run.stage_state_path, run.stage_state)
 
 
-# ── 5. validation ───────────────────────────────────────────────────────────
+# 5. validation
 
 def _epoch_validation_combos(run: TrainingRun, plan: EpochPlan, rec: EpochRecord) -> List[str]:
     """The held-out combos validated this epoch: those of the systems the
@@ -1255,8 +1276,8 @@ def validate(run: TrainingRun, plan: EpochPlan, epoch: int, stats: Dict, rec: Ep
     val_reward, val_std = val_stats.get('avg_reward', nan), val_stats.get('reward_std', nan)
     train_reward, train_std = stats.get('avg_reward', nan), stats.get('reward_std', nan)
     val_loss, train_loss = val_stats.get('loss', nan), stats.get('loss', nan)
-    lines = [f"  [VALIDATION] Train Reward: {train_reward:7.4f}±{train_std:6.4f}  |  "
-             f"Val Reward: {val_reward:7.4f}±{val_std:6.4f}  "
+    lines = [f"  [VALIDATION] Train Reward: {train_reward:7.4f} +/- {train_std:6.4f}  |  "
+             f"Val Reward: {val_reward:7.4f} +/- {val_std:6.4f}  "
              f"(delta: {val_reward - train_reward:+.4f})",
              f"  [VALIDATION] Train Loss: {train_loss:7.4f}  |  Val Loss: {val_loss:7.4f}"]
     pair_line = format_pair_success(val_stats.get('pair_success', {}), 'validation')
@@ -1273,7 +1294,7 @@ def validate(run: TrainingRun, plan: EpochPlan, epoch: int, stats: Dict, rec: Ep
         _apply_gate(run, epoch, val_combos, val_stats, rec)
 
 
-# ── 6. log and checkpoint ───────────────────────────────────────────────────
+# 6. log and checkpoint
 
 def _cost_lines(run: TrainingRun, rec: EpochRecord) -> Dict:
     """Training ns per system so far (validation listed separately: it checks
@@ -1325,10 +1346,10 @@ def _epoch_log_block(run: TrainingRun, plan: EpochPlan, stats: Dict, rec: EpochR
 def _summary_lines(run: TrainingRun, epoch: int, stats: Dict) -> List[str]:
     lines = [f"\nEpoch {epoch} Summary:",
              f"  Policy Loss: {stats['loss']:.4f}",
-             f"  Avg Reward: {stats['avg_reward']:.4f}±{stats.get('reward_std', 0.0):.4f}"]
+             f"  Avg Reward: {stats['avg_reward']:.4f} +/- {stats.get('reward_std', 0.0):.4f}"]
     if 'val_reward' in stats and not np.isnan(stats['val_reward']):
         lines.append(f"  Val Reward: {stats['val_reward']:.4f}"
-                     f"±{stats.get('val_reward_std', 0.0):.4f} "
+                     f" +/- {stats.get('val_reward_std', 0.0):.4f} "
                      f"({stats.get('val_n_combos', len(run.validation_combos))} combos)")
     lines.append(f"  Success batch: {stats.get('n_success', 0)}")
     train_line = format_pair_success(stats.get('pair_success', {}), 'train batch')
@@ -1392,7 +1413,7 @@ def step_scheduler(run: TrainingRun, stats: Dict) -> None:
     run.rl_scheduler.step(stats.get('n_success', 0))
     new = [pg['lr'] for pg in run.rl_optimizer.param_groups]
     if new != prev:
-        log.info(f"  ReduceLROnPlateau fired: LR {prev[0]:.2e} → {new[0]:.2e}")
+        log.info(f"  ReduceLROnPlateau fired: LR {prev[0]:.2e} -> {new[0]:.2e}")
 
 
 def _baseline_fields(run: TrainingRun) -> Dict:
@@ -1418,7 +1439,7 @@ def save_checkpoint(run: TrainingRun, epoch: int, stats: Dict) -> None:
 def finish(run: TrainingRun) -> None:
     """End on the best validated model when the last validation scored
     lower, and save final_model.pt."""
-    log.info("\n=== Training Complete ===")
+    log.info("\nTraining complete")
     g = run.gate
     final_from = 'last epoch'
     if g.best_state is not None and g.last_score is not None and g.last_score < g.best_score:
@@ -1433,9 +1454,11 @@ def finish(run: TrainingRun) -> None:
                 'all_stats': run.all_stats,
                 **_baseline_fields(run)}, final_path)
     log.info(f"Saved final model: {final_path}")
+    if run.archive:
+        archive_finished(run)
 
 
-# ── the loop ────────────────────────────────────────────────────────────────
+# the loop
 
 def run_epoch(run: TrainingRun, epoch: int) -> bool:
     """Plan, train, record, validate and checkpoint one epoch. Returns False
@@ -1508,14 +1531,17 @@ def run_epoch(run: TrainingRun, epoch: int) -> bool:
 
 def run_training(config_path: str, verbose: Optional[bool] = None) -> None:
     """Run online policy training from a workflow YAML file (see
-    :doc:`workflow`): build or load the combo manifests, initialize or
+    :doc:`/docs/workflow`): build or load the combo manifests, initialize or
     resume the policy, run the configured (curriculum) epochs and save
     checkpoints. In deploy mode the model and output paths come from the
-    ``deploy:`` block. ``verbose`` overrides the config's ``verbose`` key."""
+    ``deploy:`` block. ``verbose`` overrides the config's ``verbose`` key.
+    Every message is also recorded in ``<output.base_dir>/training.log``."""
     config = setup.load_training_config(config_path)
     if verbose is not None:
         config['verbose'] = verbose
-    with WarningSummary():
+    log_file = Path(config.get('output', {}).get('base_dir', 'checkpoints')) / LOG_FILE
+    with log_to_file(log_file), WarningSummary():
+        log.info(f"Log: {log_file}")
         run = setup_run(config)
         for epoch in range(run.start_epoch, run.num_epochs):
             if not run_epoch(run, epoch):

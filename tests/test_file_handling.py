@@ -266,7 +266,8 @@ def test_parse_pair_barriers_matches_profile():
 
 
 def test_pair_transitions_credit_each_state_change_to_its_pair():
-    # site with 3 subs (blocks 2,3,4): states 2 → 3 → 2 → 4 → 3, with non-physical frames between
+    # site with 3 subs (blocks 2,3,4): states 2 -> 3 -> 2 -> 4 -> 3, with non-physical
+    # frames between
     from mllf.file_handling.read_output import parse_pair_profile
     seq = [
         [
@@ -282,9 +283,9 @@ def test_pair_transitions_credit_each_state_change_to_its_pair():
     for r in seq:
         rows += [r] * 30          # keep every pair above the minimum-frames threshold
     prof = parse_pair_profile(_lambda_output(rows))
-    assert prof[(2, 3)]["transitions"] == 2      # 2→3, 3→2
-    assert prof[(2, 4)]["transitions"] == 1      # 2→4
-    assert prof[(3, 4)]["transitions"] == 1      # 4→3
+    assert prof[(2, 3)]["transitions"] == 2      # 2->3, 3->2
+    assert prof[(2, 4)]["transitions"] == 1      # 2->4
+    assert prof[(3, 4)]["transitions"] == 1      # 4->3
     # CHARMM's site total would be 4 + 1 (first entry into a physical state)
     assert sum(v["transitions"] for v in prof.values()) == 4
 

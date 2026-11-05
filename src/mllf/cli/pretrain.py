@@ -79,14 +79,14 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--no-filter-outliers",
         action="store_true",
         help="If set, disable statistical filtering of outlier runs. By default, runs with "
-             "coefficients outside ±N standard deviations are excluded.",
+             "coefficients outside +/-N standard deviations are excluded.",
     )
     parser.add_argument(
         "--outlier-std-threshold",
         type=float,
         default=3.0,
         help="Number of standard deviations for outlier threshold (default: 3.0). Runs with any "
-             "coefficient exceeding mean ± N*std are excluded.",
+             "coefficient exceeding mean +/- N*std are excluded.",
     )
     parser.add_argument(
         "--min-transitions",
@@ -95,7 +95,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="N",
         help="Keep only runs where every site has >= N transitions at the highest lambda "
              "value (e.g. --min-transitions 3). Uses the raw transition counts from "
-             "simulation_results.json — no reward formula involved. Takes precedence over "
+             "simulation_results.json; no reward formula involved. Takes precedence over "
              "--min-reward-threshold and --stratified-negative-fraction when set.",
     )
     parser.add_argument(
@@ -144,8 +144,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--awr-temperature",
         type=float,
         default=1.0,
-        help="Temperature β for AWR loss: each run is weighted by exp(r/β). Higher β → "
-             "more uniform weighting; lower β → sharper emphasis on high-reward runs. "
+        help="Temperature beta for AWR loss: each run is weighted by exp(r/beta). Higher beta: "
+             "more uniform weighting; lower beta: sharper emphasis on high-reward runs. "
              "Default: 1.0.",
     )
     parser.add_argument(
@@ -197,8 +197,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="After the normal BC loop finishes, also build and save a "
-             "use_bayesian_heads=True sibling policy for NeuralLinear + "
-             "Thompson Sampling online training (best_policy_bayesian.pt / "
+             "use_bayesian_heads=True sibling policy for online training with "
+             "Thompson sampling (best_policy_bayesian.pt / "
              "final_policy_bayesian.pt). Trunks are copied from the trained "
              "deterministic policy and each BayesianLinearHead's posterior "
              "mean is warm-started from the deterministic readout; the "
@@ -220,7 +220,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "coefficient units) as a fraction of the real physical residual "
              "variance for each dimension, when --bayesian-heads is set. "
              "Raise (e.g. 0.5-1.0) for more exploration in online "
-             "NeuralLinear+TS training. Default: 0.3.",
+             "Bayesian-head training. Default: 0.3.",
     )
     parser.add_argument(
         "--emphasize-systems",
@@ -242,13 +242,13 @@ def _emphasis(entries) -> Dict[str, float]:
     for entry in entries or []:
         name, sep, weight_str = entry.rpartition(':')
         if not sep:
-            log.warning(f"  Warning: --emphasize-systems entry '{entry}' missing ':WEIGHT' — "
+            log.warning(f"  Warning: --emphasize-systems entry '{entry}' missing ':WEIGHT'; "
                         "skipping")
             continue
         try:
             system_emphasis[name] = float(weight_str)
         except ValueError:
-            log.warning(f"  Warning: --emphasize-systems entry '{entry}' has non-numeric weight — "
+            log.warning(f"  Warning: --emphasize-systems entry '{entry}' has non-numeric weight; "
                         "skipping")
     if system_emphasis:
         log.info(f"System emphasis weights: {system_emphasis}")
@@ -282,6 +282,16 @@ def _pretraining_dirs(args) -> List[str]:
 
 
 def run(args: argparse.Namespace) -> None:
+    from mllf.log import log_to_file
+    from mllf.pretrain.trainer import LOG_FILE
+
+    dirs = _pretraining_dirs(args)     # argument errors before any output is written
+    with log_to_file(Path(args.output_dir) / LOG_FILE):
+        log.debug(f"Pretraining directories ({len(dirs)}): {dirs}")
+        _run(args, dirs)
+
+
+def _run(args: argparse.Namespace, dirs: List[str]) -> None:
     import yaml
 
     from mllf.pretrain.config import PretrainOptions
@@ -290,7 +300,7 @@ def run(args: argparse.Namespace) -> None:
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    all_runs = load_runs_from_dirs(_pretraining_dirs(args))
+    all_runs = load_runs_from_dirs(dirs)
     log.info(f"\nTotal runs from all directories: {len(all_runs)}")
     if args.max_runs is not None and len(all_runs) > args.max_runs:
         all_runs = random.Random(0).sample(all_runs, args.max_runs)

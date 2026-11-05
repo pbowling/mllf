@@ -1,6 +1,8 @@
 import math
 from pathlib import Path
 
+import pytest
+
 from mllf.file_handling.read_output import (
     parse_single_ddg,
     parse_single_population,
@@ -63,64 +65,37 @@ def test_parse_single_ddg_returns_empty_for_no_section():
     assert parse_single_ddg("some text\nno ddg here\n") == {}
 
 
-def test_parse_single_ddg_nan_returns_none():
-    """NaN values are mapped to None (no usable crossings)."""
-    txt = _make_ddg_text("2  3   NaN   NaN   NaN   NaN")
-    result = parse_single_ddg(txt)
-    assert (2, 3) in result
-    assert result[(2, 3)] is None
-
-
-def test_parse_single_ddg_infinity_returns_none():
-    """Infinity (only one crossing direction) is mapped to None."""
-    txt = _make_ddg_text("2  3  Infinity  Infinity  Infinity  Infinity")
-    result = parse_single_ddg(txt)
-    assert result[(2, 3)] is None
-
-
-def test_parse_single_ddg_negative_infinity_returns_none():
-    """-Infinity is mapped to None (no round-trip free energy)."""
-    txt = _make_ddg_text("2  3  -Infinity  -Infinity  -Infinity  -Infinity")
-    result = parse_single_ddg(txt)
-    assert result[(2, 3)] is None
-
-
-def test_parse_single_ddg_finite_value_returned():
-    """A pair with finite bias DDG has its highest-lambda value returned."""
-    # 4 columns: nobias_0.95, nobias_0.99, bias_0.95, bias_0.99
-    # highest bias col (last) = -3.14
-    txt = _make_ddg_text("2  3   1.0   1.1   -2.5   -3.14")
-    result = parse_single_ddg(txt)
-    assert (2, 3) in result
-    assert math.isclose(result[(2, 3)], -3.14, rel_tol=1e-6)
-
-
-def test_parse_single_ddg_key_ordering():
-    """Keys are always (lo, hi) regardless of the order they appear in the file."""
-    txt = _make_ddg_text("4  2   1.0   1.1   -2.5   -3.14")
-    result = parse_single_ddg(txt)
-    assert (2, 4) in result
-    assert (4, 2) not in result
+@pytest.mark.parametrize('row, pair, expected', [
+    ("2  3   NaN   NaN   NaN   NaN", (2, 3), None),               # no usable crossings
+    ("2  3  Infinity  Infinity  Infinity  Infinity", (2, 3), None),   # one direction only
+    ("2  3  -Infinity  -Infinity  -Infinity  -Infinity", (2, 3), None),
+    ("2  3   1.0   1.1   -2.5   -3.14", (2, 3), -3.14),           # highest-lambda bias column
+    ("4  2   1.0   1.1   -2.5   -3.14", (2, 4), -3.14),           # keys are (lo, hi)
+])
+def test_parse_single_ddg_values(row, pair, expected):
+    result = parse_single_ddg(_make_ddg_text(row))
+    assert list(result) == [pair]
+    if expected is None:
+        assert result[pair] is None
+    else:
+        assert math.isclose(result[pair], expected, rel_tol=1e-6)
 
 
 def test_parse_single_ddg_multiple_pairs():
-    """Multiple pairs are all parsed, with correct None / float values."""
-    txt = _make_ddg_text(
+    result = parse_single_ddg(_make_ddg_text(
         "2  3   NaN   NaN   NaN   NaN",
         "2  4   1.0   1.1   0.5   0.55",
         "3  4   Infinity  Infinity  Infinity  Infinity",
-    )
-    result = parse_single_ddg(txt)
-    assert result[(2, 3)] is None
+    ))
+    assert result[(2, 3)] is None and result[(3, 4)] is None
     assert math.isclose(result[(2, 4)], 0.55, rel_tol=1e-6)
-    assert result[(3, 4)] is None
 
 
 def test_parse_single_ddg_sample_file():
-    """All pairs in the example output file are NaN or ±Inf → all None."""
+    """All pairs in the example output file are NaN or +/-Inf -> all None."""
     txt = load_example()
     result = parse_single_ddg(txt)
-    # The sample file has DDG rows for two sites; all values are NaN or ±Inf
+    # The sample file has DDG rows for two sites; all values are NaN or +/-Inf
     assert len(result) > 0, "Expected DDG pairs from sample file"
     assert all(v is None for v in result.values()), (
         "All sample DDG values should be None (NaN/Inf)"

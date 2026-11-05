@@ -110,7 +110,7 @@ def summarize_ledger(ledger: Dict[str, Dict]) -> Dict[str, Dict]:
     return out
 
 
-# ── ALF baseline ─────────────────────────────────────────────────────────────
+# ALF baseline
 
 def alf_dataset_dirs(system: str, pretraining_root,
                      explicit: Optional[List[str]] = None) -> List[Path]:
