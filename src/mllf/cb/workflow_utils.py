@@ -5,6 +5,7 @@ This module contains reusable functions for:
 - Managing simulation success checking and metric parsing
 - SLURM job submission and monitoring utilities
 """
+import logging
 import math
 from pathlib import Path
 from typing import Callable, List, Dict, Optional
@@ -22,6 +23,8 @@ from mllf.file_handling.read_output import (
     parse_pair_profile,
     parse_site_holdoff,
 )
+
+log = logging.getLogger(__name__)
 
 
 _STEPS_RE = {'equil': re.compile(r"^(esteps\s*=\s*)(\d+)", re.M),
@@ -861,8 +864,8 @@ def select_combos_by_uncertainty(
     scored = [(s, c) for s, c, _ in scored]
 
     if n_skipped:
-        print(f"  select_combos_by_uncertainty: {n_skipped}/{len(eligible)} candidates "
-              "could not be scored (graph build failed) — excluded from ranking")
+        log.info(f"  select_combos_by_uncertainty: {n_skipped}/{len(eligible)} candidates "
+                 "could not be scored (graph build failed) — excluded from ranking")
 
     scored.sort(key=lambda t: t[0], reverse=True)
 
@@ -895,9 +898,9 @@ def select_combos_by_uncertainty(
             deferred,
             key=lambda c: bandit_state.get(c, {}).get('software_failures', 0),
         )[:n_backfill]
-        print(f"  select_combos_by_uncertainty: only {len(selected)} eligible combos "
-              f"scored; backfilling {len(backfilled)} deferred combo(s) to reach "
-              f"n_select={n_select}: {[Path(c).name for c in backfilled]}")
+        log.info(f"  select_combos_by_uncertainty: only {len(selected)} eligible combos "
+                 f"scored; backfilling {len(backfilled)} deferred combo(s) to reach "
+                 f"n_select={n_select}: {[Path(c).name for c in backfilled]}")
         selected.extend(backfilled)
 
     return selected

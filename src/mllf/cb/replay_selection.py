@@ -4,6 +4,7 @@ Coverage selection scores pair sampling from pretraining runs, then greedily all
 replay budget across systems. ``plan_replay`` returns selected runs and a
 per-pair ownership report.
 """
+import logging
 import concurrent.futures
 import heapq
 import json
@@ -14,6 +15,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from mllf.cb.hindsight import pair_key
 from mllf.file_handling.combo_sets import rtf_signature
+
+log = logging.getLogger(__name__)
+
 
 FULL_RUN_CROSSINGS = 10     # full-length pair test (hindsight.SUCCESS_MIN_TRANSITIONS)
 SHORT_RUN_CROSSINGS = 3     # short-run test (stage explore_min_transitions)
@@ -409,8 +413,8 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
             indexes[sysn] = FragmentIndex.from_preps(
                 [p / 'prep' for p in paths if (p / 'prep').is_dir()])
             if verbose:
-                print(f"  [replay] {sysn}: no {prep}; substituents numbered from its datasets' "
-                      f"fragments ({indexes[sysn].n_subs})")
+                log.info(f"  [replay] {sysn}: no {prep}; substituents numbered from its datasets' "
+                         f"fragments ({indexes[sysn].n_subs})")
 
     tasks = []
     for sysn, paths in by_system.items():
@@ -458,12 +462,12 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
                                'candidates': n_cand[p]})
         if verbose:
             n_ext = sum(1 for c in runs if c in extra.get(sysn, []))
-            print(f"  [replay] {sysn}: {n_subs[sysn]} subs, budget {budgets[sysn]}, "
-                  f"{len(cand[sysn])} candidate runs, {len(runs)} chosen"
-                  + (f" ({n_ext} for the minimum)" if n_ext else '')
-                  + f", {len(own)}/{len(n_cand)} sampled pairs covered "
-                  f"({len(n_cand) - uncovered(cand[sysn], chosen[sysn])} at quality >= "
-                  f"{COVER_QUALITY})")
+            log.info('%s', f"  [replay] {sysn}: {n_subs[sysn]} subs, budget {budgets[sysn]}, "
+                     f"{len(cand[sysn])} candidate runs, {len(runs)} chosen"
+                     + (f" ({n_ext} for the minimum)" if n_ext else '')
+                     + f", {len(own)}/{len(n_cand)} sampled pairs covered "
+                     f"({len(n_cand) - uncovered(cand[sysn], chosen[sysn])} at quality >= "
+                     f"{COVER_QUALITY})")
     if verbose:
-        print(f"  [replay] total: {len(plan)} graphs over {len(cand)} systems (target {total})")
+        log.info(f"  [replay] total: {len(plan)} graphs over {len(cand)} systems (target {total})")
     return plan, report

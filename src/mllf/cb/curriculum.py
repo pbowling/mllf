@@ -15,6 +15,8 @@ import re
 import numpy as np
 import torch
 
+log = logging.getLogger(__name__)
+
 
 def build_system_index(systems_cfg: List[Dict]) -> Dict[str, int]:
     """Stable system-name -> integer index map for ``ContextBaseline``'s
@@ -112,7 +114,7 @@ def apply_stage_combo_filter(train_combos, stage, curriculum_config, stage_idx, 
         keep = set(stage['systems'])
         train_combos = [c for c in train_combos
                         if combo_system_map.get(c, {}).get('name') in keep]
-        print(f"  Stage systems: {sorted(keep)} ({len(train_combos)} combos)")
+        log.info(f"  Stage systems: {sorted(keep)} ({len(train_combos)} combos)")
     combos = filter_combos_by_curriculum(
         train_combos,
         min_sites=stage['min_sites'],
@@ -121,18 +123,18 @@ def apply_stage_combo_filter(train_combos, stage, curriculum_config, stage_idx, 
         max_subs_per_site=stage.get('max_subs_per_site', None),
         whitelist=stage.get('combo_whitelist'),
     )
-    print(f"  Filtered to {len(combos)} combos for this stage")
+    log.info(f"  Filtered to {len(combos)} combos for this stage")
 
     trans_filter = stage.get('min_transitions_for_stage') if apply_transition_filter else None
     if trans_filter is not None:
         lookback = stage.get('transition_filter_lookback', 3)
         before = len(combos)
         combos = filter_combos_by_transitions(combos, trans_filter, lookback)
-        print(f"  Transition filter (≥{trans_filter} trans, lookback={lookback}): "
-              f"{len(combos)}/{before} combos qualify")
+        log.info(f"  Transition filter (≥{trans_filter} trans, lookback={lookback}): "
+                 f"{len(combos)}/{before} combos qualify")
         if combos:
             names = [Path(c).name for c in combos]
-            print(f"  Qualifying combos: {', '.join(names)}")
+            log.info(f"  Qualifying combos: {', '.join(names)}")
 
     return combos
 
@@ -161,8 +163,8 @@ def sample_combos_stratified(system_combo_pools: Dict[str, List[str]],
     # Check feasibility
     min_total = min_per_system * n_systems
     if min_total > n_total:
-        logging.warning(f"n_total={n_total} < min required {min_total}; "
-                        f"reducing min_per_system to {n_total // n_systems}")
+        log.warning(f"n_total={n_total} < min required {min_total}; "
+                    f"reducing min_per_system to {n_total // n_systems}")
         min_per_system = max(1, n_total // n_systems)
 
     # Allocate minimum to each system first

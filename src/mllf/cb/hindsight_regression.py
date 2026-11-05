@@ -5,6 +5,7 @@ feature trunk and readout. The trained readout becomes the Bayesian posterior
 mean; its precision is retained for Thompson sampling and uncertainty-based
 selection.
 """
+import logging
 import csv
 import json
 import random
@@ -20,6 +21,9 @@ from mllf.cb.pair_weights import (
 )
 from mllf.cb.policy import PHASE_NODE_INPUTS, SITE_SIZE_SLOT
 from mllf.cb.replay_selection import plan_replay
+
+log = logging.getLogger(__name__)
+
 
 DEFAULTS = {
     'steps': 100,              # gradient steps per epoch
@@ -142,7 +146,7 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
             w.writeheader()
             w.writerows(report)
         if verbose:
-            print(f"  [regression] replay pair report: {out}")
+            log.info(f"  [regression] replay pair report: {out}")
     chosen = []
     for item in plan:
         run_dir = Path(item['run_dir'])
@@ -213,7 +217,7 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
         _check_replay_env_input(data, cfg.get('env_input', 'dual'), cache)
         _check_replay_ligand(cfg, cache)
         if verbose:
-            print(f"  [regression] replay set loaded from {cache}: {len(data)} runs")
+            log.info(f"  [regression] replay set loaded from {cache}: {len(data)} runs")
         return data
 
     # Deferred: the pretraining module (Uni-Mol embeddings, run loading) is
@@ -308,7 +312,7 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
         except Exception:
             continue
         if verbose and (n + 1) % 200 == 0:
-            print(f"  [regression] replay: built {len(data)}/{n + 1}")
+            log.info(f"  [regression] replay: built {len(data)}/{n + 1}")
     if cache:
         Path(cache).parent.mkdir(parents=True, exist_ok=True)
         torch.save(data, cache)
@@ -317,8 +321,8 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
              'ligand_other_sites': bool(cfg.get('ligand_other_sites', False)),
              'site_size_input': bool(cfg.get('site_size_input', False))}))
     if verbose:
-        print(f"  [regression] replay set built: {len(data)} runs"
-              + (f", saved to {cache}" if cache else ""))
+        log.info('%s', f"  [regression] replay set built: {len(data)} runs"
+                 + (f", saved to {cache}" if cache else ""))
     return data
 
 

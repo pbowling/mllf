@@ -1,17 +1,17 @@
-"""Command line for behavior-cloning pretraining
-(``python -m mllf.cli.pretrain --help``).
-"""
+"""``mllf pretrain``: behavior-clone the policy on collected runs
+(``mllf.pretrain.trainer.pretrain_with_runs``)."""
+import logging
 import argparse
 import random
 import sys
 from pathlib import Path
 from typing import Dict, List
 
-import yaml
+log = logging.getLogger(__name__)
 
-from mllf.pretrain.config import PretrainOptions
-from mllf.pretrain.runs import load_runs_from_dirs, read_manifest
-from mllf.pretrain.trainer import pretrain_with_runs
+DESCRIPTION = "Pretrain MSLD policy on collected simulation data"
+EPILOG = ("Example: mllf pretrain --pretraining-dir pretraining/14benz_solv "
+          "--output-dir models/14benz --config examples/workflow_pretrain.yaml --bayesian-heads")
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -241,51 +241,59 @@ def _emphasis(entries) -> Dict[str, float]:
     for entry in entries or []:
         name, sep, weight_str = entry.rpartition(':')
         if not sep:
-            print(f"  Warning: --emphasize-systems entry '{entry}' missing ':WEIGHT' — skipping")
+            log.warning(f"  Warning: --emphasize-systems entry '{entry}' missing ':WEIGHT' — "
+                        "skipping")
             continue
         try:
             system_emphasis[name] = float(weight_str)
         except ValueError:
-            print(f"  Warning: --emphasize-systems entry '{entry}' has non-numeric weight — "
-                  "skipping")
+            log.warning(f"  Warning: --emphasize-systems entry '{entry}' has non-numeric weight — "
+                        "skipping")
     if system_emphasis:
-        print(f"System emphasis weights: {system_emphasis}")
+        log.info(f"System emphasis weights: {system_emphasis}")
     return system_emphasis
 
 
 def _pretraining_dirs(args) -> List[str]:
+    from mllf.pretrain.runs import read_manifest
     if args.manifest_file:
         if args.pretraining_dir:
-            print("Error: Cannot specify both --manifest-file and --pretraining-dir")
+            log.error("Error: Cannot specify both --manifest-file and --pretraining-dir")
             sys.exit(1)
-        print(f"\nLoading pretraining directories from manifest: {args.manifest_file}")
+        log.info(f"\nLoading pretraining directories from manifest: {args.manifest_file}")
         try:
             dirs = read_manifest(args.manifest_file)
         except FileNotFoundError:
-            print(f"Error: Manifest file not found: {args.manifest_file}")
+            log.error(f"Error: Manifest file not found: {args.manifest_file}")
             sys.exit(1)
         except ValueError as e:
-            print(f"Error: {e}")
+            log.error(f"Error: {e}")
             sys.exit(1)
         except Exception as e:
-            print(f"Error reading manifest file: {e}")
+            log.error(f"Error reading manifest file: {e}")
             sys.exit(1)
-        print(f"  Found {len(dirs)} directories in manifest")
+        log.info(f"  Found {len(dirs)} directories in manifest")
         return dirs
     if args.pretraining_dir:
         return args.pretraining_dir
-    print("Error: Must specify either --pretraining-dir or --manifest-file")
+    log.error("Error: Must specify either --pretraining-dir or --manifest-file")
     sys.exit(1)
 
 
 def run(args: argparse.Namespace) -> None:
+    import yaml
+
+    from mllf.pretrain.config import PretrainOptions
+    from mllf.pretrain.runs import load_runs_from_dirs
+    from mllf.pretrain.trainer import pretrain_with_runs
+
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     all_runs = load_runs_from_dirs(_pretraining_dirs(args))
-    print(f"\nTotal runs from all directories: {len(all_runs)}")
+    log.info(f"\nTotal runs from all directories: {len(all_runs)}")
     if args.max_runs is not None and len(all_runs) > args.max_runs:
         all_runs = random.Random(0).sample(all_runs, args.max_runs)
-        print(f"Sampled {len(all_runs)} runs (--max-runs, seed 0)")
+        log.info(f"Sampled {len(all_runs)} runs (--max-runs, seed 0)")
     system_emphasis = _emphasis(args.emphasize_systems)
 
     pretrain_with_runs(all_runs, Path(args.output_dir), config, PretrainOptions(
@@ -312,11 +320,11 @@ def run(args: argparse.Namespace) -> None:
     ))
 
 
-def main(argv=None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Pretrain MSLD policy on collected simulation data")
+def main(argv=None):
+    from mllf.cli.common import run_command
+    parser = argparse.ArgumentParser(description=DESCRIPTION, epilog=EPILOG)
     add_arguments(parser)
-    run(parser.parse_args(argv))
+    return run_command(parser, run, argv)
 
 
 if __name__ == "__main__":

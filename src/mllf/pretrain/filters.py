@@ -2,6 +2,7 @@
 transition thresholds, stratified sampling of negative-reward runs and
 coefficient outliers.
 """
+import logging
 import json
 import math
 import random
@@ -18,6 +19,8 @@ from mllf.pretrain.rewards import (
     compute_reward_from_sim_results,
     reward_kwargs,
 )
+
+log = logging.getLogger(__name__)
 
 
 def filter_best_runs_per_system(
@@ -111,7 +114,7 @@ def filter_best_runs_per_system(
                             # Convert to ordered list
                             nsubs_per_site = [site_counts[i] for i in sorted(site_counts.keys())]
                     except Exception as e:
-                        print(f"  Warning: Could not parse graph_info.json: {e}")
+                        log.warning(f"  Warning: Could not parse graph_info.json: {e}")
 
             # Fallback: estimate from total (asymmetric-safe distribution)
             if nsubs_per_site is None:
@@ -137,7 +140,7 @@ def filter_best_runs_per_system(
         if run_rewards:
             best_run, best_reward = max(run_rewards, key=lambda x: x[1])
             best_runs.append(best_run)
-            print(f"  {system_name}: selected run with reward {best_reward:.2f}")
+            log.info(f"  {system_name}: selected run with reward {best_reward:.2f}")
 
     return best_runs
 
@@ -166,7 +169,7 @@ def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, floa
         'end': []
     }
 
-    print(f"Computing coefficient statistics across {len(runs)} runs...")
+    log.info(f"Computing coefficient statistics across {len(runs)} runs...")
 
     for run in runs:
         run_dir = run["run_dir"]
@@ -240,13 +243,13 @@ def compute_coefficient_statistics(runs: List[Dict]) -> Dict[str, Dict[str, floa
             }
 
     # Print statistics
-    print("\n" + "=" * 80)
-    print("Coefficient Statistics Across All Runs")
-    print("=" * 80)
+    log.info('%s', "\n" + "=" * 80)
+    log.info("Coefficient Statistics Across All Runs")
+    log.info('%s', "=" * 80)
     for bias_type, stat in stats.items():
-        print(f"{bias_type:12s}: mean={stat['mean']:7.2f}, std={stat['std']:7.2f}, "
-              f"p95={stat['p95']:7.2f}, max={stat['max']:7.2f}, n={stat['count']}")
-    print("=" * 80 + "\n")
+        log.info(f"{bias_type:12s}: mean={stat['mean']:7.2f}, std={stat['std']:7.2f}, "
+                 f"p95={stat['p95']:7.2f}, max={stat['max']:7.2f}, n={stat['count']}")
+    log.info('%s', "=" * 80 + "\n")
 
     return stats
 
@@ -270,7 +273,7 @@ def filter_runs_by_coefficient_range(
         Filtered list of runs
     """
     if len(runs) < min_runs_to_compute_stats:
-        print(f"Warning: Only {len(runs)} runs available, skipping statistical filtering")
+        log.warning(f"Warning: Only {len(runs)} runs available, skipping statistical filtering")
         return runs
 
     # Compute statistics across all runs
@@ -278,12 +281,12 @@ def filter_runs_by_coefficient_range(
 
     # Compute thresholds
     thresholds = {}
-    print(f"Filtering thresholds (mean ± {n_std}σ):")
+    log.info(f"Filtering thresholds (mean ± {n_std}σ):")
     for bias_type, stat in stats.items():
         threshold = stat['mean'] + n_std * stat['std']
         thresholds[bias_type] = threshold
-        print(f"  {bias_type:12s}: ≤ {threshold:.2f}")
-    print()
+        log.info(f"  {bias_type:12s}: ≤ {threshold:.2f}")
+    log.info('')
 
     # Filter runs
     filtered_runs = []
@@ -358,20 +361,20 @@ def filter_runs_by_coefficient_range(
             filtered_runs.append(run)
 
     # Report results
-    print(f"\n{'=' * 80}")
-    print(f"Statistical Filtering Results (±{n_std}σ threshold)")
-    print(f"{'=' * 80}")
-    print(f"  Total runs: {len(runs)}")
-    print(f"  Kept: {len(filtered_runs)} ({100 * len(filtered_runs) / len(runs):.1f}%)")
-    print(f"  Excluded: {len(excluded_runs)} ({100 * len(excluded_runs) / len(runs):.1f}%)")
+    log.info(f"\n{'=' * 80}")
+    log.info(f"Statistical Filtering Results (±{n_std}σ threshold)")
+    log.info(f"{'=' * 80}")
+    log.info(f"  Total runs: {len(runs)}")
+    log.info(f"  Kept: {len(filtered_runs)} ({100 * len(filtered_runs) / len(runs):.1f}%)")
+    log.info(f"  Excluded: {len(excluded_runs)} ({100 * len(excluded_runs) / len(runs):.1f}%)")
 
     if excluded_runs:
-        print("\n  Top 10 excluded runs:")
+        log.info("\n  Top 10 excluded runs:")
         excluded_runs.sort(key=lambda x: x[3], reverse=True)
         for system, run, bias_type, max_val in excluded_runs[:10]:
-            print(f"    {system:30s} {run:15s} ({bias_type:10s}: {max_val:.2f})")
+            log.info(f"    {system:30s} {run:15s} ({bias_type:10s}: {max_val:.2f})")
 
-    print(f"{'=' * 80}\n")
+    log.info(f"{'=' * 80}\n")
 
     return filtered_runs
 
@@ -396,9 +399,9 @@ def filter_runs_by_reward(
         Filtered list of runs meeting reward threshold
     """
 
-    print(f"\n{'=' * 80}")
-    print(f"Reward Filtering (threshold: >= {min_reward})")
-    print(f"{'=' * 80}")
+    log.info(f"\n{'=' * 80}")
+    log.info(f"Reward Filtering (threshold: >= {min_reward})")
+    log.info(f"{'=' * 80}")
 
     filtered_runs = []
     excluded_runs = []
@@ -466,33 +469,33 @@ def filter_runs_by_reward(
             excluded_runs.append((run_dir.parent.name, run_dir.name, None, error_reason))
 
     # Report results
-    print(f"  Total runs: {len(runs)}")
-    print(f"  Kept: {len(filtered_runs)} ({100 * len(filtered_runs) / len(runs):.1f}%)")
-    print(f"  Excluded: {len(excluded_runs)} ({100 * len(excluded_runs) / len(runs):.1f}%)")
+    log.info(f"  Total runs: {len(runs)}")
+    log.info(f"  Kept: {len(filtered_runs)} ({100 * len(filtered_runs) / len(runs):.1f}%)")
+    log.info(f"  Excluded: {len(excluded_runs)} ({100 * len(excluded_runs) / len(runs):.1f}%)")
 
     # Show error breakdown
     if error_counts:
-        print("\n  Error breakdown:")
+        log.error("\n  Error breakdown:")
         for error_reason, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {error_reason}: {count} runs")
+            log.info(f"    {error_reason}: {count} runs")
 
     if excluded_runs:
         # Show distribution of excluded runs
         reward_excluded = [x for x in excluded_runs if isinstance(x[2], (int, float))]
         if reward_excluded:
-            print("\n  Reward statistics for excluded runs:")
+            log.info("\n  Reward statistics for excluded runs:")
             rewards = [x[2] for x in reward_excluded]
-            print(f"    Mean: {sum(rewards) / len(rewards):.2f}")
-            print(f"    Min: {min(rewards):.2f}")
-            print(f"    Max: {max(rewards):.2f}")
+            log.info(f"    Mean: {sum(rewards) / len(rewards):.2f}")
+            log.info(f"    Min: {min(rewards):.2f}")
+            log.info(f"    Max: {max(rewards):.2f}")
 
-        print("\n  Top 10 excluded runs (by reward):")
+        log.info("\n  Top 10 excluded runs (by reward):")
         # Sort by reward (descending) - show the "best" of the excluded runs
         reward_excluded_sorted = sorted(reward_excluded, key=lambda x: x[2], reverse=True)
         for system, run, reward, reason in reward_excluded_sorted[:10]:
-            print(f"    {system:30s} {run:15s} reward={reward:7.2f}")
+            log.info(f"    {system:30s} {run:15s} reward={reward:7.2f}")
 
-    print(f"{'=' * 80}\n")
+    log.info(f"{'=' * 80}\n")
 
     return filtered_runs
 
@@ -519,9 +522,9 @@ def filter_runs_by_min_transitions(
         Filtered list of runs where all sites meet the threshold
     """
 
-    print(f"\n{'=' * 80}")
-    print(f"Transition Filtering (min transitions per site: >= {min_transitions})")
-    print(f"{'=' * 80}")
+    log.info(f"\n{'=' * 80}")
+    log.info(f"Transition Filtering (min transitions per site: >= {min_transitions})")
+    log.info(f"{'=' * 80}")
 
     filtered_runs = []
     excluded_runs = []   # (system, run, min_t, reason)
@@ -564,23 +567,23 @@ def filter_runs_by_min_transitions(
             n_errors += 1
             excluded_runs.append((run_dir.parent.name, run_dir.name, None, f"error: {exc}"))
 
-    print(f"  Total runs : {len(runs)}")
-    print(f"  Kept       : {len(filtered_runs)} "
-          f"({100 * len(filtered_runs) / max(len(runs), 1):.1f}%)")
-    print(f"  Excluded   : {len(excluded_runs)} "
-          f"({100 * len(excluded_runs) / max(len(runs), 1):.1f}%)")
+    log.info(f"  Total runs : {len(runs)}")
+    log.info(f"  Kept       : {len(filtered_runs)} "
+             f"({100 * len(filtered_runs) / max(len(runs), 1):.1f}%)")
+    log.info(f"  Excluded   : {len(excluded_runs)} "
+             f"({100 * len(excluded_runs) / max(len(runs), 1):.1f}%)")
     if n_errors:
-        print(f"  Errors     : {n_errors}")
+        log.error(f"  Errors     : {n_errors}")
 
     # Histogram of worst-site transition counts in excluded runs
     excl_counts = [t for _, _, t, _ in excluded_runs if isinstance(t, int)]
     if excl_counts:
         hist = Counter(excl_counts)
-        print("  Excluded by worst-site transition count:")
+        log.info("  Excluded by worst-site transition count:")
         for k in sorted(hist):
-            print(f"    {k:3d} transitions: {hist[k]} runs")
+            log.info(f"    {k:3d} transitions: {hist[k]} runs")
 
-    print(f"{'=' * 80}\n")
+    log.info(f"{'=' * 80}\n")
     return filtered_runs
 
 
@@ -658,10 +661,10 @@ def sample_runs_stratified_negative(
     # whose upper bound satisfies r <= upper_bound.
     BUCKET_UPPER_BOUNDS = [-50, -40, -30, -20, -10, 0]
 
-    print(f"\n{'=' * 80}")
-    print(f"Stratified Negative Sampling  (max_fraction={fraction_per_bucket:.0%}, quadratic "
-          "ramp)")
-    print(f"{'=' * 80}")
+    log.info(f"\n{'=' * 80}")
+    log.info(f"Stratified Negative Sampling  (max_fraction={fraction_per_bucket:.0%}, quadratic "
+             "ramp)")
+    log.info(f"{'=' * 80}")
 
     # Compute reward for every run -----------------------------------------
     scored: List[tuple] = []  # (reward, run_dict)
@@ -708,9 +711,9 @@ def sample_runs_stratified_negative(
             n_error += 1
             error_log.append((str(run_dir), f"{type(e).__name__}: {str(e)[:80]}"))
 
-    print(f"  Total runs scored: {len(scored):,}")
+    log.info(f"  Total runs scored: {len(scored):,}")
     if n_error:
-        print(f"  Skipped (scoring error): {n_error:,}")
+        log.info(f"  Skipped (scoring error): {n_error:,}")
         # Print top error types
         error_types = {}
         for run_path, error_msg in error_log:
@@ -720,10 +723,10 @@ def sample_runs_stratified_negative(
                 error_type = error_msg
             error_types[error_type] = error_types.get(error_type, 0) + 1
 
-        print("\n  Error Type Breakdown:")
+        log.error("\n  Error Type Breakdown:")
         for error_type in sorted(error_types.keys(), key=lambda x: error_types[x], reverse=True):
             count = error_types[error_type]
-            print(f"    {error_type:<40} {count:>6,}")
+            log.info(f"    {error_type:<40} {count:>6,}")
 
         # Log to file for detailed analysis
         error_log_path = Path("scoring_errors.log")
@@ -732,7 +735,7 @@ def sample_runs_stratified_negative(
             f.write(f"Total errors: {n_error}\n\n")
             for run_path, error_msg in error_log[:20]:  # Log first 20
                 f.write(f"{run_path}\n  {error_msg}\n")
-        print(f"\n  Full error log saved to: {error_log_path}")
+        log.info(f"\n  Full error log saved to: {error_log_path}")
 
     # Separate positive runs (kept in full) and bucket negative ones ---------
     positive_runs = [r for rew, r in scored if rew >= 0]
@@ -759,8 +762,8 @@ def sample_runs_stratified_negative(
     n_buckets = len(BUCKET_UPPER_BOUNDS)
     rng = random.Random(seed)
     sampled_negative: List[Dict] = []
-    print(f"\n  {'Bucket':<18} {'Fraction':>8} {'Available':>10} {'Sampled':>9}")
-    print(f"  {'-' * 18} {'-' * 8} {'-' * 10} {'-' * 9}")
+    log.info(f"\n  {'Bucket':<18} {'Fraction':>8} {'Available':>10} {'Sampled':>9}")
+    log.info(f"  {'-' * 18} {'-' * 8} {'-' * 10} {'-' * 9}")
     for i, label in enumerate(bucket_labels):
         available = buckets[i]
         n_avail = len(available)
@@ -773,7 +776,7 @@ def sample_runs_stratified_negative(
         else:
             selected = rng.sample(available, n_sample) if n_sample > 0 else []
         sampled_negative.extend(selected)
-        print(f"  {label:<18} {bucket_frac:>7.0%} {n_avail:>10,} {len(selected):>9,}")
+        log.info(f"  {label:<18} {bucket_frac:>7.0%} {n_avail:>10,} {len(selected):>9,}")
 
     result = positive_runs + sampled_negative
 
@@ -796,15 +799,15 @@ def sample_runs_stratified_negative(
             pos_labels.append(f"[{prev_p}, {hi}]")
         prev_p = str(int(hi)) if hi != math.inf else str(int(POS_BUCKET_UPPER_BOUNDS[-2]))
 
-    print(f"\n  Positive (kept all):   {len(positive_runs):>7,}")
-    print(f"  {'Bucket':<18} {'Count':>10}")
-    print(f"  {'-' * 18} {'-' * 10}")
+    log.info(f"\n  Positive (kept all):   {len(positive_runs):>7,}")
+    log.info(f"  {'Bucket':<18} {'Count':>10}")
+    log.info(f"  {'-' * 18} {'-' * 10}")
     for i, label in enumerate(pos_labels):
-        print(f"  {label:<18} {pos_buckets[i]:>10,}")
+        log.info(f"  {label:<18} {pos_buckets[i]:>10,}")
 
-    print(f"\n  Negative (sampled):    {len(sampled_negative):>7,}")
-    print(f"  Total after sampling:  {len(result):>7,}")
-    print(f"{'=' * 80}\n")
+    log.info(f"\n  Negative (sampled):    {len(sampled_negative):>7,}")
+    log.info(f"  Total after sampling:  {len(result):>7,}")
+    log.info(f"{'=' * 80}\n")
     return result
 
 
@@ -812,49 +815,49 @@ def select_runs(runs: List[Dict], opts, reward_config: Dict) -> Optional[List[Di
     """Apply the run filters of ``PretrainOptions`` in order; None (after
     printing why) when no run is left."""
     if opts.use_best_only:
-        print(f"\nFiltering {len(runs)} runs to keep only best per system...")
-        print(f"Using reward config: {reward_config}")
+        log.info(f"\nFiltering {len(runs)} runs to keep only best per system...")
+        log.info(f"Using reward config: {reward_config}")
         runs = filter_best_runs_per_system(runs, reward_config=reward_config)
-        print(f"Filtered to {len(runs)} best runs for training\n")
+        log.info(f"Filtered to {len(runs)} best runs for training\n")
         if len(runs) == 0:
-            print("Error: No valid runs after filtering")
+            log.error("Error: No valid runs after filtering")
             return None
     else:
-        print(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
+        log.info(f"\nUsing all {len(runs)} valid runs for pretraining (no filtering)\n")
 
     # Transition-count filter takes highest precedence -- a direct data
     # quality criterion; then stratified negative sampling; then the reward
     # threshold.
     if opts.min_transitions is not None:
-        print(f"\nApplying transition filtering (min per site: >= {opts.min_transitions})...")
+        log.info(f"\nApplying transition filtering (min per site: >= {opts.min_transitions})...")
         runs = filter_runs_by_min_transitions(runs, min_transitions=opts.min_transitions)
         if len(runs) == 0:
-            print("Error: No runs remaining after transition filtering")
-            print("Try lowering --min-transitions")
+            log.error("Error: No runs remaining after transition filtering")
+            log.info("Try lowering --min-transitions")
             return None
     elif opts.stratified_negative_fraction is not None:
-        print("\nApplying stratified negative sampling "
-              f"(max_fraction={opts.stratified_negative_fraction:.0%}, quadratic ramp)...")
+        log.info("\nApplying stratified negative sampling "
+                 f"(max_fraction={opts.stratified_negative_fraction:.0%}, quadratic ramp)...")
         runs = sample_runs_stratified_negative(
             runs, fraction_per_bucket=opts.stratified_negative_fraction,
             reward_config=reward_config)
         if len(runs) == 0:
-            print("Error: No runs remaining after stratified negative sampling")
+            log.error("Error: No runs remaining after stratified negative sampling")
             return None
     elif opts.min_reward_threshold is not None:
-        print(f"\nApplying reward filtering (threshold: >= {opts.min_reward_threshold})...")
+        log.info(f"\nApplying reward filtering (threshold: >= {opts.min_reward_threshold})...")
         runs = filter_runs_by_reward(runs, min_reward=opts.min_reward_threshold,
                                      reward_config=reward_config)
         if len(runs) == 0:
-            print("Error: No runs remaining after reward filtering")
-            print("Try lowering min_reward_threshold or disable reward filtering")
+            log.error("Error: No runs remaining after reward filtering")
+            log.info("Try lowering min_reward_threshold or disable reward filtering")
             return None
 
     if opts.filter_outliers:
-        print(f"\nApplying statistical filtering (±{opts.outlier_std_threshold}σ threshold)...")
+        log.info(f"\nApplying statistical filtering (±{opts.outlier_std_threshold}σ threshold)...")
         runs = filter_runs_by_coefficient_range(runs, n_std=opts.outlier_std_threshold)
         if len(runs) == 0:
-            print("Error: No runs remaining after statistical filtering")
-            print("Try increasing outlier_std_threshold or set filter_outliers=False")
+            log.error("Error: No runs remaining after statistical filtering")
+            log.info("Try increasing outlier_std_threshold or set filter_outliers=False")
             return None
     return runs

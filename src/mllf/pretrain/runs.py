@@ -1,9 +1,12 @@
 """Loading collected pretraining runs (``collect_pretraining_data`` output)."""
+import logging
 import json
 from pathlib import Path
 from typing import Dict, List
 
 from mllf.file_handling.generate_combinations import is_combo_dir_name
+
+log = logging.getLogger(__name__)
 
 
 def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
@@ -33,13 +36,13 @@ def load_pretraining_runs(pretraining_dir: Path) -> List[Dict]:
 
         # Skip if simulation didn't terminate normally
         if not metadata.get("terminated_normally", False):
-            print(f"  Skipping {run_dir.name}: did not terminate normally")
+            log.info(f"  Skipping {run_dir.name}: did not terminate normally")
             return None
 
         # Load simulation results
         results_file = run_dir / "simulation_results.json"
         if not results_file.exists():
-            print(f"  Skipping {run_dir.name}: no simulation_results.json")
+            log.info(f"  Skipping {run_dir.name}: no simulation_results.json")
             return None
 
         with open(results_file, 'r') as f:
@@ -103,9 +106,9 @@ def load_runs_from_dirs(pretraining_dirs: List) -> List[Dict]:
     all_runs = []
     for d in pretraining_dirs:
         pretrain_dir = Path(d)
-        print(f"\nLoading from {pretrain_dir}...")
+        log.info(f"\nLoading from {pretrain_dir}...")
         runs = load_pretraining_runs(pretrain_dir)
-        print(f"  Loaded {len(runs)} runs")
+        log.info(f"  Loaded {len(runs)} runs")
         label = system_label(pretrain_dir)
         for run in runs:
             run['system_label'] = label

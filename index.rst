@@ -11,6 +11,7 @@ the ``docs/`` directory; see the sections below.
 
    docs/index
    docs/installation
+   docs/cli
    docs/examples
    docs/api
 

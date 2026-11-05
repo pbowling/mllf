@@ -56,8 +56,6 @@ For behavior-cloning pretraining, see :doc:`cb_pretraining`.
    mllf.pretrain.rewards
    mllf.pretrain.trainer
    mllf.pretrain.bayesian_init
-   mllf.cli.pretrain
-   mllf.cli.collect_pretraining_data
 
 Workflow Utilities
 ------------------
@@ -67,7 +65,6 @@ For the workflow system, see :doc:`workflow`.
 .. autosummary::
    :toctree: api
 
-   mllf.cli.train_workflow
    mllf.cb.training_loop
    mllf.cb.training_setup
    mllf.cb.bandit_config
@@ -88,3 +85,22 @@ For the workflow system, see :doc:`workflow`.
    mllf.cb.slurm
    mllf.file_handling.manifests
    mllf.file_handling.combo_sets
+
+Command Line and Logging
+------------------------
+
+For the ``mllf`` command, see :doc:`cli`.
+
+.. autosummary::
+   :toctree: api
+
+   mllf.cli.main
+   mllf.cli.common
+   mllf.cli.combos
+   mllf.cli.collect_pretraining_data
+   mllf.cli.pretrain
+   mllf.cli.replay
+   mllf.cli.train
+   mllf.cli.export
+   mllf.cli.cost
+   mllf.log

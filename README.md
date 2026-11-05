@@ -1,7 +1,8 @@
 # mllf
 ![mllf logo](docs/mllf_logo.png)
 
-Machine Learning Landscape Flattening model building and training
+Machine-learned landscape flattening: bias coefficients for multisite lambda dynamics,
+pretrained on collected simulations and trained online against new ones.
 
 ## Installation
 
@@ -20,6 +21,22 @@ If you use conda, activate your environment then run:
 ```bash
 pip install -e '.[dev]'
 ```
+
+## Usage
+
+Installing puts the `mllf` command on your path:
+
+```bash
+mllf -h                                   # list the commands
+mllf collect RUN_DIR -o pretraining/sys   # collect finished MSLD runs
+mllf pretrain --pretraining-dir pretraining/sys --output-dir models/run --config pretrain.yaml
+mllf train workflow.yaml                  # online training (rerun to resume)
+mllf export workflow.yaml --label checkpoints_dir
+mllf cost checkpoints_dir --pretraining-root pretraining
+```
+
+`-v` / `-q` (before or after the command) give more or less output; `mllf COMMAND -h`
+lists a command's options. See `docs/cli.rst`.
 
 ## Running tests
 

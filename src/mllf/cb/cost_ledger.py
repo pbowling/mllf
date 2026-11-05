@@ -14,11 +14,14 @@ ALF's cost comes from the pretraining datasets (``pretraining/<system>_group*``
 etc.): each ``run*/metadata.json`` names the original ALF run directory, whose
 ``output`` file is parsed the same way (``alf_cost``).
 """
+import logging
 import json
 import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-import argparse
+
+log = logging.getLogger(__name__)
+
 
 _NSTEP_RE = re.compile(r"^\s+NSTEP\s*=\s*(\d+)\s+NSAVC")
 _TIMESTEP_RE = re.compile(r"TIME STEP\s*=\s*\S+\s+AKMA\s+(\S+)\s+PS")
@@ -171,44 +174,10 @@ def alf_cost(dataset_dirs: Iterable[Path]) -> Dict[str, Dict]:
     return out
 
 
-def main() -> None:
-    """Per-system cost of an online run next to ALF's::
-
-        python -m mllf.cb.cost_ledger training/checkpoints_x --pretraining-root pretraining
-    """
-    p = argparse.ArgumentParser(description='Simulated ns per system: online run vs ALF')
-    p.add_argument('checkpoint_dir', help='online run output dir (holds cost_ledger.json)')
-    p.add_argument('--pretraining-root', default=None,
-                   help='pretraining datasets dir, for ALF cost (omit to skip ALF)')
-    p.add_argument('--json', default=None, help='also write the table to this JSON file')
-    args = p.parse_args()
-
-    summary = summarize_ledger(load_ledger(Path(args.checkpoint_dir) / LEDGER_FILE))
-    stages_path = Path(args.checkpoint_dir) / 'system_stages.json'
-    stages = json.loads(stages_path.read_text()) if stages_path.exists() else {}
-    rows = {}
-    print(f"{'system':28s} {'train ns':>9s} {'runs':>6s} {'valid ns':>9s} {'ALF ns':>9s} "
-          f"{'ALF runs':>9s}  stages")
-    for system in sorted(summary):
-        s = summary[system]
-        alf = None
-        if args.pretraining_root:
-            per_group = alf_cost(alf_dataset_dirs(system, args.pretraining_root))
-            if per_group:
-                alf = {'runs': sum(g['runs'] for g in per_group.values()),
-                       'ns': sum(g['ns'] for g in per_group.values()),
-                       'missing': sum(g['missing'] for g in per_group.values()),
-                       'groups': per_group}
-        st = stages.get(system) or {}
-        hist = ' > '.join(
-            f"{h['stage']}({h['epochs']}, {h['reason']})" for h in st.get('history', []))
-        rows[system] = {'online': s, 'alf': alf, 'stages': st}
-        print(f"{system:28s} {s['train']['ns']:9.1f} {s['train']['runs']:6d} "
-              f"{s['validation']['ns']:9.1f} "
-              f"{(alf['ns'] if alf else float('nan')):9.1f} {(alf['runs'] if alf else 0):9d}  "
-              f"{hist}")
-    if args.json:
-        Path(args.json).write_text(json.dumps(rows, indent=1))
+def main(argv=None):
+    """Same as ``mllf cost``."""
+    from mllf.cli.cost import main as cli_main
+    return cli_main(argv)
 
 
 if __name__ == '__main__':

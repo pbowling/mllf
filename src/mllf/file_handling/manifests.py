@@ -8,6 +8,7 @@ loading a whole system's ``combo_metadata.json`` into memory at once.
 Moved here from ``training/workflow.py`` as part of making the online CB
 training driver importable as a library (see ``mllf.cli.train_workflow``).
 """
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 import json
@@ -21,6 +22,8 @@ from mllf.file_handling.generate_combinations import (
 )
 from math import comb as _comb
 from itertools import combinations as _icombinations
+
+log = logging.getLogger(__name__)
 
 
 def load_manifest(manifest_path: str) -> List[str]:
@@ -87,7 +90,7 @@ def build_system_manifest(sys_entry: Dict, max_combos: Optional[int] = None,
     input_dir = Path(sys_entry['input_dir'])
     out_dir = Path(sys_entry['out_dir'])
 
-    log = [
+    lines = [
         f"\n=== System: {sys_name} ===",
         f"  input_dir : {input_dir}",
         f"  out_dir   : {out_dir}",
@@ -101,17 +104,17 @@ def build_system_manifest(sys_entry: Dict, max_combos: Optional[int] = None,
             f"Manifest not found at {manifest_path}. "
             "Call create_and_load_system_manifest for systems needing creation."
         )
-    log.append(f"  Manifest already exists at {manifest_path}")
+    lines.append(f"  Manifest already exists at {manifest_path}")
     sys_combos = load_manifest(str(manifest_path))
     total = len(sys_combos)
     if max_combos is not None and total > max_combos:
         rng = np.random.RandomState(seed ^ (hash(sys_name) & 0x7fffffff))
         idxs = rng.choice(total, size=max_combos, replace=False)
         sys_combos = [sys_combos[j] for j in sorted(idxs)]
-        log.append(f"  Sampled {max_combos:,} / {total:,} combos (max_combos_per_system cap)")
+        lines.append(f"  Sampled {max_combos:,} / {total:,} combos (max_combos_per_system cap)")
     else:
-        log.append(f"  Loaded {total:,} combos")
-    return {'sys_entry': sys_entry, 'combos': sys_combos, 'log': log}
+        lines.append(f"  Loaded {total:,} combos")
+    return {'sys_entry': sys_entry, 'combos': sys_combos, 'log': lines}
 
 
 def create_and_load_system_manifest(sys_entry: Dict, max_subs_per_site: int = 10,
@@ -127,7 +130,7 @@ def create_and_load_system_manifest(sys_entry: Dict, max_subs_per_site: int = 10
     input_dir = Path(sys_entry['input_dir'])
     out_dir = Path(sys_entry['out_dir'])
 
-    log = [
+    lines = [
         f"\n=== System: {sys_name} ===",
         f"  input_dir : {input_dir}",
         f"  out_dir   : {out_dir}",
@@ -137,12 +140,12 @@ def create_and_load_system_manifest(sys_entry: Dict, max_subs_per_site: int = 10
 
     # Per-system override takes precedence over the global config value.
     effective_max_subs = sys_entry.get('max_subs_per_site', max_subs_per_site)
-    log.append(f"  max_subs_per_site : {effective_max_subs}")
+    lines.append(f"  max_subs_per_site : {effective_max_subs}")
     all_combo_info = list_possible_combinations(
         input_dir, out_dir,
         max_subs_per_site=effective_max_subs
     )
-    log.append(f"  Found {len(all_combo_info)} possible combinations")
+    lines.append(f"  Found {len(all_combo_info)} possible combinations")
     out_dir.mkdir(parents=True, exist_ok=True)
     with (input_dir / 'manifest.txt').open('w') as f:
         for info in all_combo_info:
@@ -150,7 +153,7 @@ def create_and_load_system_manifest(sys_entry: Dict, max_subs_per_site: int = 10
     combo_metadata_path = input_dir / 'combo_metadata.json'
     with open(combo_metadata_path, 'w') as f:
         json.dump(all_combo_info, f, indent=2)
-    log.append(f"  Saved metadata to {combo_metadata_path}")
+    lines.append(f"  Saved metadata to {combo_metadata_path}")
 
     sys_combos = load_manifest(str(input_dir / 'manifest.txt'))
     total = len(sys_combos)
@@ -158,10 +161,10 @@ def create_and_load_system_manifest(sys_entry: Dict, max_subs_per_site: int = 10
         rng = np.random.RandomState(seed ^ (hash(sys_name) & 0x7fffffff))
         idxs = rng.choice(total, size=max_combos, replace=False)
         sys_combos = [sys_combos[j] for j in sorted(idxs)]
-        log.append(f"  Sampled {max_combos:,} / {total:,} combos (max_combos_per_system cap)")
+        lines.append(f"  Sampled {max_combos:,} / {total:,} combos (max_combos_per_system cap)")
     else:
-        log.append(f"  Loaded {total:,} combos")
-    return {'sys_entry': sys_entry, 'combos': sys_combos, 'log': log}
+        lines.append(f"  Loaded {total:,} combos")
+    return {'sys_entry': sys_entry, 'combos': sys_combos, 'log': lines}
 
 
 def iter_json_array_streaming(path, chunk_size: int = 1 << 20):
@@ -257,8 +260,8 @@ def build_combo_dir_lookup(
 
     n_systems = len(missing_by_system)
     n_missing = sum(len(v) for v in missing_by_system.values())
-    print(f"  [dir lookup] {n_missing} combos need creation across "
-          f"{n_systems} system(s) — scanning metadata ...")
+    log.info(f"  [dir lookup] {n_missing} combos need creation across "
+             f"{n_systems} system(s) — scanning metadata ...")
 
     lookup: Dict[str, Any] = {}
     for idir, needed_paths in missing_by_system.items():
@@ -273,7 +276,7 @@ def build_combo_dir_lookup(
                 if not remaining:
                     break
 
-    print(f"  [dir lookup] found {len(lookup)}/{n_missing} entries")
+    log.info(f"  [dir lookup] found {len(lookup)}/{n_missing} entries")
     lookup.update(found)
     return lookup
 
@@ -323,7 +326,7 @@ def ensure_combo_dir_exists(combo_path: Path, system_config: Dict,
     output_dir = Path(system_config['out_dir'])
 
     if verbose:
-        print(f"  Creating combo directory on-demand: {combo_path.name}")
+        log.info(f"  Creating combo directory on-demand: {combo_path.name}")
     created_path = create_single_combination_dir(
         input_dir, output_dir, combo_info, include_patterns=include_patterns,
         verbose=verbose,

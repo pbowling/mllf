@@ -29,7 +29,7 @@ Online training is driven by a YAML configuration file:
 .. code-block:: bash
 
    cd mllf   # repository root
-   python -m mllf.cli.train_workflow examples/workflow_14benz.yaml
+   mllf train examples/workflow_14benz.yaml
 
 :doc:`examples` walks through the 1,4-benzene (14benz) example. The driver itself is
 ``mllf.cb.training_loop.run_training``: setup in ``mllf.cb.training_setup``, one epoch's
@@ -526,9 +526,9 @@ run:
 
 .. code-block:: bash
 
-   python -m mllf.cb.export_biases config.yaml --model final_model.pt \
+   mllf export config.yaml --model final_model.pt \
        --bandit-state <output.base_dir>/bandit_state.json --out final_biases
-   python -m mllf.cb.export_biases config.yaml --label <output.base_dir>
+   mllf export config.yaml --label <output.base_dir>
 
 .. _Testing on New Systems:
 
@@ -567,7 +567,7 @@ datasets:
 
 .. code-block:: bash
 
-   python -m mllf.cb.cost_ledger <output.base_dir> --pretraining-root pretraining
+   mllf cost <output.base_dir> --pretraining-root pretraining
 
 The comparison is like for like when both methods ran the same substituent groups (the
 ALF-derived combo sets), validation runs are reported separately (they test the model and

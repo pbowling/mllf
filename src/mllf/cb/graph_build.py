@@ -7,6 +7,7 @@ embeddings, directed within-site edges) that ``mllf.cb.reinforce_trainer``'s
 Moved here from ``training/workflow.py`` as part of making the online CB
 training driver importable as a library (see ``mllf.cli.train_workflow``).
 """
+import logging
 from pathlib import Path
 from typing import Dict, Optional
 import re
@@ -22,6 +23,8 @@ from mllf.cb.unimol_representation import (
     get_substituent_dual_embeddings,
 )
 from mllf.file_handling.read_rtf import parse_rtf_dir
+
+log = logging.getLogger(__name__)
 
 
 def build_graph_and_data(combo_dir: str, system_config: Dict,
@@ -145,10 +148,10 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     combo_name = combo_path.name
     _env_input = global_config.get('unimol', {}).get('env_input', 'dual')
     _kind = 'dual' if _env_input == 'dual' else f'ligand + {_env_input}'
-    print(f"  Computing Uni-Mol embeddings ({_kind}) for {combo_name} (system: "
-          f"{system_config.get('name', 'unknown')}, solvent_state: {solvent_state})")
+    log.info(f"  Computing Uni-Mol embeddings ({_kind}) for {combo_name} (system: "
+             f"{system_config.get('name', 'unknown')}, solvent_state: {solvent_state})")
     if custom_search_paths:
-        print(f"    Custom environment PDB paths: {custom_search_paths}")
+        log.info(f"    Custom environment PDB paths: {custom_search_paths}")
 
     site_consensus = {}  # site_idx -> consensus_atoms set
     if solvent_state and solvent_state.lower() != 'gas':
@@ -162,16 +165,17 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                 )
                 if consensus_atoms:
                     site_consensus[site_idx] = consensus_atoms
-                    print(f"    Site {site_idx}: consensus contains {len(consensus_atoms)} atoms")
+                    log.info(f"    Site {site_idx}: consensus contains {len(consensus_atoms)} "
+                             "atoms")
                 else:
-                    print(
+                    log.info(
                         f"    Site {site_idx}: no consensus found, using distance-based fallback")
             except Exception as e:
-                print(
+                log.info(
                     f"    Site {site_idx}: consensus building failed ({e}), using distance-based "
                     "fallback")
     else:
-        print("    Skipping consensus building for gas-phase system (no environment)")
+        log.info("    Skipping consensus building for gas-phase system (no environment)")
 
     unimol_embeddings = []
     for site_idx in sorted(site_to_sub_map.keys()):

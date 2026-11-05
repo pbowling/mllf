@@ -1,4 +1,5 @@
 """Run- and pair-level rewards for pretraining's advantage weighting."""
+import logging
 import json
 import math
 from pathlib import Path
@@ -20,6 +21,8 @@ from mllf.cb.workflow_utils import (
     SKEW_WIDTH,
     compute_pair_reward,
 )
+
+log = logging.getLogger(__name__)
 
 
 # ── Run length ───────────────────────────────────────────────────────────────
@@ -509,9 +512,9 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
     pair_reward_cache = [None] * len(runs)
     pair_success_cache = [None] * len(runs)
 
-    print(f"\n{'=' * 60}")
-    print("Building per-pair reward cache for per-edge, per-dimension AWR...")
-    print(f"{'=' * 60}")
+    log.info(f"\n{'=' * 60}")
+    log.info("Building per-pair reward cache for per-edge, per-dimension AWR...")
+    log.info(f"{'=' * 60}")
     n_pair_ok = 0
     for run_idx, run in enumerate(runs):
         try:
@@ -527,7 +530,7 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
         except Exception:
             pass   # the run falls back to its scalar reward
         if (run_idx + 1) % 100 == 0 or (run_idx + 1) == len(runs):
-            print(f"  {run_idx + 1}/{len(runs)} runs ({n_pair_ok} with pair rewards)...")
+            log.info(f"  {run_idx + 1}/{len(runs)} runs ({n_pair_ok} with pair rewards)...")
 
     if not n_pair_ok:
         return None
@@ -535,20 +538,20 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
     advantages, baseline_mean, baseline_std = pair_advantages(
         pair_reward_cache, pair_success=pair_success_cache if success_gate else None,
         success_floor=success_floor)
-    print("\nPer-pair reward baseline computed:")
-    print(f"  Runs with per-pair rewards: {n_pair_ok}/{len(runs)}")
-    print(f"  Baseline mean [lin, quad, skew, end]: {baseline_mean.numpy()}")
-    print(f"  Baseline  std [lin, quad, skew, end]: {baseline_std.numpy()}")
-    print(f"  Success floor: {success_floor}")
+    log.info("\nPer-pair reward baseline computed:")
+    log.info(f"  Runs with per-pair rewards: {n_pair_ok}/{len(runs)}")
+    log.info(f"  Baseline mean [lin, quad, skew, end]: {baseline_mean.numpy()}")
+    log.info(f"  Baseline  std [lin, quad, skew, end]: {baseline_std.numpy()}")
+    log.info(f"  Success floor: {success_floor}")
     if success_gate:
         for name, short in (('full', False), ('short', True)):
             flags = [ok for ok, sh in zip(pair_success_cache, short_runs)
                      if ok is not None and sh == short]
             n_edges = sum(int(f.numel()) for f in flags)
             n_passed = sum(int(f.sum()) for f in flags)
-            print(f"  Success gate, {name} runs (short = under "
-                  f"{0.5 * full_length_ns:g} ns): {n_passed}/{n_edges} edges passed "
-                  f"the online {'short-run' if short else 'full-run'} test")
+            log.info(f"  Success gate, {name} runs (short = under "
+                     f"{0.5 * full_length_ns:g} ns): {n_passed}/{n_edges} edges passed "
+                     f"the online {'short-run' if short else 'full-run'} test")
     return advantages
 
 
@@ -556,7 +559,7 @@ def assign_run_rewards(runs: List[Dict], reward_config: Dict) -> int:
     """Set run["_bc_reward"] = max(0, reward) on every run (the scalar AWR
     weight is exp(r / beta)); returns the number of positive-reward runs."""
     filtered_rc = reward_kwargs(reward_config)
-    print("\nPre-computing per-run rewards for AWR loss weighting...")
+    log.info("\nPre-computing per-run rewards for AWR loss weighting...")
     n_pos = 0
     total_pos = 0.0
     for run in runs:
@@ -575,6 +578,6 @@ def assign_run_rewards(runs: List[Dict], reward_config: Dict) -> int:
                 total_pos += r
         except Exception:
             run["_bc_reward"] = 0.0
-    print(f"  Positive-reward runs: {n_pos}/{len(runs)}  "
-          f"(total positive reward mass: {total_pos:.2f})")
+    log.info(f"  Positive-reward runs: {n_pos}/{len(runs)}  "
+             f"(total positive reward mass: {total_pos:.2f})")
     return n_pos

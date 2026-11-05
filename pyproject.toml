@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mllf"
-version = "0.1.0"
-description = "MLLF bias coefficient file handling"
+dynamic = ["version"]
+description = "Machine-learned bias coefficients for multisite lambda dynamics"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
@@ -22,6 +22,9 @@ dependencies = [
     "unimol_tools>=0.1.6",
 ]
 
+[project.scripts]
+mllf = "mllf.cli.main:main"
+
 [project.urls]
 "Repository" = "https://github.com/pbowling/mllf"
 
@@ -31,6 +34,9 @@ dev = [
     "pytest-cov",
     "flake8",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "mllf.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

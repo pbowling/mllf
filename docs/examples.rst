@@ -24,7 +24,7 @@ from the input directory itself.
 .. code-block:: bash
 
    cd mllf   # repository root
-   python examples/run_workflow.py examples/workflow_14benz.yaml
+   mllf train examples/workflow_14benz.yaml
 
 ``examples/workflow_14benz.yaml`` is kept small so that it runs quickly and without a
 pretrained model:
@@ -47,11 +47,11 @@ Pretraining warm-starts the policy from completed simulations (:doc:`cb_pretrain
 .. code-block:: bash
 
    # collect run directories into pretraining records
-   python -m mllf.cli.collect_pretraining_data previous_runs/14benz_solv \
+   mllf collect previous_runs/14benz_solv \
        --output-dir pretraining/14benz_solv
 
    # behavior cloning
-   python -m mllf.cli.pretrain --pretraining-dir pretraining/14benz_solv \
+   mllf pretrain --pretraining-dir pretraining/14benz_solv \
        --output-dir models/14benz_pretrain --config examples/workflow_pretrain.yaml \
        --epochs 50
 
@@ -75,7 +75,7 @@ job that submits the simulations:
    tail -f checkpoints_online_1/epoch_summary.log   # one block per epoch
 
    # simulated time so far, against the iterative-flattening runs of the same systems
-   python -m mllf.cb.cost_ledger checkpoints_online_1 --pretraining-root ../pretraining
+   mllf cost checkpoints_online_1 --pretraining-root ../pretraining
 
 Each stage starts from the previous stage's final model, and stages 3 and 4 test the
 trained model on systems it has not seen (``mode: deploy``, :ref:`Testing on New

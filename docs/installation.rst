@@ -20,4 +20,7 @@ Run the tests with:
 
    python -m pytest tests/ -v
 
+Installing puts the ``mllf`` command on the path (:doc:`cli`); ``mllf -h`` lists its
+subcommands.
+
 To build the documentation locally, see ``docs/README.md``.

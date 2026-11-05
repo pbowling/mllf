@@ -12,28 +12,37 @@ not the full prep directory.
 from __future__ import annotations
 
 import argparse
-import re
-import yaml
-from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List
 import json
+import logging
+import re
+import sys
+from multiprocessing import Pool
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
 
 from mllf.cb.cost_ledger import simulated_ns
+from mllf.cli.common import UsageError, run_command
 from mllf.file_handling.generate_combinations import is_combo_dir_name
-from mllf.file_handling.read_rtf import parse_rtf_dir
-from mllf.file_handling.read_output import (
-    parse_single_population,
-    parse_transitions_and_rates,
-    parse_single_ddg,
-    parse_pair_profile,
-    resolve_output_file,
-)
 from mllf.file_handling.read_bias_coeff import (
     FLAT_TO_MATRIX_NONLINEAR,
     NONLINEAR_SIGN_KEY,
     read_bias_coeff,
 )
-from multiprocessing import Pool
+from mllf.file_handling.read_output import (
+    parse_pair_profile,
+    parse_single_ddg,
+    parse_single_population,
+    parse_transitions_and_rates,
+    resolve_output_file,
+)
+from mllf.file_handling.read_rtf import parse_rtf_dir
+
+log = logging.getLogger(__name__)
+
+
+log = logging.getLogger(__name__)
 
 
 def find_run_directories(base_path: Path) -> List[Path]:
@@ -398,8 +407,8 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
     """
     sim_results_files = sorted(pretraining_root.rglob('simulation_results.json'))
     total = len(sim_results_files)
-    print(f"Found {total} simulation_results.json files under {pretraining_root}"
-          + (f" ({workers} workers)" if workers > 1 else ""), flush=True)
+    log.info('%s', f"Found {total} simulation_results.json files under {pretraining_root}"
+             + (f" ({workers} workers)" if workers > 1 else ""))
 
     tasks = [(p, dry_run, overwrite) for p in sim_results_files]
     counts = {'updated': 0, 'present': 0, 'no_output': 0, 'error': 0}
@@ -413,9 +422,9 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
                 shown[status] += 1
                 prefix = {'updated': 'Would update', 'no_output': 'No output file for',
                           'error': 'Warning:'}[status]
-                print(f"  {prefix} {msg}", flush=True)
+                log.info(f"  {prefix} {msg}")
             if n % 1000 == 0:
-                print(f"  ... {n}/{total} runs checked", flush=True)
+                log.info(f"  ... {n}/{total} runs checked")
 
     if workers > 1:
         with Pool(workers) as pool:
@@ -425,9 +434,9 @@ def backfill_barrier_pairs(pretraining_root: Path, dry_run: bool = False,
 
     n_skipped = counts['present'] + counts['no_output'] + counts['error']
     verb = "would update" if dry_run else "updated"
-    print(f"\nLambda-profile backfill summary: {counts['updated']} {verb}, "
-          f"{counts['present']} already had the fields, {counts['no_output']} without "
-          f"an output file, {counts['error']} errors", flush=True)
+    log.info(f"\nLambda-profile backfill summary: {counts['updated']} {verb}, "
+             f"{counts['present']} already had the fields, {counts['no_output']} without "
+             f"an output file, {counts['error']} errors")
     return counts['updated'], n_skipped
 
 
@@ -471,7 +480,7 @@ def fix_inp_nonlinear_signs(pretraining_root: Path, dry_run: bool = False) -> Tu
     n_fixed = n_ok = n_unresolved = 0
     unresolved_examples: List[str] = []
     var_files = sorted(pretraining_root.rglob('variables.py'))
-    print(f"Found {len(var_files)} variables.py files under {pretraining_root}")
+    log.info(f"Found {len(var_files)} variables.py files under {pretraining_root}")
     for var_path in var_files:
         run_dir = var_path.parent
         text = var_path.read_text()
@@ -498,17 +507,17 @@ def fix_inp_nonlinear_signs(pretraining_root: Path, dry_run: bool = False) -> Tu
         bias[NONLINEAR_SIGN_KEY] = "matrix"
         if dry_run:
             if n_fixed < 5:
-                print(f"  Would fix {run_dir}")
+                log.info(f"  Would fix {run_dir}")
         else:
             bias_yaml = yaml.dump(bias, default_flow_style=False, sort_keys=False)
             var_path.write_text(text[:m.start(1)] + "\n" + bias_yaml.strip() + "\n"
                                 + text[m.end(1):])
         n_fixed += 1
     verb = "would fix" if dry_run else "fixed"
-    print(f"\n.inp sign fix: {n_fixed} {verb}, {n_ok} already correct (.py source or marked), "
-          f"{n_unresolved} unresolved (no source dir/variables file)")
+    log.info(f"\n.inp sign fix: {n_fixed} {verb}, {n_ok} already correct (.py source or marked), "
+             f"{n_unresolved} unresolved (no source dir/variables file)")
     for ex in unresolved_examples:
-        print(f"  unresolved e.g. {ex}")
+        log.info(f"  unresolved e.g. {ex}")
     return n_fixed, n_ok, n_unresolved
 
 
@@ -535,7 +544,8 @@ def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[i
     n_skipped = 0
 
     sim_results_files = sorted(pretraining_root.rglob('simulation_results.json'))
-    print(f"Found {len(sim_results_files)} simulation_results.json files under {pretraining_root}")
+    log.info(f"Found {len(sim_results_files)} simulation_results.json files under "
+             f"{pretraining_root}")
 
     for sim_path in sim_results_files:
         run_dir = sim_path.parent
@@ -549,7 +559,7 @@ def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[i
 
         metadata_path = run_dir / 'metadata.json'
         if not metadata_path.exists():
-            print(f"  Warning: No metadata.json in {run_dir.name}, skipping")
+            log.warning(f"  Warning: No metadata.json in {run_dir.name}, skipping")
             n_skipped += 1
             continue
 
@@ -558,7 +568,7 @@ def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[i
 
         source_run_dir = metadata.get('source_run_dir')
         if not source_run_dir:
-            print(f"  Warning: No source_run_dir in {run_dir.name} metadata, skipping")
+            log.warning(f"  Warning: No source_run_dir in {run_dir.name} metadata, skipping")
             n_skipped += 1
             continue
 
@@ -570,14 +580,14 @@ def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[i
                 break
 
         if output_file is None:
-            print(f"  Warning: No output file in source {source_run_dir}, skipping")
+            log.warning(f"  Warning: No output file in source {source_run_dir}, skipping")
             n_skipped += 1
             continue
 
         try:
             ddg_raw = parse_single_ddg(output_file.read_text())
         except Exception as exc:
-            print(f"  Warning: Could not parse DDG for {run_dir.name}: {exc}")
+            log.warning(f"  Warning: Could not parse DDG for {run_dir.name}: {exc}")
             n_skipped += 1
             continue
 
@@ -587,7 +597,7 @@ def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[i
 
         n_transitions = sum(1 for v in ddg_serialized.values() if v is not None)
         if dry_run:
-            print(
+            log.info(
                 f"  Would update {run_dir.name}: "
                 f"{n_transitions}/{len(ddg_serialized)} pairs with transitions"
             )
@@ -598,7 +608,7 @@ def backfill_ddg_pairs(pretraining_root: Path, dry_run: bool = False) -> Tuple[i
 
         n_updated += 1
 
-    print(f"\nBackfill summary: {n_updated} updated, {n_skipped} skipped")
+    log.info(f"\nBackfill summary: {n_updated} updated, {n_skipped} skipped")
     return n_updated, n_skipped
 
 
@@ -843,8 +853,8 @@ def parse_active_subs_from_inp(
             continue
         distinct = {json.dumps(r, sort_keys=True) for _, r in tier}
         if len(distinct) > 1:
-            print(f"  Warning: {prep_dir}: .inp files disagree on the active substituents "
-                  f"({', '.join(n for n, _ in tier)}); using {tier[0][0]}")
+            log.warning(f"  Warning: {prep_dir}: .inp files disagree on the active substituents "
+                        f"({', '.join(n for n, _ in tier)}); using {tier[0][0]}")
         return tier[0][1]
     return _sequential_subs(nsubs_per_site)
 
@@ -1093,7 +1103,7 @@ def create_pretraining_entry(
 
     # Apply minimum-transitions filter before touching the filesystem
     if total_trans < min_transitions:
-        print(f"  Skipping {combo_name}: {total_trans} transitions < {min_transitions}")
+        log.info(f"  Skipping {combo_name}: {total_trans} transitions < {min_transitions}")
         return None
 
     # Create output directory
@@ -1217,8 +1227,8 @@ def relabel_active_subs(root: Path, datasets: Optional[List[str]] = None,
     """
     entries = sorted(p.parent for p in root.glob('*/*/graph_info.json')
                      if not datasets or p.parent.parent.name in datasets)
-    print(f"Relabeling active substituents in {len(entries)} runs under {root}"
-          + (" (dry run)" if dry_run else ""), flush=True)
+    log.info('%s', f"Relabeling active substituents in {len(entries)} runs under {root}"
+             + (" (dry run)" if dry_run else ""))
     counts = {k: 0 for k in ('relabeled', 'annotated', 'same', 'no_source', 'error')}
     by_dataset: Dict[str, str] = {}
     tasks = [(e, dry_run) for e in entries]
@@ -1232,45 +1242,38 @@ def relabel_active_subs(root: Path, datasets: Optional[List[str]] = None,
         if status == 'relabeled':
             by_dataset.setdefault(entry_dir.parent.name, msg.split(': ', 1)[1])
         elif status == 'error':
-            print(f"  Warning: {msg}", flush=True)
+            log.warning(f"  Warning: {msg}")
     for ds, change in sorted(by_dataset.items()):
-        print(f"  {ds}: {change}", flush=True)
+        log.info(f"  {ds}: {change}")
     verb = 'would be' if dry_run else 'were'
-    print(
-        f"\nRelabel summary ({verb}): " +
-        ', '.join(
-            f"{v} {k}" for k,
-            v in counts.items()),
-        flush=True)
+    log.info(f"\nRelabel summary ({verb}): "
+             + ', '.join(f"{v} {k}" for k, v in counts.items()))
     return counts
 
 
-def main():
-    """Main entry point for collecting pretraining data."""
-    parser = argparse.ArgumentParser(
-        description="Collect pretraining data from MSLD run directories",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+DESCRIPTION = "Collect pretraining data from MSLD run directories"
+EPILOG = """
 Examples:
   # Collect all run directories from a base path
-  python -m mllf.cli.collect_pretraining_data \\
+  mllf collect \\
       /path/to/wLambda \\
       --output-dir pretraining/14benz_solv
 
   # Collect specific runs with custom names
-  python -m mllf.cli.collect_pretraining_data \\
+  mllf collect \\
       /path/to/wLambda \\
       --output-dir pretraining/14benz_solv \\
       --runs run1 run5 run10
 
   # Process with custom combo name pattern
-  python -m mllf.cli.collect_pretraining_data \\
+  mllf collect \\
       /path/to/wLambda \\
       --output-dir pretraining/14benz_solv \\
       --name-pattern "14benz_solv_{:03d}"
         """
-    )
 
+
+def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         'base_path',
         type=Path,
@@ -1388,13 +1391,12 @@ Examples:
         help='With --backfill-barrier: parallel worker processes (default 1)',
     )
 
-    args = parser.parse_args()
 
-    # --- Maintenance modes: mutually exclusive with normal collection mode ---
+def run(args: argparse.Namespace):
     if args.relabel_subs is not None:
         root = args.relabel_subs.resolve()
         if not root.exists():
-            print(f"Error: root does not exist: {root}")
+            log.error(f"Error: root does not exist: {root}")
             return 1
         counts = relabel_active_subs(root, datasets=args.datasets, dry_run=args.dry_run,
                                      workers=max(1, args.workers))
@@ -1403,7 +1405,7 @@ Examples:
     if args.fix_inp_signs is not None:
         root = args.fix_inp_signs.resolve()
         if not root.exists():
-            print(f"Error: root does not exist: {root}")
+            log.error(f"Error: root does not exist: {root}")
             return 1
         fix_inp_nonlinear_signs(root, dry_run=args.dry_run)
         return 0
@@ -1411,7 +1413,7 @@ Examples:
     if args.backfill_barrier is not None:
         root = args.backfill_barrier.resolve()
         if not root.exists():
-            print(f"Error: Backfill root does not exist: {root}")
+            log.error(f"Error: Backfill root does not exist: {root}")
             return 1
         backfill_barrier_pairs(root, dry_run=args.dry_run, overwrite=args.overwrite,
                                workers=max(1, args.workers))
@@ -1420,24 +1422,24 @@ Examples:
     if args.backfill_ddg is not None:
         root = args.backfill_ddg.resolve()
         if not root.exists():
-            print(f"Error: Backfill root does not exist: {root}")
+            log.error(f"Error: Backfill root does not exist: {root}")
             return 1
         backfill_ddg_pairs(root, dry_run=args.dry_run)
         return 0
 
     # Normal collection mode — base_path and --output-dir are required
     if args.base_path is None:
-        parser.error(
+        raise UsageError(
             "base_path is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode is "
             "specified")
     if args.output_dir is None:
-        parser.error(
+        raise UsageError(
             "--output-dir is required unless a --backfill-*/--fix-inp-signs/--relabel-subs mode "
             "is specified")
 
     base_path = args.base_path.resolve()
     if not base_path.exists():
-        print(f"Error: Base path does not exist: {base_path}")
+        log.error(f"Error: Base path does not exist: {base_path}")
         return 1
 
     # Find run directories
@@ -1448,10 +1450,10 @@ Examples:
         run_dirs = find_run_directories(base_path)
 
     if not run_dirs:
-        print(f"No run directories found in {base_path}")
+        log.info(f"No run directories found in {base_path}")
         return 1
 
-    print(f"Found {len(run_dirs)} run directories")
+    log.info(f"Found {len(run_dirs)} run directories")
 
     # Process each run directory
     success_count = 0
@@ -1472,10 +1474,10 @@ Examples:
             else:
                 combo_name = run_dir.name
 
-        print(f"\n[{i}/{len(run_dirs)}] Processing {run_dir.name} -> {combo_name}")
+        log.info(f"\n[{i}/{len(run_dirs)}] Processing {run_dir.name} -> {combo_name}")
 
         if args.dry_run:
-            print(f"  Would create: {args.output_dir / combo_name}")
+            log.info(f"  Would create: {args.output_dir / combo_name}")
             try:
                 bias_data, output_results, graph_info = collect_run_data(
                     run_dir, args.solvent_state)
@@ -1489,19 +1491,19 @@ Examples:
                     else:
                         dry_trans += trans_dict
                 if dry_trans < args.min_transitions:
-                    print(f"  Would skip: {dry_trans} transitions < {args.min_transitions}")
+                    log.info(f"  Would skip: {dry_trans} transitions < {args.min_transitions}")
                 else:
-                    print(f"  Bias keys: {list(bias_data.keys())}")
-                    print(f"  Populations: {len(output_results['populations'])} sites")
+                    log.info(f"  Bias keys: {list(bias_data.keys())}")
+                    log.info(f"  Populations: {len(output_results['populations'])} sites")
                     if output_results['transitions']:
-                        print(f"  Transition pairs: {len(output_results['transitions'])}")
-                    print(f"  Total transitions (highest λ): {dry_trans}")
-                    print(f"  Terminated normally: {output_results['terminated_normally']}")
-                    print(f"  Solvent state: {graph_info['solvent_state']}")
-                    print(f"  Sites found: {len(graph_info['sites'])}")
+                        log.info(f"  Transition pairs: {len(output_results['transitions'])}")
+                    log.info(f"  Total transitions (highest λ): {dry_trans}")
+                    log.info(f"  Terminated normally: {output_results['terminated_normally']}")
+                    log.info(f"  Solvent state: {graph_info['solvent_state']}")
+                    log.info(f"  Sites found: {len(graph_info['sites'])}")
                 success_count += 1
             except Exception as e:
-                print(f"  Error: {e}")
+                log.error(f"  Error: {e}")
                 error_count += 1
         else:
             try:
@@ -1512,21 +1514,28 @@ Examples:
                 if entry_dir is None:
                     skipped_count += 1
                 else:
-                    print(f"  ✓ Created: {entry_dir}")
+                    log.info(f"  ✓ Created: {entry_dir}")
                     success_count += 1
             except Exception as e:
-                print(f"  ✗ Error: {e}")
+                log.info(f"  ✗ Error: {e}")
                 error_count += 1
 
-    print(f"\n{'=' * 60}")
-    print(f"Summary: {success_count} successful, {skipped_count} skipped (< "
-          f"{args.min_transitions} transitions), {error_count} errors")
+    log.info(f"\n{'=' * 60}")
+    log.info(f"Summary: {success_count} successful, {skipped_count} skipped (< "
+             f"{args.min_transitions} transitions), {error_count} errors")
 
     if not args.dry_run and success_count > 0:
-        print(f"Pretraining data written to: {args.output_dir.resolve()}")
+        log.info(f"Pretraining data written to: {args.output_dir.resolve()}")
 
     return 0 if error_count == 0 else 1
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=DESCRIPTION, epilog=EPILOG,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_arguments(parser)
+    return run_command(parser, run, argv)
+
+
 if __name__ == '__main__':
-    exit(main())
+    sys.exit(main())

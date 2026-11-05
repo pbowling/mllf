@@ -31,7 +31,6 @@ For ANI-2x, use cutoff=5.1 Å (radial) or 3.5 Å (angular) to match the AEV func
 
 from __future__ import annotations
 
-import os
 import warnings
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
@@ -480,32 +479,3 @@ def parse_pdb_dir(directory: str, pattern: str = '*.pdb') -> Dict[str, Dict[str,
         }
 
     return results
-
-
-if __name__ == '__main__':
-    # Quick smoke test when run directly
-    import sys
-
-    # Try to find example PDB files
-    example_dirs = [
-        os.path.join(os.path.dirname(__file__), '..', '..', '..', 'examples', '14benz', 'prep'),
-        os.path.join(os.path.dirname(__file__), '..', '..', '..', 'pretraining', '14benz_solv'),
-    ]
-
-    for example_dir in example_dirs:
-        example_dir = os.path.abspath(example_dir)
-        if os.path.exists(example_dir):
-            print(f"Parsing PDB files in: {example_dir}")
-            results = parse_pdb_dir(example_dir)
-
-            # Print summary
-            print(f"Found {len(results)} PDB files:")
-            for key, data in list(results.items())[:3]:  # Show first 3
-                print(f"  {key}: {data['num_atoms']} atoms, elements: {set(data['elements'])}")
-
-            if len(results) > 3:
-                print(f"  ... and {len(results) - 3} more files")
-
-            sys.exit(0)
-
-    print("No example PDB directories found for smoke test.")

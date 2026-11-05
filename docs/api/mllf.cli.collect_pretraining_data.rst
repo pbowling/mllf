@@ -8,6 +8,7 @@ mllf.cli.collect\_pretraining\_data
 
    .. autosummary::
    
+      add_arguments
       backfill_barrier_pairs
       backfill_ddg_pairs
       collect_run_data
@@ -25,4 +26,5 @@ mllf.cli.collect\_pretraining\_data
       parse_output_file
       rekey_graph_info
       relabel_active_subs
+      run
    

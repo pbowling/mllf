@@ -37,7 +37,7 @@ existing datasets in place, keeping the original as ``graph_info.orig.json``:
 
 .. code-block:: bash
 
-   python -m mllf.cli.collect_pretraining_data --relabel-subs pretraining \
+   mllf collect --relabel-subs pretraining \
        [--datasets luis_bace_solvent ...] [--dry-run]
 
 Adding Online Runs
@@ -66,7 +66,7 @@ Running Pretraining
 
 .. code-block:: bash
 
-   python -m mllf.cli.pretrain --pretraining-dir pretraining/ \
+   mllf pretrain --pretraining-dir pretraining/ \
        --output-dir models/my_pretrain_run --config examples/workflow_pretrain.yaml \
        --epochs 50 --bayesian-heads
 

@@ -28,7 +28,7 @@ The training driver labels each system when it finishes; for a finished run::
 
     python -m mllf.cb.export_biases config.yaml --label checkpoints_online_A
 """
-import argparse
+import logging
 import json
 import re
 import shutil
@@ -36,10 +36,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import yaml
 
 from mllf.cb import system_stages as ss
-from mllf.cb.bandit_config import BanditConfig, with_hindsight_defaults
+from mllf.cb.bandit_config import BanditConfig
 from mllf.cb.graph_build import build_graph_and_data
 from mllf.cb.hindsight import (
     BIAS_DIMS,
@@ -52,10 +51,10 @@ from mllf.cb.hindsight import (
     pair_offset_posterior,
 )
 from mllf.cb.group_correction import apply_group_values, correction_config
-from mllf.cb.training_setup import build_policy
-from mllf.cb.workflow_utils import load_bandit_state
 from mllf.file_handling.combo_sets import build_combo_sets
 from mllf.file_handling.write_bias_coeff import write_variables_from_actions
+
+log = logging.getLogger(__name__)
 
 
 def input_dir_labels(combo_dir) -> List[Tuple[int, int]]:
@@ -232,45 +231,10 @@ def label_final_biases(checkpoint_dir, config: Dict, systems: Optional[List[str]
     return n
 
 
-def main() -> None:
-
-    p = argparse.ArgumentParser(description='Export production biases from a trained policy')
-    p.add_argument('config', help='workflow YAML (systems, unimol, bandit, training)')
-    p.add_argument(
-        '--model',
-        default=None,
-        help='checkpoint with policy_state_dict or policy_state')
-    p.add_argument('--bandit-state', default=None, help='bandit_state.json with per-pair offsets')
-    p.add_argument('--systems', nargs='*', default=None,
-                   help='system names (default: all in config)')
-    p.add_argument(
-        '--out',
-        default='final_biases',
-        help='output root (one subdirectory per system)')
-    p.add_argument('--label', default=None, metavar='CHECKPOINT_DIR',
-                   help='only label an existing run\'s exported groups (confidence files, '
-                        '_unconverged names) and exit')
-    args = p.parse_args()
-
-    with open(args.config) as f:
-        config = with_hindsight_defaults(yaml.safe_load(f))
-    if args.label:
-        n = label_final_biases(args.label, config, args.systems)
-        print(f"labelled {n} exported group(s) under {Path(args.label) / 'final_biases'}")
-        return
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    policy = build_policy(config, device, bayesian_default=True)
-    if not args.model:
-        p.error('--model is required unless --label is given')
-    ckpt = torch.load(args.model, map_location=device, weights_only=False)
-    policy.load_state_dict(ckpt.get('policy_state_dict') or ckpt['policy_state'])
-    state = load_bandit_state(Path(args.bandit_state)) if args.bandit_state else None
-    for sys_cfg in config.get('systems', []):
-        if args.systems and sys_cfg.get('name') not in args.systems:
-            continue
-        path = export_final_biases(policy, sys_cfg, config, state,
-                                   Path(args.out) / sys_cfg['name'], device=device)
-        print(f"{sys_cfg['name']}: {path}")
+def main(argv=None):
+    """Same as ``mllf export``."""
+    from mllf.cli.export import main as cli_main
+    return cli_main(argv)
 
 
 if __name__ == '__main__':

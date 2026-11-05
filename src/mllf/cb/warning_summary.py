@@ -1,9 +1,12 @@
 """Deduplicated summary of the warnings raised during a long run."""
+import logging
 import collections
 import re
 import threading
 import warnings
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 class WarningSummary:
@@ -43,14 +46,14 @@ class WarningSummary:
     def report(self) -> None:
         if not self.counts:
             return
-        print(f"\n{'='*60}")
-        print(f"Warning Summary ({sum(self.counts.values())} total occurrences, "
-              f"{len(self.counts)} unique types)")
-        print(f"{'='*60}")
+        log.warning(f"\n{'='*60}")
+        log.warning(f"Warning Summary ({sum(self.counts.values())} total occurrences, "
+                    f"{len(self.counts)} unique types)")
+        log.warning(f"{'='*60}")
         for (cat, template), count in sorted(self.counts.items(), key=lambda kv: -kv[1]):
             example_text, ex_file, ex_line = self.example[(cat, template)]
             short_file = Path(ex_file).name if ex_file else '?'
-            print(f"  [{count:5d}x] {cat} ({short_file}:{ex_line})")
+            log.warning(f"  [{count:5d}x] {cat} ({short_file}:{ex_line})")
             shown = template if self.show_template else example_text
-            print(f"           {shown[:self.width]}")
-        print(f"{'='*60}")
+            log.warning(f"           {shown[:self.width]}")
+        log.warning(f"{'='*60}")

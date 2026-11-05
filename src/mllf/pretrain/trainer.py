@@ -1,4 +1,5 @@
 """Behavior-cloning pretraining: the AWR epoch and the full training run."""
+import logging
 import json
 import math
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ from mllf.pretrain.features import (
 )
 from mllf.pretrain.filters import select_runs
 from mllf.pretrain.rewards import assign_run_rewards, build_pair_advantages
+
+log = logging.getLogger(__name__)
 
 
 def _awr_run_loss(w, logp_per, combined_mask, active_mask, w_sum, data_hygiene):
@@ -279,7 +282,7 @@ def pretrain_epoch(
                     continue
                 targets = torch.tensor(targets_list, dtype=torch.float32, device=device)
             except Exception as e:
-                print(f"  Error computing Uni-Mol embeddings for {run_dir.name}: {e}")
+                log.error(f"  Error computing Uni-Mol embeddings for {run_dir.name}: {e}")
                 continue
 
         # Move to device
@@ -354,32 +357,32 @@ def build_policy(config: Dict, unimol: UnimolSettings, device) -> UnimolPolicy:
 
 def _print_setup(unimol: UnimolSettings) -> None:
     # Fixed schema: 4 bias types (linear, quadratic, skew, end), 2 directions each.
-    print("\nSchema for Uni-Mol pretraining:")
-    print("  Bias types: 4 (linear, quadratic, skew, end)")
-    print(f"  Relations: {len(RELATION_NAMES)} (2 directions per type)")
-    print(f"  Relation names: {RELATION_NAMES}")
-    print(f"Environment input: {unimol.env_input}")
-    print(f"Ligand other-site reference substituents: {unimol.ligand_other_sites}")
-    print(f"Site-size input: {unimol.site_size_input}")
-    print(f"Ligand geometry from minimized.pdb for minimized runs: "
-          f"{unimol.ligand_from_minimized}")
+    log.info("\nSchema for Uni-Mol pretraining:")
+    log.info("  Bias types: 4 (linear, quadratic, skew, end)")
+    log.info(f"  Relations: {len(RELATION_NAMES)} (2 directions per type)")
+    log.info(f"  Relation names: {RELATION_NAMES}")
+    log.info(f"Environment input: {unimol.env_input}")
+    log.info(f"Ligand other-site reference substituents: {unimol.ligand_other_sites}")
+    log.info(f"Site-size input: {unimol.site_size_input}")
+    log.info(f"Ligand geometry from minimized.pdb for minimized runs: "
+             f"{unimol.ligand_from_minimized}")
 
 
 def _print_model(policy, unimol: UnimolSettings, opts: PretrainOptions, n_runs: int) -> None:
-    print("\nModel architecture:")
+    log.info("\nModel architecture:")
     if unimol.use_environment_difference:
-        print("  Policy: UnimolPolicy (dual embeddings: ligand-only + full)")
-        print("  Input: [diff_ligand(512D), mean_full(512D)] = 1024D edge features")
-        print("  diff_ligand captures substituent variation (sub-dependent)")
-        print("  mean_full captures environment effects (environment-dependent)")
+        log.info("  Policy: UnimolPolicy (dual embeddings: ligand-only + full)")
+        log.info("  Input: [diff_ligand(512D), mean_full(512D)] = 1024D edge features")
+        log.info("  diff_ligand captures substituent variation (sub-dependent)")
+        log.info("  mean_full captures environment effects (environment-dependent)")
     else:
-        print("  Policy: UnimolPolicy (ligand+environment)")
-        print("  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
-    print(f"  Total parameters: {sum(p.numel() for p in policy.parameters())}")
+        log.info("  Policy: UnimolPolicy (ligand+environment)")
+        log.info("  Dimensionality: 1024D (2×512D) → 512D → 256D → 64D (EdgeValueMLP)")
+    log.info(f"  Total parameters: {sum(p.numel() for p in policy.parameters())}")
     lr = opts.learning_rate
-    print(f"  Learning rate: {lr} (cosine annealed to {lr / 100:.6f})")
-    print(f"  Early stopping patience: {opts.patience} epochs")
-    print(f"  Graph caching: all {n_runs} graphs pre-built once, reused across all epochs")
+    log.info(f"  Learning rate: {lr} (cosine annealed to {lr / 100:.6f})")
+    log.info(f"  Early stopping patience: {opts.patience} epochs")
+    log.info(f"  Graph caching: all {n_runs} graphs pre-built once, reused across all epochs")
 
 
 @dataclass
@@ -403,9 +406,9 @@ def _resume(path: Path, policy, optimizer, scheduler, output_dir: Path, device) 
         best = torch.load(best_path, map_location='cpu', weights_only=False)
         progress.best_loss = float(best['loss'])
         progress.epochs_without_improvement = progress.start_epoch - int(best['epoch'])
-    print(f"\nResuming from {path}: epoch {progress.start_epoch} done; "
-          f"best loss {progress.best_loss:.4f}, {progress.epochs_without_improvement} epoch(s) "
-          "without improvement")
+    log.info(f"\nResuming from {path}: epoch {progress.start_epoch} done; "
+             f"best loss {progress.best_loss:.4f}, {progress.epochs_without_improvement} epoch(s) "
+             "without improvement")
     return progress
 
 
@@ -418,7 +421,7 @@ def _train_epochs(policy, optimizer, scheduler, runs, inputs: RunInputs, weights
     # one run per group: pretrain_epoch's per-group gradient accumulation
     groups = {f"run_{i}": [i] for i in range(len(runs)) if inputs.graph_cache[i] is not None}
     for epoch in range(progress.start_epoch, opts.epochs):
-        print(f"Epoch {epoch + 1}/{opts.epochs}")
+        log.info(f"Epoch {epoch + 1}/{opts.epochs}")
         stats = pretrain_epoch(
             policy, optimizer, runs, reward_config, device,
             graph_cache=inputs.graph_cache,
@@ -432,10 +435,10 @@ def _train_epochs(policy, optimizer, scheduler, runs, inputs: RunInputs, weights
             system_emphasis=opts.system_emphasis,
             data_hygiene=opts.data_hygiene,
         )
-        print(f"  AWR Loss: {stats['loss']:.4f}")
-        print(f"  Runs processed: {stats['num_runs']} "
-              f"({stats.get('num_updates', stats['num_runs'])} grad steps)")
-        print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+        log.info(f"  AWR Loss: {stats['loss']:.4f}")
+        log.info(f"  Runs processed: {stats['num_runs']} "
+                 f"({stats.get('num_updates', stats['num_runs'])} grad steps)")
+        log.info(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
         scheduler.step()
 
         if stats['loss'] < progress.best_loss:
@@ -443,7 +446,7 @@ def _train_epochs(policy, optimizer, scheduler, runs, inputs: RunInputs, weights
             progress.epochs_without_improvement = 0
             torch.save({'policy_state': policy.state_dict(), 'epoch': epoch + 1,
                         'loss': stats['loss']}, output_dir / "best_policy.pt")
-            print(f"  Saved best model (loss: {progress.best_loss:.4f})")
+            log.info(f"  Saved best model (loss: {progress.best_loss:.4f})")
         else:
             progress.epochs_without_improvement += 1
 
@@ -454,8 +457,8 @@ def _train_epochs(policy, optimizer, scheduler, runs, inputs: RunInputs, weights
                     'stats': stats}, output_dir / f"checkpoint_epoch_{epoch + 1:03d}.pt")
 
         if progress.epochs_without_improvement >= opts.patience:
-            print(f"\nEarly stopping: no improvement for {opts.patience} epochs (best loss: "
-                  f"{progress.best_loss:.4f})")
+            log.info(f"\nEarly stopping: no improvement for {opts.patience} epochs (best loss: "
+                     f"{progress.best_loss:.4f})")
             break
 
 
@@ -467,9 +470,9 @@ def _save_bayesian_siblings(policy, config: Dict, unimol: UnimolSettings,
     deterministic readout (``initialize_bayesian_heads_from_pretrained``) and
     its noise variance estimated from the behavior-cloning residuals. The
     deterministic checkpoints are not changed."""
-    print(f"\n{'=' * 60}")
-    print("NeuralLinear + TS: building Bayesian-head sibling checkpoint(s)")
-    print(f"{'=' * 60}")
+    log.info(f"\n{'=' * 60}")
+    log.info("NeuralLinear + TS: building Bayesian-head sibling checkpoint(s)")
+    log.info(f"{'=' * 60}")
     try:
         hygiene_weights = weights_cache if opts.data_hygiene else None
         noise_vars = estimate_reward_noise_variance(
@@ -486,7 +489,7 @@ def _save_bayesian_siblings(policy, config: Dict, unimol: UnimolSettings,
             ckpt = {'policy_state': bayes_policy.state_dict(), 'noise_var': noise_vars}
             ckpt.update(extra_fields)
             torch.save(ckpt, out_path)
-            print(f"  Saved {out_path}")
+            log.info(f"  Saved {out_path}")
 
         save(policy, output_dir / "final_policy_bayesian.pt", {'epoch': opts.epochs})
         best_path = output_dir / "best_policy.pt"
@@ -497,7 +500,7 @@ def _save_bayesian_siblings(policy, config: Dict, unimol: UnimolSettings,
             save(best_policy, output_dir / "best_policy_bayesian.pt",
                  {'epoch': best.get('epoch'), 'loss': best.get('loss')})
     except Exception as e:
-        print(f"  Warning: Bayesian-head post-pass failed: {e}")
+        log.warning(f"  Warning: Bayesian-head post-pass failed: {e}")
 
 
 def _write_metadata(config: Dict, unimol: UnimolSettings, opts: PretrainOptions, n_runs: int,
@@ -544,9 +547,9 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(opts.device if opts.device is not None
                           else 'cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    log.info(f"Using device: {device}")
     if len(runs) == 0:
-        print("Error: No valid runs found")
+        log.error("Error: No valid runs found")
         return
 
     reward_config = config.get('reward', {})
@@ -554,7 +557,7 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
     if runs is None:
         return
     if 'vocabulary' in config:
-        print("  Note: the 'vocabulary' config block is no longer used and is ignored")
+        log.info("  Note: the 'vocabulary' config block is no longer used and is ignored")
 
     unimol = UnimolSettings.from_config(config)
     _print_setup(unimol)
@@ -562,8 +565,8 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
     if opts.init_checkpoint is not None:
         init = torch.load(opts.init_checkpoint, map_location=device, weights_only=False)
         policy.load_state_dict(init['policy_state'])
-        print(f"\nInitialized policy from {opts.init_checkpoint} "
-              f"(epoch {init.get('epoch')}, loss {init.get('loss')})")
+        log.info(f"\nInitialized policy from {opts.init_checkpoint} "
+                 f"(epoch {init.get('epoch')}, loss {init.get('loss')})")
     _print_model(policy, unimol, opts, len(runs))
 
     # Adam, cosine-annealed from lr to lr/100 over all epochs
@@ -583,15 +586,15 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
                       if opts.use_per_pair_awr else None)
         reward_weighted = opts.reward_weighted
         if assign_run_rewards(runs, reward_config) == 0 and reward_weighted:
-            print("  Warning: all rewards zero or negative — disabling reward weighting.")
+            log.warning("  Warning: all rewards zero or negative — disabling reward weighting.")
             reward_weighted = False
 
-        print(f"\n{'=' * 60}")
-        print(f"Starting behavior cloning for {opts.epochs} epochs")
-        print(f"Training on {len(runs)} runs ({inputs.n_ok} with valid graphs)")
+        log.info(f"\n{'=' * 60}")
+        log.info(f"Starting behavior cloning for {opts.epochs} epochs")
+        log.info(f"Training on {len(runs)} runs ({inputs.n_ok} with valid graphs)")
         if reward_weighted:
-            print("Reward-weighted loss: ENABLED")
-        print(f"{'=' * 60}\n")
+            log.info("Reward-weighted loss: ENABLED")
+        log.info(f"{'=' * 60}\n")
         _train_epochs(policy, optimizer, scheduler, runs, inputs, weights_cache, advantages,
                       reward_weighted, unimol, opts, reward_config, output_dir, device,
                       progress)
@@ -602,8 +605,8 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
                                     output_dir, device)
         _write_metadata(config, unimol, opts, len(runs), inputs.n_ok, progress.best_loss,
                         output_dir, device)
-        print(f"\n{'=' * 60}")
-        print("Behavior cloning complete!")
-        print(f"Best MSE loss: {progress.best_loss:.4f}")
-        print(f"Saved to: {output_dir}")
-        print(f"{'=' * 60}")
+        log.info(f"\n{'=' * 60}")
+        log.info("Behavior cloning complete!")
+        log.info(f"Best MSE loss: {progress.best_loss:.4f}")
+        log.info(f"Saved to: {output_dir}")
+        log.info(f"{'=' * 60}")

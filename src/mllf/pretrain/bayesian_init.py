@@ -1,12 +1,15 @@
 """Bayesian-head warm start (NeuralLinear + Thompson sampling) from a
 behavior-cloned deterministic policy.
 """
+import logging
 from typing import List, Optional
 
 import numpy as np
 import torch
 
 from mllf.cb.policy import UnimolPolicy
+
+log = logging.getLogger(__name__)
 
 
 # ── NeuralLinear + Thompson Sampling: Bayesian head warm-start ──────────────
@@ -169,9 +172,9 @@ def estimate_reward_noise_variance(
             noise_var_physical = 1.0  # too little data — fall back to a neutral hyperparameter
         noise_vars.append(noise_var_physical / float(scale_factors[d]) ** 2)
     dim_names = ['linear', 'quadratic', 'skew', 'end']
-    print("  Estimated reward noise variance (sigma^2, pre-activation space) "
-          f"from {n_used} sampled runs: "
-          + ', '.join(f'{n}={v:.6f}' for n, v in zip(dim_names, noise_vars)))
+    log.info('%s', "  Estimated reward noise variance (sigma^2, pre-activation space) "
+             f"from {n_used} sampled runs: "
+             + ', '.join(f'{n}={v:.6f}' for n, v in zip(dim_names, noise_vars)))
     return noise_vars
 
 
@@ -262,10 +265,11 @@ def initialize_bayesian_heads_from_pretrained(
             max(float(np.var(residuals[d])), 1e-6) if len(residuals[d]) >= 5 else None
             for d in range(4)
         ]
-        print("  Data-driven prior-precision calibration: E[||z||^2]="
-              + ', '.join(f'{v:.2f}' for v in typical_z_norm_sq)
-              + ", physical residual var="
-              + ', '.join(f'{v:.4f}' if v is not None else 'n/a' for v in residual_vars_physical))
+        log.info('%s', "  Data-driven prior-precision calibration: E[||z||^2]="
+                 + ', '.join(f'{v:.2f}' for v in typical_z_norm_sq)
+                 + ", physical residual var="
+                 + ', '.join(f'{v:.4f}' if v is not None else 'n/a'
+                             for v in residual_vars_physical))
 
     scale_factors = policy_det.scale_factors.detach().cpu().numpy()
 

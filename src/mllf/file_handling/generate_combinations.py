@@ -64,7 +64,7 @@ Additional Features:
 """
 from __future__ import annotations
 
-import argparse
+import logging
 import json
 import re
 import itertools
@@ -75,6 +75,8 @@ from shutil import make_archive
 from typing import Dict, List, Optional, Tuple
 from glob import glob
 import shutil
+
+log = logging.getLogger(__name__)
 
 
 SITE_SUB_RE = re.compile(r"site(\d+)_sub(\d+)_([A-Za-z0-9_-]+)\.([A-Za-z0-9]+)$", re.IGNORECASE)
@@ -692,7 +694,7 @@ def create_single_combination_dir(input_dir: Path, out_dir: Path, combo_info: Di
 
                     if core_rtf.exists() and core_pdb.exists():
                         if verbose:
-                            print(
+                            log.info(
                                 f"  Augmenting core with site{excluded_site}_sub1 for single-site "
                                 "combo")
                         augment_core_with_excluded_sub1(core_rtf, core_pdb, sub1_rtf, sub1_pdb)
@@ -825,7 +827,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
         cnt += 1
         mapping = []
         if dry_run:
-            print(f"DRY: would create {combo_path}")
+            log.info(f"DRY: would create {combo_path}")
         else:
             combo_path.mkdir(exist_ok=True)
 
@@ -863,7 +865,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
         if prep_src.exists() and prep_src.is_dir():
             prep_dest = combo_path / 'prep'
             if dry_run:
-                print(f"DRY: would create prep directory {prep_dest}")
+                log.info(f"DRY: would create prep directory {prep_dest}")
             else:
                 prep_dest.mkdir(exist_ok=True)
 
@@ -880,7 +882,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                     # Symlink subdirectories (e.g. prep/pdb/) rather than copying
                     dest_file = prep_dest / prep_file.name
                     if dry_run:
-                        print(f"DRY: would symlink prep subdir {prep_file} -> {dest_file}")
+                        log.info(f"DRY: would symlink prep subdir {prep_file} -> {dest_file}")
                     elif not dest_file.exists():
                         dest_file.symlink_to(prep_file.resolve())
                     continue
@@ -898,7 +900,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                 # Copy non-site-specific files (full_ligand.*, par_all36_msld.prm, etc.)
                 dest_file = prep_dest / prep_file.name
                 if dry_run:
-                    print(f"DRY: would copy prep file {prep_file} -> {dest_file}")
+                    log.info(f"DRY: would copy prep file {prep_file} -> {dest_file}")
                 else:
                     copy2(prep_file, dest_file)
                     mapping.append({
@@ -921,7 +923,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                         dest_in_prep = prep_dest / new_name
 
                         if dry_run:
-                            print(f"DRY: would copy and rename {src_path} -> {dest_in_prep}")
+                            log.info(f"DRY: would copy and rename {src_path} -> {dest_in_prep}")
                         else:
                             # Copy directly from source to prep with new name
                             copy2(src_path, dest_in_prep)
@@ -975,7 +977,7 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                         'note': 'included_extra',
                     })
                     if dry_run:
-                        print(f"DRY: would copy extra {extra} -> {dest}")
+                        log.info(f"DRY: would copy extra {extra} -> {dest}")
                     else:
                         copy2(extra, dest)
 
@@ -1005,14 +1007,14 @@ def create_combination_dirs(input_dir: Path, out_dir: Path, dry_run: bool = Fals
                         core_pdb = prep_dest / 'core.pdb'
 
                         if core_rtf.exists() and core_pdb.exists():
-                            print(
+                            log.info(
                                 f"  Augmenting {name} core with site{excluded_site}_sub1 for "
                                 "single-site combo")
                             augment_core_with_excluded_sub1(core_rtf, core_pdb, sub1_rtf, sub1_pdb)
 
         # write mapping file
         if dry_run:
-            print(f"DRY: would write mapping.json in {combo_path}")
+            log.info(f"DRY: would write mapping.json in {combo_path}")
         else:
             mapping_path = combo_path / 'mapping.json'
             with mapping_path.open('w') as fh:
@@ -1102,61 +1104,14 @@ def archive_combo_dirs(out_dir: Path, pattern: str = 'comb_*', remove: bool = Fa
 
                 shutil.rmtree(base_name)
         except Exception as e:
-            print(f"Failed to archive {base_name}: {e}")
+            log.warning(f"Failed to archive {base_name}: {e}")
     return archived
 
 
-def main():
-    p = argparse.ArgumentParser(description="Generate combination directories from site_sub files")
-    p.add_argument('input_dir', type=Path, help='Directory containing site{n}_sub{m}.* files')
-    p.add_argument(
-        '--out',
-        '-o',
-        dest='out_dir',
-        type=Path,
-        default=Path('combos'),
-        help='Output base directory')
-    p.add_argument('--dry-run', action='store_true', help='Show actions without copying files')
-    p.add_argument(
-        '--include',
-        '-i',
-        dest='include',
-        action='append',
-        default=[],
-        help='Glob pattern(s) of additional files to copy into each combo dir (relative to '
-             'input_dir). Can be provided multiple times.')
-    p.add_argument(
-        '--max-subs',
-        type=int,
-        default=10,
-        help='Maximum number of substituents per site in any single combination (default: 10). '
-             'All substituents can still participate, but each combination is limited to this '
-             'size per site.')
-    p.add_argument(
-        '--archive',
-        dest='archive',
-        action='store_true',
-        help='Create .tar.gz archives of generated combo directories matching pattern comb_*')
-    p.add_argument('--archive-remove', dest='archive_remove', action='store_true',
-                   help='Remove combo directories after successful archiving')
-    args = p.parse_args()
-
-    input_dir = args.input_dir
-    if not input_dir.exists() or not input_dir.is_dir():
-        raise SystemExit(f"Input directory not found: {input_dir}")
-
-    include_patterns = args.include if args.include else None
-    created = create_combination_dirs(
-        input_dir,
-        args.out_dir,
-        dry_run=args.dry_run,
-        include_patterns=include_patterns,
-        max_subs_per_site=args.max_subs)
-    print(f"Created {len(created)} combination dirs under {args.out_dir}")
-
-    if args.archive:
-        archived = archive_combo_dirs(args.out_dir, pattern='comb_*', remove=args.archive_remove)
-        print(f"Archived {len(archived)} combo directories")
+def main(argv=None):
+    """Same as ``mllf combos``."""
+    from mllf.cli.combos import main as cli_main
+    return cli_main(argv)
 
 
 if __name__ == '__main__':

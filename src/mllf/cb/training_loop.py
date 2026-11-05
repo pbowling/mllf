@@ -14,6 +14,7 @@ and, every epoch:
 5. validates on the held-out combos (with the regression validation gate);
 6. exports finished systems, logs the epoch, checkpoints.
 """
+import logging
 import collections
 import copy
 import functools
@@ -52,6 +53,9 @@ from mllf.cb.workflow_utils import (
 )
 from mllf.file_handling.combo_sets import reversed_pair
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
+
+log = logging.getLogger(__name__)
+
 
 # Stage keys that set the whole epoch's training; one batch mixes systems, so
 # per-system stages cannot honour them.
@@ -218,10 +222,10 @@ def setup_run(config: Dict) -> TrainingRun:
     curriculum_cfg = config.get('curriculum', {})
     setup.print_curriculum(curriculum_cfg)
 
-    print("\n=== Initializing Uni-Mol CB Policy ===")
+    log.info("\n=== Initializing Uni-Mol CB Policy ===")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    print("Using pretrained Uni-Mol representation...")
+    log.info(f"Using device: {device}")
+    log.info("Using pretrained Uni-Mol representation...")
     train_cfg = config.get('training', {})
     policy_cfg = train_cfg.get('policy', {})
     bandit = BanditConfig.from_config(config)
@@ -230,18 +234,18 @@ def setup_run(config: Dict) -> TrainingRun:
     setup.freeze_heads(policy, policy_cfg.get('freeze_heads', []))
     rl_optimizer, rl_scheduler = setup.make_rl_optimizer(
         policy, train_cfg.get('optimizer', {}).get('lr', 0.001))
-    print(f"Uni-Mol policy: {sum(p.numel() for p in policy.parameters())} params")
-    print(f"Uni-Mol dimension: {policy_cfg.get('unimol_dim', 512)}")
-    print(f"MLP hidden dimension: {policy_cfg.get('mlp_hidden', 64)}")
+    log.info(f"Uni-Mol policy: {sum(p.numel() for p in policy.parameters())} params")
+    log.info(f"Uni-Mol dimension: {policy_cfg.get('unimol_dim', 512)}")
+    log.info(f"MLP hidden dimension: {policy_cfg.get('mlp_hidden', 64)}")
     system_to_idx = build_system_index(systems_cfg)
     baseline_net, baseline_optimizer = setup.make_context_baseline(train_cfg, bandit.algorithm,
                                                                    system_to_idx,
                                                                    device)
     history_replay_cfg = config.get('replay', {})
     if history_replay_cfg.get('enabled', False) and bandit.algorithm == 'hindsight':
-        print("  Warning: replay.enabled=True but bandit.algorithm == "
-              "'hindsight' — history replay folds an extra REINFORCE-"
-              "style loss into a gradient step hindsight doesn't take; ignoring.")
+        log.warning("  Warning: replay.enabled=True but bandit.algorithm == "
+                    "'hindsight' — history replay folds an extra REINFORCE-"
+                    "style loss into a gradient step hindsight doesn't take; ignoring.")
         history_replay_cfg = {}
 
     checkpoint_dir = Path(config.get('output', {}).get('base_dir', 'checkpoints'))
@@ -253,15 +257,15 @@ def setup_run(config: Dict) -> TrainingRun:
                                                  baseline_optimizer,
                                                  checkpoint_dir, pretrain_path, device)
 
-    print("\n=== Training ===")
+    log.info("\n=== Training ===")
     curriculum_enabled = curriculum_cfg.get('enabled', False)
     stages = curriculum_cfg.get('stages', []) if curriculum_enabled else []
     if curriculum_enabled:
         num_epochs = sum(stage['epochs'] for stage in stages)
-        print(f"Curriculum: {len(stages)} stages, {num_epochs} total epochs")
+        log.info(f"Curriculum: {len(stages)} stages, {num_epochs} total epochs")
     else:
         num_epochs = train_cfg.get('num_epochs', 100)
-        print(f"Training for {num_epochs} epochs")
+        log.info(f"Training for {num_epochs} epochs")
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
     run = TrainingRun(
         config=config, bandit=bandit, device=device, deploy=deploy, systems_cfg=systems_cfg,
@@ -276,7 +280,7 @@ def setup_run(config: Dict) -> TrainingRun:
         # Shared-model updates: always in training; in deploy only on request.
         update_shared=(not deploy) or bool(deploy_cfg.get('update_shared_model', False)))
     # Lightweight per-epoch summary next to the (very large) job stdout.
-    print(f"Epoch summary log: {run.summary_log_path}")
+    log.info(f"Epoch summary log: {run.summary_log_path}")
     _init_curriculum(run, start_stage_idx)
     _init_per_system(run)
     run.validation_combos, run.active_train_combos = setup.choose_validation(
@@ -324,8 +328,8 @@ def _init_curriculum(run: TrainingRun, start_stage_idx: Optional[int]) -> None:
                                                         for si in range(run.current_stage_idx))
     stage = run.current_stage
     resumed = run.start_epoch > 0
-    print(f"\n=== Stage {run.current_stage_idx+1}/{len(stages)}: {stage['name']}"
-          f"{' (resumed)' if resumed else ''} ===")
+    log.info(f"\n=== Stage {run.current_stage_idx+1}/{len(stages)}: {stage['name']}"
+             f"{' (resumed)' if resumed else ''} ===")
     # A combo_set stage (per-system only) has no manifest filter; per-system
     # pools are rebuilt every epoch.
     if stage.get('combo_set'):
@@ -337,7 +341,7 @@ def _init_curriculum(run: TrainingRun, start_stage_idx: Optional[int]) -> None:
             combo_system_map=run.combo_system_map)
     if resumed and stage.get('policy_lr') is not None:
         _set_lr(run, stage['policy_lr'])
-        print(f"  Policy LR restored to {stage['policy_lr']}")
+        log.info(f"  Policy LR restored to {stage['policy_lr']}")
     run.epoch_config = _stage_epoch_config(run, stage)
 
 
@@ -356,19 +360,20 @@ def _init_per_system(run: TrainingRun) -> None:
         run.combos_by_system.setdefault(run.system_of(c), []).append(c)
     ignored = sorted({k for st in run.stages for k in st if k in _EPOCH_WIDE_STAGE_KEYS})
     if ignored:
-        print(f"  Warning: per-system stages ignore stage keys {ignored} "
-              "(they would apply to every system in the epoch)")
+        log.warning(f"  Warning: per-system stages ignore stage keys {ignored} "
+                    "(they would apply to every system in the epoch)")
     state = (system_stages.load_state(run.stage_state_path) if run.start_epoch > 0 else None) or {}
     fresh = system_stages.init_state([s.get('name') for s in run.systems_cfg], run.stages)
     for name, st in fresh.items():
         state.setdefault(name, st)
     run.stage_state = state
     system_stages.save_state(run.stage_state_path, state)
-    print("Per-system stages:")
+    log.info("Per-system stages:")
     for name, st in state.items():
-        print(f"  {name}: " + ('done' if st['done'] else
-                               f"{run.stages[st['stage']]['name']} (epoch {st['stage_epochs']} "
-                               f"of {run.stages[st['stage']]['epochs']})"))
+        where = ('done' if st['done'] else
+                 f"{run.stages[st['stage']]['name']} (epoch {st['stage_epochs']} "
+                 f"of {run.stages[st['stage']]['epochs']})")
+        log.info(f"  {name}: {where}")
 
 
 # ── per-system pools ────────────────────────────────────────────────────────
@@ -389,7 +394,7 @@ def system_stage_pool(run: TrainingRun, sys_name: str) -> List[str]:
     if key not in run._pool_cache:
         stage = dict(run.stages[st['stage']])
         stage.pop('systems', None)
-        print(f"  [{sys_name}] stage {stage['name']}:")
+        log.info(f"  [{sys_name}] stage {stage['name']}:")
         if stage.get('combo_set'):
             # An explicit set (e.g. ALF's groups); the stage's site/sub
             # filters, if given, still apply to it.
@@ -397,7 +402,7 @@ def system_stage_pool(run: TrainingRun, sys_name: str) -> List[str]:
             run._pool_cache[key] = (apply_stage_combo_filter(
                 cands, stage, run.curriculum_cfg, stage_idx=st['stage'], seed=run.seed,
                 apply_transition_filter=False) if 'min_sites' in stage else list(cands))
-            print(f"  combo set {stage['combo_set']}: {len(run._pool_cache[key])} combos")
+            log.info(f"  combo set {stage['combo_set']}: {len(run._pool_cache[key])} combos")
         else:
             run._pool_cache[key] = apply_stage_combo_filter(
                 run.combos_by_system.get(sys_name, []), stage, run.curriculum_cfg,
@@ -461,18 +466,18 @@ def export_final(run: TrainingRun, sys_name: str) -> None:
             path = export_final_biases(run.policy, sys_cfg, run.config, run.bandit_state,
                                        out / sub if sub else out, device=run.device,
                                        combo_dir=cdir)
-            print(f"  [EXPORT] {sys_name}: final biases written to {path}")
+            log.info(f"  [EXPORT] {sys_name}: final biases written to {path}")
         except Exception as err:
-            print(f"  [EXPORT] {sys_name}{'/' + sub if sub else ''}: export failed: {err}")
+            log.info(f"  [EXPORT] {sys_name}{'/' + sub if sub else ''}: export failed: {err}")
     # The labels read system_stages.json, so save it first (scouting exports
     # before the epoch's save).
     try:
         system_stages.save_state(run.stage_state_path, run.stage_state)
         n = label_final_biases(run.checkpoint_dir, run.config, [sys_name])
         if n:
-            print(f"  [EXPORT] {sys_name}: confidence labels for {n} group(s)")
+            log.info(f"  [EXPORT] {sys_name}: confidence labels for {n} group(s)")
     except Exception as err:
-        print(f"  [EXPORT] {sys_name}: labelling failed: {err}")
+        log.info(f"  [EXPORT] {sys_name}: labelling failed: {err}")
 
 
 def _scout_tiers(run: TrainingRun, path) -> Dict[str, int]:
@@ -519,7 +524,7 @@ def apply_scouting(run: TrainingRun, sn: str, epoch: int) -> Tuple[str, Dict]:
         converged = True
         if nxt is None:
             export_final(run, sn)
-    print(line)
+    log.info('%s', line)
     return line, {'groups': len(gnames), 'passed': len(passed), 'pairs': len(resolved), 'ns': ns,
                   'converged': converged, 'dir': sdir}
 
@@ -533,7 +538,7 @@ def _skip_empty_stages(run: TrainingRun, epoch: int, held_out: Set[str]) -> None
         while not st['done'] and not [c for c in system_stage_pool(run, sn) if c not in held_out]:
             skipped = run.stages[st['stage']]['name']
             nxt = system_stages.advance(st, run.stages, sn, epoch, 'no_combos')
-            print(f"  [STAGE] {sn}: no combos for stage {skipped}; skipped")
+            log.info(f"  [STAGE] {sn}: no combos for stage {skipped}; skipped")
             if nxt is None:
                 export_final(run, sn)
 
@@ -570,7 +575,7 @@ def plan_per_system(run: TrainingRun, epoch: int) -> Optional[EpochPlan]:
     system_stages.save_state(run.stage_state_path, run.stage_state)
     plan.active_systems = sorted(s for s, st in run.stage_state.items() if not st['done'])
     if not plan.active_systems:
-        print(f"\nAll systems finished their last stage (epoch {epoch}); stopping.")
+        log.info(f"\nAll systems finished their last stage (epoch {epoch}); stopping.")
         return None
     run.active_train_combos = [c for s in plan.active_systems for c in system_stage_pool(run, s)
                                if c not in held_out]
@@ -599,7 +604,7 @@ def plan_per_system(run: TrainingRun, epoch: int) -> Optional[EpochPlan]:
         keep.append(c)
     run.active_train_combos = keep
     if len(keep) < n_before:
-        print(f"  Resolved or retired pairs left the pool: {n_before - len(keep)} combo(s)")
+        log.info(f"  Resolved or retired pairs left the pool: {n_before - len(keep)} combo(s)")
     # A stage with a group_set runs each group once group_ready_fraction of
     # its reference pairs are resolved (retired ones left out), until it
     # passes the group test; a group sent back to the pair phase
@@ -624,7 +629,7 @@ def plan_per_system(run: TrainingRun, epoch: int) -> Optional[EpochPlan]:
                 holds.pop(Path(g).name, None)
     if plan.ready_groups:
         run.active_train_combos = run.active_train_combos + plan.ready_groups
-        print(f"  Ready groups in the pool: {len(plan.ready_groups)}")
+        log.info(f"  Ready groups in the pool: {len(plan.ready_groups)}")
     return plan
 
 
@@ -642,16 +647,16 @@ def advance_curriculum(run: TrainingRun) -> None:
         avg_recent = np.mean(recent) if recent else -999.0
         can_advance = avg_recent >= threshold
         if not can_advance:
-            print(f"\nStage {run.current_stage_idx+1} kept: avg reward "
-                  f"{avg_recent:.4f} < threshold {threshold}")
+            log.info(f"\nStage {run.current_stage_idx+1} kept: avg reward "
+                     f"{avg_recent:.4f} < threshold {threshold}")
     if not (can_advance and run.current_stage_idx + 1 < len(stages)):
         return
     run.current_stage_idx += 1
     run.current_stage_epoch = 0
     stage = run.current_stage
-    print(f"\n{'='*60}")
-    print(f"=== Stage {run.current_stage_idx+1}/{len(stages)}: {stage['name']} ===")
-    print(f"{'='*60}")
+    log.info(f"\n{'='*60}")
+    log.info(f"=== Stage {run.current_stage_idx+1}/{len(stages)}: {stage['name']} ===")
+    log.info(f"{'='*60}")
     held_out = set(run.validation_combos)
     run.active_train_combos = [c for c in apply_stage_combo_filter(
         run.train_combos, stage, run.curriculum_cfg, stage_idx=run.current_stage_idx,
@@ -660,7 +665,7 @@ def advance_curriculum(run: TrainingRun) -> None:
     if stage.get('policy_lr') is not None:
         _set_lr(run, stage['policy_lr'])
         run.rl_scheduler = setup.make_scheduler(run.rl_optimizer)
-        print(f"  Policy LR updated to {stage['policy_lr']}, scheduler reset")
+        log.info(f"  Policy LR updated to {stage['policy_lr']}, scheduler reset")
     run.epoch_config = _stage_epoch_config(run, stage)
 
 
@@ -676,9 +681,9 @@ def print_epoch_header(run: TrainingRun, plan: EpochPlan) -> None:
                  f"epoch {run.current_stage_epoch+1}/{run.current_stage['epochs']}")
     else:
         label = f"epoch {plan.epoch}"
-    print(f"\n{'='*80}")
-    print(f"EPOCH {plan.epoch}/{run.num_epochs-1}  [{label}]")
-    print(f"{'='*80}")
+    log.info(f"\n{'='*80}")
+    log.info(f"EPOCH {plan.epoch}/{run.num_epochs-1}  [{label}]")
+    log.info(f"{'='*80}")
 
 
 # ── 2. select the epoch's combos ────────────────────────────────────────────
@@ -698,7 +703,7 @@ def _reference_quota(run: TrainingRun, plan: EpochPlan) -> None:
     plan.system_quota = {s: max(qmin, int(round(plan.max_combos * n / tot)))
                          for s, n in nref.items()}
     plan.max_combos = max(plan.max_combos, sum(plan.system_quota.values()))
-    print("  Per-system shares (reference pairs): " + ', '.join(
+    log.info('%s', "  Per-system shares (reference pairs): " + ', '.join(
         f"{s} {q}" for s, q in sorted(plan.system_quota.items())))
 
 
@@ -713,9 +718,9 @@ def _use_uncertainty_selection(run: TrainingRun) -> bool:
         min_obs = run.bandit.min_observations_before_confident
         n_obs = [mlp.bayesian_head.n_obs.item() for mlp in run.policy.edge_mlp.mlps]
         if min(n_obs) < min_obs:
-            print("  NeuralLinear+TS: posterior not yet confident "
-                  f"(min n_obs={min(n_obs):.0f} < {min_obs}) — "
-                  "falling back to random combo selection for this epoch")
+            log.info("  NeuralLinear+TS: posterior not yet confident "
+                     f"(min n_obs={min(n_obs):.0f} < {min_obs}) — "
+                     "falling back to random combo selection for this epoch")
             use = False
     return use
 
@@ -777,25 +782,25 @@ def select_epoch_combos(run: TrainingRun, plan: EpochPlan) -> None:
             attention_fn=functools.partial(_pair_attention, run, plan),
             attention_weight=float(run.bandit.selection_attention_weight),
             system_quota=plan.system_quota)
-        print("  Epoch combo sample (uncertainty-driven, "
-              f"{'posterior variance' if hindsight else 'action std'}): "
-              f"{len(plan.combos)}/{len(active)} combos selected "
-              f"({len(candidates)} candidates scored, min_per_system={min_per_system})")
+        log.info("  Epoch combo sample (uncertainty-driven, "
+                 f"{'posterior variance' if hindsight else 'action std'}): "
+                 f"{len(plan.combos)}/{len(active)} combos selected "
+                 f"({len(candidates)} candidates scored, min_per_system={min_per_system})")
     elif over_budget and cfg.get('stratified_sampling', True):
         pools = _by_system(run, active)
         min_per_sys = cfg.get('min_combos_per_system', 5)
         plan.combos = sample_combos_stratified(pools, n_total=plan.max_combos,
                                                min_per_system=min_per_sys, seed=run.seed + epoch)
-        print(f"  Epoch combo sample (stratified): {len(plan.combos)}/{len(active)} "
-              f"combos selected (min_per_system={min_per_sys}, seed={run.seed + epoch})")
+        log.info(f"  Epoch combo sample (stratified): {len(plan.combos)}/{len(active)} "
+                 f"combos selected (min_per_system={min_per_sys}, seed={run.seed + epoch})")
         alloc = ', '.join(f"{s}:{sum(1 for c in plan.combos if run.system_of(c) == s)}"
                           for s in sorted(pools))
-        print(f"  Allocation per system: {alloc}")
+        log.info(f"  Allocation per system: {alloc}")
     elif over_budget:
         rng = np.random.RandomState(run.seed + epoch)
         plan.combos = list(rng.choice(active, size=plan.max_combos, replace=False))
-        print(f"  Epoch combo sample (uniform): {plan.max_combos}/{len(active)} "
-              f"combos selected (seed={run.seed + epoch})")
+        log.info(f"  Epoch combo sample (uniform): {plan.max_combos}/{len(active)} "
+                 f"combos selected (seed={run.seed + epoch})")
     else:
         plan.combos = active
 
@@ -836,7 +841,7 @@ def add_revisits(run: TrainingRun, plan: EpochPlan) -> None:
     msg = (f"  Revisits: {len(revisits)} in-progress pair(s) rerun "
            f"(pool: {counts['active']} active, {counts['satisfied']} satisfied, "
            f"{counts['exhausted']} exhausted); {len(plan.combos)} combos this epoch")
-    print(msg)
+    log.info('%s', msg)
     plan.detail_lines = [msg]
 
 
@@ -912,7 +917,7 @@ def add_priorities(run: TrainingRun, plan: EpochPlan) -> None:
            + (f"{n_ref} reference pair(s) + {n_partner} reversed partner(s), " if n_ref else '')
            + f"{n_conf} pair(s) awaiting a full-length confirming run, "
            f"{n_new} not yet run; {len(plan.combos)} combos this epoch")
-    print(msg)
+    log.info('%s', msg)
     plan.detail_lines.append(msg)
 
 
@@ -986,7 +991,7 @@ def _log_holdoff(run: TrainingRun, rec: EpochRecord, sys_name: str, st: Dict, cd
         line = (f"  [HOLDOFF] {sys_name}/{cdir.name}: {_block_label(labels, h['dom'])} dominates "
                 f"{h['dom_frac']:.0%} of frames at mean lambda {h['mean_dom']:.2f}, "
                 f"endpoint held {h['at_frac']:.1%}; {len(h['partners'])} partners")
-        print(line)
+        log.info('%s', line)
         rec.stage_lines.append(line)
     del recs[:-20]
     rec.holdoff.append(f"{sys_name}/{cdir.name.split('_site')[0]} "
@@ -1005,7 +1010,7 @@ def _log_group_correction(run: TrainingRun, rec: EpochRecord, sys_name: str, cdi
     what += ''.join(f", s{s} overshot: stepped back" for s in gc.get('guarded') or [])
     line = (f"  [GROUPFIX] {sys_name}/{cdir.name}: {what.lstrip(', ')}"
             + ("" if gc.get('stepped') else " (at the floor)"))
-    print(line)
+    log.info('%s', line)
     rec.stage_lines.append(line)
     rec.groupfix.append(f"{sys_name}/{cdir.name.split('_site')[0]} ({what.lstrip(', ')})")
     return gc
@@ -1034,7 +1039,7 @@ def _reopen_failed_group(run: TrainingRun, rec: EpochRecord, sys_name: str, st: 
     reopened[cdir.name] = int(reopened.get(cdir.name, 0)) + 1
     line = (f"  [GROUP] {sys_name}/{cdir.name}: failed {gmax} runs; back to the "
             f"pair phase ({len(keys)} pair(s) reopened)")
-    print(line)
+    log.info('%s', line)
     rec.stage_lines.append(line)
     rec.reopened.append((f"{sys_name}/{cdir.name.split('_site')[0]}", len(keys)))
     run.save_bandit_state()
@@ -1156,7 +1161,7 @@ def advance_system_stages(run: TrainingRun, plan: EpochPlan, epoch: int, rec: Ep
             rec.ended.add(sys_name)
             if nxt is None:
                 rec.to_export.append(sys_name)
-        print(line)
+        log.info('%s', line)
         rec.stage_lines.append(line)
         rec.rows.append({
             'system': sys_name, 'stage': stage['name'],
@@ -1199,7 +1204,7 @@ def _apply_gate(run: TrainingRun, epoch: int, val_combos: List[str], val_stats: 
     key = frozenset(val_combos)
     if g.key is not None and key != g.key:
         # e.g. a new stage adds a system: scores aren't comparable
-        print("  [VALIDATION GATE] held-out set changed (new stage): gate and best model reset")
+        log.info("  [VALIDATION GATE] held-out set changed (new stage): gate and best model reset")
         g.accepted_state = g.accepted_score = None
         g.best_state = g.best_score = g.best_epoch = None
     g.key = key
@@ -1224,7 +1229,7 @@ def _apply_gate(run: TrainingRun, epoch: int, val_combos: List[str], val_stats: 
                    run.checkpoint_dir / 'best_model.pt')
         msg += f"; new best (epoch {epoch}) saved to best_model.pt"
         rec.gate += ", new best saved"
-    print(msg)
+    log.info('%s', msg)
     rec.val_lines.append(msg)
 
 
@@ -1238,7 +1243,8 @@ def validate(run: TrainingRun, plan: EpochPlan, epoch: int, stats: Dict, rec: Ep
     if not val_combos or not (stage_schedule or epoch % run.config.get('eval_freq', 1) == 0
                               or epoch == run.num_epochs - 1):
         return
-    print(f"\n  [VALIDATION] Evaluating on {len(val_combos)} held-out combos (deterministic)...")
+    log.info(f"\n  [VALIDATION] Evaluating on {len(val_combos)} held-out combos "
+             "(deterministic)...")
     val_stats = train_epoch(run.policy, run.rl_optimizer, val_combos, run.combo_system_map, epoch,
                             run.epoch_config, run.device,
                             options=EpochOptions(update_policy=False, deterministic_actions=True,
@@ -1256,7 +1262,7 @@ def validate(run: TrainingRun, plan: EpochPlan, epoch: int, stats: Dict, rec: Ep
     if pair_line:
         lines.append(pair_line)
     for line in lines:
-        print(line)
+        log.info('%s', line)
     rec.val_lines.extend(lines)
     stats.update({'val_reward': val_reward, 'val_reward_std': val_std, 'val_loss': val_loss,
                   'val_n_combos': len(val_combos),
@@ -1275,12 +1281,12 @@ def _cost_lines(run: TrainingRun, rec: EpochRecord) -> Dict:
     if cost:
         rec.stage_lines.append("  [COST] training ns so far: " + ', '.join(
             f"{s} {c['train']['ns']:.1f}" for s, c in sorted(cost.items())))
-        print(rec.stage_lines[-1])
+        log.info('%s', rec.stage_lines[-1])
         vns = sum(c['validation']['ns'] for c in cost.values())
         if vns:
             rec.stage_lines.append(
                 f"  [COST] validation ns so far (not in the totals above): {vns:.1f}")
-            print(rec.stage_lines[-1])
+            log.info('%s', rec.stage_lines[-1])
     return cost
 
 
@@ -1353,7 +1359,7 @@ def write_epoch_summary(run: TrainingRun, plan: EpochPlan, stats: Dict, rec: Epo
     try:
         lines = _summary_lines(run, plan.epoch, stats)
         for line in lines:
-            print(line)
+            log.info('%s', line)
         sys.stdout.flush()
         try:
             if run.per_system:
@@ -1366,10 +1372,10 @@ def write_epoch_summary(run: TrainingRun, plan: EpochPlan, stats: Dict, rec: Epo
                 if details:
                     append_summary(run.summary_log_path, '\n'.join(details))
         except Exception as err:
-            print(f"  Warning: Failed to write epoch summary to file: {err}")
+            log.warning(f"  Warning: Failed to write epoch summary to file: {err}")
             sys.stdout.flush()
     except Exception as err:
-        print(f"\nERROR: Failed to print epoch summary: {err}")
+        log.error(f"\nERROR: Failed to print epoch summary: {err}")
         traceback.print_exc()
         sys.stdout.flush()
 
@@ -1385,7 +1391,7 @@ def step_scheduler(run: TrainingRun, stats: Dict) -> None:
     run.rl_scheduler.step(stats.get('n_success', 0))
     new = [pg['lr'] for pg in run.rl_optimizer.param_groups]
     if new != prev:
-        print(f"  ReduceLROnPlateau fired: LR {prev[0]:.2e} → {new[0]:.2e}")
+        log.info(f"  ReduceLROnPlateau fired: LR {prev[0]:.2e} → {new[0]:.2e}")
 
 
 def _baseline_fields(run: TrainingRun) -> Dict:
@@ -1405,27 +1411,27 @@ def save_checkpoint(run: TrainingRun, epoch: int, stats: Dict) -> None:
                 'rl_optimizer_state_dict': run.rl_optimizer.state_dict(),
                 'current_stage_idx': run.current_stage_idx, 'stats': stats,
                 **_baseline_fields(run)}, path)
-    print(f"  Saved checkpoint: {path}")
+    log.info(f"  Saved checkpoint: {path}")
 
 
 def finish(run: TrainingRun) -> None:
     """End on the best validated model when the last validation scored
     lower, and save final_model.pt."""
-    print("\n=== Training Complete ===")
+    log.info("\n=== Training Complete ===")
     g = run.gate
     final_from = 'last epoch'
     if g.best_state is not None and g.last_score is not None and g.last_score < g.best_score:
         run.policy.load_state_dict(g.best_state)
         final_from = (f'best validated model (epoch {g.best_epoch}, '
                       f'held-out success {g.best_score})')
-        print(f"Restored the best validated model: epoch {g.best_epoch}, held-out success "
-              f"{g.best_score} (last validation {g.last_score})")
+        log.info(f"Restored the best validated model: epoch {g.best_epoch}, held-out success "
+                 f"{g.best_score} (last validation {g.last_score})")
     final_path = run.checkpoint_dir / 'final_model.pt'
     torch.save({'final_from': final_from, 'policy_state_dict': run.policy.state_dict(),
                 'rl_optimizer_state_dict': run.rl_optimizer.state_dict(),
                 'all_stats': run.all_stats,
                 **_baseline_fields(run)}, final_path)
-    print(f"Saved final model: {final_path}")
+    log.info(f"Saved final model: {final_path}")
 
 
 # ── the loop ────────────────────────────────────────────────────────────────
@@ -1499,13 +1505,15 @@ def run_epoch(run: TrainingRun, epoch: int) -> bool:
     return True
 
 
-def run_training(config_path: str) -> None:
+def run_training(config_path: str, verbose: Optional[bool] = None) -> None:
     """Run online policy training from a workflow YAML file (see
     :doc:`workflow`): build or load the combo manifests, initialize or
     resume the policy, run the configured (curriculum) epochs and save
     checkpoints. In deploy mode the model and output paths come from the
-    ``deploy:`` block."""
+    ``deploy:`` block. ``verbose`` overrides the config's ``verbose`` key."""
     config = setup.load_training_config(config_path)
+    if verbose is not None:
+        config['verbose'] = verbose
     with WarningSummary():
         run = setup_run(config)
         for epoch in range(run.start_epoch, run.num_epochs):

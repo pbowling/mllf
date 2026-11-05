@@ -7,6 +7,7 @@
 * ``reinforce_update``: one REINFORCE step on the epoch's batch (plus the
   optional failure batch, context baseline and history replay).
 """
+import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -58,6 +59,9 @@ from mllf.cb.workflow_utils import (
     compute_pair_success_stats,
 )
 from mllf.file_handling.manifests import ensure_combo_dir_exists
+
+log = logging.getLogger(__name__)
+
 
 PAIR_STAT_KEYS = ('total', 'crossed', 'balanced', 'both')
 
@@ -181,8 +185,8 @@ def bc_target_norm(run: EpochRun) -> torch.Tensor:
             target_norm = torch.cat(norm_list, dim=0).std(dim=0).clamp(min=1.0).to(device)
         else:
             target_norm = policy.scale_factors.to(device)
-        print("  BC target_norm (per-dim std, min=1): "
-              f"{[f'{v:.3f}' for v in target_norm.tolist()]}")
+        log.info("  BC target_norm (per-dim std, min=1): "
+                 f"{[f'{v:.3f}' for v in target_norm.tolist()]}")
         return target_norm
     return policy.scale_factors.to(device)
 
@@ -241,7 +245,7 @@ def _bc_loss(run: EpochRun, combo_path: Path, sys_cfg: Dict, saved_data: Dict) -
                 nsubs_per_site=nsubs_per_site, pairs=build_directed_pairs(nsubs_per_site))
         except Exception as e:
             if verbose:
-                print(f"    Warning: Could not compute pairwise weights: {e}")
+                log.warning(f"    Warning: Could not compute pairwise weights: {e}")
 
     logp = torch.distributions.Normal(mean, torch.exp(log_std)).log_prob(saved_actions)
     mask = routed & (saved_actions.abs() > 1e-8)       # only non-zero target edges
@@ -256,7 +260,7 @@ def _bc_loss(run: EpochRun, combo_path: Path, sys_cfg: Dict, saved_data: Dict) -
         return -weighted.mean() if weighted.numel() > 0 else unweighted()
     except Exception as e:
         if verbose:
-            print(f"    Warning: Could not apply pairwise weights: {e}")
+            log.warning(f"    Warning: Could not apply pairwise weights: {e}")
         return unweighted()
 
 
@@ -285,15 +289,15 @@ def behavior_cloning_epoch(run: EpochRun, rl_optimizer) -> Dict:
                 bc_loss.backward()
                 epoch_loss += bc_loss.item()
                 n_bc += 1
-                print(f"  BC update {combo_path.name}: loss={bc_loss.item():.4f}  "
-                      f"reward={reward_bc:.2f}")
+                log.info(f"  BC update {combo_path.name}: loss={bc_loss.item():.4f}  "
+                         f"reward={reward_bc:.2f}")
         except Exception as e:
-            print(f"  Warning: BC update failed for {combo_path.name}: {e}")
+            log.warning(f"  Warning: BC update failed for {combo_path.name}: {e}")
     if n_bc > 0:
         torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
         rl_optimizer.step()
         epoch_loss /= n_bc
-    print(f"  BC: {n_bc}/{len(run.combos)} combos updated")
+    log.info(f"  BC: {n_bc}/{len(run.combos)} combos updated")
     rewards = run.epoch_rewards
     return {
         'loss': epoch_loss,
@@ -504,7 +508,7 @@ def _regression_update(run: EpochRun, items: list) -> None:
            f"{rs.get('online_after', float('nan')):.3f}, replay "
            f"{rs.get('replay_before', float('nan')):.3f} -> "
            f"{rs.get('replay_after', float('nan')):.3f}")
-    print(msg)
+    log.info('%s', msg)
     run.detail_lines.append(msg)
     run.epoch_info['regression'] = dict(rs)
 
@@ -583,7 +587,7 @@ def hindsight_update(run: EpochRun, pair_stats: Dict[str, Dict[str, int]]) -> in
                 n_success += 1
             r_relevant_all.append(r_relevant)
         except Exception as e:
-            print(f"  Warning: NeuralLinear+TS update failed for {combo_path_u.name}: {e}")
+            log.warning(f"  Warning: NeuralLinear+TS update failed for {combo_path_u.name}: {e}")
 
     if r_relevant_all:
         all_r = torch.cat(r_relevant_all)
@@ -593,7 +597,7 @@ def hindsight_update(run: EpochRun, pair_stats: Dict[str, Dict[str, int]]) -> in
                f"combos ({n_success} meeting transition floor), "
                f"{all_r.shape[0]} edges, reward mean={all_r.mean().item():.3f} "
                f"std={all_r.std().item():.3f}, n_obs per head=[{n_obs}]")
-        print(msg)
+        log.info('%s', msg)
         run.detail_lines.append(msg)
     if opts.update_policy and opts.update_shared and b.shared_regression:
         _regression_update(run, reg_items)
@@ -613,7 +617,7 @@ def hindsight_update(run: EpochRun, pair_stats: Dict[str, Dict[str, int]]) -> in
                   if run.offset_sampling else "")
                + (f"; group corrections {n.gc_runs} run(s), stepped {n.gc_stepped}, "
                   f"guarded sites {n.gc_guarded}" if run.gc_cfg is not None else ""))
-        print(msg)
+        log.info('%s', msg)
         run.detail_lines.append(msg)
         run.epoch_info['hindsight'] = {
             'median_step': {d: (float(np.median(v)) if v else None) for d, v in n.steps.items()},
@@ -730,7 +734,7 @@ def _reinforce_batches(run: EpochRun, pair_stats: Dict[str, int], min_trans, fai
             raw_batch.append((combo_path_u, vdata_u, saved_actions, r_pair, logp_old,
                               edge_weights_u))
         except Exception as e:
-            print(f"  Warning: Could not prepare update for {combo_path_u.name}: {e}")
+            log.warning(f"  Warning: Could not prepare update for {combo_path_u.name}: {e}")
     return raw_batch, failure_batch, n_partial
 
 
@@ -777,7 +781,7 @@ def _reward_baseline(run: EpochRun, raw_batch, n_partial: int, no_transition_wei
            f"{f', {n_partial} partial' if n_partial else ''}, "
            f"{all_r.shape[0]} edges [{n_downweighted} down-weighted "
            f"x{no_transition_weight}], baseline={baseline_src}): {stats_str}")
-    print(msg)
+    log.info('%s', msg)
     run.detail_lines.append(msg)
     return r_mean, r_std, r_mean_batch
 
@@ -877,7 +881,7 @@ def reinforce_update(run: EpochRun, rl_optimizer, target_norm, pair_stats: Dict[
                     naive_sq_err += (((r_mean_batch.unsqueeze(0) - r_pair) ** 2) * b_w).sum(dim=0)
                     baseline_w += b_w.sum(dim=0)
         except Exception as e:
-            print(f"  Warning: REINFORCE update failed for {combo_path_u.name}: {e}")
+            log.warning(f"  Warning: REINFORCE update failed for {combo_path_u.name}: {e}")
 
     # Failure batch: heavily down-weighted (failure_loss_weight) and
     # floor-clamped, so a below-floor run never outweighs the strongest
@@ -899,11 +903,11 @@ def reinforce_update(run: EpochRun, rl_optimizer, target_norm, pair_stats: Dict[
                 if not (torch.isnan(fail_loss) or torch.isinf(fail_loss)):
                     fail_loss.backward()
             except Exception as e:
-                print(f"  Warning: failure gradient failed for {combo_path_f.name}: {e}")
+                log.warning(f"  Warning: failure gradient failed for {combo_path_f.name}: {e}")
         msg = (f"  Failure gradient: {len(failure_batch)} below-floor combos, "
                f"A={failure_advantage:.1f} (loss_weight={beta_fail:.3f}, "
                "floor-clamped, merged into success step)")
-        print(msg)
+        log.info('%s', msg)
         run.detail_lines.append(msg)
 
     replay_cfg = opts.history_replay_cfg
@@ -925,7 +929,7 @@ def reinforce_update(run: EpochRun, rl_optimizer, target_norm, pair_stats: Dict[
             msg = (f"  History replay (AWR): {n_used}/{len(items)} "
                    f"sampled observations used (k_per_epoch={k_replay}, "
                    f"awr_temperature={awr_temp})")
-            print(msg)
+            log.info('%s', msg)
             run.detail_lines.append(msg)
 
     torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
@@ -939,6 +943,6 @@ def reinforce_update(run: EpochRun, rl_optimizer, target_norm, pair_stats: Dict[
             msg = ("  Context baseline MSE vs naive pooled-mean MSE (lower is better): "
                    + ", ".join(f"{name}: {bl_mse[i]:.4f} vs {naive_mse[i]:.4f}"
                                for i, name in enumerate(BIAS_DIMS)))
-            print(msg)
+            log.info('%s', msg)
             run.detail_lines.append(msg)
     return n_success

@@ -140,22 +140,6 @@ def parse_rtf_dir(directory: str) -> Dict[str, Dict[str, object]]:
     return results
 
 
-if __name__ == '__main__':
-    # quick smoke test when run directly
-    import json
-    here = os.path.join(
-        os.path.dirname(__file__),
-        '..',
-        '..',
-        '..',
-        'examples',
-        'training_files',
-        '14benz_vac_5.5')
-    here = os.path.abspath(here)
-    out = parse_rtf_dir(here)
-    print(json.dumps(out, indent=2))
-
-
 def infer_element_from_cgenff_type(atom_type: str) -> str:
     """Infer element from CGenFF atom type name.
 

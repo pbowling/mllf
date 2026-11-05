@@ -1,5 +1,6 @@
 """Build and persist consistent environment atom selections for pretraining."""
 
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 import json
@@ -9,6 +10,8 @@ from mllf.cb.unimol_representation import (
     get_substituent_unimol_with_environment,
     get_substituent_dual_embeddings,
 )
+
+log = logging.getLogger(__name__)
 
 
 def build_site_consensus(
@@ -38,7 +41,7 @@ def build_site_consensus(
         Selected atom identifiers, or None when none are found.
     """
     system_label = f" [{system_name}]" if system_name else ""
-    print(f"\n[CONSENSUS] Building {site_name} consensus from core{system_label}")
+    log.info(f"\n[CONSENSUS] Building {site_name} consensus from core{system_label}")
 
     consensus = build_environment_consensus(
         core_pdb=core_pdb,
@@ -48,10 +51,10 @@ def build_site_consensus(
     )
 
     if consensus:
-        print(f"[CONSENSUS] {site_name}: Found {len(consensus)} consensus atoms{system_label}")
+        log.info(f"[CONSENSUS] {site_name}: Found {len(consensus)} consensus atoms{system_label}")
         return consensus
     else:
-        print(
+        log.info(
             f"[CONSENSUS] {site_name}: No consensus atoms found (environment may not "
             f"exist){system_label}")
         return None
@@ -79,7 +82,7 @@ def save_consensus_atoms(
     with open(save_path, 'w') as f:
         json.dump(consensus_serializable, f, indent=2)
 
-    print(f"[CONSENSUS] Saved consensus atoms to {save_path}")
+    log.info(f"[CONSENSUS] Saved consensus atoms to {save_path}")
     return save_path
 
 
@@ -91,7 +94,7 @@ def load_consensus_atoms(
     load_path = run_dir / filename
 
     if not load_path.exists():
-        print(f"[CONSENSUS] No consensus file found at {load_path}")
+        log.info(f"[CONSENSUS] No consensus file found at {load_path}")
         return {}
 
     with open(load_path, 'r') as f:
@@ -105,7 +108,7 @@ def load_consensus_atoms(
         else:
             consensus_dict[site_name] = None
 
-    print(f"[CONSENSUS] Loaded consensus atoms from {load_path}")
+    log.info(f"[CONSENSUS] Loaded consensus atoms from {load_path}")
     return consensus_dict
 
 
@@ -155,9 +158,9 @@ def compute_run_embeddings_with_consensus(
         site_str = sub_pdb.stem.split('_')[0]  # e.g., "site1"
         consensus = consensus_dict.get(site_str)
 
-        print(f"\nComputing embedding for {sub_pdb.name}")
-        print(f"  Using consensus: {site_str} ({len(consensus)} atoms if consensus "
-              "provided)" if consensus else "  No consensus")
+        log.info(f"\nComputing embedding for {sub_pdb.name}")
+        log.info('%s', f"  Using consensus: {site_str} ({len(consensus)} atoms if consensus "
+                 "provided)" if consensus else "  No consensus")
 
         try:
             if use_dual_embeddings:
@@ -182,7 +185,7 @@ def compute_run_embeddings_with_consensus(
                 results[sub_pdb.name] = {'embedding': emb}
 
         except Exception as e:
-            print(f"  ERROR: {e}")
+            log.error(f"  ERROR: {e}")
             results[sub_pdb.name] = {'error': str(e)}
 
     return results
