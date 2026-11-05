@@ -34,10 +34,10 @@ def replay_config(full_config: dict, args: argparse.Namespace) -> dict:
     """The regression config the trainer would use, with the command-line overrides."""
     from mllf.cb.hindsight_regression import regression_config
     cfg = regression_config(full_config['bandit'])
-    unimol = full_config.get('unimol') or {}
-    cfg['env_input'] = unimol.get('env_input', 'dual')
-    cfg['ligand_other_sites'] = bool(unimol.get('ligand_other_sites', False))
-    cfg['site_size_input'] = bool(unimol.get('site_size_input', False))
+    from mllf.cb.policy import unimol_options
+    unimol = unimol_options(full_config)
+    for key in ('env_input', 'ligand_other_sites', 'site_size_input'):
+        cfg[key] = unimol[key]
     if args.cache:
         cfg['replay_cache'] = args.cache
     if args.manifest:

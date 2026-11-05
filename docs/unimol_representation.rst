@@ -20,11 +20,11 @@ node feature is their concatenation (1024-D).
    the molecule it belongs to.
 2. **Second half**, set by ``unimol.env_input``:
 
-   * ``phase`` and ``phase_ligmean``: two flags, [condensed, protein] (vacuum [0, 0],
-     solvent [1, 0], protein [1, 1]), read from the system name and followed by zeros.
-     Every current model uses one of these inputs.
-   * ``dual`` (the default when ``env_input`` is not set): a second Uni-Mol embedding of
-     the ligand together with its environment (below).
+   * ``phase`` (the default) and ``phase_ligmean``: two flags, [condensed, protein]
+     (vacuum [0, 0], solvent [1, 0], protein [1, 1]), read from the system name and
+     followed by zeros.
+   * ``dual``: a second Uni-Mol embedding of the ligand together with its environment
+     (below).
 
 The policy combines the halves per edge (:doc:`cb_setup`), using the *difference* of the
 ligand halves and the symmetric second half, so the two halves carry different
@@ -33,7 +33,24 @@ substituent's site size for the current run. That value is set per run and is ne
 cached, since the same substituent appears in pairs and in groups.
 
 The ``unimol`` settings change what the model sees, so online training and pretraining
-must use the same ones (:doc:`cb_pretraining`).
+must use the same ones (:doc:`cb_pretraining`). The defaults are the settings of the
+current pretrained model (``pretraining_Nov02b``), so a config that leaves them out matches
+it:
+
+.. code-block:: yaml
+
+   unimol:
+     env_input: phase             # phase flags in the second half
+     site_size_input: true        # edge input: 512 + 2 + 1 = 515-D
+     ligand_other_sites: true     # other sites' reference substituents in the ligand
+     ligand_from_minimized: false
+     structure_selection: unrelaxed
+
+A model pretrained with other values needs them written out in both its pretraining and
+its online config. A different ``env_input`` or ``site_size_input`` changes the width of
+the edge input, so loading the model fails with a shape mismatch; a different
+``ligand_other_sites`` keeps the width and goes unnoticed, so its value is recorded in
+``pretrain_metadata.json`` and should be checked against the online config.
 
 Environment Embedding (``env_input: dual``)
 -------------------------------------------

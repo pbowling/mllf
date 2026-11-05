@@ -87,3 +87,22 @@ def test_bandit_config_null_turns_off_or_keeps_the_default():
 def test_unknown_bandit_keys_are_reported():
     block = {'algoritm': 'hindsight', 'c_cap': {}, 'group_correction': {}}
     assert BanditConfig.unknown_keys(block) == ['algoritm']
+
+
+def test_unimol_defaults_are_the_current_model_settings():
+    """A config without a unimol: block builds the 515-D phase + site-size policy
+    of the current pretrained model; keys it sets override the defaults."""
+    from mllf.cb.policy import unimol_options
+    from mllf.cb.training_setup import build_policy
+    from mllf.pretrain.config import UnimolSettings
+
+    u = unimol_options({})
+    assert (u['env_input'], u['site_size_input'], u['ligand_other_sites']) == ('phase', True, True)
+    assert unimol_options({'unimol': {'env_input': 'dual', 'site_size_input': False}})[
+        'env_input'] == 'dual'
+    policy = build_policy({}, 'cpu')
+    first = next(m for m in policy.edge_mlp.mlps[0].trunk if hasattr(m, 'in_features'))
+    assert first.in_features == 515
+    s = UnimolSettings.from_config({})
+    assert (s.env_input, s.site_size_input, s.ligand_other_sites,
+            s.structure_selection) == ('phase', True, True, 'unrelaxed')

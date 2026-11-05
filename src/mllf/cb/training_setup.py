@@ -24,7 +24,7 @@ from mllf.cb.bandit_config import (
 )
 from mllf.cb.curriculum import apply_stage_combo_filter, filter_combos_by_curriculum
 from mllf.cb.hindsight import BIAS_DIMS
-from mllf.cb.policy import ContextBaseline, UnimolPolicy
+from mllf.cb.policy import ContextBaseline, UnimolPolicy, unimol_options
 from mllf.file_handling.combo_sets import build_combo_sets
 from mllf.file_handling.generate_combinations import find_site_sub_files
 from mllf.file_handling.manifests import (
@@ -204,17 +204,17 @@ NUM_BIAS_TYPES = len(BIAS_DIMS)   # linear, quadratic, skew, end
 
 
 def build_policy(config: Dict, device: str, bayesian_default: bool = False) -> UnimolPolicy:
-    """The UnimolPolicy a workflow config describes (dual embeddings; the
-    unimol.* inputs must match the pretrained model's)."""
+    """The UnimolPolicy a workflow config describes (the unimol.* inputs, with
+    ``UNIMOL_DEFAULTS``, must match the pretrained model's)."""
     policy_cfg = config.get('training', {}).get('policy', {})
-    unimol_cfg = config.get('unimol', {})
+    unimol = unimol_options(config)
     return UnimolPolicy(
         unimol_dim=policy_cfg.get('unimol_dim', 512),
         mlp_hidden=policy_cfg.get('mlp_hidden', 64),
         mlp_out_dim=NUM_BIAS_TYPES,
         use_dual_embeddings=True,
-        env_input=unimol_cfg.get('env_input', 'dual'),
-        site_size_input=bool(unimol_cfg.get('site_size_input', False)),
+        env_input=unimol['env_input'],
+        site_size_input=unimol['site_size_input'],
         use_bayesian_heads=policy_cfg.get('use_bayesian_heads', bayesian_default),
         bayesian_prior_precision=BanditConfig.from_config(config).prior_precision,
     ).to(device)

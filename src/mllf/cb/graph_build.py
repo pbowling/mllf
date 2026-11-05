@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from mllf.cb.pairs import build_directed_pairs
-from mllf.cb.policy import fill_site_size
+from mllf.cb.policy import fill_site_size, unimol_options
 from mllf.cb.unimol_representation import (
     build_environment_consensus,
     get_substituent_dual_embeddings,
@@ -140,7 +140,8 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     # the site, as in pretraining); with 'phase' / 'phase_ligmean' it holds
     # the phase flags and no environment is read.
     combo_name = combo_path.name
-    env_input = global_config.get('unimol', {}).get('env_input', 'dual')
+    unimol = unimol_options(global_config)
+    env_input = unimol['env_input']
     log.debug(f"embedding {combo_name} ({system_config.get('name', 'unknown')}, "
               f"{solvent_state}, env_input {env_input})")
     if custom_search_paths:
@@ -190,11 +191,8 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                     cache_dir=embed_cache_dir,
                     save_cache=(embed_cache_dir is not None),
                     env_input=env_input,
-                    # unimol.ligand_other_sites: other sites' reference subs in the ligand half
-                    ligand_other_sites=bool(
-                        global_config.get(
-                            'unimol', {}).get(
-                            'ligand_other_sites', False)),
+                    # other sites' reference subs in the ligand half
+                    ligand_other_sites=unimol['ligand_other_sites'],
                 )
                 sub_emb = np.concatenate([emb_ligand, emb_full])  # [1024]
                 if sub_emb.ndim == 1:
@@ -243,7 +241,7 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
     # Prepare embedding as node features (now 1024D for dual embeddings)
     unimol_emb_t = torch.from_numpy(unimol_emb_array).float().to(device)  # [N, 1024]
     # unimol.site_size_input: this combo's site sizes in the full half (UnimolPolicy)
-    if global_config.get('unimol', {}).get('site_size_input', False):
+    if unimol['site_size_input']:
         fill_site_size(unimol_emb_t, nsubs_per_site)
 
     # Create a simple data-like object with required attributes

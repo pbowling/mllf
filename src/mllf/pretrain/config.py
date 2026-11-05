@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from mllf.cb.policy import UNIMOL_DEFAULTS, unimol_options
+
 
 @dataclass(frozen=True)
 class PretrainOptions:
@@ -62,11 +64,14 @@ class PretrainOptions:
 class UnimolSettings:
     """The config's ``unimol:`` block (the representation of each substituent).
 
-    structure_selection: 'minimized' (default), 'unrelaxed' or 'random'; random
+    Defaults are ``UNIMOL_DEFAULTS`` (the current pretrained model's settings:
+    phase flags, site size and other-site reference substituents, 515-D).
+
+    structure_selection: 'minimized', 'unrelaxed' (default) or 'random'; random
         picks a structure per run (``features._select_structure_type_for_run``)
         and records the choice in pretraining_representations_used.csv.
-    env_input: 'dual' (mean full Uni-Mol embedding), 'phase' (2 phase flags) or
-        'phase_ligmean' (mean ligand embedding + phase flags); see UnimolPolicy.
+    env_input: 'phase' (2 phase flags; default), 'phase_ligmean' (mean ligand
+        embedding + phase flags) or 'dual' (environment embedding); see UnimolPolicy.
     ligand_other_sites: the ligand half is core + substituent + every other
         site's reference substituent (as each combo holds them fixed).
     site_size_input: the edge input also carries 1 / (n - 1) for the n
@@ -79,13 +84,13 @@ class UnimolSettings:
     cache_embeddings / cache_dir: persistent on-disk embedding cache (default
         <output_dir>/embeddings_cache).
     """
-    structure_selection: str = 'minimized'
+    structure_selection: str = UNIMOL_DEFAULTS['structure_selection']
     environment_cutoff: float = 8.0
     use_environment_difference: bool = True
-    env_input: str = 'dual'
-    ligand_other_sites: bool = False
-    site_size_input: bool = False
-    ligand_from_minimized: bool = False
+    env_input: str = UNIMOL_DEFAULTS['env_input']
+    ligand_other_sites: bool = UNIMOL_DEFAULTS['ligand_other_sites']
+    site_size_input: bool = UNIMOL_DEFAULTS['site_size_input']
+    ligand_from_minimized: bool = UNIMOL_DEFAULTS['ligand_from_minimized']
     use_environment_consensus: bool = True
     skip_unrelaxed_for_systems: List[str] = field(default_factory=list)
     cache_embeddings: bool = False
@@ -93,15 +98,15 @@ class UnimolSettings:
 
     @classmethod
     def from_config(cls, config: Dict) -> 'UnimolSettings':
-        u = config.get('unimol', {}) or {}
+        u = unimol_options(config)
         return cls(
-            structure_selection=u.get('structure_selection', 'minimized').lower(),
+            structure_selection=u['structure_selection'].lower(),
             environment_cutoff=u.get('environment_cutoff', 8.0),
             use_environment_difference=u.get('use_environment_difference', True),
-            env_input=u.get('env_input', 'dual'),
-            ligand_other_sites=bool(u.get('ligand_other_sites', False)),
-            site_size_input=bool(u.get('site_size_input', False)),
-            ligand_from_minimized=bool(u.get('ligand_from_minimized', False)),
+            env_input=u['env_input'],
+            ligand_other_sites=u['ligand_other_sites'],
+            site_size_input=u['site_size_input'],
+            ligand_from_minimized=u['ligand_from_minimized'],
             use_environment_consensus=u.get('use_environment_consensus', True),
             skip_unrelaxed_for_systems=u.get('skip_unrelaxed_for_systems', []),
             cache_embeddings=bool(u.get('cache_embeddings', False)),

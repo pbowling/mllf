@@ -48,6 +48,7 @@ from mllf.cb.hindsight_regression import (
 )
 from mllf.cb.pair_weights import compute_pairwise_confidence_weights
 from mllf.cb.pairs import build_directed_pairs
+from mllf.cb.policy import unimol_options
 from mllf.cb.workflow_utils import (
     BARRIER_TARGET,
     BARRIER_WIDTH,
@@ -482,9 +483,9 @@ def _regression_update(run: EpochRun, items: list) -> None:
     pretraining replay."""
     config = run.config
     reg_cfg = regression_config(run.bandit.raw)
-    reg_cfg['env_input'] = config.get('unimol', {}).get('env_input', 'dual')
-    reg_cfg['ligand_other_sites'] = bool(config.get('unimol', {}).get('ligand_other_sites', False))
-    reg_cfg['site_size_input'] = bool(config.get('unimol', {}).get('site_size_input', False))
+    unimol = unimol_options(config)
+    for key in ('env_input', 'ligand_other_sites', 'site_size_input'):
+        reg_cfg[key] = unimol[key]
     ck = Path(config.get('output', {}).get('base_dir', 'checkpoints'))
     buf_path = ck / 'regression_online_buffer.pt'
     buf = torch.load(buf_path, weights_only=False) if buf_path.exists() else []

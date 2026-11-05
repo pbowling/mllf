@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from mllf.cb.pairs import build_directed_pairs
-from mllf.cb.policy import UnimolPolicy
+from mllf.cb.policy import UnimolPolicy, unimol_options
 from mllf.cb.warning_summary import WarningSummary
 from mllf.log import log_to_file
 from mllf.pretrain.bayesian_init import (
@@ -126,6 +126,7 @@ def pretrain_epoch(
 
     env_cutoff = unimol_config.get('environment_cutoff', 8.0)
     use_environment_difference = unimol_config.get('use_environment_difference', True)
+    unimol = unimol_options({'unimol': unimol_config})
     policy.train()
 
     # Build normalised reward weights (mean = 1.0) so the learning rate is unchanged.
@@ -277,9 +278,9 @@ def pretrain_epoch(
                     env_cutoff=env_cutoff,
                     use_environment_difference=use_environment_difference,
                     consensus_dict=consensus_dict,
-                    env_input=unimol_config.get('env_input', 'dual'),
-                    ligand_other_sites=bool(unimol_config.get('ligand_other_sites', False)),
-                    site_size_input=bool(unimol_config.get('site_size_input', False)),
+                    env_input=unimol['env_input'],
+                    ligand_other_sites=unimol['ligand_other_sites'],
+                    site_size_input=unimol['site_size_input'],
                 )
                 pairs = build_directed_pairs(nsubs_per_site)
                 targets_list = extract_targets_from_variables(run_dir, nsubs_per_site, pairs)

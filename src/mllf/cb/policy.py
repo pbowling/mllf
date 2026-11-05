@@ -180,6 +180,30 @@ ENV_INPUTS = ('dual', 'phase', 'phase_ligmean')
 # Inputs whose node 'full' half holds the phase flags (no environment embedding).
 PHASE_NODE_INPUTS = ('phase', 'phase_ligmean')
 PHASE_DIM = 2
+
+# Defaults of a config's unimol: block: the settings of the current pretrained
+# model (pretraining_Nov02b). The edge input is the ligand difference (512),
+# the phase flags (2) and the site size (1), 515-D; the ligand embedding holds
+# every other site's reference substituent. A config sets a key to change it,
+# and online training must use the settings its pretrained model was built with.
+UNIMOL_DEFAULTS = {
+    'env_input': 'phase',
+    'site_size_input': True,
+    'ligand_other_sites': True,
+    'ligand_from_minimized': False,
+    'structure_selection': 'unrelaxed',
+}
+
+
+def unimol_options(config: Optional[Dict]) -> Dict:
+    """A config's unimol: block with ``UNIMOL_DEFAULTS`` filled in."""
+    out = dict(UNIMOL_DEFAULTS)
+    out.update((config or {}).get('unimol') or {})
+    for key in ('site_size_input', 'ligand_other_sites', 'ligand_from_minimized'):
+        out[key] = bool(out[key])
+    return out
+
+
 # unimol.site_size_input: the node's 'full' half carries 1 / (n - 1) for the n
 # substituents at its site in this run in the slot after the phase flags (pair
 # 1, 3 subs 0.5, 8 subs 0.14), and the edge input gains it after the phase

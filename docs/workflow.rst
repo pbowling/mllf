@@ -49,7 +49,8 @@ shared model is trained across all of them. The top-level sections are:
 * **pretrain**: the behavior-cloned checkpoint to start from (:doc:`cb_pretraining`)
 * **unimol**: how the node features are built (``env_input``, ``ligand_other_sites``,
   ``site_size_input``, ``cache_embeddings``, ``cache_dir``), which must match the
-  pretrained model (:doc:`unimol_representation`)
+  pretrained model; the defaults are those of the current model, a 515-D phase and
+  site-size input (:doc:`unimol_representation`)
 * **curriculum**: the stages each system passes through (:ref:`Staged Online Training`)
 * **validation_per_system** / **eval_schedule**: the held-out set and when it is run
 * **alf_root**: the iterative-flattening datasets, used for ALF-derived combo sets and

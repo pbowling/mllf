@@ -10,9 +10,9 @@
 # This allows training with diverse structural conformations (minimized vs unrelaxed)
 unimol:
   env_input: phase
-    # Second half of each node: 'phase' (phase flags; every current model) or
-    # 'phase_ligmean', or 'dual' for an environment embedding (the default when
-    # unset; the environment options below apply to 'dual' only).
+    # Second half of each node: 'phase' (phase flags; the default) or
+    # 'phase_ligmean', or 'dual' for an environment embedding (the environment
+    # options below apply to 'dual' only).
     # See docs/unimol_representation.rst.
 
   structure_selection: unrelaxed

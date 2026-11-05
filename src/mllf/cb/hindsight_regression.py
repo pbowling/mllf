@@ -19,7 +19,12 @@ from mllf.cb.pair_weights import (
     compute_pairwise_measured_mask,
 )
 from mllf.cb.pairs import build_directed_pairs
-from mllf.cb.policy import PHASE_NODE_INPUTS, SITE_SIZE_SLOT
+from mllf.cb.policy import (
+    PHASE_NODE_INPUTS,
+    SITE_SIZE_SLOT,
+    UNIMOL_DEFAULTS,
+    unimol_options,
+)
 from mllf.cb.replay_selection import plan_replay
 
 
@@ -45,13 +50,13 @@ DEFAULTS = {
     'structure_type': 'unrelaxed',
     # The model's unimol.env_input; replay graphs are built the same way
     # (set from the config's unimol section by the trainer).
-    'env_input': 'dual',
+    'env_input': UNIMOL_DEFAULTS['env_input'],
     # The model's unimol.ligand_other_sites (recorded next to the replay cache
     # in <cache>.json; a cache without it was built without)
-    'ligand_other_sites': False,
+    'ligand_other_sites': UNIMOL_DEFAULTS['ligand_other_sites'],
     # The model's unimol.site_size_input (recorded in <cache>.json like
     # ligand_other_sites)
-    'site_size_input': False,
+    'site_size_input': UNIMOL_DEFAULTS['site_size_input'],
     'grad_clip': 1.0,
     # 'random': one random run per combo directory, round-robin over datasets.
     # 'coverage': per system, the runs that best cover its pairs, replay_runs
@@ -229,7 +234,7 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
     cache = cfg.get('replay_cache')
     if cache and Path(cache).exists():
         data = torch.load(cache, weights_only=False)
-        _check_replay_env_input(data, cfg.get('env_input', 'dual'), cache)
+        _check_replay_env_input(data, cfg.get('env_input', UNIMOL_DEFAULTS['env_input']), cache)
         _check_replay_ligand(cfg, cache)
         if verbose:
             log.info(f"  replay set loaded from {cache}: {len(data)} runs")
@@ -308,8 +313,9 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
     prep_dirs = {str(Path(r['run_dir']).parent / 'prep') for r, *_ in chosen}
     # only the environment embedding (env_input 'dual') reads the environment atoms
     consensus = (_load_consensus(cfg.get('replay_consensus'), prep_dirs, manifest=manifest)
-                 if cfg.get('env_input', 'dual') == 'dual' else None)
+                 if cfg.get('env_input', UNIMOL_DEFAULTS['env_input']) == 'dual' else None)
 
+    unimol = unimol_options({'unimol': cfg})   # the model's inputs, set by the trainer
     data = []
     for n, (run, ns, pairs, weights) in enumerate(chosen):
         run_dir = Path(run['run_dir'])
@@ -318,9 +324,8 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
                 run_dir, run_dir / 'graph_info.json',
                 structure_type=cfg['structure_type'], use_environment_difference=True,
                 consensus_dict=consensus, cache_dir=cfg.get('embedding_cache_dir'), run_idx=n,
-                env_input=cfg.get('env_input', 'dual'),
-                ligand_other_sites=bool(cfg.get('ligand_other_sites', False)),
-                site_size_input=bool(cfg.get('site_size_input', False)))
+                env_input=unimol['env_input'], ligand_other_sites=unimol['ligand_other_sites'],
+                site_size_input=unimol['site_size_input'])
             targets = extract_targets_from_variables(run_dir, ns2, build_directed_pairs(ns2))
             if not targets or len(targets) != ei.size(1) or len(weights) != ei.size(1):
                 continue
@@ -334,9 +339,7 @@ def build_replay_set(cfg: Dict, seed: int = 0, verbose: bool = True) -> List[Tup
         Path(cache).parent.mkdir(parents=True, exist_ok=True)
         torch.save(data, cache)
         _replay_info_path(cache).write_text(json.dumps(
-            {'env_input': cfg.get('env_input', 'dual'),
-             'ligand_other_sites': bool(cfg.get('ligand_other_sites', False)),
-             'site_size_input': bool(cfg.get('site_size_input', False))}))
+            {k: unimol[k] for k in ('env_input', 'ligand_other_sites', 'site_size_input')}))
     if verbose:
         log.info('%s', f"  replay set built: {len(data)} runs"
                  + (f", saved to {cache}" if cache else ""))
