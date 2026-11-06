@@ -182,3 +182,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# outputs of the minimal example (examples/minimal/run_pipeline.sh)
+examples/minimal/output/
+mllf_minimal_*.out

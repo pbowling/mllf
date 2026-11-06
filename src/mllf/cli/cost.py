@@ -47,10 +47,9 @@ def run(args: argparse.Namespace) -> None:
         hist = ' > '.join(
             f"{h['stage']}({h['epochs']}, {h['reason']})" for h in st.get('history', []))
         rows[system] = {'online': s, 'alf': alf, 'stages': st}
+        alf_cols = f"{alf['ns']:9.1f} {alf['runs']:9d}" if alf else f"{'-':>9s} {'-':>9s}"
         log.info(f"{system:28s} {s['train']['ns']:9.1f} {s['train']['runs']:6d} "
-                 f"{s['validation']['ns']:9.1f} "
-                 f"{(alf['ns'] if alf else float('nan')):9.1f} {(alf['runs'] if alf else 0):9d}  "
-                 f"{hist}")
+                 f"{s['validation']['ns']:9.1f} {alf_cols}  {hist}")
     if args.json:
         Path(args.json).write_text(json.dumps(rows, indent=1))
 

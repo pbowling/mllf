@@ -8,7 +8,7 @@ import argparse
 
 
 DESCRIPTION = 'Run online CB-policy training from a YAML config'
-EPILOG = ('Example: mllf train examples/workflow_14benz.yaml\n'
+EPILOG = ('Example: mllf train examples/minimal/workflow.yaml\n'
           'Rerunning the same command resumes from the latest checkpoint.')
 
 

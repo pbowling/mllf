@@ -516,12 +516,13 @@ def _scout_tiers(run: TrainingRun, path) -> Dict[str, int]:
 
 
 def apply_scouting(run: TrainingRun, sn: str, epoch: int) -> Tuple[str, Dict]:
-    """Stage key ``scouting: <dir>`` (training/scouting/scout_groups.py):
+    """Stage key ``scouting: <dir>`` (``mllf scout``, mllf.cb.scouting):
     before a system's first epoch in the stage, groups whose scouting run
     sampled every substituent have passed, pairs whose scouting run passed
     the full-run test are resolved (system_stages.apply_scouting), and the
     scouting runs enter the cost ledger at epoch - 1. A system whose group
-    criterion already holds leaves the stage. Returns its log line and counts."""
+    criterion already holds leaves the stage, unless the stage's advance sets
+    ``min_epochs``. Returns its log line and counts."""
     st = run.stage_state[sn]
     stg = run.stages[st['stage']]
     sdir = stg['scouting']
@@ -541,7 +542,9 @@ def apply_scouting(run: TrainingRun, sn: str, epoch: int) -> Tuple[str, Dict]:
     adv = stg.get('advance') or {}
     n_done = sum(1 for g in gnames if g in (st.get('groups_done') or {}))
     converged = False
-    if (adv.get('type') == 'groups_done' and gnames
+    # an explicit advance.min_epochs keeps the system in the stage for that
+    # many epochs even when scouting already meets its criterion
+    if (adv.get('type') == 'groups_done' and gnames and int(adv.get('min_epochs', 0)) <= 0
             and system_stages.criterion_met(adv, n_done, len(gnames))):
         nxt = system_stages.advance(st, run.stages, sn, epoch - 1, 'criterion',
                                     (n_done, len(gnames)))

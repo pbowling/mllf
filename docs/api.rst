@@ -79,6 +79,7 @@ For the workflow system, see :doc:`workflow`.
    mllf.cb.group_correction
    mllf.cb.curriculum
    mllf.cb.system_stages
+   mllf.cb.scouting
    mllf.cb.export_biases
    mllf.cb.cost_ledger
    mllf.cb.epoch_log
@@ -101,6 +102,7 @@ For the ``mllf`` command, see :doc:`cli`.
    mllf.cli.collect_pretraining_data
    mllf.cli.pretrain
    mllf.cli.replay
+   mllf.cli.scout
    mllf.cli.train
    mllf.cli.export
    mllf.cli.cost

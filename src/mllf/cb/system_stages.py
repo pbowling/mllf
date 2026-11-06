@@ -254,10 +254,10 @@ def combo_scout_tier(tiers: Dict[str, int], system: str, combo) -> int:
 
 def apply_scouting(sys_state: Dict, bandit_state: Dict, system: str, stage: str, summary: Dict,
                    group_names: Iterable[str]) -> Tuple[Dict[str, str], List[str], List[str]]:
-    """Apply a scouting summary (training/scouting/scout_groups.py
-    --priorities, ``scout_summary.json``) to one system entering ``stage``,
-    once: each of its groups whose scouting run sampled every substituent has
-    passed (``groups_done``, exporting the scouting run; also kept in
+    """Apply a scouting summary (``mllf scout``, ``scout_summary.json``) to one
+    system entering ``stage``, once: each of its groups whose scouting run
+    sampled every substituent has passed (``groups_done``, exporting the
+    scouting run; also kept in
     ``scouted_groups``), and its pairs whose scouting run passed the full-run
     test are resolved (``scout_resolved``). Returns (groups passed: name ->
     run, pairs resolved, every scouting run of the system)."""

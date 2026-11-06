@@ -288,7 +288,17 @@ def run(args: argparse.Namespace) -> None:
     dirs = _pretraining_dirs(args)     # argument errors before any output is written
     with log_to_file(Path(args.output_dir) / LOG_FILE):
         log.debug(f"Pretraining directories ({len(dirs)}): {dirs}")
+        _write_manifest(Path(args.output_dir), dirs)
         _run(args, dirs)
+
+
+def _write_manifest(output_dir: Path, dirs: List[str]) -> None:
+    """pretraining_manifest.json: the directories pretraining read, as absolute
+    paths (the regression replay's bandit.regression.replay_manifest)."""
+    import json
+    path = output_dir / 'pretraining_manifest.json'
+    path.write_text(json.dumps({'directories': [str(Path(d).resolve()) for d in dirs]},
+                               indent=1))
 
 
 def _run(args: argparse.Namespace, dirs: List[str]) -> None:

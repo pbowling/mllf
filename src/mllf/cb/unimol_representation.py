@@ -36,12 +36,18 @@ def _import_unimol_repr():
     warnings."""
     logs = Path.cwd() / 'logs'
     existed = logs.exists()
-    if not sys.stderr.isatty():
-        # per-call progress bars only clutter a job's output file
-        os.environ.setdefault('TQDM_DISABLE', '1')
     from unimol_tools import UniMolRepr
     if not existed and logs.is_dir() and not any(logs.iterdir()):
         logs.rmdir()
+    if not sys.stderr.isatty():
+        # One progress bar per embedding call only clutters a job's output
+        # file. TQDM_DISABLE does not help once another package has imported
+        # tqdm, so the name unimol_tools' inference loop calls is replaced.
+        try:
+            from unimol_tools.tasks import trainer
+            trainer.tqdm = functools.partial(trainer.tqdm, disable=True)
+        except (ImportError, AttributeError):
+            pass
     quiet_unimol_tools()
     return UniMolRepr
 

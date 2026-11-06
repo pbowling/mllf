@@ -25,8 +25,9 @@ def submit_epoch_simulation(
     ``config['slurm']`` (``mllf.slurm``). Returns the SLURM job ID string
     (e.g. '12345').
     """
-    combo_path = Path(combo_path)
-    epoch_dir = Path(epoch_dir)
+    # absolute, since sbatch runs in epoch_dir and the job script cds to combo_path
+    combo_path = Path(combo_path).resolve()
+    epoch_dir = Path(epoch_dir).resolve()
     epoch_dir.mkdir(parents=True, exist_ok=True)
 
     epoch_label = epoch_dir.name  # e.g. 'run_007'
@@ -49,7 +50,10 @@ def submit_epoch_simulation(
     result = subprocess.run(
         ['sbatch', str(script_path)],
         cwd=str(epoch_dir),
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"sbatch {script_path} failed: "
+                           f"{(result.stderr or result.stdout).strip()}")
     job_id = result.stdout.strip().split()[-1]
     return job_id

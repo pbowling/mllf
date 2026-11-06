@@ -1,7 +1,8 @@
 # Pretraining configuration for MSLD policy using Uni-Mol embeddings
 # This config is used for supervised pretraining on collected simulation data.
 # Trains UnimolPolicy to predict bias coefficients from best runs using MSE loss.
-# After pretraining, use workflow_14benz.yaml or workflow_deepset.yaml with pretrain.model_path set
+# After pretraining, set pretrain.model_path in the workflow config (examples/minimal
+# runs the whole pipeline)
 
 # ============================================================================
 # STRUCTURE REPRESENTATION SETTINGS

@@ -111,20 +111,31 @@ def test_submit_epoch_simulation_partition_without_gres(tmp_path, monkeypatch):
     assert 'module load' not in content
 
 
-def test_submit_epoch_simulation_raises_on_sbatch_failure(tmp_path, monkeypatch):
-    import subprocess as real_subprocess
-
+def test_submit_epoch_simulation_raises_with_sbatch_message(tmp_path, monkeypatch):
     combo_path = tmp_path / 'combo'
     combo_path.mkdir()
     epoch_dir = combo_path / 'run_003'
 
     def _failing_run(cmd, cwd=None, capture_output=None, text=None, check=None):
-        raise real_subprocess.CalledProcessError(1, cmd)
+        return _FakeCompletedProcess(returncode=1, stdout='',
+                                     stderr='sbatch: error: invalid partition\n')
 
     monkeypatch.setattr(slurm_mod.subprocess, 'run', _failing_run)
 
-    with pytest.raises(real_subprocess.CalledProcessError):
+    with pytest.raises(RuntimeError, match='invalid partition'):
         submit_epoch_simulation(str(combo_path), str(epoch_dir), config={})
+
+
+def test_submit_epoch_simulation_uses_absolute_paths(tmp_path, monkeypatch):
+    """sbatch runs in the run directory, so relative out_dir paths must be resolved."""
+    (tmp_path / 'combo').mkdir()
+    monkeypatch.chdir(tmp_path)
+    fake = _fake_sbatch_run()
+    monkeypatch.setattr(slurm_mod.subprocess, 'run', fake)
+    submit_epoch_simulation('combo', 'combo/run_001', config={})
+    script = fake.calls[0]['cmd'][1]
+    assert script == str(tmp_path / 'combo' / 'run_001' / 'run_epoch.sh')
+    assert f"cd {tmp_path / 'combo'}" in open(script).read()
 
 
 # ---------------------------------------------------------------- mllf.slurm

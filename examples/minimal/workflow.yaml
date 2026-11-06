@@ -1,0 +1,78 @@
+# Online training for the minimal example (examples/minimal/run_pipeline.sh):
+# one system (1,4-benzene in water), one stage of pairs and one group, scouted
+# with the pretrained model, then one epoch of online training. Paths are
+# relative to the repository root, where the pipeline runs.
+
+systems:
+  - name: 14benz_solv              # 'solv' in the name sets the phase flags
+    input_dir: examples/14benz
+    out_dir: examples/minimal/output/simulations/14benz_solv/
+    solvent_state: solv
+    include_patterns: [msld_flat.py]
+    max_subs_per_site: 3
+    combo_sets:
+      # explicit sets ({site: [subs]}, the first sub is the reference)
+      groups: [{1: [1, 2, 3], 2: [1, 2]}]        # scouted, and exported at the end
+      wide: [{1: [1, 2, 3, 4], 2: [1, 2, 3]}]
+      train_pairs: {pairs_of: wide}               # 9 within-site pairs
+      ref_pairs: {pairs_of: wide, reference_only: true}
+    export_combo_set: groups
+
+pretrain:
+  model_path: examples/minimal/output/pretrain/best_policy_bayesian.pt
+
+unimol:                            # the model's settings (the defaults)
+  cache_embeddings: true
+  cache_dir: examples/minimal/output/embeddings_cache
+
+curriculum:
+  enabled: true
+  per_system: true
+  max_train_combos_per_stage: 4    # combos per epoch
+  min_combos_per_system: 2
+  stages:
+    - name: pairs_groups
+      combo_set: train_pairs
+      reference_set: ref_pairs
+      group_set: groups
+      scouting: examples/minimal/output/scouting   # written by mllf scout
+      run_steps: {equil: 13000, prod: 39000}       # short exploratory runs
+      epochs: 1
+      advance:
+        type: groups_done
+        min_epochs: 1              # train at least one epoch, even if scouting passes
+        successes: 2
+        max_offset_sd: {linear: 1.0, quadratic: 3.0}
+
+validation_per_system: 1           # one held-out pair, validated after the epoch
+
+bandit:
+  algorithm: hindsight
+  regression:
+    replay_manifest: examples/minimal/output/pretrain/pretraining_manifest.json
+    replay_cache: examples/minimal/output/replay.pt   # built by mllf replay
+    replay_selection: random
+    replay_runs: 20
+    embedding_cache_dir: examples/minimal/output/embeddings_cache
+
+output:
+  base_dir: examples/minimal/output/training
+  checkpoint_freq: 1
+
+archive:
+  when: end                        # one .tar.gz of the combo directories
+
+max_concurrent_jobs: 10
+
+# Each simulation is one SLURM job; adjust for your cluster (docs/workflow.rst,
+# Launching Simulations). Any sbatch option can be added (exclude, qos, ...).
+slurm:
+  partition: ada6000
+  gres: gpu:1
+  time: '00:20:00'
+  module: charmm/charmm/c51a1
+
+reward:
+  T_baseline: 20.0
+  min_transitions_per_site: 10
+  no_transition_weight: 0.15

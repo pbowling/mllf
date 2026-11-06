@@ -29,9 +29,10 @@ Online training is driven by a YAML configuration file:
 .. code-block:: bash
 
    cd mllf   # repository root
-   mllf train examples/workflow_14benz.yaml
+   mllf train examples/minimal/workflow.yaml
 
-:doc:`examples` walks through the 1,4-benzene (14benz) example. The driver itself is
+:doc:`examples` walks through the 1,4-benzene (14benz) example, which first pretrains the
+model this config starts from. The driver itself is
 ``mllf.cb.training_loop.run_training``: setup in ``mllf.cb.training_setup``, one epoch's
 simulations and updates in ``mllf.cb.reinforce_trainer`` (``epoch_runs`` /
 ``epoch_updates``).
@@ -343,19 +344,34 @@ fresh retirement allowance), and the group waits for them. A run in which the gr
 correction lowered the group's end terms (:doc:`cb_setup`) does not count as a failure,
 since it tested values that have since changed.
 
+.. _Scouting:
+
 Scouting
 ~~~~~~~~
 
-A stage's ``scouting:`` directory holds one ∼1 ns run per ALF group with the starting
-model's biases (``training/scouting/scout_groups.py``), and is applied once, before the
-system's first epoch in the stage. A group whose scouting run sampled every substituent
+A stage's ``scouting:`` directory holds one ∼1 ns run per group of its ``group_set`` with
+the starting model's biases, and is applied once, before the system's first epoch in the
+stage. A group whose scouting run sampled every substituent
 has passed (its scouting run is the exported run), a pair whose scouting run passed the
 full-length test is resolved, and the scouting runs' simulated time enters the cost
 ledger. The directory's ``pair_priority.json`` (or the stage's ``scout_priority`` file)
 ranks the reference pairs by how hard scouting found them, from tier 0 (a substituent
 never sampled, or fewer than 5 crossings) to tier 2 (10 or more crossings). Pairs that
 scouting did not cover count as tier 1. Scouting runs must come from the same starting
-model as the stage, so each stage that uses scouting needs its own.
+model as the stage, so each stage that uses scouting needs its own. A system whose groups all pass on
+their scouting runs leaves a ``groups_done`` stage at once, unless the stage's advance
+sets ``min_epochs``.
+
+``mllf scout CONFIG --out DIR`` builds and submits the runs with the model of
+``deploy.model_path`` (else ``pretrain.model_path``), and refuses a model pretrained with
+other unimol settings than the config's. With ``--wait`` it waits for them and writes the
+summary; ``--summarize`` writes it later from finished runs. ``DIR/uncertainty.json``
+records each scouted pair's predicted b and c with their posterior predictive sd.
+
+.. code-block:: bash
+
+   mllf scout online_1.yaml --out scouting/online_1 --wait
+   # stage key:  scouting: scouting/online_1
 
 Stage Settings
 ~~~~~~~~~~~~~~
@@ -798,8 +814,9 @@ each generated combination directory separately (``archive_combo_dirs``).
 Example Configurations
 ----------------------
 
-* ``examples/workflow_14benz.yaml`` is the smallest working config (one system,
-  REINFORCE, global curriculum, no pretrained model), walked through in :doc:`examples`.
+* ``examples/minimal/workflow.yaml`` is the smallest complete config (one system, one
+  per-system stage with scouting, hindsight with regression replay), run with its
+  pretraining by ``examples/minimal/run_pipeline.sh`` (:doc:`examples`).
 * ``training/online_1.yaml`` through ``online_4_hne_pr3.yaml`` are the staged curriculum
   for production biases: known systems in solvent and protein (stage 1), the hardest
   systems (1b), vacuum legs (2), and deployment on chemistry and proteins the model was

@@ -1,0 +1,14 @@
+# Pretraining settings for the minimal example (examples/minimal/run_pipeline.sh).
+#
+# The unimol: settings default to those of the current pretrained model
+# (phase flags, site size and other-site reference substituents; a 515-D edge
+# input), and workflow.yaml leaves them at the same defaults, as the online
+# config must match the model. Only the embedding cache is set here.
+unimol:
+  cache_embeddings: true
+  cache_dir: examples/minimal/output/embeddings_cache
+
+# Run rewards that weight the behavior-cloning loss (docs/cb_pretraining.rst).
+reward:
+  T_baseline: 20.0
+  min_transitions_per_site: 10

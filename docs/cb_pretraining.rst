@@ -74,8 +74,8 @@ Running Pretraining
 to weight runs (below) and the Uni-Mol options, ``unimol.env_input``,
 ``ligand_other_sites``, ``site_size_input``, ``structure_selection``,
 ``environment_cutoff`` and ``cache_embeddings``. The first three are recorded in
-``pretrain_metadata.json``, and an online config must use the same values
-(:doc:`unimol_representation`). Filters and optimizer settings are command-line flags.
+``pretrain_metadata.json``, and an online config must use the same values; online
+training and ``mllf scout`` check them (:doc:`unimol_representation`). Filters and optimizer settings are command-line flags.
 
 * ``--no-data-hygiene``, ``--no-per-pair-awr`` and ``--awr-temperature`` (default 1.0) set
   the objective (below).
@@ -97,6 +97,8 @@ directory holds:
   ``pretrain.model_path`` in a workflow config, and ``final_policy*.pt``
 * ``checkpoint_epoch_NNN.pt``, from which ``--resume-checkpoint`` continues
 * ``pretrain_metadata.json``: the Uni-Mol settings the model was trained with
+* ``pretraining_manifest.json``: every directory pretraining read, as absolute paths, the
+  ``bandit.regression.replay_manifest`` of the regression replay
 * ``pretraining_systems.json``: the systems pretraining used, read by ``mllf replay``
 * ``pretrain.log``: every message with time stamps, including the per-run detail and the
   filter statistics the console leaves out (:doc:`cli`)

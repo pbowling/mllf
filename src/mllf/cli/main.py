@@ -23,6 +23,7 @@ COMMANDS = {
                 'collect finished MSLD runs into pretraining records'),
     'pretrain': ('mllf.cli.pretrain', 'behavior-clone the policy on collected runs'),
     'replay': ('mllf.cli.replay', 'prebuild the regression replay set of a workflow config'),
+    'scout': ('mllf.cli.scout', 'scouting runs before a stage, and their summary'),
     'train': ('mllf.cli.train', 'online training from a workflow config'),
     'export': ('mllf.cli.export', 'export production biases from a trained policy'),
     'cost': ('mllf.cli.cost', 'simulated ns per system: online run vs ALF'),

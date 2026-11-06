@@ -107,9 +107,8 @@ def load_runs_from_dirs(pretraining_dirs: List) -> List[Dict]:
     all_runs = []
     for d in pretraining_dirs:
         pretrain_dir = Path(d)
-        log.info(f"\nLoading from {pretrain_dir}...")
         runs = load_pretraining_runs(pretrain_dir)
-        log.info(f"  Loaded {len(runs)} runs")
+        log.debug(f"Loaded {len(runs)} runs from {pretrain_dir}")
         label = system_label(pretrain_dir)
         for run in runs:
             run['system_label'] = label

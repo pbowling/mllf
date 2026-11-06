@@ -276,17 +276,25 @@ def policy_weights(checkpoint: Dict):
 
 
 def check_pretrain_inputs(config: Dict, pretrain_path: Optional[str]) -> None:
-    """The model's node inputs must be built the same way online
-    (unimol.ligand_other_sites / site_size_input, in pretrain_metadata.json)."""
+    """The model's node inputs must be built the same way online: the config's
+    unimol settings (defaults filled in) against the model's
+    pretrain_metadata.json. A key the metadata lacks predates it and was off
+    (env_input is checked only when recorded)."""
     if not pretrain_path:
         return
     meta_path = Path(pretrain_path).parent / 'pretrain_metadata.json'
     if not meta_path.exists():
         return
     meta = json.loads(meta_path.read_text())
-    for key in ('ligand_other_sites', 'site_size_input'):
-        built = meta.get(key, False)
-        if bool(built) != bool(config.get('unimol', {}).get(key, False)):
+    unimol = unimol_options(config)
+    for key in ('env_input', 'ligand_other_sites', 'site_size_input'):
+        if key == 'env_input':
+            if key in meta and meta[key] != unimol[key]:
+                raise ValueError(f"{pretrain_path} was pretrained with unimol.{key}="
+                                 f"{meta[key]}; set the same in this config")
+            continue
+        built = bool(meta.get(key, False))
+        if built != unimol[key]:
             raise ValueError(f"{pretrain_path} was pretrained with unimol.{key}={built}; "
                              "set the same in this config")
 

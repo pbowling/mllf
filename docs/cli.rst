@@ -25,7 +25,8 @@ of the pipeline (``python -m mllf`` is the same command):
    mllf pretrain --pretraining-dir pretraining/14benz_solv --output-dir models/14benz \
        --config examples/workflow_pretrain.yaml --bayesian-heads
    mllf replay online_1.yaml --cache replay_online_1.pt
-   mllf train examples/workflow_14benz.yaml
+   mllf scout online_1.yaml --out scouting/online_1 --wait
+   mllf train examples/minimal/workflow.yaml
    mllf export online_1.yaml --label checkpoints_online_1
    mllf cost checkpoints_online_1 --pretraining-root pretraining
    mllf archive online_1.yaml --remove

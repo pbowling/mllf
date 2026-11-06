@@ -47,10 +47,11 @@ it:
      structure_selection: unrelaxed
 
 A model pretrained with other values needs them written out in both its pretraining and
-its online config. A different ``env_input`` or ``site_size_input`` changes the width of
-the edge input, so loading the model fails with a shape mismatch; a different
-``ligand_other_sites`` keeps the width and goes unnoticed, so its value is recorded in
-``pretrain_metadata.json`` and should be checked against the online config.
+its online config. Pretraining records them in ``pretrain_metadata.json``, and online
+training and ``mllf scout`` stop with an error when the config's settings (defaults filled
+in) differ from the model's. Without that file, a different ``env_input`` or
+``site_size_input`` still fails, as a shape mismatch when the model is loaded, but a
+different ``ligand_other_sites`` keeps the width of the edge input and goes unnoticed.
 
 Environment Embedding (``env_input: dual``)
 -------------------------------------------
