@@ -53,6 +53,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     p.add_argument('--out', default=None, metavar='DIR',
                    help='output directory (default: <model dir>/analysis)')
     p.add_argument('--device', default=None, help='torch device (default: cuda if available)')
+    p.add_argument('--similarity-full', action='store_true',
+                   help='also draw similarity_full: per system and environment, with the full '
+                        '515-D node input (ligand embedding, phase flags, site size)')
+    p.add_argument('--dataset-stats', action='store_true',
+                   help='also draw dataset_stats; lists every pretraining directory (minutes '
+                        'for a full set; cached in <out>/cache)')
     p.add_argument('--max-runs-per-dataset', type=int, default=None, metavar='N',
                    help='analyze the N runs of each dataset with the most scored targets, of 50 '
                         'read at random (default 10; 0: every run, hours for a full set)')
@@ -103,7 +109,9 @@ def run(args: argparse.Namespace) -> int:
         analyze_pretrain(Path(args.model_dir), out, model=args.model, config_path=args.config,
                          device=args.device, max_runs=args.max_runs_per_dataset,
                          only=args.only, workers=args.workers, rescan=args.rescan,
-                         fmt=args.fmt, grayscale=args.grayscale)
+                         fmt=args.fmt, grayscale=args.grayscale,
+                         dataset_stats=args.dataset_stats,
+                         similarity_full=args.similarity_full)
     return 0
 
 

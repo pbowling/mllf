@@ -34,7 +34,8 @@ online training's success test for a run of its length and, for c, x and s, the 
 measured that coefficient's signal. Each dataset contributes the
 ``--max-runs-per-dataset`` runs (default 10) with the most such targets, of 50 of its
 runs read at random (0 reads and analyzes every run, which takes hours for a full
-pretraining set). ``--config``
+pretraining set). ``--workers`` threads read the runs. The predictions are cached, so
+redrawing the figures takes about a minute. ``--config``
 names the pretraining config when the model directory holds none; its
 ``unimol.cache_dir`` reuses pretraining's embeddings.
 
@@ -47,12 +48,16 @@ names the pretraining config when the model directory holds none; its
    The first principal components of the substituents' Uni-Mol ligand embeddings, the
    five most common families highlighted, and the variance each component explains.
 ``similarity``
-   Distance between systems in embedding space: for each substituent of one system, the
+   Distance between systems in Uni-Mol ligand-embedding space, one row per system (a
+   substituent counts once across environments): for each substituent of one system, the
    distance to the nearest substituent of the other (each dimension standardized),
-   averaged and symmetrized.
+   averaged and symmetrized. ``--similarity-full`` adds ``similarity_full``, one row per
+   system and environment, from the full 515-D node input the model sees (ligand
+   embedding, phase flags and site size).
 ``dataset_stats``
-   Runs per dataset, substituents and sites per run, and the distribution of each scored
-   coefficient.
+   With ``--dataset-stats`` only, since it lists every pretraining directory (minutes for
+   a full set; cached afterwards): runs per dataset, substituents and sites per run, and
+   the distribution of each scored coefficient.
 
 The report gives N, R², Pearson r, MUE, RMSE and the median posterior predictive sd per
 coefficient, the same per family (``tables/metrics_by_system.csv`` per system), and each

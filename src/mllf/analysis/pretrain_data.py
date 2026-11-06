@@ -61,7 +61,12 @@ def manifest_dirs(model_dir: Path) -> List[Path]:
     if base is None:
         raise FileNotFoundError(f"{dirs[0]} (first entry of {path}) not found relative to the "
                                 "working directory or the model directory")
-    return [Path(d) if Path(d).is_absolute() else (base / d).resolve() for d in dirs]
+    # normalized as text: resolving each of tens of thousands of entries on
+    # a network filesystem takes minutes
+    import os
+    base = Path(os.path.abspath(base))
+    return [Path(d) if Path(d).is_absolute() else Path(os.path.normpath(base / d))
+            for d in dirs]
 
 
 def model_settings(model_dir: Path, config_path: Optional[str] = None):
@@ -137,32 +142,47 @@ def good_mask(sim_results: Dict, pairs: List, reward_config: Dict) -> np.ndarray
     return mask
 
 
-def select_runs(dirs: List[Path], max_runs: Optional[int], reward_config: Dict,
-                seed: int = 0) -> List[Dict]:
-    """Runs of every dataset (system label), at most ``max_runs`` per dataset:
-    those with the most good (pair, coefficient) targets."""
+def _scored_runs(task):
+    """(good targets, run dir, run) of each run of one directory."""
     from mllf.cb.graph_utils import build_directed_pairs
-    from mllf.pretrain.runs import load_pretraining_runs, system_label
+    from mllf.pretrain.runs import load_pretraining_runs
+    d, name, reward_config = task
+    out = []
+    for run in load_pretraining_runs(d):
+        nsubs = (run.get('metadata') or {}).get('nsubs_per_site')
+        if not nsubs:
+            continue
+        n_good = int(good_mask(run['sim_results'], build_directed_pairs(nsubs),
+                               reward_config).sum())
+        if n_good:
+            run['system_label'] = name
+            out.append((n_good, str(run['run_dir']), run))
+    return out
+
+
+def select_runs(dirs: List[Path], max_runs: Optional[int], reward_config: Dict,
+                seed: int = 0, workers: int = 8) -> List[Dict]:
+    """Runs of every dataset (system label), at most ``max_runs`` per dataset:
+    those with the most good (pair, coefficient) targets, of
+    CANDIDATES_PER_DATASET directories read at random (``workers`` threads)."""
+    import concurrent.futures
+    from mllf.pretrain.runs import system_label
     by_dataset: Dict[str, List[Path]] = defaultdict(list)
     for d in dirs:
         by_dataset[system_label(d)].append(d)
     rng = random.Random(seed)
     chosen = []
+    tasks = []
     for name, ds in sorted(by_dataset.items()):
         if max_runs and len(ds) > CANDIDATES_PER_DATASET:
             ds = rng.sample(ds, CANDIDATES_PER_DATASET)
-        scored = []
-        for d in ds:
-            for run in load_pretraining_runs(d):
-                nsubs = (run.get('metadata') or {}).get('nsubs_per_site')
-                if not nsubs:
-                    continue
-                n_good = int(good_mask(run['sim_results'], build_directed_pairs(nsubs),
-                                       reward_config).sum())
-                if n_good:
-                    run['system_label'] = name
-                    scored.append((n_good, str(run['run_dir']), run))
-        scored.sort(key=lambda t: (-t[0], t[1]))
+        tasks += [(d, name, reward_config) for d in ds]
+    by_name: Dict[str, List] = defaultdict(list)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        for (_, name, _), found in zip(tasks, ex.map(_scored_runs, tasks)):
+            by_name[name].extend(found)
+    for name in sorted(by_dataset):
+        scored = sorted(by_name[name], key=lambda t: (-t[0], t[1]))
         keep = [r for _, _, r in (scored[:max_runs] if max_runs else scored)]
         chosen.extend(keep)
         log.debug(f"{name}: {len(keep)} of {len(scored)} runs with good targets")
@@ -187,7 +207,7 @@ def _node_labels(run_dir: Path, n: int) -> List[Dict]:
 
 def collect(model_dir: Path, out_cache: Path, model: Optional[str] = None,
             config_path: Optional[str] = None, device: Optional[str] = None,
-            max_runs: Optional[int] = 10) -> Dict:
+            max_runs: Optional[int] = 10, workers: int = 8) -> Dict:
     """Records of every selected run (cached in ``out_cache`` by model file,
     manifest and ``max_runs``): {'runs': [...], 'settings': {...}}.
 
@@ -214,7 +234,7 @@ def collect(model_dir: Path, out_cache: Path, model: Optional[str] = None,
     dirs = manifest_dirs(model_dir)
     log.info(f"Selecting runs from {len(dirs)} pretraining directories "
              f"(up to {max_runs or 'all'} per dataset)")
-    runs = select_runs(dirs, max_runs, reward_config)
+    runs = select_runs(dirs, max_runs, reward_config, workers=workers)
     work = out_cache.parent / 'inputs'
     work.mkdir(parents=True, exist_ok=True)
     inputs = build_run_inputs(runs, unimol, work)
@@ -240,6 +260,9 @@ def collect(model_dir: Path, out_cache: Path, model: Optional[str] = None,
             'run_dir': str(run_dir), 'nsubs': list(run['metadata'].get('nsubs_per_site') or []),
             'pairs': pairs, 'nodes': _node_labels(run_dir, emb.size(0)),
             'ligand': emb[:, :512].cpu().numpy().astype(np.float32),
+            # the node input the model sees: ligand embedding, then the second
+            # half's phase flags and site size (515-D)
+            'node_input': emb[:, :515].cpu().numpy().astype(np.float32),
             'pred': pred, 'actual': actual, 'sd': sd, 'good': good})
     log.info(f"  predictions for {len(records)} runs")
     data = {'key': key, 'runs': records,

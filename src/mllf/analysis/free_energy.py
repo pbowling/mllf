@@ -162,58 +162,79 @@ def group_runs(data, pretraining_root=None, systems=None) -> List[Dict]:
     return out
 
 
+# Line styles of the substituents: six line-safe shades (light colours are
+# never lines) with a line style each, so neighbouring substituents differ in
+# both and the darkest shades are not used for every line.
+SUB_COLORS = [bs.PALETTE['plum'], bs.PALETTE['orange'], bs.PALETTE['forest'],
+              bs.EXTENDED['plum_mid'], bs.EXTENDED['orange_dark'], bs.EXTENDED['forest_mid']]
+SUB_LINESTYLES = ['-', '--', ':', '-.']
+RUN_STYLE = {'MLLF': dict(color=bs.PALETTE['plum'], ls='-'),
+             'ALF': dict(color=bs.PALETTE['orange'], ls='--')}
+
+
+def _sub_style(i: int) -> Dict:
+    return {'color': SUB_COLORS[i % len(SUB_COLORS)],
+            'ls': SUB_LINESTYLES[i % len(SUB_LINESTYLES)]}
+
+
 def profile_figure(rec: Dict, site: int, mllf_prof, alf_prof):
     """One site of one group: 1D profiles of the MLLF run (A) and ALF's run
     (B, when available) on one y scale, then the transition profile of each
-    pair (MLLF solid, ALF dashed)."""
+    pair (MLLF solid, ALF dashed), titled "i / j" with x = 1 at substituent i.
+    Legends sit to the right of the panels."""
     import matplotlib.pyplot as plt
     one_d, trans = mllf_prof
     a_one, a_trans = alf_prof if alf_prof else ({}, {})
     subs = list(one_d)
     n = len(subs)
     k = max(n - 1, 1)
-    width = bs.WIDTHS['double'] if n > 3 else bs.WIDTHS['onehalf']
-    cell = width / max(k, 2)
-    fig = plt.figure(figsize=(width, 2.3 + cell * k))
-    gs = fig.add_gridspec(2, 1, height_ratios=[2.3, cell * k])
+    width = bs.WIDTHS['double']
+    cell = min(1.25, (width - 1.4) / max(k, 2))
+    fig = plt.figure(figsize=(width, 2.4 + cell * k + 0.4))
+    gs = fig.add_gridspec(2, 1, height_ratios=[2.4, cell * k + 0.4])
     top = gs[0].subgridspec(1, 2)
     ax_m = fig.add_subplot(top[0, 0])
     ax_a = fig.add_subplot(top[0, 1], sharey=ax_m)
-    sub_styles = dict(zip(subs, bs.styles(n, 'line', markers=False)))
+    styles = {sub: _sub_style(i) for i, sub in enumerate(subs)}
     for ax, prof, name in ((ax_m, one_d, 'MLLF'), (ax_a, a_one, 'ALF')):
         for sub in subs:
             if sub in prof:
                 x, g, _ = prof[sub]
-                ax.plot(x, g - g.min(), label=f'Sub {sub}', **sub_styles[sub])
+                ax.plot(x, g - g.min(), label=f'Sub {sub}', **styles[sub])
         ax.set_xlim(0, 1)
         ax.set_xlabel('λ')
         ax.set_title(f'{name} run' if prof else f'{name}: no matching run')
     ax_m.set_ylabel('G (kcal/mol)')
-    # a flat profile is low only at the ends: the bottom centre is empty
-    ax_m.legend(loc='lower center', ncol=min(n, 3))
-    grid = gs[1].subgridspec(k, k)
-    run_style = {'MLLF': dict(color=bs.PALETTE['plum'], ls='-'),
-                 'ALF': dict(color=bs.PALETTE['orange'], ls='--')}
+    handles, labels = ax_m.get_legend_handles_labels()
+    ax_a.legend(handles, labels, loc='center left', bbox_to_anchor=(1.03, 0.5))
+    grid = gs[1].subgridspec(k, k + 1, width_ratios=[1] * k + [0.6])
     first = None
+    small = bs.mpl.rcParams['font.size'] - 1
     for i, si in enumerate(subs):
         for j, sj in enumerate(subs):
             if j <= i:
                 continue
-            ax = fig.add_subplot(grid[i, j - 1], sharey=first)
+            ax = fig.add_subplot(grid[i, j - 1], sharex=first, sharey=first)
             first = first or ax
             for prof, name in ((trans.get((si, sj)), 'MLLF'), (a_trans.get((si, sj)), 'ALF')):
                 if prof is not None:
                     x, g, _ = prof
-                    ax.plot(x, g - g.min(), label=name, **run_style[name])
+                    ax.plot(x, g - g.min(), label=name, **RUN_STYLE[name])
             ax.set_xlim(0, 1)
-            if j == i + 1:
+            ax.set_title(f'{si} / {sj}', fontsize=small, pad=2)
+            ax.tick_params(labelsize=small)
+            diagonal = j == i + 1        # leftmost in its row and lowest in its column
+            ax.tick_params(labelleft=diagonal, labelbottom=diagonal)
+            if i == 0 and j == 1:
                 ax.set_ylabel('G (kcal/mol)')
             if i == n - 2:
                 ax.set_xlabel(r'$\lambda_i / (\lambda_i + \lambda_j)$')
-            ax.set_title(f'Sub {si} (x = 1) / sub {sj} (x = 0)',
-                         fontsize=bs.mpl.rcParams['font.size'] - 1)
-            if i == 0 and j == 1:
-                ax.legend(loc='lower center', ncol=2)
+    if first is not None:
+        lax = fig.add_subplot(grid[0, k])
+        lax.axis('off')
+        lax._bowling_no_snap = lax._bowling_no_zero = True
+        lax.legend(*first.get_legend_handles_labels(), loc='upper left',
+                   title='Pair i / j\n(x = 1 at i)')
     bs.label_panels([ax_m, ax_a])
     return fig
 

@@ -30,7 +30,7 @@ def success_over_epochs(epochs, validation: bool = True):
     if epochs is None or epochs.empty:
         return None
     plt = _plt()
-    fig, ax = plt.subplots(figsize=bs.figsize('single', 0.75))
+    fig, ax = plt.subplots(figsize=(bs.WIDTHS['onehalf'], 2.6))
     series = [('Pair runs', 'pairs_pct'), ('Group runs', 'groups_pct')]
     if validation:
         series.append(('Held-out pairs', 'validation_pct'))
@@ -45,7 +45,7 @@ def success_over_epochs(epochs, validation: bool = True):
     ax.set_xlabel('Epoch')
     ax.set_ylabel('Runs passing their test (%)')
     _int_axis(ax, 'x', epochs['epoch'].min(), epochs['epoch'].max())
-    _legend_above(ax, ncol=len(series))
+    ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5))
     return fig
 
 
@@ -118,10 +118,14 @@ def outcomes_by_system(runs, env: Dict[str, str]):
         return None
     systems = system_order(train['system'], env)
     plt = _plt()
-    fig, axes = plt.subplots(1, len(panels), sharey=True, squeeze=False,
-                             figsize=(bs.WIDTHS['double'], _ROW_IN * len(systems) + 2.0))
+    fig = plt.figure(figsize=(bs.WIDTHS['double'], _ROW_IN * len(systems) + 2.6))
+    # a row for the legends above the panels, so each stays within its column
+    gs = fig.add_gridspec(2, len(panels), height_ratios=[1.5, _ROW_IN * len(systems)])
+    axes = np.array([[fig.add_subplot(gs[1, 0])]])
+    for k in range(1, len(panels)):
+        axes = np.append(axes, [[fig.add_subplot(gs[1, k], sharey=axes[0, 0])]], axis=1)
     y = np.arange(len(systems))
-    for ax, (lab, sub, order) in zip(axes[0], panels):
+    for k, (ax, (lab, sub, order)) in enumerate(zip(axes[0], panels)):
         t = (sub.groupby(['system', 'outcome']).size().unstack(fill_value=0)
              .reindex(systems, fill_value=0))
         styles = _outcome_styles(order)
@@ -132,10 +136,16 @@ def outcomes_by_system(runs, env: Dict[str, str]):
                 left += t[o].values
         ax.set_xlabel('Runs')
         _int_axis(ax, 'x', 0, float(left.max()) if len(left) else 1)
-        _legend_above(ax, ncol=2, title=lab)
+        lax = fig.add_subplot(gs[0, k])
+        lax.axis('off')
+        lax._bowling_no_snap = lax._bowling_no_zero = True
+        handles, labels = ax.get_legend_handles_labels()
+        lax.legend(handles, labels, loc='lower center', ncol=1, title=lab)
+        if k:
+            ax.tick_params(labelleft=False)
     axes[0, 0].set_yticks(y)
     axes[0, 0].set_yticklabels(systems)
-    axes[0, 0].invert_yaxis()
+    axes[0, 0].set_ylim(len(systems) - 0.5, -0.5)
     return fig
 
 
@@ -342,7 +352,7 @@ def _int_axis(ax, which: str, lo: float, hi: float, pad: float = 0.0) -> None:
     from matplotlib.ticker import MultipleLocator
     span = max(hi - lo, 1)
     step = next(s for s in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 10 ** 9)
-                if span / s <= 6)
+                if span / s <= 5)
     lo2, hi2 = np.floor(lo / step) * step, np.ceil(hi / step) * step
     if hi2 == lo2 and pad == 0:
         hi2 = lo2 + step              # a count axis needs a range

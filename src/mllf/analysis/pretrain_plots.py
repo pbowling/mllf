@@ -60,28 +60,50 @@ def _parity_panel(ax, df, bias: str, label_outliers: int = 0, dense: bool = True
         return
     kw = bs.sns_kwargs('scatter_dense') if dense and len(x) > 300 else bs.sns_kwargs('scatter')
     kw = {k: v for k, v in kw.items() if k in ('s', 'linewidth', 'alpha', 'edgecolor')}
+    kw.setdefault('s', 14)
     ax.scatter(x, y, color=bs.PALETTE['plum'], zorder=2, **kw)
-    bs.parity(ax, x=x, y=y, band=1.0)
+    # at most 5 tick intervals of 1, 2 or 5 x 10^n, so the labels never crowd
+    from matplotlib.ticker import MaxNLocator
+    lo, hi = float(min(x.min(), y.min())), float(max(x.max(), y.max()))
+    ticks = MaxNLocator(nbins=5, steps=[1, 2, 5, 10]).tick_values(lo, hi)
+    bs.parity(ax, x=x, y=y, band=1.0, step=float(np.diff(ticks).min()))
     ax._bowling_no_zero = True          # y = x is the reference here
     ax.set_xlabel(_axis_label('Actual', bias))
     ax.set_ylabel(_axis_label('Predicted', bias))
     m = metrics(x, y)
-    bs.stat_text(ax, [(f"MUE = {m['mue']:.2f}", bs.INK), (f"R² = {m['r2']:.2f}", bs.INK),
-                      (f"N = {m['n']}", bs.INK)], loc='lower right',
-                 size=bs.mpl.rcParams['font.size'])
+    # statistics in the title, so both corners off the diagonal stay free
+    ax.set_title(f"MUE {m['mue']:.2f}, R² {m['r2']:.2f}, N {m['n']}",
+                 fontsize=bs.mpl.rcParams['font.size'], fontweight='normal')
     if label_outliers:
-        err = np.abs(y - x)
-        order = np.argsort(-err)
-        seen = set()
-        for k in order:
-            name = sub['system'].iloc[k]
-            if name in seen:
-                continue
+        _label_outliers(ax, sub, x, y, label_outliers)
+
+
+def _label_outliers(ax, sub, x, y, n: int) -> None:
+    """Label the ``n`` largest errors (one per system) in the empty corner on
+    their side of y = x: over-predictions upper left, under-predictions lower
+    right, stacked, each with a thin leader line to its point."""
+    err = y - x
+    seen, picks = set(), []
+    for k in np.argsort(-np.abs(err)):
+        name = sub['system'].iloc[k]
+        if name not in seen:
             seen.add(name)
-            ax.annotate(name, xy=(x[k], y[k]), xytext=(4, 4), textcoords='offset points',
-                        fontsize=bs.mpl.rcParams['font.size'] - 2)
-            if len(seen) >= label_outliers:
-                break
+            picks.append(k)
+        if len(picks) >= n:
+            break
+    fs = bs.mpl.rcParams['font.size'] - 1
+    # stacks ordered like their points, so the leader lines do not cross:
+    # top-left stack from the highest point down, bottom-right from the lowest up
+    over = sorted((k for k in picks if err[k] > 0), key=lambda k: -y[k])
+    under = sorted((k for k in picks if err[k] <= 0), key=lambda k: y[k])
+    for group, (x0, y0, step, ha, va) in ((over, (0.04, 0.96, -0.075, 'left', 'top')),
+                                          (under, (0.96, 0.04, 0.075, 'right', 'bottom'))):
+        for i, k in enumerate(group):
+            ax.annotate(sub['system'].iloc[k], xy=(x[k], y[k]), xycoords='data',
+                        xytext=(x0, y0 + i * step), textcoords='axes fraction',
+                        ha=ha, va=va, fontsize=fs,
+                        arrowprops=dict(arrowstyle='-', color=bs.MUTED_LINE, lw=0.6,
+                                        shrinkA=1, shrinkB=2))
 
 
 def parity_all(df):
@@ -104,9 +126,9 @@ def parity_system(df, system: str):
     if sub.empty:
         return None
     plt = _plt()
-    fig, axes = plt.subplots(1, 4, figsize=bs.figsize('double', 0.27))
-    for ax, bias in zip(axes, BIASES):
-        _parity_panel(ax, sub, bias, dense=False)
+    fig, axes = plt.subplots(2, 2, figsize=bs.figsize('onehalf', 0.5, 2))
+    for ax, bias in zip(axes.flat, BIASES):
+        _parity_panel(ax, sub, bias, dense=len(sub) > 400)
     fig.suptitle(system, fontweight='bold')
     bs.label_panels(axes)
     return fig
@@ -114,16 +136,24 @@ def parity_system(df, system: str):
 
 # embeddings
 
-def substituent_table(records: List[Dict]):
-    """One row per substituent (system, family, environment, site, sub,
-    fragment) with its ligand embedding (mean over the runs that hold it)."""
+def substituent_table(records: List[Dict], full: bool = False):
+    """One row per substituent with its embedding (mean over the runs that
+    hold it). By default a substituent of a system (family) is one row
+    whatever its environment, with its 512-D Uni-Mol ligand embedding; with
+    ``full``, one row per system and environment with the full node input the
+    model sees (ligand embedding, phase flags and site size: 515-D)."""
     import pandas as pd
+    if full and any('node_input' not in r for r in records):
+        raise ValueError("the cached predictions predate the full node input; rerun with "
+                         "--rescan")
     rows, embs = {}, {}
     for r in records:
+        group = r['system'] if full else r['family']
+        vecs = r['node_input'] if full else r['ligand']
         for k, node in enumerate(r['nodes']):
-            key = (r['system'], node['site'], node['fragment'] or f"sub{node['sub']}")
-            embs.setdefault(key, []).append(r['ligand'][k])
-            rows.setdefault(key, {'system': r['system'], 'family': r['family'],
+            key = (group, node['site'], node['fragment'] or f"sub{node['sub']}")
+            embs.setdefault(key, []).append(vecs[k])
+            rows.setdefault(key, {'group': group, 'system': r['system'], 'family': r['family'],
                                   'environment': r['environment'], 'site': node['site'],
                                   'sub': node['sub'], 'fragment': node['fragment']})
     keys = list(rows)
@@ -171,17 +201,18 @@ def embedding_pca(subs, X):
     k = np.arange(1, len(var) + 1)
     ax.bar(k, var, color=bs.PALETTE['lavender'], edgecolor=bs.INK)
     ax.set_xlabel('Principal component')
-    ax.set_ylabel('Variance explained (%)')
+    ax.set_ylabel('Variance (%)')
     ax.set_xticks(k[::2] if len(k) > 6 else k)
     bs.label_panels(axes)
     return fig
 
 
 def system_distances(subs, X):
-    """Distance between systems: for each substituent of system A, the
-    distance to the nearest substituent of system B (ligand embeddings, each
-    dimension standardized over all substituents), averaged over A's
-    substituents and symmetrized. Returns (systems, matrix)."""
+    """Distance between the groups of ``substituent_table`` (systems, or
+    systems and environments): for each substituent of group A, the distance
+    to the nearest substituent of group B (each dimension standardized over
+    all substituents), averaged over A's substituents and symmetrized.
+    Returns (groups, matrix)."""
     if len(X) == 0:
         return [], np.zeros((0, 0))
     sd = X.std(axis=0)
@@ -189,8 +220,8 @@ def system_distances(subs, X):
     # all substituent pairs at once: |a - b|^2 = |a|^2 + |b|^2 - 2 a.b
     sq = (Z ** 2).sum(axis=1)
     full = np.sqrt(np.clip(sq[:, None] + sq[None, :] - 2 * Z @ Z.T, 0, None))
-    systems = sorted(subs['system'].unique(), key=lambda s: (_family(subs, s), s))
-    idx = {s: np.where(subs['system'].to_numpy() == s)[0] for s in systems}
+    systems = sorted(subs['group'].unique(), key=lambda s: (_family(subs, s), s))
+    idx = {s: np.where(subs['group'].to_numpy() == s)[0] for s in systems}
     n = len(systems)
     D = np.zeros((n, n))
     for a in range(n):
@@ -201,8 +232,8 @@ def system_distances(subs, X):
     return systems, (D + D.T) / 2
 
 
-def _family(subs, system):
-    return subs.loc[subs['system'] == system, 'family'].iloc[0]
+def _family(subs, group):
+    return subs.loc[subs['group'] == group, 'family'].iloc[0]
 
 
 def similarity_heatmap(systems: List[str], D: np.ndarray):
