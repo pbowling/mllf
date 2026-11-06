@@ -12,9 +12,11 @@ of the pipeline (``python -m mllf`` is the same command):
    collect    collect finished MSLD runs into pretraining records
    pretrain   behavior-clone the policy on collected runs
    replay     prebuild the regression replay set of a workflow config
+   scout      scouting runs before a stage, and their summary
    train      online training from a workflow config
    export     export production biases from a trained policy
    cost       simulated ns per system: online run vs ALF
+   analyze    figures and a report: pretrained model or online run
    archive    archive a run's combo directories, one .tar.gz per system
 
 ``mllf COMMAND -h`` lists a command's options. For example:
@@ -29,6 +31,8 @@ of the pipeline (``python -m mllf`` is the same command):
    mllf train examples/minimal/workflow.yaml
    mllf export online_1.yaml --label checkpoints_online_1
    mllf cost checkpoints_online_1 --pretraining-root pretraining
+   mllf analyze online online_1.yaml
+   mllf analyze pretrain models/14benz
    mllf archive online_1.yaml --remove
 
 Output and verbosity

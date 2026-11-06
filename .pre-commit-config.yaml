@@ -7,20 +7,21 @@ repos:
     rev: 9.0.2
     hooks:
       - id: isort
-        exclude: ^(tests/samples|examples)/
+        # style.py: the author's bowling_style.py, kept byte-identical
+        exclude: ^(tests/samples|examples)/|^src/mllf/analysis/style\.py$
   - repo: https://github.com/pycqa/flake8
     rev: 7.3.0
     hooks:
       - id: flake8
         # files are passed explicitly, which bypasses .flake8's exclude
-        exclude: ^(tests/samples|examples|docs)/|^conf\.py$
+        exclude: ^(tests/samples|examples|docs)/|^conf\.py$|^src/mllf/analysis/style\.py$
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: end-of-file-fixer
-        exclude: ^(tests/samples|examples|docs/api)/
+        exclude: ^(tests/samples|examples|docs/api)/|^src/mllf/analysis/style\.py$
       - id: trailing-whitespace
-        exclude: ^(tests/samples|examples|docs/api)/|^tests/test_pdb_reader\.py$
+        exclude: ^(tests/samples|examples|docs/api)/|^tests/test_pdb_reader\.py$|^src/mllf/analysis/style\.py$
       - id: check-yaml
       - id: check-added-large-files
         args: [--maxkb=2048]

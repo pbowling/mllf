@@ -1457,6 +1457,10 @@ def finish(run: TrainingRun) -> None:
                 'all_stats': run.all_stats,
                 **_baseline_fields(run)}, final_path)
     log.info(f"Saved final model: {final_path}")
+    if run.config.get('analysis'):
+        # before archiving, which may remove the run directories it reads
+        from mllf.analysis.online import analyze_after_training
+        analyze_after_training(run.config, run.checkpoint_dir)
     if run.archive:
         archive_finished(run)
 

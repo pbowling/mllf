@@ -106,6 +106,25 @@ For the ``mllf`` command, see :doc:`cli`.
    mllf.cli.train
    mllf.cli.export
    mllf.cli.cost
+   mllf.cli.analyze
    mllf.cli.archive
    mllf.log
    mllf.slurm
+
+Analysis
+--------
+
+Figures and reports (:doc:`analysis`). The figure style, ``mllf.analysis.style``, is
+the author's ``bowling_style.py``, kept unchanged.
+
+.. autosummary::
+   :toctree: api
+
+   mllf.analysis.online
+   mllf.analysis.online_data
+   mllf.analysis.online_plots
+   mllf.analysis.free_energy
+   mllf.analysis.pretrain
+   mllf.analysis.pretrain_data
+   mllf.analysis.pretrain_plots
+   mllf.analysis.common

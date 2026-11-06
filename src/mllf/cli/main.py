@@ -27,6 +27,7 @@ COMMANDS = {
     'train': ('mllf.cli.train', 'online training from a workflow config'),
     'export': ('mllf.cli.export', 'export production biases from a trained policy'),
     'cost': ('mllf.cli.cost', 'simulated ns per system: online run vs ALF'),
+    'analyze': ('mllf.cli.analyze', 'figures and a report: pretrained model or online run'),
     'archive': ('mllf.cli.archive', "archive a run's combo directories, one .tar.gz per system"),
 }
 

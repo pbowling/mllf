@@ -8,7 +8,7 @@ environment:
 
    conda create -n mllf python=3.10      # or: python -m venv .venv && source .venv/bin/activate
    conda activate mllf
-   pip install -e .
+   pip install -e ".[analysis]"          # the extra adds the figures of mllf analyze
    pip install -r docs/requirements.txt
 
 Simulations need CHARMM with pyCHARMM on the cluster; the workflow loads it through the

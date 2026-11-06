@@ -36,6 +36,11 @@ mllf = "mllf.cli.main:main"
 "Repository" = "https://github.com/pbowling/mllf"
 
 [project.optional-dependencies]
+analysis = [
+    "matplotlib>=3.7",
+    "pandas>=1.5",
+    "pillow",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
@@ -63,6 +68,7 @@ line_length = 99
 known_first_party = ["mllf"]
 src_paths = ["src", "tests"]
 extend_skip = ["examples", "tests/samples"]
+extend_skip_glob = ["src/mllf/analysis/style.py"]   # the author's bowling_style.py, unchanged
 lines_after_imports = 2
 
 # flake8 does not read pyproject.toml; its settings are in .flake8.

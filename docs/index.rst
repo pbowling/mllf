@@ -24,6 +24,7 @@ Where to start
 * Configuring online training: :doc:`workflow`.
 * How the model learns: :doc:`cb_setup`, :doc:`cb_pretraining` and
   :doc:`unimol_representation`.
+* Figures and reports of a model or a run: :doc:`analysis`.
 * Input and output formats: :doc:`file_handling`.
 
 .. toctree::
@@ -37,6 +38,7 @@ Where to start
    cb_setup
    cb_pretraining
    unimol_representation
+   analysis
    file_handling
    references
    api

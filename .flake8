@@ -10,7 +10,9 @@ exclude =
     training,
     pretraining,
     examples,
-    tests/samples
+    tests/samples,
+    # the figure style, kept identical to the author's bowling_style.py
+    src/mllf/analysis/style.py
 per-file-ignores =
     # Fixture strings reproduce PDB records, whose trailing columns are blanks.
     tests/test_pdb_reader.py: W291

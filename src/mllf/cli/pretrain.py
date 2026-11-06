@@ -234,6 +234,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "case-insensitive substring against the --pretraining-dir "
              "basename. Repeat the flag to emphasize multiple systems.",
     )
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="after training, write figures and a report to <output-dir>/analysis "
+             "(mllf analyze pretrain; also the config key analysis: true)",
+    )
 
 
 def _emphasis(entries) -> Dict[str, float]:
@@ -339,6 +345,23 @@ def _run(args: argparse.Namespace, dirs: List[str]) -> None:
         init_checkpoint=args.init_checkpoint,
         resume_checkpoint=args.resume_checkpoint,
     ))
+    if args.analyze or config.get('analysis'):
+        _analyze(args)
+
+
+def _analyze(args: argparse.Namespace) -> None:
+    """``--analyze``: the model's analysis (mllf analyze pretrain); a failure
+    is a warning, the trained model stands."""
+    out = Path(args.output_dir) / 'analysis'
+    try:
+        from mllf.analysis.common import require_plotting
+        from mllf.analysis.pretrain import analyze_pretrain
+        require_plotting()
+        log.info(f"\nAnalysis -> {out}")
+        analyze_pretrain(Path(args.output_dir), out, config_path=args.config, device=args.device)
+    except Exception as e:
+        log.warning(f"  Warning: analysis not completed ({type(e).__name__}: {e}); run "
+                    f"'mllf analyze pretrain {args.output_dir}' to retry")
 
 
 def main(argv=None):
