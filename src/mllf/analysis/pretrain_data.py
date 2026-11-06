@@ -166,6 +166,7 @@ def select_runs(dirs: List[Path], max_runs: Optional[int], reward_config: Dict,
     those with the most good (pair, coefficient) targets, of
     CANDIDATES_PER_DATASET directories read at random (``workers`` threads)."""
     import concurrent.futures
+
     from mllf.pretrain.runs import system_label
     by_dataset: Dict[str, List[Path]] = defaultdict(list)
     for d in dirs:
