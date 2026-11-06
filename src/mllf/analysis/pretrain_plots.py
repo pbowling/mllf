@@ -9,7 +9,11 @@ from mllf.analysis.pretrain_data import BIASES
 
 LABELS = {'linear': 'b', 'quadratic': 'c', 'skew': 'x', 'end': 's'}
 N_OUTLIERS = 4          # labelled per parity panel
-N_FAMILIES_SHOWN = 5    # highlighted in the embedding PCA
+N_FAMILIES_SHOWN = 6    # highlighted in the embedding PCA
+# Their colours: six distinct palette shades first (checked with
+# style.check_colors: min dE >= 22 under every colour-vision deficiency), each
+# also with its own marker, the second cue for grayscale print.
+FAMILY_COLORS = ['plum', 'orange', 'forest', 'plum_mid', 'apricot', 'forest_mid']
 
 
 def _plt():
@@ -179,7 +183,9 @@ def embedding_pca(subs, X):
         return None
     scores, var = pca(X)
     fams = subs['family'].value_counts().index[:N_FAMILIES_SHOWN].tolist()
-    styles = dict(zip(fams, bs.styles(len(fams), 'marker')))
+    palette = {**bs.PALETTE, **bs.EXTENDED}
+    styles = {f: {'c': palette[FAMILY_COLORS[i]], 'marker': bs.MARKERS[i], 'edgecolors': bs.INK}
+              for i, f in enumerate(fams)}
     plt = _plt()
     fig, axes = plt.subplots(1, 3, figsize=bs.figsize('double', 0.36),
                              gridspec_kw={'width_ratios': [1, 1, 0.8]})
@@ -196,11 +202,14 @@ def embedding_pca(subs, X):
         ax.set_xlabel(f'PC{i + 1} ({var[i]:.0f}%)')
         ax.set_ylabel(f'PC{j + 1} ({var[j]:.0f}%)')
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='outside upper center', ncol=min(len(labels), 6))
+    order = [k for k, lab in enumerate(labels) if lab != 'Other families'] + \
+        [k for k, lab in enumerate(labels) if lab == 'Other families']
+    fig.legend([handles[k] for k in order], [labels[k] for k in order],
+               loc='outside upper center', ncol=(len(labels) + 1) // 2)
     ax = axes[2]
     k = np.arange(1, len(var) + 1)
     ax.bar(k, var, color=bs.PALETTE['lavender'], edgecolor=bs.INK)
-    ax.set_xlabel('Principal component')
+    ax.set_xlabel('Component')
     ax.set_ylabel('Variance (%)')
     ax.set_xticks(k[::2] if len(k) > 6 else k)
     bs.label_panels(axes)

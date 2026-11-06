@@ -46,7 +46,7 @@ names the pretraining config when the model directory holds none; its
    The same for each system.
 ``embedding_pca``
    The first principal components of the substituents' Uni-Mol ligand embeddings, the
-   five most common families highlighted, and the variance each component explains.
+   six most common families highlighted, and the variance each component explains.
 ``similarity``
    Distance between systems in Uni-Mol ligand-embedding space, one row per system (a
    substituent counts once across environments): for each substituent of one system, the
