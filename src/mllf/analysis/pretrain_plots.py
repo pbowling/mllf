@@ -187,8 +187,11 @@ def embedding_pca(subs, X):
     styles = {f: {'c': palette[FAMILY_COLORS[i]], 'marker': bs.MARKERS[i], 'edgecolors': bs.INK}
               for i, f in enumerate(fams)}
     plt = _plt()
-    fig, axes = plt.subplots(1, 3, figsize=bs.figsize('double', 0.36),
-                             gridspec_kw={'width_ratios': [1, 1, 0.8]})
+    fig, axes = plt.subplots(1, 4, figsize=bs.figsize('double', 0.36),
+                             gridspec_kw={'width_ratios': [1, 1, 0.75, 0.55]})
+    lax, axes = axes[3], axes[:3]          # the legend's own column, right of the panels
+    lax.axis('off')
+    lax._bowling_no_snap = lax._bowling_no_zero = True
     for ax, (i, j) in zip(axes[:2], ((0, 1), (0, 2))):
         ax._bowling_no_zero = True
         other = ~subs['family'].isin(fams).to_numpy()
@@ -204,8 +207,9 @@ def embedding_pca(subs, X):
     handles, labels = axes[0].get_legend_handles_labels()
     order = [k for k, lab in enumerate(labels) if lab != 'Other families'] + \
         [k for k, lab in enumerate(labels) if lab == 'Other families']
-    fig.legend([handles[k] for k in order], [labels[k] for k in order],
-               loc='outside upper center', ncol=(len(labels) + 1) // 2)
+    # right of the panels, clear of the panel letters
+    lax.legend([handles[k] for k in order], [labels[k] for k in order], loc='center left',
+               fontsize=bs.mpl.rcParams['legend.fontsize'] - 1)
     ax = axes[2]
     k = np.arange(1, len(var) + 1)
     ax.bar(k, var, color=bs.PALETTE['lavender'], edgecolor=bs.INK)
