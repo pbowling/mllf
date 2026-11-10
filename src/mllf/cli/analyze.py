@@ -37,6 +37,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     p.add_argument('--free-energy', nargs='*', default=None, metavar='SYSTEM',
                    help="also draw free-energy profiles of the passed groups' runs (of these "
                         'systems; default all). Reads every run trajectory: minutes per system')
+    p.add_argument('--group-test', choices=('stage', 'balance'), default='stage',
+                   help="how group runs, ours and ALF's, pass: 'stage' as training judged "
+                        'them (the production test where the stage uses it; default), '
+                        "'balance' by the less strict balance test (--balance-test); writes "
+                        'to <run dir>/analysis_balance by default')
+    p.add_argument('--balance-test', nargs=2, type=float, default=(0.5, 10),
+                   metavar=('RATIO', 'TRANSITIONS'),
+                   help='the balance test of --group-test balance: each substituent >= RATIO '
+                        '/ n of its site and >= TRANSITIONS site transitions (default 0.5 10)')
     _common(p)
 
     p = sub.add_parser('pretrain', help='a pretrained model',
@@ -90,7 +99,8 @@ def run(args: argparse.Namespace) -> int:
         with open(args.config) as f:
             config = yaml.safe_load(f)
         run_dir = Path(args.run_dir or (config.get('output') or {}).get('base_dir') or '.')
-        out = Path(args.out or run_dir / 'analysis')
+        out = Path(args.out or run_dir / ('analysis_balance' if args.group_test == 'balance'
+                                          else 'analysis'))
         root = args.pretraining_root or config.get('alf_root')
         if root and str(root).lower() == 'none':
             root = None
@@ -100,7 +110,8 @@ def run(args: argparse.Namespace) -> int:
             analyze_online(config, out, run_dir=run_dir, pretraining_root=root, only=args.only,
                            validation=not args.no_validation, workers=args.workers,
                            rescan=args.rescan, free_energy=args.free_energy, fmt=args.fmt,
-                           grayscale=args.grayscale)
+                           grayscale=args.grayscale, group_test=args.group_test,
+                           balance_test=(args.balance_test[0], int(args.balance_test[1])))
         return 0
     from mllf.analysis.pretrain import FIGURES, analyze_pretrain
     _check_only(args.only, FIGURES, UsageError)

@@ -85,8 +85,14 @@ cached once per pretraining root in ``~/.cache/mllf`` and shared by every analys
 Runs are judged by online training's tests. A pair run succeeds with both substituents
 sampled, a minority fraction of at least 0.2 and at least 10 crossings, or the stage's
 short-run test (``explore_min_transitions`` / ``explore_min_fraction``) for runs under
-0.5 ns. A group run passes the stage's group test (``advance.min_population_ratio`` /
-``min_site_transitions``).
+0.5 ns. A group run passes the stage's group test: the production test where the stage
+sets ``advance.production`` (every substituent at least ``min_end_fraction`` of the frames
+at its endpoint and ``min_visits_per_ns`` entries per ns, in one run), else the balance
+test (``advance.min_population_ratio`` / ``min_site_transitions``). ALF's runs are judged
+by the same test, the production test from each run's ``simulation_results.json``.
+``--group-test balance`` judges every group run, ours and ALF's, by the less strict
+balance test instead (``--balance-test RATIO TRANSITIONS``, default 0.5 and 10), with
+convergence recomputed from those outcomes, and writes to ``<run dir>/analysis_balance``.
 
 ``success_over_epochs``
    Percent of pair runs, group runs and held-out pairs that passed their test per epoch

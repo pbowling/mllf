@@ -21,7 +21,7 @@ figure as CSV.
 """
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 from mllf.analysis.common import Output, table_text
 
@@ -36,10 +36,15 @@ def analyze_online(config: Dict, out_dir, run_dir=None, pretraining_root=None,
                    only: Optional[Sequence[str]] = None, validation: bool = True,
                    workers: int = 8, rescan: bool = False,
                    free_energy: Optional[Sequence[str]] = None, fmt: str = 'png',
-                   grayscale: bool = False) -> Path:
+                   grayscale: bool = False, group_test: str = 'stage',
+                   balance_test: Tuple[float, int] = (0.5, 10)) -> Path:
     """Write the figures, tables and report of an online run; returns the
     report's path. ``free_energy``: None skips the free-energy profiles, an
-    empty list draws them for every system, a list of names for those."""
+    empty list draws them for every system, a list of names for those.
+    ``group_test``: 'stage' judges group runs as training did (the production
+    test where the stage uses it), 'balance' by the balance test at
+    ``balance_test`` (min_population_ratio, min_site_transitions); ALF's runs
+    are judged by the same test."""
     import pandas as pd
 
     from mllf.analysis import online_data as od
@@ -47,11 +52,11 @@ def analyze_online(config: Dict, out_dir, run_dir=None, pretraining_root=None,
     from mllf.analysis import style as bs
     from mllf.analysis.common import load_cache, save_cache
     bs.apply_style()
-    data = od.load_online(config, run_dir)
+    data = od.load_online(config, run_dir, group_test=group_test, balance_test=balance_test)
     out = Output(out_dir, only=_expand(only), fmt=fmt, grayscale=grayscale)
     cache_path = out.dir / 'cache' / 'runs.pkl'
     cache = {} if rescan else load_cache(cache_path)
-    key = (od.SCAN_VERSION, len(data.ledger))
+    key = (od.SCAN_VERSION, len(data.ledger), data.group_test_mode, data.balance_test)
     if cache.get('key') != key or 'runs' not in cache:
         cache = {'key': key, 'runs': od.scan_runs(data, workers)}
         save_cache(cache_path, cache)
@@ -59,7 +64,7 @@ def analyze_online(config: Dict, out_dir, run_dir=None, pretraining_root=None,
     alf = {}
     if pretraining_root:
         alf = od.alf_runs(data, pretraining_root)
-    sys_df, grp_df = od.convergence_tables(data, alf)
+    sys_df, grp_df = od.convergence_tables(data, alf, runs)
 
     out.table('epochs', data.epochs)
     out.table('stages', data.stage_rows)
@@ -101,7 +106,8 @@ def analyze_after_training(config: Dict, run_dir) -> Optional[Path]:
     """The ``analysis:`` config key: analyze the run when training finishes.
     ``analysis: true`` writes to ``<run dir>/analysis`` and compares with ALF
     under the config's ``alf_root``; a mapping may set ``out``,
-    ``pretraining_root`` (or ``none``) and ``validation``. A failure is
+    ``pretraining_root`` (or ``none``), ``validation`` and ``group_test``
+    ('stage' or 'balance', with ``balance_test: [ratio, transitions]``). A failure is
     reported as a warning, never as a training error."""
     opts = config.get('analysis')
     opts = opts if isinstance(opts, dict) else {}
@@ -117,7 +123,9 @@ def analyze_after_training(config: Dict, run_dir) -> Optional[Path]:
         fe = [] if fe is True else (list(fe) if fe else None)
         return analyze_online(config, out, run_dir=run_dir, pretraining_root=root,
                               validation=bool(opts.get('validation', True)), free_energy=fe,
-                              fmt=opts.get('format', 'png'))
+                              fmt=opts.get('format', 'png'),
+                              group_test=opts.get('group_test', 'stage'),
+                              balance_test=tuple(opts.get('balance_test', (0.5, 10))))
     except Exception as e:
         log.warning(f"  Warning: analysis not completed ({type(e).__name__}: {e}); run "
                     f"'mllf analyze online CONFIG --run-dir {run_dir}' to retry")
@@ -140,7 +148,14 @@ def _sum(series) -> float:
 
 def report_text(data, runs, sys_df, grp_df, out: Output, pd) -> str:
     """The plain-text report (module docstring)."""
-    lines = [f"Online training analysis: {data.run_dir}", '']
+    test = data.alf_test()
+    lines = [f"Online training analysis: {data.run_dir}",
+             'Group test: ' + (f"production (every substituent >= {test[1]:g} of frames at its "
+                               f"endpoint and >= {test[2]:g} entries / ns in one run)"
+                               if test[0] == 'production' else
+                               f"balance (each substituent >= {test[1]:g} / n of its site, "
+                               f">= {test[2]} site transitions)")
+             + ', for MLLF and ALF', '']
     ep = data.epochs
     n_epochs = int(ep['epoch'].max()) + 1 if not ep.empty else 0
     ledger = pd.DataFrame(list(data.ledger.values())) if data.ledger else pd.DataFrame()

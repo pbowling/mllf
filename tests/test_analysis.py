@@ -89,6 +89,52 @@ def test_convergence_counts_ns_until_each_side_passes(tmp_path):
     assert grp_df.iloc[0]['alf_dataset'] is None
 
 
+def test_alf_runs_judged_by_the_production_test():
+    from mllf.cb.system_stages import FRAMES_PER_NS
+    frames = FRAMES_PER_NS          # 1 ns
+    res = {'populations': {'2': {'counts': {'0.99': 0.30 * frames}},
+                           '3': {'counts': {'0.99': 0.02 * frames}}},
+           'transition_pairs': {'2_3': 6}}
+    assert od.alf_production(res, [2], 1.0, 0.01, 2.0)        # 3 entries / ns each
+    res['populations']['3']['counts']['0.99'] = 0.005 * frames
+    assert not od.alf_production(res, [2], 1.0, 0.01, 2.0)    # sub 2 under 1% at its endpoint
+    res['populations']['3']['counts']['0.99'] = 0.02 * frames
+    res['transition_pairs']['2_3'] = 2
+    assert not od.alf_production(res, [2], 1.0, 0.01, 2.0)    # 1 entry / ns
+
+
+def test_alf_test_follows_the_group_stage(tmp_path):
+    data = _data(tmp_path, {}, {})
+    data.stages = [{'name': 'g', 'advance': {'type': 'groups_done', 'min_population_ratio': 0.0,
+                                             'min_site_transitions': 0,
+                                             'production': {'min_end_fraction': 0.01,
+                                                            'min_visits_per_ns': 2.0}}}]
+    assert data.alf_test() == ('production', 0.01, 2.0)
+    data.group_test_mode, data.balance_test = 'balance', (0.5, 10)
+    assert data.alf_test() == ('balance', 0.5, 10)
+    assert data.stage_group_test('g')['production'] is None
+
+
+def test_balance_mode_recomputes_mllf_convergence(tmp_path):
+    g = 'group01_site1_subs_1_2_3'
+    ledger = {f'sim/sysA/{g}/run_00{e}': {'system': 'sysA', 'kind': 'train', 'epoch': e,
+                                          'ns': 1.0} for e in range(3)}
+    # training (production test) passed the group at epoch 2; balance passes it at epoch 0
+    state = {'sysA': {'converged': True, 'groups_done': {g: f'sim/sysA/{g}/run_002'},
+                      'history': [{'ended_epoch': 2}]}}
+    runs = pd.DataFrame([{'system': 'sysA', 'combo': g, 'role': 'group', 'test': 'group',
+                          'epoch': e, 'outcome': o}
+                         for e, o in enumerate(['passed', 'short of production test',
+                                                'passed'])])
+    data = _data(tmp_path, ledger, state)
+    sys_df, _ = od.convergence_tables(data, {}, runs)
+    assert sys_df.iloc[0]['mllf_ns'] == pytest.approx(3.0)
+    data.group_test_mode = 'balance'
+    sys_df, grp_df = od.convergence_tables(data, {}, runs)
+    assert sys_df.iloc[0]['mllf_converged'] and sys_df.iloc[0]['mllf_ns'] == pytest.approx(1.0)
+    assert grp_df.iloc[0]['mllf_ns'] == pytest.approx(1.0)
+
+
 def test_names_environments_and_tables(tmp_path):
     assert system_name('luis_bace_solvent_group3') == 'luis_bace_solvent'
     assert system_name('14benz_solv_pair_combos') == '14benz_solvent'
