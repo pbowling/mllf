@@ -25,7 +25,7 @@ from mllf.cb.policy import (
     UNIMOL_DEFAULTS,
     unimol_options,
 )
-from mllf.cb.replay_selection import plan_replay
+from mllf.cb.replay_selection import manifest_resolver, plan_replay
 
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,11 @@ DEFAULTS = {
     'replay_selection': 'random',
     'replay_min_per_system': 3,     # budget floor and fewest graphs per system (coverage)
     'replay_systems_root': None,   # <system>/prep for labelling (coverage)
-    'replay_workers': 8,
+    # threads reading the runs (coverage); the scan waits on the filesystem
+    'replay_workers': 32,
+    # each directory's coverage scan, reused while the directory is unchanged
+    # (shared by every build; null scans every run)
+    'replay_scan_cache': '~/.cache/mllf/replay_scan.pkl',
 }
 
 
@@ -77,23 +81,6 @@ def regression_config(bandit_cfg: Dict) -> Dict:
 
 
 # Replay set (pretraining runs)
-
-def _manifest_resolver(manifest):
-    """Resolve a pretraining path as written (relative to where pretraining
-    was launched) against the working directory and the manifest's
-    ancestors; None if it no longer exists."""
-    bases = [Path.cwd()] + list(Path(manifest).resolve().parents)
-
-    def resolve(d):
-        p = Path(d)
-        if p.is_absolute():
-            return p if p.exists() else None
-        for b in bases:
-            if (b / p).exists():
-                return (b / p).resolve()
-        return None
-    return resolve
-
 
 def _load_consensus(path: Optional[str], prep_dirs: Optional[set] = None,
                     manifest=None) -> Optional[Dict]:
@@ -110,7 +97,7 @@ def _load_consensus(path: Optional[str], prep_dirs: Optional[set] = None,
         return None
     with open(path) as f:
         raw = json.load(f)
-    resolve = _manifest_resolver(manifest) if manifest else (lambda d: Path(d).resolve())
+    resolve = manifest_resolver(manifest) if manifest else (lambda d: Path(d).resolve())
     out = {}
     for prep, sites in raw.items():
         combo = resolve(str(Path(prep).parent))   # not prep itself: it may be a symlink
@@ -131,7 +118,7 @@ def _pretraining_systems(cfg: Dict, manifest) -> Optional[set]:
     environment_consensus.json (``replay_consensus``, models pretrained
     before that file was written)."""
     from mllf.pretrain.features import SYSTEMS_FILE
-    resolve = _manifest_resolver(manifest) if manifest else (lambda d: Path(d).resolve())
+    resolve = manifest_resolver(manifest) if manifest else (lambda d: Path(d).resolve())
     systems = Path(cfg['replay_manifest']).parent / SYSTEMS_FILE if cfg.get('replay_manifest') \
         else None
     if systems is not None and systems.exists():
@@ -153,11 +140,13 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
     # the manifest was filtered out before training, so the model never saw
     # them and their embeddings were never cached.
     used = _pretraining_systems(cfg, manifest)
+    scan_cache = cfg.get('replay_scan_cache')
+    scan_cache = Path(scan_cache).expanduser() if scan_cache else None
     plan, report = plan_replay(manifest, cfg['replay_systems_root'], int(cfg['replay_runs']),
                                int(cfg.get('replay_min_per_system', 3)),
                                include_tagged=not cfg.get('replay_pretraining_only', True),
-                               workers=int(cfg.get('replay_workers', 8)), verbose=verbose,
-                               allowed_dirs=used)
+                               workers=int(cfg.get('replay_workers', 32)), verbose=verbose,
+                               allowed_dirs=used, scan_cache=scan_cache)
     if cfg.get('replay_cache') and report:
         out = Path(cfg['replay_cache']).with_name(Path(cfg['replay_cache']).stem + '_pairs.csv')
         out.parent.mkdir(parents=True, exist_ok=True)

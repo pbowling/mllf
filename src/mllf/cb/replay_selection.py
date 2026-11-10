@@ -5,10 +5,13 @@ replay budget across systems. ``plan_replay`` returns selected runs and a
 per-pair ownership report.
 """
 import concurrent.futures
+import hashlib
 import heapq
 import json
 import logging
 import math
+import os
+import pickle
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -114,6 +117,7 @@ def node_labels(run_dir, index: Optional[FragmentIndex],
                                                                 int(kv[1].get('sub', 0)))):
             order.setdefault(f"site{int(node.get('site', 0))}", []).append(name)
     labels = []
+    combo = Path(run_dir).parent
     for site_name in sorted(order, key=lambda s: int(re.sub(r'\D', '', s) or 0)):
         for name in order[site_name]:
             node = nodes.get(name) or {}
@@ -121,26 +125,30 @@ def node_labels(run_dir, index: Optional[FragmentIndex],
             if index is None:
                 labels.append((site, sub))
                 continue
-            fname = (
-                node['master'] +
-                '_pres.rtf') if node.get('master') else (
+            fname = (node['master'] + '_pres.rtf') if node.get('master') else (
                 node.get('filename') or '')
-            rtf = Path(run_dir).parent / 'prep' / fname
-            if not rtf.exists():
-                rtf = Path(node.get('filepath') or '')
-            if not rtf.is_file():
-                return None
-            key = str(rtf.resolve())
+            # keyed by the node's file as recorded, so the runs of a combo
+            # directory (which share its prep/) check and read each file once
+            key = (str(combo), fname, node.get('filepath') or '', site)
             if _cache is not None and key in _cache:
                 hit = _cache[key]
             else:
-                hit = index.match(rtf, site)
+                hit = _match_fragment(index, combo / 'prep' / fname,
+                                      node.get('filepath') or '', site)
                 if _cache is not None:
                     _cache[key] = hit
             if hit is None:
                 return None
             labels.append(hit)
     return labels or None
+
+
+def _match_fragment(index: FragmentIndex, rtf: Path, filepath: str, site: int):
+    if not rtf.is_file():
+        rtf = Path(filepath)
+        if not filepath or not rtf.is_file():
+            return None
+    return index.match(rtf, site)
 
 
 # Pair quality
@@ -332,26 +340,63 @@ def select_runs(cand: Dict[str, Dict[str, Dict[str, float]]], budgets: Dict[str,
 
 # Plan
 
-def _resolver(manifest):
+def manifest_resolver(manifest):
+    """Resolve a pretraining path as written (relative to where pretraining
+    was launched) against the working directory and the manifest's ancestors;
+    None if it cannot be found.
+
+    The base is looked up once per leading path (``../pretraining``) and
+    each entry is then normalized as text: checking and resolving each of
+    tens of thousands of entries on a network filesystem takes minutes."""
     bases = [Path.cwd()] + list(Path(manifest).resolve().parents)
+    base_of: Dict[tuple, Optional[Path]] = {}
 
     def resolve(d):
         p = Path(d)
         if p.is_absolute():
-            return p if p.exists() else None
-        for b in bases:
-            if (b / p).exists():
-                return (b / p).resolve()
-        return None
+            return Path(os.path.normpath(p))
+        n = next((k for k, part in enumerate(p.parts) if part != '..'), len(p.parts))
+        lead = p.parts[:n + 1]
+        if lead not in base_of:
+            base_of[lead] = next((Path(os.path.abspath(b)) for b in bases
+                                  if (b / Path(*lead)).exists()), None)
+        b = base_of[lead]
+        return None if b is None else Path(os.path.normpath(b / p))
     return resolve
 
 
+SCAN_VERSION = 1    # bump when the scan's scores or labels change
+
+
+def _index_key(index: Optional[FragmentIndex]) -> str:
+    if index is None:
+        return ''
+    return hashlib.sha1(repr(sorted(index.by_sig.items())).encode()).hexdigest()
+
+
 def _scan_dir(args):
-    """Candidate runs of one combo directory: [(run_dir, labels, scores, source)]."""
-    system, combo_dir, index, include_tagged = args
-    out, cache = [], {}
-    for run in sorted(Path(combo_dir).iterdir()):
-        if not run.is_dir() or not (run / 'simulation_results.json').exists():
+    """(candidate runs, pending run names, mtime) of one combo directory.
+    Candidates: [(run_dir, labels, scores, source)]; pending: runs that have
+    not written simulation_results.json yet. A cached scan (``prev``, from a
+    scan at the same directory mtime) is reused unless a pending run has
+    since finished."""
+    system, combo_dir, index, include_tagged, prev = args
+    combo_dir = Path(combo_dir)
+    try:
+        mtime = combo_dir.stat().st_mtime_ns
+        if prev is not None and prev[2] == mtime and not any(
+                (combo_dir / r / 'simulation_results.json').exists() for r in prev[1]):
+            return prev
+        if (combo_dir / 'metadata.json').exists():
+            return [], [], mtime        # a run itself, not a directory of runs
+        runs = sorted(c for c in combo_dir.iterdir() if c.name.startswith('run'))
+    except OSError:
+        return [], [], None
+    out, pending, cache = [], [], {}
+    for run in runs:
+        if not (run / 'simulation_results.json').exists():
+            if run.is_dir():
+                pending.append(run.name)
             continue
         try:
             meta = json.loads((run / 'metadata.json').read_text())
@@ -369,15 +414,39 @@ def _scan_dir(args):
         scores = run_pair_scores(system, run, labels, sim)
         if scores:
             source = (f"online:{tag}" if tag else
-                      'alf' if re.search(r'_group\d+$', Path(combo_dir).name) or
+                      'alf' if re.search(r'_group\d+$', combo_dir.name) or
                       re.match(r'run\d', run.name) else 'manifest')
             out.append((str(run), labels, scores, source))
-    return out
+    return out, pending, mtime
+
+
+def _load_scan_cache(path) -> Dict:
+    try:
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_scan_cache(path, data: Dict):
+    """Written to a temporary file and renamed, so concurrent builds never
+    read a partial cache."""
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        with open(tmp, 'wb') as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning(f"Could not write the replay scan cache {path}: {e}")
 
 
 def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
-                include_tagged: bool = True, workers: int = 8, verbose: bool = True,
-                allowed_dirs: Optional[set] = None) -> Tuple[List[Dict], List[Dict]]:
+                include_tagged: bool = True, workers: int = 32, verbose: bool = True,
+                allowed_dirs: Optional[set] = None,
+                scan_cache=None) -> Tuple[List[Dict], List[Dict]]:
     """(plan, report). plan: one dict per chosen run {'system', 'run_dir',
     'source', 'role' ('cover' or 'second'), 'owned': [(i, j) node pairs that
     keep weight]}; report: one dict per weighted (run, pair) {'system',
@@ -388,9 +457,15 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
     ``systems_root``: directory of the systems' inputs (``<system>/prep``);
     a system without one has its substituents numbered from the distinct
     fragments of its datasets (``FragmentIndex.from_preps``).
-    ``allowed_dirs``: resolved directory paths to consider (e.g. those
-    pretraining built graphs for); None = every manifest directory."""
-    resolve = _resolver(manifest)
+    ``allowed_dirs``: directory paths (as ``manifest_resolver`` gives them)
+    to consider (e.g. those pretraining built graphs for); None = every
+    manifest directory.
+    ``workers``: threads reading the runs; the scan waits on the filesystem,
+    not the CPU, so more threads than cores help.
+    ``scan_cache``: a file keeping each directory's scan, reused while the
+    directory is unchanged (its mtime, and no unfinished run has finished),
+    so a later build reads only new runs; None scans everything."""
+    resolve = manifest_resolver(manifest)
     dirs = json.loads(Path(manifest).read_text())['directories']
     datasets = sorted({dataset_of(d) for d in dirs})
     known = sorted({p.name for p in Path(systems_root).iterdir() if (p / 'prep').is_dir()}
@@ -417,25 +492,40 @@ def plan_replay(manifest, systems_root, total: int, min_per_system: int = 3,
                 log.debug(f"  {sysn}: no {prep}; substituents numbered from its datasets' "
                           f"fragments ({indexes[sysn].n_subs})")
 
+    # a cached scan holds only for the same system, fragment index and options
+    cached = _load_scan_cache(scan_cache) if scan_cache else {}
+    cached = cached.get('dirs', {}) if cached.get('version') == SCAN_VERSION else {}
+    keys = {s: (s, _index_key(indexes[s]), bool(include_tagged)) for s in by_system}
     tasks = []
     for sysn, paths in by_system.items():
         for p in paths:
-            if any(c.is_dir() and c.name.startswith('run')
-                   for c in p.iterdir()) and not (p / 'metadata.json').exists():
-                tasks.append((sysn, p, indexes[sysn], include_tagged))
+            prev = cached.get(str(p))
+            prev = prev[1] if prev is not None and prev[0] == keys[sysn] else None
+            tasks.append((sysn, p, indexes[sysn], include_tagged, prev))
     cand: Dict[str, Dict[str, Dict[str, float]]] = {}
     nodes_of: Dict[str, Dict[str, Tuple[int, int]]] = {}
     source_of: Dict[str, str] = {}
     labels_seen: Dict[str, set] = {}
+    scanned: Dict[str, tuple] = {}
+    reused = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        for (sysn, *_), runs in zip(tasks, ex.map(_scan_dir, tasks)):
+        for (sysn, p, _, _, prev), result in zip(tasks, ex.map(_scan_dir, tasks)):
+            reused += result is prev
+            runs, _, mtime = result
+            if mtime is not None:
+                scanned[str(p)] = (keys[sysn], result)
             for run_dir, labels, scores, source in runs:
                 cand.setdefault(sysn, {})[run_dir] = {p: s[0] for p, s in scores.items()}
                 nodes_of[run_dir] = {p: (s[1], s[2]) for p, s in scores.items()}
                 source_of[run_dir] = source
                 labels_seen.setdefault(sysn, set()).update(labels)
-    n_subs = {s: (indexes[s].n_subs if indexes.get(
-        s) and indexes[s].n_subs else len(labels_seen.get(s, ()))) for s in cand}
+    if verbose and scan_cache:
+        log.info(f"  replay scan: {len(tasks)} directories, {reused} unchanged since the "
+                 f"cached scan ({scan_cache})")
+    if scan_cache and reused < len(scanned):
+        _save_scan_cache(scan_cache, {'version': SCAN_VERSION, 'dirs': {**cached, **scanned}})
+    n_subs = {s: (indexes[s].n_subs if indexes.get(s) and indexes[s].n_subs
+                  else len(labels_seen.get(s, ()))) for s in cand}
     budgets = system_budgets(n_subs, total, min_per_system)
     chosen, extra = select_runs(cand, budgets, total, min_graphs=min_per_system)
     plan, report = [], []

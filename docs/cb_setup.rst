@@ -400,6 +400,11 @@ last layer (``shared_update: posterior``).
   online runs by fragment content against ``replay_systems_root/<system>/prep``, and a
   per-pair report (``<replay_cache>_pairs.csv``) lists each pair's run, source and score.
   ``random`` takes one random run per combination directory instead.
+* Scoring reads every run of the manifest, which is bound by the filesystem rather than
+  the CPU, so ``regression.replay_workers`` (32) threads read the runs. Each directory's
+  scan is kept in ``regression.replay_scan_cache`` (``~/.cache/mllf/replay_scan.pkl``,
+  shared by every build; ``null`` turns it off) and reused while the directory is
+  unchanged, so a later build reads only the runs added since.
 * ``regression.replay_pretraining_only: true`` skips online runs collected into the
   datasets (tagged with ``collection_tag``, :doc:`cb_pretraining`), for a model that was
   not pretrained on them.
