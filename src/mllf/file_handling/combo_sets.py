@@ -159,6 +159,11 @@ def group_combo_info(prefix: str, index: int, group: Dict[int, List[int]], out_d
             'subs_per_site_counts': counts if len(sites) > 1 else None, 'counter': index}
 
 
+def is_group_combo(combo_path) -> bool:
+    """A group combo (``group_combo_info('group', ...)``), not a pair."""
+    return Path(str(combo_path)).name.startswith('group')
+
+
 def reversed_pair(combo_path) -> Optional[str]:
     """The reverse-orientation partner of a one-site pair combo
     (``pair07_site1_subs_1_9`` -> ``pair07r_site1_subs_9_1``, in the same

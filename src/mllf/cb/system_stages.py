@@ -427,6 +427,39 @@ def site_balanced(saved_data: Dict, nsubs_per_site: Sequence[int],
     return True
 
 
+FRAMES_PER_NS = 37500.0     # saved lambda frames per ns (nsavl 10), ours and ALF's
+
+
+def production_balanced(saved_data: Dict, nsubs_per_site: Sequence[int], cfg: Dict) -> bool:
+    """Production test (advance.production): in this one run, every
+    substituent spent >= min_end_fraction of the frames at lambda >= 0.99
+    (read_output.parse_endpoint_nodes) and entered its endpoint >= min_visits_per_ns
+    times per ns (half its transitions with its site partners,
+    transition_pairs). Pairs need not cross each other directly; Potts / DCA
+    post-processing uses the site's whole state. False when the run lacks
+    the per-substituent counts."""
+    from mllf.cb.hindsight import node_transition_counts
+    nd = saved_data.get('endpoint_nodes') or {}
+    frames = nd.get('frames') or 0
+    if frames <= 0 or not saved_data.get('transition_pairs'):
+        return False
+    min_end = float(cfg.get('min_end_fraction', 0.01))
+    min_visits = float(cfg.get('min_visits_per_ns', 2.0))
+    ns = frames / float(cfg.get('frames_per_ns', FRAMES_PER_NS))
+    core = nd.get('core') or {}
+    start = 0
+    for n in nsubs_per_site:
+        nodes = list(range(start, start + n))
+        start += n
+        counts = node_transition_counts(saved_data, nodes)
+        for v in nodes:
+            if core.get(str(v + 2), 0) / frames < min_end:
+                return False
+            if counts is None or counts[v] / 2.0 / ns < min_visits:
+                return False
+    return True
+
+
 def pooled_group_test(history: Sequence[Dict], nsubs_per_site: Sequence[int],
                       min_population_ratio: float, min_site_transitions: int) -> Tuple[bool, Optional[str]]:
     """Group test over a group's recent runs (stage key group_pass_window).

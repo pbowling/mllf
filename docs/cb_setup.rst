@@ -197,7 +197,7 @@ sections that follow explain each setting.
    * - ``group_holdoff``
      - dominant_min 0.7, at_max 0.05, partner_min 0.02, min_partners 2
    * - ``group_correction``
-     - step 0.25, floor 0.5
+     - step_x 0.35, floor_x 0.4, step_s 0.15, floor_s 0.7
    * - ``revisit``
      - enabled, max_visits 12
    * - ``regression.replay_selection`` / ``regression.replay_pretraining_only``
@@ -330,10 +330,15 @@ detected (``mllf.cb.group_correction``).
 * **Site**: no substituent at a site of three or more reaches λ = 0.99 and the site barely
   transitions, while another site in the same run samples normally.
 
-A flagged run lowers those pairs' x and s for that group by ``step`` of their first value
-per run, scaled by each partner's λ share for an endpoint, down to ``floor``. A corrected
-site that then traps endpoints (some substituents unsampled, few transitions) is stepped
-back by half. The corrections are stored per group in ``bandit_state.json``, the group's
+A flagged run lowers those pairs' x and s for that group, each by its own fraction of
+its first value per run (``step_x`` / ``step_s``), scaled by each partner's λ share for an
+endpoint, down to ``floor_x`` / ``floor_s``. x is stepped harder than s: where groups
+were flagged, the x summed on one substituent was about twice what a working ALF run of
+the group used, and the summed s only slightly more. If a substituent whose partners'
+terms were shrunk is then trapped at its own endpoint (it dominates the site at λ ≥ 0.99
+in at least ``guard_at_min`` of those frames while a partner goes unsampled), half of the
+last step of the pairs acting on it is undone; a site trapped for other reasons is left
+alone. The corrections are stored per group in ``bandit_state.json``, the group's
 later runs and its export use them, the model trains on the corrected values for those
 edges, and c and b are left unchanged. A run that stepped does not count toward
 ``group_max_failures`` (:doc:`workflow`).

@@ -37,6 +37,7 @@ from mllf.cb.hindsight import (
     OFFSET_DIMS,
     QUADRATIC_STEP_MAX,
     apply_pair_offsets,
+    depth_config,
     barrier_trapped_c_targets,
     cap_quadratic,
     lambda_states,
@@ -88,6 +89,7 @@ from mllf.cb.workflow_utils import (
 from mllf.cb.cost_ledger import simulated_ns
 from mllf.cli.slurm import submit_epoch_simulation
 from mllf.cli.workflow import write_variables_from_actions
+from mllf.file_handling.combo_sets import is_group_combo
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
 
 
@@ -517,6 +519,13 @@ def train_epoch(
                     and bool(_bandit_cfg.get('pair_offsets', True)))
     _hs_dims = [d for d in _bandit_cfg.get('hindsight_dims', list(BIAS_DIMS)) if d in OFFSET_DIMS]
     _offset_sampling = _use_offsets and bool(_bandit_cfg.get('offset_sampling', False))
+    # bandit.group_offset_dims: the pair offsets a group run uses (default:
+    # all of hindsight_dims). x / s offsets are tuned to a pair alone and
+    # stack over a substituent's partners in a group; [] starts every group
+    # run from the model's prediction (plus the group correction).
+    _group_dims_cfg = _bandit_cfg.get('group_offset_dims')
+    _group_dims = (_hs_dims if _group_dims_cfg is None
+                   else [d for d in _hs_dims if d in set(_group_dims_cfg)])
     # bandit.group_correction (mllf.cb.group_correction): a group run whose
     # end terms hold an endpoint (or a whole site) off shrinks those pairs'
     # x / s for that group; its later runs use the corrected values.
@@ -538,19 +547,21 @@ def train_epoch(
                 data.x, data.edge_index, data.edge_type, deterministic=True)
         labels = combo_node_labels(combo_path)
         sys_name = sys_cfg.get('name', 'unknown')
+        dims = _group_dims if is_group_combo(combo_path) else _hs_dims
         shifted, _n = apply_pair_offsets(
             actions, mean.detach(), bandit_state, sys_name,
             labels, data.edge_index,
             prior_sd=_bandit_cfg.get('offset_prior_sd'),
             sample=_offset_sampling and not deterministic_actions,
             base_sd=_bandit_cfg.get('offset_base_sd'),
-            dims=_hs_dims)
+            dims=dims)
         shifted, _ = cap_quadratic(shifted, mean.detach(), _bandit_cfg.get('c_cap'))
         if _gc_cfg is not None:
             shifted, _ = apply_group_values(shifted, bandit_state, sys_name, Path(combo_path).name,
                                             labels, data.edge_index)
-        lin_var = (linear_edge_variance(bandit_state, sys_name, labels, data.edge_index,
-                                        prior_sd=_bandit_cfg.get('offset_prior_sd'))
+        # without b offsets the b fit weights every edge by the prior (model alone)
+        lin_var = (linear_edge_variance(bandit_state if 'linear' in dims else None, sys_name, labels,
+                                        data.edge_index, prior_sd=_bandit_cfg.get('offset_prior_sd'))
                    if 'linear' in _hs_dims else None)
         return shifted, lin_var
     _templates: Dict[str, Optional[Dict[str, float]]] = {}
@@ -937,6 +948,7 @@ def train_epoch(
             'transition_pairs': raw_metrics.get('transition_pairs', {}),
             'endpoint_pairs': raw_metrics.get('endpoint_pairs', {}),
             'site_holdoff': raw_metrics.get('site_holdoff', []),
+            'endpoint_nodes': raw_metrics.get('endpoint_nodes'),
             'run_id': run_id,
         }, jepoch_dir / 'epoch_results.pt')
 
@@ -1044,6 +1056,7 @@ def train_epoch(
                     'transition_pairs': _rec_metrics.get('transition_pairs', {}),
                     'endpoint_pairs': _rec_metrics.get('endpoint_pairs', {}),
                     'site_holdoff': _rec_metrics.get('site_holdoff', []),
+                    'endpoint_nodes': _rec_metrics.get('endpoint_nodes'),
                     'run_id': run_id,
                 }, epoch_results_file)
                 if verbose:
@@ -1295,6 +1308,8 @@ def train_epoch(
             skew_step_cap=float(bandit_cfg.get('hindsight_skew_step_cap', 3.0)),
             end_step_cap=float(bandit_cfg.get('hindsight_end_step_cap', 1.5)),
             end_reference=float(bandit_cfg.get('end_reference_s', 1.5)),
+            # bandit.endpoint_depth: s targets each substituent's endpoint depth
+            endpoint_depth_cfg=depth_config(bandit_cfg.get('endpoint_depth')),
         )
         # Shared-model update strength: one number, or per head
         # ({linear: .., quadratic: .., skew: .., end: ..}, missing heads 1.0).
@@ -1400,10 +1415,14 @@ def train_epoch(
                     # Other heads keep the AWR target above.
                     _applied = read_applied_biases(epoch_dir_u)
                     if _applied is not None:
+                        _caps_u = _hs_caps
+                        _dcfg = _hs_caps['endpoint_depth_cfg']
+                        if _dcfg and _dcfg['groups_only'] and not is_group_combo(combo_path_u):
+                            _caps_u = {**_hs_caps, 'endpoint_depth_cfg': None}
                         hs_t, hs_v, hs_dir = hindsight_targets(
                             vdata_u.edge_index, _applied, saved_data,
                             barrier_target=_hs_barrier_target,
-                            temperature=_hs_temperature, return_directional=True, **_hs_caps,
+                            temperature=_hs_temperature, return_directional=True, **_caps_u,
                         )
                         _labels = combo_node_labels(combo_path_u) if _use_offsets else None
                         _sys_name = combo_system_map.get(str(combo_path_u), {}).get('name', 'unknown')

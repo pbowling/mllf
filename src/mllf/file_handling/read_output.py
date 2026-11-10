@@ -383,6 +383,35 @@ def parse_lambda_trajectory(text: str) -> Tuple[Optional[int], List[List[float]]
     return first_block, frames
 
 
+def parse_endpoint_nodes(text: str) -> Optional[Dict]:
+    """Each block's own endpoint occupancy, from the lambda trajectory.
+
+    Returns {'frames': N, 'core': {block: frames with lambda >= 0.99},
+    'shoulder': {block: frames with 0.95 <= lambda < 0.99}} (block IDs as
+    strings), or None without a trajectory. The two counts match CHARMM's
+    SINGLE POPULATION at 0.99 and 0.95 - 0.99; their ratio gives the depth of
+    the block's endpoint well (hindsight.endpoint_depth), and core / N its
+    share of the trajectory (system_stages.production_balanced).
+    """
+    first_block, frames = parse_lambda_trajectory(text)
+    if not frames:
+        return None
+    first_block = first_block or 2
+    n_cols = min(len(f) for f in frames)
+    core = [0] * n_cols
+    shoulder = [0] * n_cols
+    for f in frames:
+        for k in range(n_cols):
+            v = f[k]
+            if v >= 0.99:
+                core[k] += 1
+            elif v >= 0.95:
+                shoulder[k] += 1
+    return {'frames': len(frames),
+            'core': {str(first_block + k): core[k] for k in range(n_cols)},
+            'shoulder': {str(first_block + k): shoulder[k] for k in range(n_cols)}}
+
+
 # Pair lambda-profile estimator settings (see parse_pair_profile).
 BARRIER_MID_WINDOW = (0.45, 0.55)   # pair coordinate r treated as "midpoint"
 BARRIER_END_WIDTH = 0.10            # r < 0.10 / r >= 0.90 treated as the two endpoints (barrier)

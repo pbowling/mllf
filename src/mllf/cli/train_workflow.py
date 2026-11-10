@@ -872,11 +872,14 @@ def run_training(config_path: str) -> None:
     for epoch in range(start_epoch, num_epochs):
         _active_systems: List[str] = []
         if per_system:
-            # A stage with no combos for a system (filters leave none) is skipped.
+            # A stage with no combos for a system (filters leave none, and no
+            # groups in its group_set) is skipped. A groups-only stage has an
+            # empty pair pool but its groups.
             _val_set_ps = set(validation_combos)
             for _sn in sorted(stage_state):
                 _st = stage_state[_sn]
-                while not _st['done'] and not [c for c in _system_stage_pool(_sn) if c not in _val_set_ps]:
+                while not _st['done'] and not ([c for c in _system_stage_pool(_sn) if c not in _val_set_ps]
+                                               or _system_group_pool(_sn)):
                     _skipped = stages[_st['stage']]['name']
                     _nxt = system_stages.advance(_st, stages, _sn, epoch, 'no_combos')
                     print(f"  [STAGE] {_sn}: no combos for stage {_skipped}; skipped")
@@ -1358,7 +1361,9 @@ def run_training(config_path: str) -> None:
             if not st or st['done'] or st['stage'] is None:
                 return None
             if combo_name in {Path(g).name for g in _system_group_pool(sys_name)}:
-                return None                      # group runs are full length
+                # group runs are full length unless the stage sets group_run_steps
+                grs = stages[st['stage']].get('group_run_steps')
+                return (int(grs['equil']), int(grs['prod'])) if grs else None
             rs = stages[st['stage']].get('run_steps')
             if not rs:
                 return None
@@ -1492,7 +1497,8 @@ def run_training(config_path: str) -> None:
                            if _adv.get('type') == 'groups_done' else None)
                 if _gc_rec:
                     _what = ', '.join(f"{f['kind']} s{f['site']}" + (f" ({f['dom']})" if f.get('dom') else '')
-                                      + f" ratio {_gc_rec['ratio'].get(str(f['site']), 1.0):.2f}"
+                                      + f" ratio x {_gc_rec['ratio'].get(str(f['site']), 1.0):.2f}"
+                                      + f" s {(_gc_rec.get('ratio_s') or _gc_rec['ratio']).get(str(f['site']), 1.0):.2f}"
                                       for f in _gc_rec.get('flagged') or [])
                     _what += ''.join(f", s{s} overshot: stepped back" for s in _gc_rec.get('guarded') or [])
                     _fline = (f"  [GROUPFIX] {_sys}/{_cdir.name}: {_what.lstrip(', ')}"
@@ -1502,7 +1508,11 @@ def run_training(config_path: str) -> None:
                     _log_groupfix.append(f"{_sys}/{_cdir.name.split('_site')[0]} ({_what.lstrip(', ')})")
                 _export_rd = str(_rd)
                 _window = int(stages[_st['stage']].get('group_pass_window', 1))
-                if _adv.get('type') == 'groups_done' and _window > 1:
+                if _adv.get('type') == 'groups_done' and _adv.get('production'):
+                    # advance.production: one run must give every substituent
+                    # enough endpoint time and visits (no pooling over runs)
+                    _passes = system_stages.production_balanced(_sd, _nsubs, _adv['production'])
+                elif _adv.get('type') == 'groups_done' and _window > 1:
                     # group_pass_window: pool the group's last runs -- every
                     # substituent sampled in at least one of them passes (with
                     # the default thresholds); export the run that sampled most.
@@ -1871,7 +1881,10 @@ def run_training(config_path: str) -> None:
         'policy_state_dict': policy.state_dict(),
         'rl_optimizer_state_dict': rl_optimizer.state_dict(),
         'all_stats': all_stats,
-        **_baseline_ckpt_fields,
+        # (built here too: a run that stops before its first epoch never set it)
+        **({'baseline_state_dict': baseline_net.state_dict(),
+            'baseline_optimizer_state_dict': baseline_optimizer.state_dict()}
+           if baseline_net is not None else {}),
     }, final_path)
     print(f"Saved final model: {final_path}")
 

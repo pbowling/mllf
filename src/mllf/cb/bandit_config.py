@@ -23,7 +23,7 @@ HINDSIGHT_DEFAULTS = {
     'hindsight_weight_scale': {'linear': 0.1, 'quadratic': 0.01, 'skew': 0.1, 'end': 0.1},
     'c_cap': {'floor': 15.0, 'fraction': 0.5},
     'group_holdoff': {'dominant_min': 0.7, 'at_max': 0.05, 'partner_min': 0.02, 'min_partners': 2},
-    'group_correction': {'step': 0.25, 'floor': 0.5},
+    'group_correction': {'step_x': 0.35, 'floor_x': 0.4, 'step_s': 0.15, 'floor_s': 0.7},
     'revisit': {'enabled': True, 'max_visits': 12},
     'regression': {'replay_selection': 'coverage', 'replay_pretraining_only': False},
 }

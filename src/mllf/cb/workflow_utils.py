@@ -196,6 +196,8 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
                        ``parse_pair_profile``
           'site_holdoff': per site, where lambda sits around the dominant
                        substituent (see ``parse_site_holdoff``)
+          'endpoint_nodes': frames and each block's frames at / just short of
+                       its own endpoint (see ``parse_endpoint_nodes``), or None
     """
     from mllf.file_handling.read_output import (
         parse_single_population,
@@ -204,12 +206,13 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
         parse_fraction_physical_ligand,
         parse_pair_profile,
         parse_site_holdoff,
+        parse_endpoint_nodes,
     )
 
     raw_metrics = {'populations': [], 'population_sites': [], 'transitions': [], 'ddg_pairs': {},
                    'fraction_physical': None,
                    'barrier_pairs': {}, 'skew_pairs': {}, 'end_pairs': {}, 'transition_pairs': {},
-                   'endpoint_pairs': {}, 'site_holdoff': []}
+                   'endpoint_pairs': {}, 'site_holdoff': [], 'endpoint_nodes': None}
 
     try:
         with open(output_file, 'r') as f:
@@ -231,6 +234,10 @@ def parse_simulation_metrics(output_file: Path) -> Dict[str, List]:
             pass
         try:
             raw_metrics['site_holdoff'] = parse_site_holdoff(output_text, pairs=list(ddg_data.keys()))
+        except Exception:
+            pass
+        try:
+            raw_metrics['endpoint_nodes'] = parse_endpoint_nodes(output_text)
         except Exception:
             pass
         

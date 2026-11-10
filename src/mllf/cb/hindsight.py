@@ -118,6 +118,73 @@ HELD_OFF_RATIO = 0.05
 END_REFERENCE_S = 1.5
 END_REFERENCE_FRACTION = 0.5
 
+# Endpoint depth (bandit.endpoint_depth, off by default): each substituent's
+# own endpoint well, K = kT ln[(N_core / 0.01) / (N_shoulder / 0.04)] from its
+# frames at lambda >= 0.99 and in [0.95, 0.99) (read_output.parse_endpoint_nodes).
+# Targets by site size are where ALF's production-good runs peak (every
+# substituent >= 1% of frames at its endpoint, >= 2 entries per ns;
+# training/analysis/production_targets): 1.16 / 0.98 / 0.78 / 0.65 / 0.74 for
+# 2 / 3 / 4 / 5 / 6+ substituents; too deep also fails. Slopes: change of K per
+# unit of the s summed over the substituent's partners (s[j][v], j on its
+# site), within substituent across ALF runs.
+DEPTH_TARGETS = {2: 1.2, 3: 1.0, 4: 0.75}          # sizes above the largest key use its value
+DEPTH_SLOPES = {2: 0.48, 3: 0.22, 4: 0.11, 5: 0.07, 6: 0.06}
+DEPTH_SD = 0.25
+DEPTH_MIN_FRAMES = 5          # core and shoulder each need this many frames to measure K
+DEPTH_HELD_OFF_FRAMES = 20    # no core but this many shoulder frames: held off, step s down
+
+
+def _by_size(table: Dict, n: int) -> float:
+    keys = sorted(int(k) for k in table)
+    k = max([x for x in keys if x <= n] or [keys[0]])
+    return float(table[k] if k in table else table[str(k)])
+
+
+def depth_config(cfg) -> Optional[Dict]:
+    """bandit.endpoint_depth: false / None (off), true (defaults) or
+    {targets: {size: K}, slopes: {size: dK/dS}, sd: .., groups_only: ..}.
+    groups_only: the trainer applies it to group runs only; pair runs keep
+    the asymmetry / held-off s targets (pairs tuned to depth carry deep s
+    into groups, where it stacks over partners)."""
+    if not cfg:
+        return None
+    cfg = cfg if isinstance(cfg, dict) else {}
+    return {'targets': {int(k): float(v) for k, v in (cfg.get('targets') or DEPTH_TARGETS).items()},
+            'slopes': {int(k): float(v) for k, v in (cfg.get('slopes') or DEPTH_SLOPES).items()},
+            'sd': float(cfg.get('sd', DEPTH_SD)),
+            'groups_only': bool(cfg.get('groups_only', False))}
+
+
+def endpoint_depth(nodes_data: Optional[Dict], block: int, kT: float) -> Tuple[Optional[float], bool]:
+    """(K, held_off) for one block's own endpoint: K None when unmeasured;
+    held_off when it has no core frames but DEPTH_HELD_OFF_FRAMES at its shoulder."""
+    if not nodes_data:
+        return None, False
+    core = (nodes_data.get('core') or {}).get(str(block), 0)
+    sh = (nodes_data.get('shoulder') or {}).get(str(block), 0)
+    if core >= DEPTH_MIN_FRAMES and sh >= DEPTH_MIN_FRAMES:
+        return kT * math.log((core / 0.01) / (sh / 0.04)), False
+    return None, core < DEPTH_MIN_FRAMES and sh >= DEPTH_HELD_OFF_FRAMES
+
+
+def depth_end_hindsight(s: float, depth: Optional[float], held_off: bool, n_site: int,
+                        cfg: Dict, step_cap: float = END_STEP_CAP) -> Tuple[float, float]:
+    """Target and variance for s[i][j] from the depth of j's endpoint.
+
+    The s summed over j's partners moves K_j by -slope per unit; the change
+    that brings K_j to its target is split equally over the n - 1 partners.
+    A held-off endpoint gives a capped step down (a direction)."""
+    n_part = max(n_site - 1, 1)
+    slope = _by_size(cfg['slopes'], n_site)
+    if held_off:
+        return s - step_cap, (step_cap / 2.0) ** 2
+    if not _finite(depth):
+        return s, math.inf
+    delta = (depth - _by_size(cfg['targets'], n_site)) / slope / n_part
+    step, var = _capped(delta, step_cap, (cfg['sd'] / slope / n_part) ** 2)
+    return s + step, var
+
+
 # Pair success, for exploration (minority fraction, pair transitions).
 SUCCESS_MIN_FRACTION = 0.2
 SUCCESS_MIN_TRANSITIONS = 10
@@ -377,6 +444,7 @@ def hindsight_targets(edge_index: torch.Tensor, applied: Dict[str, List], saved_
                       skew_step_cap: float = SKEW_STEP_CAP,
                       end_step_cap: float = END_STEP_CAP,
                       end_reference: float = END_REFERENCE_S,
+                      endpoint_depth_cfg: Optional[Dict] = None,
                       return_directional: bool = False):
     """Per-edge hindsight targets for all four heads.
 
@@ -394,7 +462,11 @@ def hindsight_targets(edge_index: torch.Tensor, applied: Dict[str, List], saved_
         difference b[j] - b[i], c, x[i][j] and s[i][j]. ``var`` is inf where
         the run says nothing about that coefficient. Use
         ``held_off_counts`` to see which s targets came from a held-off
-        endpoint. With ``return_directional``, also a [E, 4] bool mask of
+        endpoint. ``endpoint_depth_cfg`` (``depth_config``): s[i][j] instead
+        targets the depth of j's own endpoint (``depth_end_hindsight``) where
+        the run measures it, unless a held-off pair endpoint already set it;
+        the end asymmetry remains the fallback.
+        With ``return_directional``, also a [E, 4] bool mask of
         targets that are a direction rather than a measured value (b toward a
         substituent never sampled, s at a held-off endpoint); see
         ``record_pair_targets``.
@@ -413,6 +485,7 @@ def hindsight_targets(edge_index: torch.Tensor, applied: Dict[str, List], saved_
     skews = saved_data.get('skew_pairs') or {}
     ends = saved_data.get('end_pairs') or {}
     endpoints = saved_data.get('endpoint_pairs') or {}
+    nodes_data = saved_data.get('endpoint_nodes')
     sites = site_nodes(edge_index)
     node_trans: Dict[Tuple[int, ...], Optional[Dict[int, int]]] = {}
 
@@ -465,6 +538,14 @@ def hindsight_targets(edge_index: torch.Tensor, applied: Dict[str, List], saved_
                 bw = held_off_end_hindsight(s_hl, end_reference)
             targets[k, 3], var[k, 3] = fw if forward else bw
             directional[k, 3] = math.isfinite(var[k, 3]) and held['hi' if forward else 'lo']
+            if endpoint_depth_cfg is not None and not held['hi' if forward else 'lo']:
+                # s[i][j] (this edge's entry) shapes j's endpoint.
+                K, j_held = endpoint_depth(nodes_data, j + block_offset, kT)
+                if K is not None or j_held:
+                    targets[k, 3], var[k, 3] = depth_end_hindsight(
+                        _m(smat, i, j), K, j_held, len(sites.get(j, (i, j))), endpoint_depth_cfg,
+                        step_cap=end_step_cap)
+                    directional[k, 3] = j_held
     if return_directional:
         return targets, var, directional
     return targets, var
