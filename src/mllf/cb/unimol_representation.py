@@ -37,8 +37,13 @@ def _import_unimol_repr():
     logs = Path.cwd() / 'logs'
     existed = logs.exists()
     from unimol_tools import UniMolRepr
-    if not existed and logs.is_dir() and not any(logs.iterdir()):
-        logs.rmdir()
+    # jobs started together in one directory race for it: another may have
+    # removed it already, or written into it
+    try:
+        if not existed and logs.is_dir() and not any(logs.iterdir()):
+            logs.rmdir()
+    except OSError:
+        pass
     if not sys.stderr.isatty():
         # One progress bar per embedding call only clutters a job's output
         # file. TQDM_DISABLE does not help once another package has imported
