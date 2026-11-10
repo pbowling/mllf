@@ -9,6 +9,8 @@ Figures (``<out>/figures``):
 * ``parity_all``: predicted vs actual for every family, one panel per
   coefficient; the largest errors are labelled with their system
 * ``parity_systems/<system>``: the same per system
+* ``embedding_pca_families``: PC1 vs PC2 once per family, that family
+  highlighted over all others, so every system can be found
 * ``embedding_pca``: principal components of the substituents' Uni-Mol
   ligand embeddings
 * ``similarity``: distance between systems in Uni-Mol ligand-embedding space
@@ -36,7 +38,8 @@ from mllf.analysis.common import Output, table_text
 
 log = logging.getLogger(__name__)
 
-FIGURES = ('parity_all', 'parity_systems', 'embedding_pca', 'similarity', 'dataset_stats')
+FIGURES = ('parity_all', 'parity_systems', 'embedding_pca', 'embedding_pca_families',
+           'similarity', 'dataset_stats')
 # the figures drawn by default (dataset_stats needs dataset_stats=True)
 DEFAULT_FIGURES = FIGURES[:-1]
 
@@ -101,6 +104,7 @@ def analyze_pretrain(model_dir: Path, out_dir, model: Optional[str] = None,
         for s in sorted(scored['system'].unique()):
             out.figure(f'parity_systems/{s}', lambda s=s: pp.parity_system(scored, s))
     out.figure('embedding_pca', lambda: pp.embedding_pca(subs, X))
+    out.figure('embedding_pca_families', lambda: pp.embedding_pca_families(subs, X))
     out.figure('similarity', lambda: pp.similarity_heatmap(systems, D))
     if full_groups:
         if out.only is not None:

@@ -223,6 +223,38 @@ def embedding_pca(subs, X):
     return fig
 
 
+def embedding_pca_families(subs, X, ncols: int = 5):
+    """PC1 vs PC2 once per family: that family's substituents in plum over
+    every other substituent in gray, so each system of the pretraining set can
+    be found (``embedding_pca`` colours only the most common families).
+    Families in name order; every panel on the same axes."""
+    if len(X) < 4:
+        return None
+    scores, var = pca(X, 2)
+    fams = sorted(subs['family'].unique())
+    nrows = int(np.ceil(len(fams) / ncols))
+    plt = _plt()
+    cell = bs.WIDTHS['double'] / ncols
+    fig, axes = plt.subplots(nrows, ncols, sharex=True, sharey=True, squeeze=False,
+                             figsize=(bs.WIDTHS['double'], cell * nrows + 0.5))
+    fam = subs['family'].to_numpy()
+    for ax, f in zip(axes.flat, fams):
+        m = fam == f
+        ax.scatter(scores[~m, 0], scores[~m, 1], s=4, c=bs.MUTED, linewidths=0, zorder=1)
+        ax.scatter(scores[m, 0], scores[m, 1], s=9, c=bs.PALETTE['plum'], edgecolors=bs.INK,
+                   linewidths=0.3, zorder=2)
+        ax.set_title(f'{f} ({int(m.sum())})', fontsize=bs.mpl.rcParams['font.size'] - 1, pad=2)
+        ax.set_box_aspect(1)
+        ax._bowling_no_zero = True
+        ax.tick_params(labelsize=bs.mpl.rcParams['font.size'] - 2)
+    for ax in list(axes.flat)[len(fams):]:
+        ax.set_visible(False)
+    shown = [a for a in axes.flat if a.get_visible()]
+    bs.shared_label(fig, shown, f'PC1 ({var[0]:.0f}%)', axis='x')
+    bs.shared_label(fig, shown, f'PC2 ({var[1]:.0f}%)', axis='y')
+    return fig
+
+
 def system_distances(subs, X):
     """Distance between the groups of ``substituent_table`` (systems, or
     systems and environments): for each substituent of group A, the distance
