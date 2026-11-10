@@ -17,7 +17,11 @@ run passes when every site holds each substituent at >= ``min_population_ratio``
 stage's ``advance``, default 0.5 and 10). With the stage's
 ``group_pass_window`` above 1, training pools a group's latest runs: a run
 that fails alone but passes together with the group's previous runs is
-"passed with previous run".
+"passed with previous run". A stage with ``advance.production`` instead
+judges each group run alone by the production test
+(``system_stages.production_balanced``: every substituent's time at its
+endpoint and its visits per ns); a run that meets the balance test but not
+the production test is "short of production test".
 """
 import concurrent.futures
 import json
@@ -33,10 +37,11 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 PAIR_OUTCOMES = ['success', 'unbalanced', 'few crossings', 'one-sided', 'neither sampled']
-GROUP_OUTCOMES = ['passed', 'passed with previous run', 'uneven', 'few transitions',
+GROUP_OUTCOMES = ['passed', 'passed with previous run', 'short of production test', 'uneven',
+                  'few transitions',
                   'unsampled substituent']
 SHORT_RUN_NS = 0.5
-SCAN_VERSION = 3          # bump when scan_runs' rows change (rebuilds caches)
+SCAN_VERSION = 4          # bump when scan_runs' rows change (rebuilds caches)
 FULL_TEST = (10, 0.2)
 
 
@@ -74,6 +79,23 @@ class OnlineData:
     def pass_window(self) -> int:
         """The stages' group_pass_window (the most runs pooled by the group test)."""
         return max([int(s.get('group_pass_window', 1)) for s in self.stages] or [1])
+
+    def stage_group_test(self, stage_name: Optional[str]) -> Dict:
+        """The group test of one stage, as training applies it: the balance
+        test (min_population_ratio / min_site_transitions), pooled over
+        group_pass_window runs, or the production test (advance.production,
+        one run, no pooling)."""
+        st = next((s for s in self.stages if s.get('name') == stage_name), None)
+        if st is None:
+            ratio, trans = self.group_test()
+            return {'ratio': ratio, 'trans': trans, 'production': None,
+                    'window': self.pass_window()}
+        adv = st.get('advance') or {}
+        prod = adv.get('production') if adv.get('type') == 'groups_done' else None
+        return {'ratio': float(adv.get('min_population_ratio', 0.5)),
+                'trans': int(adv.get('min_site_transitions', 10)),
+                'production': prod or None,
+                'window': 1 if prod else int(st.get('group_pass_window', 1))}
 
     def short_test(self) -> Tuple[int, float]:
         st = next((s for s in self.stages if s.get('run_steps')), {})
@@ -286,7 +308,7 @@ def _read_run(run_dir: Path) -> Optional[Dict]:
 
 
 def _run_record(task) -> Optional[Dict]:
-    run_dir, rec, role, short_test, group_test = task
+    run_dir, rec, role, short_test, gtest = task
     saved = _read_run(run_dir)
     if saved is None:
         return None
@@ -300,8 +322,16 @@ def _run_record(task) -> Optional[Dict]:
            'epoch': int(rec.get('epoch', 0)), 'stage': rec.get('stage'), 'kind': rec.get('kind'),
            'role': role, 'length': length, 'ns': ns}
     if role == 'group' or (nsubs and (len(nsubs) > 1 or nsubs[0] > 2)):
-        out['outcome'] = classify_group(pops, trans, nsubs, *group_test)
+        out['outcome'] = classify_group(pops, trans, nsubs, gtest['ratio'], gtest['trans'])
+        if gtest['production']:
+            from mllf.cb.system_stages import production_balanced
+            if production_balanced(saved, nsubs, gtest['production']):
+                out['outcome'] = 'passed'
+            elif out['outcome'] == 'passed':
+                out['outcome'] = 'short of production test'
         out['test'] = 'group'
+        out['_window'] = gtest['window']
+        out['_ratio_trans'] = (gtest['ratio'], gtest['trans'])
         out['_counts'] = (pops, trans, nsubs)
     else:
         p0 = pops[0] if pops else 0.0
@@ -321,7 +351,7 @@ def scan_runs(data: OnlineData, workers: int = 8):
     import pandas as pd
 
     from mllf.cb.system_stages import combo_pair_keys
-    short, group = data.short_test(), data.group_test()
+    short = data.short_test()
     groups = {(s, g) for s, gs in data.group_combos.items() for g in gs}
     tasks = []
     for rd, rec in data.ledger.items():
@@ -341,22 +371,22 @@ def scan_runs(data: OnlineData, workers: int = 8):
             role = 'reference pair'
         else:
             role = 'other pair'
-        tasks.append((run_dir, rec, role, short, group))
+        tasks.append((run_dir, rec, role, short, data.stage_group_test(rec.get('stage'))))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         rows = [r for r in ex.map(_run_record, tasks) if r]
     log.info(f"  read {len(rows)} of {len(tasks)} runs in the cost ledger")
-    _pool_group_runs(rows, data.pass_window(), group)
+    _pool_group_runs(rows)
     for r in rows:
-        r.pop('_counts', None)
+        for k in ('_counts', '_window', '_ratio_trans'):
+            r.pop(k, None)
     return pd.DataFrame(rows)
 
 
-def _pool_group_runs(rows: List[Dict], window: int, test: Tuple[float, int]) -> None:
+def _pool_group_runs(rows: List[Dict]) -> None:
     """A group run that failed alone but passes pooled with the group's
-    previous ``window`` - 1 runs (``system_stages.pooled_group_test``, as
-    training judges it) becomes 'passed with previous run'."""
-    if window <= 1:
-        return
+    previous runs (its stage's group_pass_window - 1 of them;
+    ``system_stages.pooled_group_test``, as training judges it) becomes
+    'passed with previous run'. Stages with the production test do not pool."""
     from mllf.cb.system_stages import pooled_group_test
     by_group: Dict[Tuple[str, str], List[Dict]] = {}
     for r in rows:
@@ -366,11 +396,12 @@ def _pool_group_runs(rows: List[Dict], window: int, test: Tuple[float, int]) -> 
     for runs in by_group.values():
         runs.sort(key=lambda r: r['epoch'])
         for k, r in enumerate(runs):
-            if r['outcome'] == 'passed' or k == 0:
+            window = int(r.get('_window', 1))
+            if r['outcome'] == 'passed' or k == 0 or window <= 1:
                 continue
             hist = [{'run': x['run'], 'populations': x['_counts'][0],
                      'transitions': x['_counts'][1]} for x in runs[max(0, k - window + 1):k + 1]]
-            if pooled_group_test(hist, r['_counts'][2], *test)[0]:
+            if pooled_group_test(hist, r['_counts'][2], *r['_ratio_trans'])[0]:
                 r['outcome'] = 'passed with previous run'
 
 

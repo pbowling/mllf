@@ -43,6 +43,7 @@ from mllf.cb.workflow_utils import (
     set_msld_steps,
     template_steps,
 )
+from mllf.file_handling.combo_sets import is_group_combo
 from mllf.file_handling.manifests import build_combo_dir_lookup, ensure_combo_dir_exists
 from mllf.file_handling.write_bias_coeff import write_variables_from_actions
 from mllf.slurm import refresh_exclude
@@ -65,7 +66,7 @@ REWARD_DEFAULTS = {
 METRIC_FIELDS = (
     ('populations', {}), ('transitions', {}), ('ddg_pairs', {}), ('fraction_physical', None),
     ('barrier_pairs', {}), ('skew_pairs', {}), ('end_pairs', {}), ('transition_pairs', {}),
-    ('endpoint_pairs', {}), ('site_holdoff', []),
+    ('endpoint_pairs', {}), ('site_holdoff', []), ('endpoint_nodes', None),
 )
 
 
@@ -233,6 +234,9 @@ class EpochRun:
         self.use_offsets = (self.bandit.use_hindsight and self.bandit_state is not None
                             and bool(self.bandit.pair_offsets))
         self.hs_dims = self.bandit.offset_dims
+        # bandit.group_offset_dims: x / s offsets are tuned to a pair alone
+        # and stack over a substituent's partners in a group
+        self.group_dims = self.bandit.group_dims
         self.offset_sampling = self.use_offsets and bool(self.bandit.offset_sampling)
         # bandit.group_correction: a group run whose end terms hold an
         # endpoint (or a whole site) off shrinks those pairs' x / s for that
@@ -321,19 +325,22 @@ class EpochRun:
         labels = combo_node_labels(combo_path)
         sys_name = sys_cfg.get('name', 'unknown')
         b = self.bandit
+        dims = self.group_dims if is_group_combo(combo_path) else self.hs_dims
         shifted, _n = apply_pair_offsets(
             actions, mean.detach(), self.bandit_state, sys_name,
             labels, data.edge_index,
             prior_sd=b.offset_prior_sd,
             sample=self.offset_sampling and not self.opts.deterministic_actions,
             base_sd=b.offset_base_sd,
-            dims=self.hs_dims)
+            dims=dims)
         shifted, _ = cap_quadratic(shifted, mean.detach(), b.c_cap)
         if self.gc_cfg is not None:
             shifted, _ = apply_group_values(shifted, self.bandit_state, sys_name,
                                             Path(combo_path).name,
                                             labels, data.edge_index)
-        lin_var = (linear_edge_variance(self.bandit_state, sys_name, labels, data.edge_index,
+        # without b offsets the b fit weights every edge by the prior (model alone)
+        lin_var = (linear_edge_variance(self.bandit_state if 'linear' in dims else None,
+                                        sys_name, labels, data.edge_index,
                                         prior_sd=b.offset_prior_sd)
                    if 'linear' in self.hs_dims else None)
         return shifted, lin_var

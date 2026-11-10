@@ -561,10 +561,13 @@ def apply_scouting(run: TrainingRun, sn: str, epoch: int) -> Tuple[str, Dict]:
 # 1. plan the epoch
 
 def _skip_empty_stages(run: TrainingRun, epoch: int, held_out: Set[str]) -> None:
-    """A stage with no combos for a system (filters leave none) is skipped."""
+    """A stage with no combos for a system (filters leave none, and no
+    groups in its group_set) is skipped. A groups-only stage has an empty
+    pair pool but its groups."""
     for sn in sorted(run.stage_state):
         st = run.stage_state[sn]
-        while not st['done'] and not [c for c in system_stage_pool(run, sn) if c not in held_out]:
+        while not st['done'] and not ([c for c in system_stage_pool(run, sn) if c not in held_out]
+                                      or system_group_pool(run, sn)):
             skipped = run.stages[st['stage']]['name']
             nxt = system_stages.advance(st, run.stages, sn, epoch, 'no_combos')
             log.info(f"  [STAGE] {sn}: no combos for stage {skipped}; skipped")
@@ -949,13 +952,15 @@ def add_priorities(run: TrainingRun, plan: EpochPlan) -> None:
 def run_steps(run: TrainingRun, plan: EpochPlan, sys_name: str, combo_name: str):
     """(equil, prod) MD steps for a combo's run this epoch: the stage's
     run_steps (short exploratory runs) or, for bracketed pairs,
-    bracketed_run_steps; None (the template's full length) for group runs
-    and pairs awaiting their full-length confirming run."""
+    bracketed_run_steps; for group runs the stage's group_run_steps (None,
+    the template's full length, without it); None for pairs awaiting their
+    full-length confirming run."""
     stage = _system_stage(run, sys_name) if run.per_system else None
     if stage is None:
         return None
     if combo_name in _group_names(run, sys_name):
-        return None                      # group runs are full length
+        grs = stage.get('group_run_steps')
+        return (int(grs['equil']), int(grs['prod'])) if grs else None
     rs = stage.get('run_steps')
     if not rs:
         return None
@@ -1030,7 +1035,8 @@ def _log_group_correction(run: TrainingRun, rec: EpochRecord, sys_name: str, cdi
     if not gc:
         return None
     what = ', '.join(f"{f['kind']} s{f['site']}" + (f" ({f['dom']})" if f.get('dom') else '')
-                     + f" ratio {gc['ratio'].get(str(f['site']), 1.0):.2f}"
+                     + f" ratio x {gc['ratio'].get(str(f['site']), 1.0):.2f}"
+                     + f" s {(gc.get('ratio_s') or gc['ratio']).get(str(f['site']), 1.0):.2f}"
                      for f in gc.get('flagged') or [])
     what += ''.join(f", s{s} overshot: stepped back" for s in gc.get('guarded') or [])
     line = (f"  [GROUPFIX] {sys_name}/{cdir.name}: {what.lstrip(', ')}"
@@ -1099,7 +1105,11 @@ def record_group_runs(run: TrainingRun, stats: Dict, epoch: int, rec: EpochRecor
         window = int(stage.get('group_pass_window', 1))
         min_ratio = float(adv.get('min_population_ratio', 0.5))
         min_trans = int(adv.get('min_site_transitions', 10))
-        if groups and window > 1:
+        if groups and adv.get('production'):
+            # advance.production: one run must give every substituent enough
+            # endpoint time and visits (no pooling over runs)
+            passes = system_stages.production_balanced(saved_data, nsubs, adv['production'])
+        elif groups and window > 1:
             # Pool the group's last runs: every substituent sampled in one of
             # them passes; the run that sampled most is the one exported.
             hist = st.setdefault('group_window', {}).setdefault(cdir.name, [])

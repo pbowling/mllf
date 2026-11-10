@@ -1,4 +1,4 @@
-mllf.cb.group\_correction
+﻿mllf.cb.group\_correction
 =========================
 
 .. automodule:: mllf.cb.group_correction
@@ -14,6 +14,7 @@ mllf.cb.group\_correction
       edge_id
       flagged_sites
       group_id
+      ratios
       run_record
       run_sites
       update_group

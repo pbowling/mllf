@@ -407,8 +407,9 @@ Stage Settings
      - Scouting results applied at stage entry, and an optional separate tier file.
    * - ``prioritize_unvisited``
      - Run pairs not yet run in this stage ahead of selection (default true).
-   * - ``run_steps`` / ``bracketed_run_steps``
-     - ``{equil, prod}`` MD steps for pair runs, and for pairs whose b bracket has closed.
+   * - ``run_steps`` / ``bracketed_run_steps`` / ``group_run_steps``
+     - ``{equil, prod}`` MD steps for pair runs, for pairs whose b bracket has closed, and
+       for group runs (default the template's full length).
    * - ``bracketed_runs_sticky``
      - Keep a pair on longer runs until it resolves or retires.
    * - ``confirm_full_length``
@@ -419,7 +420,8 @@ Stage Settings
      - Slow-crossing runs that resolve a pair, and the crossings each needs (default 3).
        0 turns this off.
    * - ``group_set``
-     - The combo set of groups that join the pool once ready.
+     - The combo set of groups that join the pool once ready. A stage with groups but an
+       empty pair pool (groups only) runs its groups.
    * - ``group_ready_fraction`` / ``group_min_resolved_per_site``
      - Share of a group's reference pairs that must be resolved (default 1.0), and the
        fewest resolved at each site (default 0).
@@ -450,7 +452,11 @@ is checked.
 * ``groups_done``: ``fraction`` of the system's groups have passed the group test
   (``min_population_ratio``, default 0.5, and ``min_site_transitions``, default 10).
   ``successes`` and ``max_offset_sd`` still define resolved pairs, which decide when a
-  group is ready.
+  group is ready. ``production: {min_end_fraction, min_visits_per_ns}`` replaces the group
+  test with the production test: in one run, with no pooling over runs, every substituent
+  spends at least ``min_end_fraction`` (default 0.01) of the frames at λ ≥ 0.99 and
+  enters its endpoint at least ``min_visits_per_ns`` (default 2) times per ns
+  (``system_stages.production_balanced``).
 * ``combos_balanced``: the latest run of ``fraction`` of the stage's combos (at least
   ``min_combos``) passes the group test, for a stage of multi-substituent combos without
   explicit groups.

@@ -1,4 +1,4 @@
-mllf.file\_handling.read\_output
+﻿mllf.file\_handling.read\_output
 ================================
 
 .. automodule:: mllf.file_handling.read_output
@@ -8,6 +8,7 @@ mllf.file\_handling.read\_output
 
    .. autosummary::
    
+      parse_endpoint_nodes
       parse_fraction_physical_ligand
       parse_lambda_trajectory
       parse_pair_barriers

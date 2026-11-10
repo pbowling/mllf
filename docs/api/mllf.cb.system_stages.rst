@@ -1,4 +1,4 @@
-mllf.cb.system\_stages
+﻿mllf.cb.system\_stages
 ======================
 
 .. automodule:: mllf.cb.system_stages
@@ -30,6 +30,7 @@ mllf.cb.system\_stages
       pair_settled
       pairs_progress
       pooled_group_test
+      production_balanced
       reopen_pairs
       retire_terms
       save_state

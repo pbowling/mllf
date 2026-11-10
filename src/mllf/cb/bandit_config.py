@@ -41,7 +41,7 @@ HINDSIGHT_DEFAULTS = {
     'hindsight_weight_scale': {'linear': 0.1, 'quadratic': 0.01, 'skew': 0.1, 'end': 0.1},
     'c_cap': {'floor': 15.0, 'fraction': 0.5},
     'group_holdoff': {'dominant_min': 0.7, 'at_max': 0.05, 'partner_min': 0.02, 'min_partners': 2},
-    'group_correction': {'step': 0.25, 'floor': 0.5},
+    'group_correction': {'step_x': 0.35, 'floor_x': 0.4, 'step_s': 0.15, 'floor_s': 0.7},
     'revisit': {'enabled': True, 'max_visits': 12},
     'regression': {'replay_selection': 'coverage', 'replay_pretraining_only': False},
 }
@@ -111,6 +111,9 @@ class BanditConfig:
     offset_prior_sd: Optional[Dict[str, float]] = None
     offset_base_sd: Optional[Dict[str, float]] = None
     offset_history: int = 5
+    # the pair offsets group runs use (None: all of hindsight_dims; []: none,
+    # every group run starts from the model's prediction plus the group correction)
+    group_offset_dims: Optional[Tuple[str, ...]] = None
     c_cap: Optional[Dict[str, float]] = None
     # hindsight targets
     hindsight_dims: Tuple[str, ...] = BIAS_DIMS
@@ -121,6 +124,9 @@ class BanditConfig:
     hindsight_skew_step_cap: float = 3.0
     hindsight_end_step_cap: float = 1.5
     end_reference_s: float = 1.5
+    # endpoint_depth (hindsight.depth_config): s targets each substituent's
+    # endpoint depth; false / None off, true defaults, or a mapping
+    endpoint_depth: Any = None
     linear_step_max: Optional[float] = None    # None: hindsight_linear_step_cap
     quadratic_step_max: float = QUADRATIC_STEP_MAX
     barrier_trap_width: float = BARRIER_TRAP_WIDTH
@@ -145,8 +151,9 @@ class BanditConfig:
         # An explicit null keeps the default, except for keys where null means "off".
         kwargs = {k: bandit[k] for k in names
                   if k in bandit and (bandit[k] is not None or k in _NULLABLE)}
-        if 'hindsight_dims' in kwargs:
-            kwargs['hindsight_dims'] = tuple(kwargs['hindsight_dims'])
+        for k in ('hindsight_dims', 'group_offset_dims'):
+            if kwargs.get(k) is not None:
+                kwargs[k] = tuple(kwargs[k])
         for k in ('revisit', 'regression'):
             kwargs[k] = dict(kwargs.get(k) or {})
         return cls(algorithm=bandit_algorithm(bandit), raw=bandit, **kwargs)
@@ -182,6 +189,13 @@ class BanditConfig:
         """``hindsight_dims`` that have per-pair offsets, in config order."""
         return [d for d in self.hindsight_dims if d in OFFSET_DIMS]
 
+    @property
+    def group_dims(self) -> List[str]:
+        """The offset dims group runs use (``group_offset_dims``, default all)."""
+        if self.group_offset_dims is None:
+            return self.offset_dims
+        return [d for d in self.offset_dims if d in set(self.group_offset_dims)]
+
     def weight_scale(self, dims) -> Dict[str, float]:
         """Shared-model update strength per head (one number, or per head, others 1.0)."""
         ws = self.hindsight_weight_scale
@@ -191,12 +205,14 @@ class BanditConfig:
 
     @property
     def step_caps(self) -> Dict[str, float]:
-        """``hindsight_targets`` step caps."""
+        """``hindsight_targets`` step caps (and the endpoint-depth target)."""
+        from mllf.cb.hindsight import depth_config
         return dict(linear_step_cap=float(self.hindsight_linear_step_cap),
                     quadratic_step_cap=float(self.hindsight_quadratic_step_cap),
                     skew_step_cap=float(self.hindsight_skew_step_cap),
                     end_step_cap=float(self.hindsight_end_step_cap),
-                    end_reference=float(self.end_reference_s))
+                    end_reference=float(self.end_reference_s),
+                    endpoint_depth_cfg=depth_config(self.endpoint_depth))
 
 
 # Keys whose explicit null means "off" rather than "use the default".

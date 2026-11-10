@@ -681,3 +681,33 @@ def test_group_failed_pairs_pools_failed_runs(tmp_path):
         'populations': [800, 0, 0]}, {'populations': [0, 0, 0]}]
     # sub 5 is empty in every run with any population; sub 9 only in one
     assert sorted(ss.group_failed_pairs('s', g, runs)) == ['s|s1|1|5', 's|s1|5|9']
+
+
+def test_endpoint_nodes_and_the_production_test():
+    from mllf.file_handling.read_output import parse_endpoint_nodes
+    lam = [1.0] * 60 + [0.97] * 10 + [0.0] * 30
+    text = " LAMBDA.......TIME(ps).. .BLOCKS   2   THRU BLOCK    3\n" + ''.join(
+        f" LAMBDA>  {0.02 * (k + 1):.4f}  {a:.4f}  {1 - a:.4f}\n" for k, a in enumerate(lam))
+    nodes = parse_endpoint_nodes(text)
+    assert nodes == {'frames': 100, 'core': {'2': 60, '3': 30}, 'shoulder': {'2': 10, '3': 0}}
+    saved = {'endpoint_nodes': {'frames': 37500, 'core': {'2': 20000, '3': 17000}},
+             'transition_pairs': {'2_3': 10}, 'populations': [20000, 17000]}
+    assert ss.production_balanced(saved, [2], {'min_end_fraction': 0.01,
+                                               'min_visits_per_ns': 2})
+    saved['transition_pairs'] = {'2_3': 2}  # one visit per ns
+    assert not ss.production_balanced(saved, [2], {'min_visits_per_ns': 2})
+    assert not ss.production_balanced({'populations': [1, 1]}, [2], {})
+
+
+def test_endpoint_depth_targets_s_toward_the_site_size_target():
+    from mllf.cb.hindsight import depth_config, depth_end_hindsight, endpoint_depth
+    cfg = depth_config(True)
+    nodes = {'core': {'3': 400}, 'shoulder': {'3': 100}}
+    K, held = endpoint_depth(nodes, 3, 0.593)
+    assert K is not None and not held
+    s_new, var = depth_end_hindsight(1.0, K, held, 2, cfg)
+    assert var < float('inf') and s_new != 1.0
+    # too shallow (below target) steps s down; held off steps down by the cap
+    s_held, _ = depth_end_hindsight(1.0, None, True, 2, cfg, step_cap=1.5)
+    assert s_held == -0.5
+    assert depth_end_hindsight(1.0, None, False, 2, cfg)[1] == float('inf')

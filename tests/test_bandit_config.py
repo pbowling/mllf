@@ -106,3 +106,14 @@ def test_unimol_defaults_are_the_current_model_settings():
     s = UnimolSettings.from_config({})
     assert (s.env_input, s.site_size_input, s.ligand_other_sites,
             s.structure_selection) == ('phase', True, True, 'unrelaxed')
+
+
+def test_group_offset_dims_and_endpoint_depth():
+    from mllf.cb.bandit_config import BanditConfig
+    b = BanditConfig.from_dict({})
+    assert b.group_dims == b.offset_dims                     # default: every offset dim
+    assert BanditConfig.from_dict({'group_offset_dims': []}).group_dims == []
+    assert BanditConfig.from_dict({'group_offset_dims': ['linear']}).group_dims == ['linear']
+    assert b.step_caps['endpoint_depth_cfg'] is None         # off by default
+    cfg = BanditConfig.from_dict({'endpoint_depth': {'groups_only': True}}).step_caps
+    assert cfg['endpoint_depth_cfg']['groups_only'] and cfg['endpoint_depth_cfg']['targets'][2]

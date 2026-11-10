@@ -60,6 +60,7 @@ _OUTCOME_FILLS = [
     {'color': bs.PALETTE['apricot'], 'hatch': '///'},
     {'color': bs.EXTENDED['plum_mid'], 'hatch': '...'},
     {'color': bs.PALETTE['lavender'], 'hatch': 'xxx'},
+    {'color': bs.MUTED, 'hatch': '++'},
 ]
 
 

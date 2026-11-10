@@ -59,6 +59,7 @@ from mllf.cb.workflow_utils import (
     compute_pair_reward,
     compute_pair_success_stats,
 )
+from mllf.file_handling.combo_sets import is_group_combo
 from mllf.file_handling.manifests import ensure_combo_dir_exists
 
 
@@ -358,10 +359,15 @@ def _hindsight_targets_for_run(run: EpochRun, s: Dict, n: _HindsightCounts, comb
     """Per-pair state updates for one run, and the shared model's targets and
     weights. Returns (update_targets, combined_weight, hs_t, hs_v)."""
     bandit_state, opts, device, hs_dims = run.bandit_state, run.opts, run.device, run.hs_dims
+    caps = s['caps']
+    depth = caps.get('endpoint_depth_cfg')
+    if depth and depth['groups_only'] and not is_group_combo(combo_path_u):
+        # endpoint_depth.groups_only: pair runs keep the asymmetry / held-off s targets
+        caps = {**caps, 'endpoint_depth_cfg': None}
     hs_t, hs_v, hs_dir = hindsight_targets(
         vdata_u.edge_index, applied, saved_data,
         barrier_target=s['barrier_target'],
-        temperature=s['temperature'], return_directional=True, **s['caps'],
+        temperature=s['temperature'], return_directional=True, **caps,
     )
     labels = combo_node_labels(combo_path_u) if run.use_offsets else None
     sys_name = run.sys_name(combo_path_u)

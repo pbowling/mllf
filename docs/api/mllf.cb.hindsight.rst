@@ -1,4 +1,4 @@
-mllf.cb.hindsight
+﻿mllf.cb.hindsight
 =================
 
 .. automodule:: mllf.cb.hindsight
@@ -12,8 +12,11 @@ mllf.cb.hindsight
       barrier_trapped_c_targets
       cap_quadratic
       combo_node_labels
+      depth_config
+      depth_end_hindsight
       edge_slot
       end_hindsight
+      endpoint_depth
       endpoint_held_off
       explore_factor
       grow_directional_b_steps
