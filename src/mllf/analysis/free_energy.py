@@ -177,6 +177,24 @@ def _sub_style(i: int) -> Dict:
             'ls': SUB_LINESTYLES[i % len(SUB_LINESTYLES)]}
 
 
+def _shared_top(axes, curves) -> None:
+    """One y range, 0 to the first tick at or above the highest curve, on
+    axes that share y. The style snaps each axes to its own data, so shared
+    axes would otherwise take the range of whichever was snapped last and
+    clip the others' peaks."""
+    from matplotlib.ticker import MaxNLocator, MultipleLocator
+    top = max((float(np.max(g)) for g in curves), default=0.0)
+    if not axes or top <= 0:
+        return
+    ticks = MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(0.0, top)
+    step = float(np.diff(ticks).min())
+    hi = float(np.ceil(top / step - 1e-9) * step)
+    for ax in axes:
+        ax.set_ylim(0.0, hi)
+        ax.yaxis.set_major_locator(MultipleLocator(step))
+        ax._bowling_no_snap = True
+
+
 def profile_figure(rec: Dict, site: int, mllf_prof, alf_prof):
     """One site of one group: 1D profiles of the MLLF run (A) and ALF's run
     (B, when available) on one y scale, then the transition profile of each
@@ -196,11 +214,13 @@ def profile_figure(rec: Dict, site: int, mllf_prof, alf_prof):
     ax_m = fig.add_subplot(top[0, 0])
     ax_a = fig.add_subplot(top[0, 1], sharey=ax_m)
     styles = {sub: _sub_style(i) for i, sub in enumerate(subs)}
+    top_curves, pair_curves, pair_axes = [], [], []
     for ax, prof, name in ((ax_m, one_d, 'MLLF'), (ax_a, a_one, 'ALF')):
         for sub in subs:
             if sub in prof:
                 x, g, _ = prof[sub]
-                ax.plot(x, g - g.min(), label=f'Sub {sub}', **styles[sub])
+                top_curves.append(g - g.min())
+                ax.plot(x, top_curves[-1], label=f'Sub {sub}', **styles[sub])
         ax.set_xlim(0, 1)
         ax.set_xlabel('λ')
         ax.set_title(f'{name} run' if prof else f'{name}: no matching run')
@@ -216,10 +236,12 @@ def profile_figure(rec: Dict, site: int, mllf_prof, alf_prof):
                 continue
             ax = fig.add_subplot(grid[i, j - 1], sharex=first, sharey=first)
             first = first or ax
+            pair_axes.append(ax)
             for prof, name in ((trans.get((si, sj)), 'MLLF'), (a_trans.get((si, sj)), 'ALF')):
                 if prof is not None:
                     x, g, _ = prof
-                    ax.plot(x, g - g.min(), label=name, **RUN_STYLE[name])
+                    pair_curves.append(g - g.min())
+                    ax.plot(x, pair_curves[-1], label=name, **RUN_STYLE[name])
             ax.set_xlim(0, 1)
             ax.set_title(f'{si} / {sj}', fontsize=small, pad=2)
             ax.tick_params(labelsize=small)
@@ -235,6 +257,8 @@ def profile_figure(rec: Dict, site: int, mllf_prof, alf_prof):
         lax._bowling_no_snap = lax._bowling_no_zero = True
         lax.legend(*first.get_legend_handles_labels(), loc='upper left',
                    title='Pair i / j\n(x = 1 at i)')
+    _shared_top([ax_m, ax_a], top_curves)
+    _shared_top(pair_axes, pair_curves)
     bs.label_panels([ax_m, ax_a])
     return fig
 

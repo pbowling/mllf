@@ -180,3 +180,26 @@ def test_figures_draw(tmp_path):
     png = Output(tmp_path / 'png')                       # the default: PNG only
     png.figure('success', lambda: op.success_over_epochs(epochs))
     assert [p.name for p in (tmp_path / 'png' / 'figures').iterdir()] == ['success.png']
+
+
+def test_free_energy_panels_share_a_range_covering_every_curve():
+    pytest.importorskip('matplotlib')
+    from mllf.analysis import free_energy as fe
+    x = np.linspace(0.0125, 0.9875, 40)
+    bump = np.sin(np.pi * x)
+
+    def prof(h):
+        return (x, h * bump, None)
+    one_d = {1: prof(2.0), 2: prof(4.6), 3: prof(1.0)}
+    trans = {(1, 2): prof(2.0), (1, 3): prof(5.3), (2, 3): prof(1.2)}   # tallest not last
+    alf = ({1: prof(2.5)}, {(1, 2): prof(2.4)})
+    fig = fe.profile_figure({}, 1, (one_d, trans), alf)
+    axes = [ax for ax in fig.axes if ax.lines]
+    pairs = [ax for ax in axes if ax.get_title() in ('1 / 2', '1 / 3', '2 / 3')]
+    assert len(pairs) == 3
+    for ax in pairs:
+        lo, hi = ax.get_ylim()
+        assert lo == 0 and hi >= 5.3 and hi < 7     # covers 1 / 3, ends on a tick
+        assert ax._bowling_no_snap
+    top = [ax for ax in axes if ax not in pairs]
+    assert all(ax.get_ylim()[1] >= 4.6 for ax in top)
