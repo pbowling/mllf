@@ -215,7 +215,8 @@ def report_text(data, runs, sys_df, grp_df, out: Output, pd) -> str:
     if not ep.empty:
         last = ep.iloc[-1]
         lines += ['Last epoch', '----------',
-                  f"Epoch {int(last['epoch'])}: pair runs good "
+                  f"Epoch {int(last['epoch'])}: pairs good (every pair of its runs, "
+                  "group runs included) "
                   f"{_frac(last.get('pairs_good'), last.get('pairs_run'))}, groups passed "
                   f"{_frac(last.get('groups_passed'), last.get('groups_run'))}, "
                   "held-out pairs good "

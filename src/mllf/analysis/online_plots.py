@@ -24,14 +24,16 @@ def _plt():
 # success over epochs
 
 def success_over_epochs(epochs, validation: bool = True):
-    """Percent of pair runs and group runs that passed their test per epoch,
-    and of held-out validation pairs (optional). Pair runs are each judged by
-    their own length's test; group runs by the stage's group test."""
+    """Percent of pairs and group runs that passed their test per epoch, and
+    of held-out validation pairs (optional). Pairs: every pair sampled in the
+    epoch's runs, the pairs inside group runs included (training's "Pair runs
+    good"), each judged by its run length's test; group runs by the stage's
+    group test."""
     if epochs is None or epochs.empty:
         return None
     plt = _plt()
     fig, ax = plt.subplots(figsize=(bs.WIDTHS['onehalf'], 2.6))
-    series = [('Pair runs', 'pairs_pct'), ('Group runs', 'groups_pct')]
+    series = [('Pairs (all runs)', 'pairs_pct'), ('Group runs', 'groups_pct')]
     if validation:
         series.append(('Held-out pairs', 'validation_pct'))
     series = [(lab, col) for lab, col in series if col in epochs and epochs[col].notna().any()]

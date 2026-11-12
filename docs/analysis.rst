@@ -95,8 +95,9 @@ balance test instead (``--balance-test RATIO TRANSITIONS``, default 0.5 and 10),
 convergence recomputed from those outcomes, and writes to ``<run dir>/analysis_balance``.
 
 ``success_over_epochs``
-   Percent of pair runs, group runs and held-out pairs that passed their test per epoch
-   (``--no-validation`` leaves out the held-out pairs).
+   Percent of pairs, group runs and held-out pairs that passed their test per epoch
+   (``--no-validation`` leaves out the held-out pairs). Pairs are every pair sampled in the
+   epoch's runs, the pairs inside group runs included.
 ``outcomes_by_epoch`` / ``outcomes_by_system``
    Training runs by outcome, as counts: success, unbalanced, few crossings, one-sided or
    neither sampled for pairs; passed, uneven, few transitions or an unsampled substituent
