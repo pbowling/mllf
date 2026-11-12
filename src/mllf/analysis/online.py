@@ -149,16 +149,16 @@ def _sum(series) -> float:
 def report_text(data, runs, sys_df, grp_df, out: Output, pd) -> str:
     """The plain-text report (module docstring)."""
     test = data.alf_test()
+    if test[0] == 'production':
+        share = test[3] if len(test) > 3 else None
+        floor = (f"{share:g} / n of frames at its endpoint (n: its site's substituents)"
+                 if share is not None else f"{100 * test[1]:g}% of frames at its endpoint")
+        desc = f"production (every substituent >= {floor}, >= {test[2]:g} entries / ns, one run)"
+    else:
+        desc = (f"balance (each substituent >= {test[1]:g} / n of its site, "
+                f">= {test[2]} site transitions)")
     lines = [f"Online training analysis: {data.run_dir}",
-             'Group test: ' + ("production (every substituent >= "
-                               + (f"{test[3]:g} / n" if len(test) > 3 and test[3] is not None
-                                  else f"{test[1]:g}")
-                               + " of frames at its endpoint, n its site's substituents, and "
-                               f">= {test[2]:g} entries / ns in one run)"
-                               if test[0] == 'production' else
-                               f"balance (each substituent >= {test[1]:g} / n of its site, "
-                               f">= {test[2]} site transitions)")
-             + ', for MLLF and ALF', '']
+             f"Group test: {desc}, for MLLF and ALF", '']
     ep = data.epochs
     n_epochs = int(ep['epoch'].max()) + 1 if not ep.empty else 0
     ledger = pd.DataFrame(list(data.ledger.values())) if data.ledger else pd.DataFrame()
