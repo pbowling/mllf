@@ -298,6 +298,12 @@ through the barrier trap. We prefer this order because b is measured directly by
 population ratio and is cheaper to get right, whereas a c raised too early must be walked
 back down by stranded runs.
 
+A stranded run's step down reaches the shared model as well as the pairs' offsets. With
+``stranded_c_shared: false`` it changes only the offsets. A group stranded by something
+other than c (its end terms, or its inputs) then cannot lower the c the model predicts
+for every other system: in a refinement run without the replay, these steps lowered c
+across all environments, solvent and protein included.
+
 The c cap (``c_cap``) bounds the other direction. Each pair's c stays within
 :math:`\max(\text{floor}, \text{fraction} \times |c_{\text{model}}|)` of the model's
 prediction in every proposal and in the exported biases, while the pair's offset itself

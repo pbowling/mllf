@@ -102,11 +102,14 @@ class OnlineData:
 
     def alf_test(self) -> Tuple:
         """The test ALF's runs are judged by, as a cache key: ('production',
-        min_end_fraction, min_visits_per_ns) or ('balance', ratio, transitions)."""
+        min_end_fraction, min_visits_per_ns, min_end_share or None) or
+        ('balance', ratio, transitions)."""
         prod = self.production_test() if self.group_test_mode == 'stage' else None
         if prod:
+            share = prod.get('min_end_share')
             return ('production', float(prod.get('min_end_fraction', 0.01)),
-                    float(prod.get('min_visits_per_ns', 2.0)))
+                    float(prod.get('min_visits_per_ns', 2.0)),
+                    None if share is None else float(share))
         ratio, trans = self.balance_test if self.group_test_mode == 'balance' \
             else self.group_test()
         return ('balance', float(ratio), int(trans))
@@ -467,7 +470,8 @@ def alf_group_runs(dataset_dir: Path, test: Tuple) -> List[Tuple[str, float, boo
             continue
         nsubs = meta.get('nsubs_per_site') or []
         if test[0] == 'production':
-            ok = alf_production(res, nsubs, float(ns), test[1], test[2])
+            ok = alf_production(res, nsubs, float(ns), test[1], test[2],
+                                test[3] if len(test) > 3 else None)
         else:
             pops_d, trans_d = res.get('populations') or {}, res.get('transitions') or {}
             pops = [(pops_d[k].get('counts') or {}).get('0.99', 0)
@@ -480,7 +484,7 @@ def alf_group_runs(dataset_dir: Path, test: Tuple) -> List[Tuple[str, float, boo
 
 
 def alf_production(res: Dict, nsubs: List[int], ns: float, min_end: float,
-                   min_visits: float) -> bool:
+                   min_visits: float, min_end_share: Optional[float] = None) -> bool:
     """The production test (``system_stages.production_balanced``) of an
     ALF run from its simulation_results.json: each block's frames at
     lambda >= 0.99 (CHARMM's population count, what parse_endpoint_nodes
@@ -492,8 +496,10 @@ def alf_production(res: Dict, nsubs: List[int], ns: float, min_end: float,
             if isinstance(v, dict)}
     saved = {'endpoint_nodes': {'frames': ns * FRAMES_PER_NS, 'core': core},
              'transition_pairs': res.get('transition_pairs') or {}}
-    return production_balanced(saved, nsubs, {'min_end_fraction': min_end,
-                                              'min_visits_per_ns': min_visits})
+    cfg = {'min_end_fraction': min_end, 'min_visits_per_ns': min_visits}
+    if min_end_share is not None:
+        cfg['min_end_share'] = min_end_share
+    return production_balanced(saved, nsubs, cfg)
 
 
 def alf_cache_path(pretraining_root) -> Path:

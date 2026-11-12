@@ -132,6 +132,10 @@ class BanditConfig:
     barrier_trap_width: float = BARRIER_TRAP_WIDTH
     b_direction_requires_crossing: bool = True
     c_up_requires_b_bracket: bool = False
+    # A stranded run's c step down also trains the shared model (True), or
+    # only the pairs' own offsets (False): a group stranded by something other
+    # than c otherwise lowers every system's c.
+    stranded_c_shared: bool = True
     explore_factor_max: float = EXPLORE_FACTOR_MAX
     explore_after_failures: int = PERSISTENT_FAILURES
     # group runs and revisits (sub-blocks)

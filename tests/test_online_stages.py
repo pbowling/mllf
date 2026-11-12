@@ -699,6 +699,17 @@ def test_endpoint_nodes_and_the_production_test():
     assert not ss.production_balanced({'populations': [1, 1]}, [2], {})
 
 
+def test_production_test_floor_scales_with_site_size():
+    # 5 substituents, the weakest at 0.6% of frames: under the flat 1% floor,
+    # over 0.02 / 5 = 0.4%
+    core = {'2': 20000, '3': 8000, '4': 5000, '5': 4000, '6': 225}
+    tp = {f'{a}_{b}': 6 for a in range(2, 7) for b in range(a + 1, 7)}
+    saved = {'endpoint_nodes': {'frames': 37500, 'core': core}, 'transition_pairs': tp}
+    assert not ss.production_balanced(saved, [5], {'min_end_fraction': 0.01})
+    assert ss.production_balanced(saved, [5], {'min_end_share': 0.02})
+    assert not ss.production_balanced(saved, [5], {'min_end_share': 0.05})     # 1% each
+
+
 def test_endpoint_depth_targets_s_toward_the_site_size_target():
     from mllf.cb.hindsight import depth_config, depth_end_hindsight, endpoint_depth
     cfg = depth_config(True)

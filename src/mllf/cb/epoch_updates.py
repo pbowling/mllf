@@ -344,6 +344,9 @@ def _hindsight_settings(run: EpochRun) -> Dict:
         # any one-sided run (a b step toward the other substituent); c steps
         # up only through the barrier trap (b bracket closed, no crossing).
         'c_needs_bracket': bool(b.c_up_requires_b_bracket),
+        # stranded_c_shared: false keeps stranded runs' c steps in the pair
+        # offsets; the shared model gets no c target from them
+        'stranded_shared': bool(b.stranded_c_shared),
         'c_trap': dict(base_step=caps['quadratic_step_cap'], max_step=float(b.quadratic_step_max),
                        trap_width=float(b.barrier_trap_width)),
         'factor_max': float(b.explore_factor_max),
@@ -457,7 +460,8 @@ def _hindsight_targets_for_run(run: EpochRun, s: Dict, n: _HindsightCounts, comb
         barrier_trapped_c_targets(
             bandit_state, sys_name, labels, vdata_u.edge_index, hs_t, hs_v, hs_dir.clone(),
             applied,
-            pinned=pinned, stranded=stranded, **{**s['c_trap'], 'grow': False})
+            pinned=pinned, stranded=stranded if s['stranded_shared'] else None,
+            **{**s['c_trap'], 'grow': False})
     if sel is not None:
         # flagged / guarded site: only the group's corrected x / s
         hs_v[gc_mask] = float('inf')

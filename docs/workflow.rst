@@ -456,7 +456,11 @@ is checked.
   test with the production test: in one run, with no pooling over runs, every substituent
   spends at least ``min_end_fraction`` (default 0.01) of the frames at λ ≥ 0.99 and
   enters its endpoint at least ``min_visits_per_ns`` (default 2) times per ns
-  (``system_stages.production_balanced``).
+  (``system_stages.production_balanced``). ``min_end_share`` replaces the flat floor with
+  one that scales with site size: each of a site's n substituents needs at least
+  ``min_end_share / n`` of the frames, so 0.02 asks 1% of each substituent at a site of
+  two and 0.4% at a site of five. A flat 1% asks a large site's substituents for most of
+  their fair share of the endpoint time, and a small site's for a fraction of it.
 * ``combos_balanced``: the latest run of ``fraction`` of the stage's combos (at least
   ``min_combos``) passes the group test, for a stage of multi-substituent combos without
   explicit groups.

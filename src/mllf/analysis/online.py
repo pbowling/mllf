@@ -150,8 +150,11 @@ def report_text(data, runs, sys_df, grp_df, out: Output, pd) -> str:
     """The plain-text report (module docstring)."""
     test = data.alf_test()
     lines = [f"Online training analysis: {data.run_dir}",
-             'Group test: ' + (f"production (every substituent >= {test[1]:g} of frames at its "
-                               f"endpoint and >= {test[2]:g} entries / ns in one run)"
+             'Group test: ' + ("production (every substituent >= "
+                               + (f"{test[3]:g} / n" if len(test) > 3 and test[3] is not None
+                                  else f"{test[1]:g}")
+                               + " of frames at its endpoint, n its site's substituents, and "
+                               f">= {test[2]:g} entries / ns in one run)"
                                if test[0] == 'production' else
                                f"balance (each substituent >= {test[1]:g} / n of its site, "
                                f">= {test[2]} site transitions)")

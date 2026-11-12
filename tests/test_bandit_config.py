@@ -117,3 +117,25 @@ def test_group_offset_dims_and_endpoint_depth():
     assert b.step_caps['endpoint_depth_cfg'] is None         # off by default
     cfg = BanditConfig.from_dict({'endpoint_depth': {'groups_only': True}}).step_caps
     assert cfg['endpoint_depth_cfg']['groups_only'] and cfg['endpoint_depth_cfg']['targets'][2]
+
+
+def test_stranded_c_steps_can_stay_out_of_the_shared_model():
+    import math
+
+    import torch
+
+    from mllf.cb.hindsight import barrier_trapped_c_targets
+    assert BanditConfig.from_dict({}).stranded_c_shared is True
+    assert BanditConfig.from_dict({'stranded_c_shared': False}).stranded_c_shared is False
+    ei = torch.tensor([[0, 1], [1, 0]])
+    applied = {'c': [[0.0, 30.0], [30.0, 0.0]]}
+
+    def shared(stranded):
+        t = torch.zeros(2, 4, dtype=torch.float64)
+        v = torch.full((2, 4), math.inf, dtype=torch.float64)
+        d = torch.zeros(2, 4, dtype=torch.bool)
+        barrier_trapped_c_targets({}, 'sys', [(1, 1), (1, 2)], ei, t, v, d, applied,
+                                  stranded=stranded, grow=False)
+        return t[0, 1].item(), v[0, 1].item()
+    assert shared(torch.tensor([True, True])) == (18.0, 36.0)    # c - 12
+    assert math.isinf(shared(None)[1])                            # stranded_c_shared: false

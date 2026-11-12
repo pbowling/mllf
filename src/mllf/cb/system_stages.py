@@ -442,13 +442,17 @@ def production_balanced(saved_data: Dict, nsubs_per_site: Sequence[int], cfg: Di
     (read_output.parse_endpoint_nodes) and entered its endpoint >= min_visits_per_ns
     times per ns (half its transitions with its site partners,
     transition_pairs). Pairs need not cross each other directly; Potts / DCA
-    post-processing uses the site's whole state. False when the run lacks
-    the per-substituent counts."""
+    post-processing uses the site's whole state. ``min_end_share`` replaces
+    the flat floor with one that scales with site size: each of a site's n
+    substituents needs >= min_end_share / n of the frames (its fair share of
+    min_end_share), so a large site is not held to a small site's floor.
+    False when the run lacks the per-substituent counts."""
     from mllf.cb.hindsight import node_transition_counts
     nd = saved_data.get('endpoint_nodes') or {}
     frames = nd.get('frames') or 0
     if frames <= 0 or not saved_data.get('transition_pairs'):
         return False
+    share = cfg.get('min_end_share')
     min_end = float(cfg.get('min_end_fraction', 0.01))
     min_visits = float(cfg.get('min_visits_per_ns', 2.0))
     ns = frames / float(cfg.get('frames_per_ns', FRAMES_PER_NS))
@@ -458,8 +462,9 @@ def production_balanced(saved_data: Dict, nsubs_per_site: Sequence[int], cfg: Di
         nodes = list(range(start, start + n))
         start += n
         counts = node_transition_counts(saved_data, nodes)
+        floor = float(share) / n if share is not None else min_end
         for v in nodes:
-            if core.get(str(v + 2), 0) / frames < min_end:
+            if core.get(str(v + 2), 0) / frames < floor:
                 return False
             if counts is None or counts[v] / 2.0 / ns < min_visits:
                 return False

@@ -109,7 +109,9 @@ def test_alf_test_follows_the_group_stage(tmp_path):
                                              'min_site_transitions': 0,
                                              'production': {'min_end_fraction': 0.01,
                                                             'min_visits_per_ns': 2.0}}}]
-    assert data.alf_test() == ('production', 0.01, 2.0)
+    assert data.alf_test() == ('production', 0.01, 2.0, None)
+    data.stages[0]['advance']['production']['min_end_share'] = 0.02
+    assert data.alf_test() == ('production', 0.01, 2.0, 0.02)
     data.group_test_mode, data.balance_test = 'balance', (0.5, 10)
     assert data.alf_test() == ('balance', 0.5, 10)
     assert data.stage_group_test('g')['production'] is None
