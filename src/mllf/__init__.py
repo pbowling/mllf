@@ -13,11 +13,13 @@ Import from the submodules directly, e.g.
 ``from mllf.file_handling.read_bias_coeff import read_bias_coeff``.
 """
 
-from mllf.log import install_default_handler
+import logging
 
 
 __version__ = "0.1.0"
 __author__ = "Paige E. Bowling"
 __email__ = "pbowling@umich.edu"
 
-install_default_handler()
+# A library leaves output to the application: no console handler on import.
+# The mllf command sets up its console in mllf.log.setup_logging.
+logging.getLogger(__name__).addHandler(logging.NullHandler())

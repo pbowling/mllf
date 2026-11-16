@@ -9,8 +9,11 @@ class UsageError(Exception):
 
 def run_command(parser: argparse.ArgumentParser, run, argv=None):
     """Parse ``argv`` with ``parser`` and call ``run(args)``; a UsageError
-    becomes ``parser.error``. Returns run's exit status."""
+    becomes ``parser.error``. Returns run's exit status. Used by the ``python -m``
+    entry points, which set up the console as the ``mllf`` command does."""
+    from mllf.log import setup_logging
     args = parser.parse_args(argv)
+    setup_logging(getattr(args, 'verbose', 0))
     try:
         return run(args)
     except UsageError as e:

@@ -143,3 +143,69 @@ def test_log_file_records_every_level_once(tmp_path, capsys):
     lines = path.read_text().splitlines()
     assert [ln.split(' ', 2)[2] for ln in lines] == ['detail', 'progress']
     assert capsys.readouterr().out.splitlines() == ['progress', 'after']
+
+
+# -------------------------------------------------- logging, used as a library
+class _Records(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+@pytest.fixture
+def library_logging():
+    """The mllf logger as ``import mllf`` leaves it (no console of its own),
+    under an application whose root logger shows INFO; restored after."""
+    logger, root = logging.getLogger('mllf'), logging.getLogger()
+    saved = (logger.handlers[:], logger.level, logger.propagate, root.level)
+    logger.handlers[:] = [logging.NullHandler()]
+    logger.setLevel(logging.NOTSET)
+    logger.propagate = True
+    app = _Records()
+    root.addHandler(app)
+    root.setLevel(logging.INFO)
+    yield app
+    root.removeHandler(app)
+    logger.handlers[:], level, logger.propagate, root_level = saved
+    logger.setLevel(level)
+    root.setLevel(root_level)
+
+
+def test_import_adds_no_console_handler():
+    import mllf  # noqa: F401
+    handlers = logging.getLogger('mllf').handlers
+    assert any(isinstance(h, logging.NullHandler) for h in handlers)
+
+
+def test_library_messages_go_to_the_application(library_logging, capsys):
+    log = logging.getLogger('mllf.test')
+    log.debug('detail')
+    log.info('progress')
+    assert library_logging.messages == ['progress']
+    assert capsys.readouterr().out == ''
+
+
+def test_library_log_file_keeps_detail_without_flooding_the_application(
+        library_logging, tmp_path, capsys):
+    from mllf.log import log_to_file
+    log, logger = logging.getLogger('mllf.test'), logging.getLogger('mllf')
+    path = tmp_path / 'run.log'
+    with log_to_file(path):
+        log.debug('detail')
+        log.info('progress')
+    log.debug('after detail')
+    assert [ln.split(' ', 2)[2] for ln in path.read_text().splitlines()] == ['detail', 'progress']
+    assert library_logging.messages == ['progress']
+    assert capsys.readouterr().out == ''
+    assert logger.propagate and logger.level == logging.NOTSET
+    assert [type(h) for h in logger.handlers] == [logging.NullHandler]
+
+
+def test_module_entry_points_show_the_console(library_logging, capsys):
+    from mllf.cli.common import run_command
+    log = logging.getLogger('mllf.test')
+    assert run_command(argparse.ArgumentParser(), lambda args: log.info('progress'), []) is None
+    assert capsys.readouterr().out == 'progress\n'

@@ -23,6 +23,15 @@ import torch
 MSLD_TEMPLATE = "timestep = 0.002\nesteps = 1000\nnsteps = 4000\n"
 
 
+@pytest.fixture(autouse=True)
+def mllf_console():
+    """mllf's messages on stdout, as the ``mllf`` command shows them (tests
+    read them with capsys). The library tests in test_cli.py undo it."""
+    from mllf.log import setup_logging
+    setup_logging(0)
+    yield
+
+
 def _seed(*parts) -> int:
     return int(hashlib.sha1('|'.join(map(str, parts)).encode()).hexdigest()[:12], 16)
 

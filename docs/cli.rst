@@ -61,9 +61,10 @@ the command:
 
 The live job status line (``[running=... | queued=...]``) and Uni-Mol's progress bars
 appear only in an interactive terminal. When mllf is used as a library (a notebook, a job
-script), the console messages are shown by default; ``mllf.log.setup_logging(-1)`` keeps
-only warnings, ``mllf.log.log_to_file(path)`` records everything in a file, and the
-``mllf`` logger can be given other handlers like any Python logger.
+script), it adds no console output of its own: its messages follow the application's
+logging configuration (``logging.basicConfig(level=logging.INFO)`` shows progress).
+``mllf.log.setup_logging()`` gives the command's console output instead (``-1`` keeps only
+warnings), and ``mllf.log.log_to_file(path)`` records everything in a file.
 
 Older entry points
 ------------------

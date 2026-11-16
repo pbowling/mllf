@@ -8,7 +8,6 @@ mllf.log
 
    .. autosummary::
    
-      install_default_handler
       log_to_file
       quiet_unimol_tools
       setup_logging

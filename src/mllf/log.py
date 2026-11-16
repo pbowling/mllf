@@ -17,9 +17,12 @@ console level::
      1  -v    the same plus each command's verbose detail
      2  -vv   every message, prefixed with its level and module
 
-Used as a library (a notebook, a job script), mllf shows the same console
-messages by default. To route them elsewhere, configure the ``mllf`` logger,
-e.g. ``logging.getLogger('mllf').handlers[:] = [my_handler]``.
+Used as a library (a notebook, a job script), mllf adds no handler of its own:
+its messages go to the application's logging configuration, like any
+library's (``logging.basicConfig(level=logging.INFO)`` shows progress). Call
+``setup_logging()`` for the command's console output instead. ``log_to_file``
+records every message either way, and passes on to the application only what
+it would have received without the file.
 """
 import contextlib
 import logging
@@ -67,19 +70,20 @@ def _console() -> logging.Handler:
     return h
 
 
-def install_default_handler() -> None:
-    """Show mllf's INFO messages on stdout unless the application has
-    configured the ``mllf`` logger itself (called on ``import mllf``)."""
-    logger = _logger()
-    if logger.handlers:
-        return
-    _console()
-    logger.setLevel(logging.DEBUG)   # handlers choose what they keep
-    logger.propagate = False
+class _ToApplication(logging.Handler):
+    """Hands records to the root logger's handlers, as propagation would, at
+    the level the application would have received without ``log_to_file``."""
+
+    def emit(self, record):
+        root = _logger().parent
+        if root.handlers:        # none: drop, as mllf's NullHandler would
+            root.handle(record)
 
 
 def setup_logging(verbosity: int = 0) -> None:
-    """Set the console level from a -q/-v count (see the module docstring)."""
+    """Show mllf's messages on stdout at the level of a -q/-v count (see the
+    module docstring). The ``mllf`` command calls it; a library user may too.
+    mllf's messages then stop propagating to the root logger."""
     h = _console()
     logger = _logger()
     logger.setLevel(logging.DEBUG)
@@ -109,12 +113,25 @@ def log_to_file(path, mode: str = 'a'):
     handler = logging.FileHandler(path, mode=mode, encoding='utf-8')
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter(FILE_FORMAT, FILE_DATE))
+    level = logger.level
+    forward = None
+    if logger.propagate:
+        # library use: the file needs DEBUG records, but the application's
+        # handlers should see only what its own levels let through
+        forward = _ToApplication(logger.getEffectiveLevel())
+        logger.addHandler(forward)
+        logger.propagate = False
+    logger.setLevel(logging.DEBUG)
     logger.addHandler(handler)
     try:
         yield path
     finally:
         logger.removeHandler(handler)
         handler.close()
+        logger.setLevel(level)
+        if forward is not None:
+            logger.removeHandler(forward)
+            logger.propagate = True
 
 
 def quiet_unimol_tools() -> None:
