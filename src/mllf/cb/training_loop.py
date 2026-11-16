@@ -1607,7 +1607,7 @@ def run_epoch(run: TrainingRun, epoch: int) -> bool:
 
 def run_training(config_path: str, verbose: Optional[bool] = None) -> None:
     """Run online policy training from a workflow YAML file (see
-    :doc:`/docs/workflow`): build or load the combo manifests, initialize or
+    :doc:`/workflow`): build or load the combo manifests, initialize or
     resume the policy, run the configured (curriculum) epochs and save
     checkpoints. In deploy mode the model and output paths come from the
     ``deploy:`` block. ``verbose`` overrides the config's ``verbose`` key.

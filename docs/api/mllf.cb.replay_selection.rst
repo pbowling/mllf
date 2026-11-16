@@ -10,6 +10,7 @@ mllf.cb.replay\_selection
    
       dataset_of
       greedy_cover
+      manifest_resolver
       node_labels
       owners
       pair_quality

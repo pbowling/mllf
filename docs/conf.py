@@ -10,13 +10,16 @@ import os
 import sys
 
 
-# make sure the package in src/ is importable when building docs
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+# make sure the package in ../src is importable when building docs
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
+
+from mllf import __version__  # noqa: E402  (one version, in src/mllf/__init__.py)
+
 
 project = 'Machine Learned Landscape Flattening'
 copyright = '2025, Paige E. Bowling, Charles L. Brooks III'
 author = 'Paige E. Bowling, Charles L. Brooks III'
-release = '0.1.0'
+release = __version__
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -33,10 +36,11 @@ extensions = [
 # generate autosummary stub pages
 autosummary_generate = True
 
-# Prefer the ReadTheDocs theme; fallback to alabaster if not installed
+# Prefer the ReadTheDocs theme; fall back to alabaster if it is not installed
 try:
+    import sphinx_rtd_theme  # noqa: F401
     html_theme = 'sphinx_rtd_theme'
-except Exception:
+except ImportError:
     html_theme = 'alabaster'
 
 templates_path = ['_templates']
@@ -49,4 +53,4 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 html_static_path = ['_static']
 
 # configuration for sphinxcontrib-bibtex
-bibtex_bibfiles = ['docs/references.bib']
+bibtex_bibfiles = ['references.bib']

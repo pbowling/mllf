@@ -34,6 +34,7 @@ Where to start
    background
    installation
    examples
+   cli
    workflow
    cb_setup
    cb_pretraining

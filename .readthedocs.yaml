@@ -15,9 +15,9 @@ build:
   # requirements; RTD will build documentation using its configured
   # Sphinx command and write to the provided $READTHEDOCS_OUTPUT/html.
 
-# Build documentation using the project's top-level conf.py
+# Build documentation from docs/ (docs/index.rst is the landing page)
 sphinx:
-  configuration: conf.py
+  configuration: docs/conf.py
 
 python:
   install:

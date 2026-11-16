@@ -1,5 +1,5 @@
-CB Behavior Cloning
-===================
+Pretraining by Behavior Cloning
+===============================
 
 Before online training, the policy is **pretrained** by behavior cloning on the bias
 coefficients of completed simulations. Online training then starts near working biases,
@@ -12,7 +12,7 @@ that system is to the pretraining data, and the online stages correct the rest.
 Pretraining Data
 ----------------
 
-``mllf.cli.collect_pretraining_data`` turns completed run directories (``variables.py``,
+``mllf collect`` (``mllf.cli.collect_pretraining_data``) turns completed run directories (``variables.py``,
 output and ``prep/``) into records under ``pretraining/``. Three layouts are recognized:
 
 .. code-block:: text
@@ -110,7 +110,7 @@ Objective
 ---------
 
 The loss is an advantage-weighted regression (AWR), the Gaussian negative log-likelihood
-of each target coefficient weighted by how well the run sampled:
+(NLL) of each target coefficient weighted by how well the run sampled:
 
 .. math::
 
@@ -156,7 +156,7 @@ the starting exploration scale.
 * **Data hygiene** (default). A run's coefficients are evidence for a coefficient only when
   the run sampled the part of λ space that coefficient shapes. A trapped run leaves the
   other coefficients wherever its optimizer stopped, and flattening runs that never
-  reached their endpoints drove end biases to 10–18, far outside converged values. Each
+  reached their endpoints drove end biases to 10–18 kcal/mol, far outside converged values. Each
   target is therefore kept only when the run measured it: **linear** when both
   substituents were sampled with a finite ΔΔG, **quadratic** when the midpoint barrier was
   measured, and **skew / end** when the asymmetry was measured (frames at both endpoint

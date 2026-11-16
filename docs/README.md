@@ -9,13 +9,17 @@ pip install -r docs/requirements.txt
 pip install -e .
 ```
 
-2. Build HTML:
+2. Build HTML from the repository root:
 
 ```bash
-sphinx-build -b html . _build/html
+sphinx-build -b html docs docs/_build/html
 ```
+
+or, from `docs/`, `make html` (`make.bat html` on Windows). Open
+`docs/_build/html/index.html` to view the result.
 
 Read the Docs
 ------------
-This project includes a `.readthedocs.yaml` that configures RTD to use the project root
-`conf.py` and to install the package and `docs/requirements.txt` prior to building.
+`.readthedocs.yaml` at the repository root configures Read the Docs to use `docs/conf.py`
+and to install the package and `docs/requirements.txt` before building. `docs/index.rst`
+is the landing page at https://mllf.readthedocs.io/en/latest/.

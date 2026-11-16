@@ -14,7 +14,7 @@ repos:
     hooks:
       - id: flake8
         # files are passed explicitly, which bypasses .flake8's exclude
-        exclude: ^(tests/samples|examples|docs)/|^conf\.py$|^src/mllf/analysis/style\.py$
+        exclude: ^(tests/samples|examples|docs)/|^src/mllf/analysis/style\.py$
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:

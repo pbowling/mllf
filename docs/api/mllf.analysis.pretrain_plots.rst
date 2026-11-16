@@ -10,6 +10,7 @@ mllf.analysis.pretrain\_plots
    
       dataset_stats
       embedding_pca
+      embedding_pca_families
       metrics
       nearest_systems
       parity_all
