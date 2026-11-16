@@ -206,6 +206,7 @@ class EpochRecord:
     ran: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     passed: List[str] = field(default_factory=list)
     reopened: List[Tuple[str, int]] = field(default_factory=list)
+    paired: List[Tuple[str, int]] = field(default_factory=list)
     holdoff: List[str] = field(default_factory=list)
     groupfix: List[str] = field(default_factory=list)
     rows: List[Dict] = field(default_factory=list)
@@ -611,6 +612,13 @@ def plan_per_system(run: TrainingRun, epoch: int) -> Optional[EpochPlan]:
         return None
     run.active_train_combos = [c for s in plan.active_systems for c in system_stage_pool(run, s)
                                if c not in held_out]
+    # pairs that groups sent back wait on (group_reopen_set), outside the stage's pool
+    pooled = set(run.active_train_combos)
+    for sn in plan.active_systems:
+        for c in _held_pair_combos(run, sn, run.stages[run.stage_state[sn]['stage']]):
+            if c not in pooled and c not in held_out:
+                run.active_train_combos.append(c)
+                pooled.add(c)
     # Reference pairs: the stage's reference_set (e.g. each ALF group's
     # reference vs the others), else the stage's pool itself.
     for sn in plan.active_systems:
@@ -894,8 +902,7 @@ def add_priorities(run: TrainingRun, plan: EpochPlan) -> None:
         # in selection rank; a pair that got stuck or stranded (run_both) also
         # runs reversed, lambda starting on its other substituent.
         want = set(plan.ref_keys.get(sn, ()))
-        for ks in (run.stage_state[sn].get('group_hold') or {}).values():
-            want |= set(ks)
+        want |= _reopened_keys(run.stage_state[sn])
         # scout_priority: the lowest tier (likely hardest) goes first.
         tiers = _scout_tiers(run, stg.get('scout_priority') or (
             str(Path(stg['scouting']) / 'pair_priority.json') if stg.get('scouting') else None))
@@ -1047,11 +1054,47 @@ def _log_group_correction(run: TrainingRun, rec: EpochRecord, sys_name: str, cdi
     return gc
 
 
+def _set_pair_keys(run: TrainingRun, sys_name: str, set_name: str) -> Set[str]:
+    """Pair keys of every combo in one of a system's combo sets."""
+    return {k for c in run.combo_sets_by_system.get(sys_name, {}).get(set_name, [])
+            for k in system_stages.combo_pair_keys(sys_name, c)}
+
+
+def _reopened_keys(st: Optional[Dict]) -> Set[str]:
+    """Pair keys reopened for a system's failing groups: those a group waits
+    on (group_hold) and those running alongside a group (group_pairs_open,
+    stage key group_reopen_hold: false)."""
+    st = st or {}
+    return {k for name in ('group_hold', 'group_pairs_open')
+            for ks in (st.get(name) or {}).values() for k in ks}
+
+
+def _held_pair_combos(run: TrainingRun, sys_name: str, stage: Dict) -> List[str]:
+    """Stage key group_reopen_set: the set's pair combos reopened for failing
+    groups (``_reopened_keys``). They join the pair pool even when the stage's
+    combo_set has no pairs (a groups-only stage)."""
+    rset = stage.get('group_reopen_set')
+    held = _reopened_keys(run.stage_state.get(sys_name))
+    if not rset or not held:
+        return []
+    out = []
+    for c in run.combo_sets_by_system.get(sys_name, {}).get(rset, []):
+        keys = system_stages.combo_pair_keys(sys_name, c)
+        if keys and all(k in held for k in keys):
+            out.append(c)
+    return out
+
+
 def _reopen_failed_group(run: TrainingRun, rec: EpochRecord, sys_name: str, st: Dict, stage: Dict,
                          cdir: Path, saved_data) -> None:
     """group_max_failures: a group failing that many runs goes back to the
     pair phase -- its pairs with a substituent its failed runs left empty are
-    reopened and it waits for them."""
+    reopened and it waits for them. With group_reopen_set (e.g. the reference
+    pairs), only its pairs in that set reopen, and they run even in a stage
+    whose combo_set has no pairs (``_held_pair_combos``). With
+    group_reopen_hold: false the group does not wait: it keeps running each
+    epoch while its pairs run alongside, their offsets reaching its next runs,
+    until they resolve or retire or the group passes."""
     gmax = stage.get('group_max_failures')
     fails = st.setdefault('group_failures', {})
     fails[cdir.name] = int(fails.get(cdir.name, 0)) + 1
@@ -1060,19 +1103,33 @@ def _reopen_failed_group(run: TrainingRun, rec: EpochRecord, sys_name: str, st: 
     if gmax is None or fails[cdir.name] < int(gmax):
         return
     keys = system_stages.group_failed_pairs(sys_name, cdir, [{'populations': p} for p in fpops])
+    rset = stage.get('group_reopen_set')
+    if rset:
+        # only the group's pairs in that set (e.g. its reference pairs); every
+        # one of them when none includes an unsampled substituent
+        allowed = _set_pair_keys(run, sys_name, rset)
+        own = [k for k in system_stages.combo_pair_keys(sys_name, cdir) if k in allowed]
+        keys = [k for k in keys if k in allowed] or own or keys
     system_stages.reopen_pairs(run.bandit_state, keys, stage['name'])
-    st.setdefault('group_hold', {})[cdir.name] = keys
+    hold = bool(stage.get('group_reopen_hold', True))
+    if hold:
+        st.setdefault('group_hold', {})[cdir.name] = keys
+    else:
+        opened = st.setdefault('group_pairs_open', {})
+        opened[cdir.name] = sorted(set(opened.get(cdir.name) or []) | set(keys))
     fails[cdir.name] = 0
     st['group_failed_pops'].pop(cdir.name, None)
     # runs from before the pairs are re-corrected are not pooled with later ones
     (st.get('group_window') or {}).pop(cdir.name, None)
     reopened = st.setdefault('groups_reopened', {})
     reopened[cdir.name] = int(reopened.get(cdir.name, 0)) + 1
-    line = (f"  [GROUP] {sys_name}/{cdir.name}: failed {gmax} runs; back to the "
-            f"pair phase ({len(keys)} pair(s) reopened)")
+    line = (f"  [GROUP] {sys_name}/{cdir.name}: failed {gmax} runs; " + (
+        f"back to the pair phase ({len(keys)} pair(s) reopened)" if hold else
+        f"{len(keys)} pair(s) reopened to run alongside it"))
     log.info('%s', line)
     rec.stage_lines.append(line)
-    rec.reopened.append((f"{sys_name}/{cdir.name.split('_site')[0]}", len(keys)))
+    (rec.reopened if hold else rec.paired).append(
+        (f"{sys_name}/{cdir.name.split('_site')[0]}", len(keys)))
     run.save_bandit_state()
 
 
@@ -1127,6 +1184,8 @@ def record_group_runs(run: TrainingRun, stats: Dict, epoch: int, rec: EpochRecor
             if cdir.name not in (st.get('groups_done') or {}):
                 rec.passed.append(f"{sys_name}/{cdir.name.split('_site')[0]}")
             st.setdefault('groups_done', {}).setdefault(cdir.name, export_rd)
+            # pairs running alongside it are no longer needed
+            (st.get('group_pairs_open') or {}).pop(cdir.name, None)
         elif (groups and cdir.name not in (st.get('groups_done') or {})
               and not (gc and gc.get('stepped'))):
             _reopen_failed_group(run, rec, sys_name, st, stage, cdir, saved_data)
@@ -1335,8 +1394,7 @@ def _epoch_log_block(run: TrainingRun, plan: EpochPlan, stats: Dict, rec: EpochR
             runs['groups'] += 1
             continue
         want = set(plan.ref_keys.get(sn, ()))
-        for ks in ((run.stage_state.get(sn) or {}).get('group_hold') or {}).values():
-            want |= set(ks)
+        want |= _reopened_keys(run.stage_state.get(sn))
         keys = system_stages.combo_pair_keys(sn, c)
         if keys and all(k in want for k in keys):
             runs['reference'] += 1
@@ -1349,6 +1407,7 @@ def _epoch_log_block(run: TrainingRun, plan: EpochPlan, stats: Dict, rec: EpochR
         plan.epoch, runs, failed=stats.get('permanently_failed', []),
         pair_short=stats.get('pair_success_short'), pair_full=stats.get('pair_success_full'),
         groups_run=runs['groups'], groups_passed=rec.passed, groups_reopened=rec.reopened,
+        groups_paired=rec.paired,
         groups_holdoff=rec.holdoff, groups_corrected=rec.groupfix,
         validation=rec.val_pair_success, gate=rec.gate, regression=stats.get('regression'),
         hindsight=stats.get('hindsight'), systems=rec.rows, stage_changes=rec.changes,

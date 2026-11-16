@@ -163,3 +163,71 @@ def test_run_training_resumes_and_finishes_with_no_epochs_left(tmp_path, fake_cl
     run_training(path)
     final = torch.load(ck / 'final_model.pt', weights_only=False)
     assert final['all_stats'] == [] and 'baseline_state_dict' in final
+
+
+def test_failed_group_resolves_its_reference_pairs_in_a_groups_only_stage(tmp_path, fake_cluster):
+    """group_reopen_set: a group failing group_max_failures runs sends only its
+    reference pairs back; they run although the stage has no pair pool, and
+    the group runs again once they are resolved (or retired)."""
+    sys_a, _ = make_system(tmp_path, 'sysA', [(1, [1, 2, 3])])
+    sys_a['combo_sets'] = {'groups': [{1: [1, 2, 3]}], 'no_pairs': [],
+                           'refpairs': {'pairs_of': 'groups', 'reference_only': True}}
+    sys_a['export_combo_set'] = 'groups'
+    cfg = _hindsight(_config(tmp_path, [sys_a], validation_per_system=0))
+    cfg['curriculum'] = {
+        'enabled': True, 'per_system': True, 'max_train_combos_per_stage': 10,
+        'stages': [{
+            'name': 'groups_only', 'epochs': 4, 'combo_set': 'no_pairs', 'group_set': 'groups',
+            'reference_set': 'refpairs', 'group_ready_fraction': 0.0,
+            'group_max_failures': 1, 'group_reopen_set': 'refpairs', 'retire_after_epochs': 2,
+            'run_steps': {'equil': 100, 'prod': 400}, 'explore_min_transitions': 1,
+            'explore_min_fraction': 0.0,
+            # the fake runs carry no endpoint counts: every group run fails
+            'advance': {'type': 'groups_done', 'successes': 1,
+                        'production': {'min_end_share': 0.02}}}]}
+    torch.manual_seed(0)
+    run_training(_write_config(tmp_path, cfg))
+
+    out = Path(sys_a['out_dir'])
+    group = out / 'group01_site1_subs_1_2_3'
+    runs = sorted(p.name for p in group.glob('run_*'))
+    # epoch 0 fails; epochs 1-2 the group waits while only its reference pairs
+    # (with substituent 1) run; once they are resolved or retired
+    # (retire_after_epochs: 2) the group runs again
+    assert runs[0] == 'run_000' and 'run_001' not in runs and len(runs) >= 2
+    pairs = sorted(p.parent.name for p in out.glob('pair*/run_*'))
+    assert pairs and all('subs_1_' in c for c in pairs)
+    assert not list(out.glob('pair*/run_000'))
+    log_text = (tmp_path / 'ck' / 'epoch_summary.log').read_text()
+    assert 'Groups back to pairs: sysA/group01 (2 pairs reopened)' in log_text
+
+
+def test_failed_group_keeps_running_with_its_reference_pairs_alongside(tmp_path, fake_cluster):
+    """group_reopen_hold: false: the failing group runs every epoch while its
+    reopened reference pairs run next to it."""
+    sys_a, _ = make_system(tmp_path, 'sysA', [(1, [1, 2, 3])])
+    sys_a['combo_sets'] = {'groups': [{1: [1, 2, 3]}], 'no_pairs': [],
+                           'refpairs': {'pairs_of': 'groups', 'reference_only': True}}
+    sys_a['export_combo_set'] = 'groups'
+    cfg = _hindsight(_config(tmp_path, [sys_a], validation_per_system=0))
+    cfg['curriculum'] = {
+        'enabled': True, 'per_system': True, 'max_train_combos_per_stage': 10,
+        'stages': [{
+            'name': 'groups_only', 'epochs': 3, 'combo_set': 'no_pairs', 'group_set': 'groups',
+            'reference_set': 'refpairs', 'group_ready_fraction': 0.0,
+            'group_max_failures': 1, 'group_reopen_set': 'refpairs',
+            'group_reopen_hold': False, 'retire_after_epochs': 2,
+            'run_steps': {'equil': 100, 'prod': 400},
+            'advance': {'type': 'groups_done', 'successes': 1,
+                        'production': {'min_end_share': 0.02}}}]}
+    torch.manual_seed(0)
+    run_training(_write_config(tmp_path, cfg))
+
+    out = Path(sys_a['out_dir'])
+    group = out / 'group01_site1_subs_1_2_3'
+    assert sorted(p.name for p in group.glob('run_*')) == ['run_000', 'run_001', 'run_002']
+    pairs = sorted(p.parent.name for p in out.glob('pair*/run_001'))
+    assert len(pairs) == 2 and all('subs_1_' in c for c in pairs)
+    log_text = (tmp_path / 'ck' / 'epoch_summary.log').read_text()
+    assert 'Pairs alongside groups: sysA/group01 (2 pairs reopened)' in log_text
+    assert 'Groups back to pairs' not in log_text
