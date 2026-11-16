@@ -1,7 +1,9 @@
 """Shared pieces of the analyses: dependency check, environments, the output
 directory (figures, tables, report) and a small pickle cache."""
 import logging
+import os
 import pickle
+import tempfile
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -61,10 +63,11 @@ def load_cache(path: Path) -> Dict:
 
 def save_cache(path: Path, data: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.tmp')
-    with open(tmp, 'wb') as f:
+    # a temporary file of its own: analyses running at once share caches
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + '.', suffix='.tmp')
+    with os.fdopen(fd, 'wb') as f:
         pickle.dump(data, f)
-    tmp.replace(path)
+    os.replace(tmp, path)
 
 
 FORMATS = ('png', 'pdf')

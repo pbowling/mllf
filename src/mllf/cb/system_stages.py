@@ -437,7 +437,7 @@ FRAMES_PER_NS = 37500.0     # saved lambda frames per ns (nsavl 10), ours and AL
 
 
 def production_balanced(saved_data: Dict, nsubs_per_site: Sequence[int], cfg: Dict) -> bool:
-    """Production test (advance.production): in this one run, every
+    """End-state test (advance.production): in this one run, every
     substituent spent >= min_end_fraction of the frames at lambda >= 0.99
     (read_output.parse_endpoint_nodes) and entered its endpoint >= min_visits_per_ns
     times per ns (half its transitions with its site partners,

@@ -62,7 +62,8 @@ names the pretraining config when the model directory holds none; its
    a full set; cached afterwards): runs per dataset, substituents and sites per run, and
    the distribution of each scored coefficient.
 
-The report gives N, R², Pearson r, MUE, RMSE and the median posterior predictive sd per
+The report gives N, R², Pearson r, the mean unsigned error (MUE), the root-mean-square
+error (RMSE) and the median posterior predictive sd per
 coefficient, the same per family (``tables/metrics_by_system.csv`` per system), and each
 system's three closest systems of other families. ``tables/predictions.csv`` holds every
 directed pair and coefficient of every analyzed run.
@@ -85,14 +86,19 @@ cached once per pretraining root in ``~/.cache/mllf`` and shared by every analys
 Runs are judged by online training's tests. A pair run succeeds with both substituents
 sampled, a minority fraction of at least 0.2 and at least 10 crossings, or the stage's
 short-run test (``explore_min_transitions`` / ``explore_min_fraction``) for runs under
-0.5 ns. A group run passes the stage's group test: the production test where the stage
-sets ``advance.production`` (every substituent at least ``min_end_fraction`` of the frames
-at its endpoint and ``min_visits_per_ns`` entries per ns, in one run), else the balance
-test (``advance.min_population_ratio`` / ``min_site_transitions``). ALF's runs are judged
-by the same test, the production test from each run's ``simulation_results.json``.
+0.5 ns. A group run passes the stage's group test, which is the end-state test when the
+stage sets ``advance.production`` (every substituent at least ``min_end_fraction`` of the
+frames at its endpoint and ``min_visits_per_ns`` entries per ns, in one run) and the
+balance test (``advance.min_population_ratio`` / ``min_site_transitions``) otherwise.
+ALF's runs are judged by the same test, the end-state test from each run's
+``simulation_results.json``.
 ``--group-test balance`` judges every group run, ours and ALF's, by the less strict
 balance test instead (``--balance-test RATIO TRANSITIONS``, default 0.5 and 10), with
 convergence recomputed from those outcomes, and writes to ``<run dir>/analysis_balance``.
+``--group-test sampling`` applies the sampling criterion, the least strict: a group
+passes at its first run in which every substituent reached its endpoint at least once,
+with no floor on the time there or on transitions and no pooling over runs, and writes
+to ``<run dir>/analysis_sampling``.
 
 ``success_over_epochs``
    Percent of pairs, group runs and held-out pairs that passed their test per epoch
@@ -107,7 +113,8 @@ convergence recomputed from those outcomes, and writes to ``<run dir>/analysis_b
    lighter and hatched where it did not (stopped at the epoch limit, or still running), a
    diamond for a system that converged on its scouting runs, and its groups passed.
 ``convergence_systems`` / ``convergence_groups`` (pages of 12 systems)
-   Simulated time to convergence for MLLF and ALF, per system and per group. Solid bars
+   Simulated time to convergence for ``mllf`` (MLLF in the figures) and ALF, per system
+   and per group. Solid bars
    converged (every group passed the group test); hatched bars never did and show every
    ns that method ran. MLLF's time includes scouting and leaves out validation; a group's
    time is its own runs plus its share of its pair runs. ALF's groups are compared one to

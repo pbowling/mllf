@@ -43,8 +43,9 @@ def analyze_online(config: Dict, out_dir, run_dir=None, pretraining_root=None,
     empty list draws them for every system, a list of names for those.
     ``group_test``: 'stage' judges group runs as training did (the production
     test where the stage uses it), 'balance' by the balance test at
-    ``balance_test`` (min_population_ratio, min_site_transitions); ALF's runs
-    are judged by the same test."""
+    ``balance_test`` (min_population_ratio, min_site_transitions), 'sampling'
+    by every substituent sampled once in one run; ALF's runs are judged by the
+    same test."""
     import pandas as pd
 
     from mllf.analysis import online_data as od
@@ -153,7 +154,9 @@ def report_text(data, runs, sys_df, grp_df, out: Output, pd) -> str:
         share = test[3] if len(test) > 3 else None
         floor = (f"{share:g} / n of frames at its endpoint (n: its site's substituents)"
                  if share is not None else f"{100 * test[1]:g}% of frames at its endpoint")
-        desc = f"production (every substituent >= {floor}, >= {test[2]:g} entries / ns, one run)"
+        desc = f"end state (every substituent >= {floor}, >= {test[2]:g} entries / ns, one run)"
+    elif data.group_test_mode == 'sampling':
+        desc = 'sampling (every substituent at its endpoint at least once, one run)'
     else:
         desc = (f"balance (each substituent >= {test[1]:g} / n of its site, "
                 f">= {test[2]} site transitions)")

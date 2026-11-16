@@ -18,17 +18,21 @@ stage's ``advance``, default 0.5 and 10). With the stage's
 ``group_pass_window`` above 1, training pools a group's latest runs: a run
 that fails alone but passes together with the group's previous runs is
 "passed with previous run". A stage with ``advance.production`` instead
-judges each group run alone by the production test
+judges each group run alone by the end-state test
 (``system_stages.production_balanced``: every substituent's time at its
 endpoint and its visits per ns); a run that meets the balance test but not
-the production test is "short of production test".
+the end-state test is "short of end-state test".
 
 ``group_test='balance'`` judges every group run by the balance test instead,
 at ``balance_test`` (min_population_ratio, min_site_transitions; default 0.5
 and 10), and recomputes each group's and system's convergence from those
-outcomes: a less strict criterion than the production test.
+outcomes: a less strict criterion than the end-state test.
+``group_test='sampling'`` (the sampling criterion) is the least strict: a
+group passes at its first run in which every substituent reached its endpoint
+(lambda >= 0.99) at least once, with no floor on the time there or the
+transitions and no pooling.
 
-ALF's runs are judged by the same test as ours: the production test where
+ALF's runs are judged by the same test as ours: the end-state test where
 the group stage uses it (from each run's simulation_results.json: frames at
 lambda >= 0.99 per substituent, its transitions per pair and the run's ns),
 else the balance test.
@@ -47,11 +51,11 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 PAIR_OUTCOMES = ['success', 'unbalanced', 'few crossings', 'one-sided', 'neither sampled']
-GROUP_OUTCOMES = ['passed', 'passed with previous run', 'short of production test', 'uneven',
+GROUP_OUTCOMES = ['passed', 'passed with previous run', 'short of end-state test', 'uneven',
                   'few transitions',
                   'unsampled substituent']
 SHORT_RUN_NS = 0.5
-SCAN_VERSION = 5          # bump when scan_runs' rows change (rebuilds caches)
+SCAN_VERSION = 6          # bump when scan_runs' rows change (rebuilds caches)
 FULL_TEST = (10, 0.2)
 
 
@@ -71,7 +75,8 @@ class OnlineData:
     alf_group_systems: Set[str] = field(default_factory=set)   # group_set = ALF's groups
     scouting_ns: float = 0.0
     # 'stage': each stage's own group test, as training judged it;
-    # 'balance': the balance test at balance_test for every group run
+    # 'balance': the balance test at balance_test for every group run;
+    # 'sampling': every substituent sampled once, one run (balance_test (0, 0))
     group_test_mode: str = 'stage'
     balance_test: Tuple[float, int] = (0.5, 10)
 
@@ -110,17 +115,20 @@ class OnlineData:
             return ('production', float(prod.get('min_end_fraction', 0.01)),
                     float(prod.get('min_visits_per_ns', 2.0)),
                     None if share is None else float(share))
-        ratio, trans = self.balance_test if self.group_test_mode == 'balance' \
+        ratio, trans = self.balance_test if self.group_test_mode in ('balance', 'sampling') \
             else self.group_test()
         return ('balance', float(ratio), int(trans))
 
     def stage_group_test(self, stage_name: Optional[str]) -> Dict:
         """The group test of one stage, as training applies it: the balance
         test (min_population_ratio / min_site_transitions), pooled over
-        group_pass_window runs, or the production test (advance.production,
+        group_pass_window runs, or the end-state test (advance.production,
         one run, no pooling). With group_test_mode 'balance', the balance
-        test at balance_test (pooled as the stage pools)."""
+        test at balance_test (pooled as the stage pools); with 'sampling',
+        every substituent sampled in one run."""
         st = next((s for s in self.stages if s.get('name') == stage_name), None)
+        if self.group_test_mode == 'sampling':
+            return {'ratio': 0.0, 'trans': 0, 'production': None, 'window': 1}
         if self.group_test_mode == 'balance':
             ratio, trans = self.balance_test
             return {'ratio': float(ratio), 'trans': int(trans), 'production': None,
@@ -148,9 +156,12 @@ def load_online(config: Dict, run_dir=None, group_test: str = 'stage',
     The config gets training's defaults first (``with_hindsight_defaults``,
     e.g. each stage's group_pass_window), so runs are judged as training
     judged them (``group_test`` 'stage'), or by the balance test at
-    ``balance_test`` ('balance')."""
-    if group_test not in ('stage', 'balance'):
-        raise ValueError(f"group_test must be 'stage' or 'balance', not {group_test!r}")
+    ``balance_test`` ('balance'), or by every substituent sampled once
+    ('sampling')."""
+    if group_test not in ('stage', 'balance', 'sampling'):
+        raise ValueError(f"group_test must be 'stage', 'balance' or 'sampling', not {group_test!r}")
+    if group_test == 'sampling':
+        balance_test = (0.0, 0)
     import copy
 
     from mllf.cb.bandit_config import with_hindsight_defaults
@@ -372,7 +383,7 @@ def _run_record(task) -> Optional[Dict]:
             if production_balanced(saved, nsubs, gtest['production']):
                 out['outcome'] = 'passed'
             elif out['outcome'] == 'passed':
-                out['outcome'] = 'short of production test'
+                out['outcome'] = 'short of end-state test'
         out['test'] = 'group'
         out['_window'] = gtest['window']
         out['_ratio_trans'] = (gtest['ratio'], gtest['trans'])
@@ -430,7 +441,7 @@ def _pool_group_runs(rows: List[Dict]) -> None:
     """A group run that failed alone but passes pooled with the group's
     previous runs (its stage's group_pass_window - 1 of them;
     ``system_stages.pooled_group_test``, as training judges it) becomes
-    'passed with previous run'. Stages with the production test do not pool."""
+    'passed with previous run'. Stages with the end-state test do not pool."""
     from mllf.cb.system_stages import pooled_group_test
     by_group: Dict[Tuple[str, str], List[Dict]] = {}
     for r in rows:
@@ -485,7 +496,7 @@ def alf_group_runs(dataset_dir: Path, test: Tuple) -> List[Tuple[str, float, boo
 
 def alf_production(res: Dict, nsubs: List[int], ns: float, min_end: float,
                    min_visits: float, min_end_share: Optional[float] = None) -> bool:
-    """The production test (``system_stages.production_balanced``) of an
+    """The end-state test (``system_stages.production_balanced``) of an
     ALF run from its simulation_results.json: each block's frames at
     lambda >= 0.99 (CHARMM's population count, what parse_endpoint_nodes
     counts for our runs), out of the run's frames (ns x FRAMES_PER_NS, the
@@ -504,8 +515,9 @@ def alf_production(res: Dict, nsubs: List[int], ns: float, min_end: float,
 
 def alf_cache_path(pretraining_root) -> Path:
     """One cache of ALF's runs per pretraining root, shared by every analysis
-    (``$XDG_CACHE_HOME/mllf``, default ``~/.cache/mllf``): those datasets do
-    not change, and reading them takes minutes."""
+    (``$XDG_CACHE_HOME/mllf``, default ``~/.cache/mllf``): reading the datasets
+    takes minutes. A system is read again when its datasets change
+    (``alf_runs``)."""
     import hashlib
     import os
     root = str(Path(pretraining_root).resolve())
@@ -516,18 +528,24 @@ def alf_cache_path(pretraining_root) -> Path:
 def alf_runs(data: OnlineData, pretraining_root,
              cache_path: Optional[Path] = None) -> Dict[str, Dict[str, list]]:
     """{system: {ALF dataset: alf_group_runs}} for the run's systems, read once
-    per group test into ``cache_path`` (default ``alf_cache_path``)."""
+    per group test into ``cache_path`` (default ``alf_cache_path``). A system's
+    entry is read again when its dataset directories (their names and
+    modification times) differ from those it was read from, e.g. a dataset
+    replaced by new runs."""
     from mllf.analysis.common import load_cache, save_cache
     from mllf.cb.cost_ledger import alf_dataset_dirs
     cache_path = cache_path or alf_cache_path(pretraining_root)
     cache = load_cache(cache_path)
     key = data.alf_test()
     by_test = cache.setdefault(key, {})
+    sigs = cache.setdefault('signatures', {})
     changed = False
     for s in data.systems:
-        if s not in by_test:
-            by_test[s] = {d.name: alf_group_runs(d, key)
-                          for d in alf_dataset_dirs(s, pretraining_root)}
+        dirs = list(alf_dataset_dirs(s, pretraining_root))
+        sig = tuple(sorted((d.name, d.stat().st_mtime_ns) for d in dirs))
+        if s not in by_test or sigs.get((key, s)) != sig:
+            by_test[s] = {d.name: alf_group_runs(d, key) for d in dirs}
+            sigs[(key, s)] = sig
             changed = True
             log.info(f"  ALF runs read: {s} ({len(by_test[s])} datasets)")
             save_cache(cache_path, cache)        # keep progress if interrupted
@@ -609,7 +627,7 @@ def convergence_tables(data: OnlineData, alf: Dict[str, Dict[str, list]], runs=N
         gcombos = data.group_combos.get(sysn) or sorted(passed)
         scouted = set(st.get('scouted_groups') or {})
         through = {g: _pass_epoch(passed[g], st) if g in passed else None for g in gcombos}
-        if data.group_test_mode == 'balance' and gcombos:
+        if data.group_test_mode in ('balance', 'sampling') and gcombos:
             pe = group_pass_epochs(runs, sysn)
             through = {g: pe.get(g) for g in gcombos}
             passed = {g: e for g, e in through.items() if e is not None}
@@ -629,10 +647,10 @@ def convergence_tables(data: OnlineData, alf: Dict[str, Dict[str, list]], runs=N
         # ALF's datasets are its groups, in the order the alf_groups set numbers ours
         matched = sysn in data.alf_group_systems
         for gi, gc in enumerate(gcombos, start=1):
-            name, runs = (alf_sorted[gi - 1] if matched and gi <= len(alf_sorted)
-                          else (None, []))
+            name, alf_group = (alf_sorted[gi - 1] if matched and gi <= len(alf_sorted)
+                               else (None, []))
             ns_cum, ns_pass = 0.0, None
-            for _, ns, ok in runs:
+            for _, ns, ok in alf_group:
                 ns_cum += ns
                 if ok and ns_pass is None:
                     ns_pass = ns_cum
@@ -644,9 +662,9 @@ def convergence_tables(data: OnlineData, alf: Dict[str, Dict[str, list]], runs=N
                 'alf_passed': ns_pass is not None if name else None,
                 'alf_ns': (ns_pass if ns_pass is not None else ns_cum) if name else np.nan,
                 'alf_ns_total': ns_cum if name else np.nan})
-        for name, runs in alf_sorted:
+        for name, alf_group in alf_sorted:
             ns_cum, ns_pass = 0.0, None
-            for _, ns, ok in runs:
+            for _, ns, ok in alf_group:
                 ns_cum += ns
                 if ok and ns_pass is None:
                     ns_pass = ns_cum

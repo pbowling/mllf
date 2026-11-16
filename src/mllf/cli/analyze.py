@@ -37,11 +37,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     p.add_argument('--free-energy', nargs='*', default=None, metavar='SYSTEM',
                    help="also draw free-energy profiles of the passed groups' runs (of these "
                         'systems; default all). Reads every run trajectory: minutes per system')
-    p.add_argument('--group-test', choices=('stage', 'balance'), default='stage',
+    p.add_argument('--group-test', choices=('stage', 'balance', 'sampling'), default='stage',
                    help="how group runs, ours and ALF's, pass: 'stage' as training judged "
-                        'them (the production test where the stage uses it; default), '
-                        "'balance' by the less strict balance test (--balance-test); writes "
-                        'to <run dir>/analysis_balance by default')
+                        'them (the end-state test where the stage uses it; default), '
+                        "'balance' by the less strict balance test (--balance-test), "
+                        "'sampling' when every substituent reached its endpoint at least once "
+                        'in one run; writes to <run dir>/analysis_balance or analysis_sampling '
+                        'by default')
     p.add_argument('--balance-test', nargs=2, type=float, default=(0.5, 10),
                    metavar=('RATIO', 'TRANSITIONS'),
                    help='the balance test of --group-test balance: each substituent >= RATIO '
@@ -99,8 +101,9 @@ def run(args: argparse.Namespace) -> int:
         with open(args.config) as f:
             config = yaml.safe_load(f)
         run_dir = Path(args.run_dir or (config.get('output') or {}).get('base_dir') or '.')
-        out = Path(args.out or run_dir / ('analysis_balance' if args.group_test == 'balance'
-                                          else 'analysis'))
+        default_out = {'balance': 'analysis_balance',
+                       'sampling': 'analysis_sampling'}.get(args.group_test, 'analysis')
+        out = Path(args.out or run_dir / default_out)
         root = args.pretraining_root or config.get('alf_root')
         if root and str(root).lower() == 'none':
             root = None

@@ -453,7 +453,7 @@ is checked.
   (``min_population_ratio``, default 0.5, and ``min_site_transitions``, default 10).
   ``successes`` and ``max_offset_sd`` still define resolved pairs, which decide when a
   group is ready. ``production: {min_end_fraction, min_visits_per_ns}`` replaces the group
-  test with the production test: in one run, with no pooling over runs, every substituent
+  test with the end-state test: in one run, with no pooling over runs, every substituent
   spends at least ``min_end_fraction`` (default 0.01) of the frames at λ ≥ 0.99 and
   enters its endpoint at least ``min_visits_per_ns`` (default 2) times per ns
   (``system_stages.production_balanced``). ``min_end_share`` replaces the flat floor with

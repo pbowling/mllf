@@ -121,12 +121,12 @@ def test_balance_mode_recomputes_mllf_convergence(tmp_path):
     g = 'group01_site1_subs_1_2_3'
     ledger = {f'sim/sysA/{g}/run_00{e}': {'system': 'sysA', 'kind': 'train', 'epoch': e,
                                           'ns': 1.0} for e in range(3)}
-    # training (production test) passed the group at epoch 2; balance passes it at epoch 0
+    # training (end-state test) passed the group at epoch 2; balance passes it at epoch 0
     state = {'sysA': {'converged': True, 'groups_done': {g: f'sim/sysA/{g}/run_002'},
                       'history': [{'ended_epoch': 2}]}}
     runs = pd.DataFrame([{'system': 'sysA', 'combo': g, 'role': 'group', 'test': 'group',
                           'epoch': e, 'outcome': o}
-                         for e, o in enumerate(['passed', 'short of production test',
+                         for e, o in enumerate(['passed', 'short of end-state test',
                                                 'passed'])])
     data = _data(tmp_path, ledger, state)
     sys_df, _ = od.convergence_tables(data, {}, runs)
@@ -135,6 +135,79 @@ def test_balance_mode_recomputes_mllf_convergence(tmp_path):
     sys_df, grp_df = od.convergence_tables(data, {}, runs)
     assert sys_df.iloc[0]['mllf_converged'] and sys_df.iloc[0]['mllf_ns'] == pytest.approx(1.0)
     assert grp_df.iloc[0]['mllf_ns'] == pytest.approx(1.0)
+
+
+def test_balance_mode_with_alf_runs_for_several_systems(tmp_path):
+    """ALF's runs of one system must not replace the scanned runs the next
+    system's balance test reads."""
+    g = 'group01_site1_subs_1_2_3'
+    ledger = {f'sim/{s}/{g}/run_000': {'system': s, 'kind': 'train', 'epoch': 0, 'ns': 1.0}
+              for s in ('sysA', 'sysB')}
+    state = {s: {'converged': False, 'groups_done': {}, 'history': [{}]} for s in ('sysA', 'sysB')}
+    runs = pd.DataFrame([{'system': s, 'combo': g, 'role': 'group', 'test': 'group',
+                          'epoch': 0, 'outcome': 'passed'} for s in ('sysA', 'sysB')])
+    data = od.OnlineData(
+        config={'systems': [{'name': s, 'solvent_state': 'solv'} for s in ('sysA', 'sysB')]},
+        run_dir=tmp_path, stages=[], env={'sysA': 'solvent', 'sysB': 'solvent'},
+        epochs=pd.DataFrame(), stage_rows=pd.DataFrame(), ledger=ledger, stage_state=state,
+        group_combos={'sysA': [g], 'sysB': [g]}, alf_group_systems={'sysA', 'sysB'})
+    data.group_test_mode = 'balance'
+    alf = {s: {f'{s}_group1': [('run1', 1.0, True)]} for s in ('sysA', 'sysB')}
+    sys_df, _ = od.convergence_tables(data, alf, runs)
+    assert list(sys_df['mllf_converged']) == [True, True]
+
+
+def test_sampled_mode_passes_a_run_with_every_substituent_sampled_once(tmp_path):
+    """The old criterion: any time at every endpoint passes, uneven or not, with
+    no transitions needed and no pooling; ALF's runs get the same test."""
+    data = od.OnlineData(config={'systems': []}, run_dir=tmp_path,
+                         stages=[{'name': 'g', 'group_pass_window': 3,
+                                  'advance': {'type': 'groups_done',
+                                              'production': {'min_end_fraction': 0.01}}}],
+                         env={}, epochs=pd.DataFrame(), stage_rows=pd.DataFrame(), ledger={},
+                         stage_state={}, group_test_mode='sampling', balance_test=(0.0, 0))
+    t = data.stage_group_test('g')
+    assert t == {'ratio': 0.0, 'trans': 0, 'production': None, 'window': 1}
+    assert od.classify_group([500, 1, 2], [0], [3], t['ratio'], t['trans']) == 'passed'
+    assert od.classify_group([500, 0, 2], [40], [3], t['ratio'], t['trans']) == \
+        'unsampled substituent'
+    assert data.alf_test() == ('balance', 0.0, 0)
+    with pytest.raises(ValueError):
+        od.load_online({'systems': []}, tmp_path, group_test='bogus')
+
+
+def test_alf_runs_read_again_when_a_dataset_is_replaced(tmp_path, monkeypatch):
+    import os
+    import shutil
+    root = tmp_path / 'pre'
+    (root / 'sysA_group1' / 'run1').mkdir(parents=True)
+    (root / 'sysA_group1.new' / 'run1').mkdir(parents=True)     # being rebuilt: ignored
+    calls = []
+    monkeypatch.setattr(od, 'alf_group_runs', lambda d, key: calls.append(d.name) or [])
+    data = od.OnlineData(config={'systems': [{'name': 'sysA'}]}, run_dir=tmp_path, stages=[],
+                         env={}, epochs=pd.DataFrame(), stage_rows=pd.DataFrame(), ledger={},
+                         stage_state={})
+    cache = tmp_path / 'alf.pkl'
+    od.alf_runs(data, root, cache)
+    od.alf_runs(data, root, cache)
+    assert calls == ['sysA_group1']                   # cached the second time
+    shutil.rmtree(root / 'sysA_group1')
+    (root / 'sysA_group1' / 'run1').mkdir(parents=True)
+    st = (root / 'sysA_group1').stat()
+    os.utime(root / 'sysA_group1', ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+    od.alf_runs(data, root, cache)
+    assert calls == ['sysA_group1', 'sysA_group1']    # replaced: read again
+
+
+def test_caches_saved_at_once_do_not_collide(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mllf.analysis.common import load_cache, save_cache
+    path = tmp_path / 'c.pkl'
+    with ThreadPoolExecutor(4) as ex:
+        list(ex.map(lambda i: save_cache(path, {'i': i}), range(40)))
+    assert load_cache(path)['i'] in range(40)
+    assert not list(tmp_path.glob('*.tmp'))
 
 
 def test_names_environments_and_tables(tmp_path):

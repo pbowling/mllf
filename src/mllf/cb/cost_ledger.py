@@ -127,7 +127,8 @@ def alf_dataset_dirs(system: str, pretraining_root,
     dirs = []
     for name in sorted(names):
         for d in [root / name] + sorted(root.glob(f"{name}_group*")):
-            if d.is_dir() and any(d.glob('run[0-9]*')) and d not in dirs:
+            # (not a dataset being rebuilt or set aside: name.new, name.old)
+            if d.is_dir() and '.' not in d.name and any(d.glob('run[0-9]*')) and d not in dirs:
                 dirs.append(d)
     return dirs
 
