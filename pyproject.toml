@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# 77: SPDX license expression and license-files (PEP 639)
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,17 +8,32 @@ name = "mllf"
 dynamic = ["version"]
 description = "Machine-learned bias coefficients for multisite lambda dynamics"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
 maintainers = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
-keywords = ["machine learning", "neural networks", "molecular dynamics", "multisite lambda dynamics"]
+keywords = [
+    "machine learning",
+    "neural networks",
+    "molecular dynamics",
+    "multisite lambda dynamics",
+    "free energy",
+    "alchemical",
+    "CHARMM",
+]
 # X | None annotations (generate_combinations) need 3.10.
 requires-python = ">=3.10"
+# The license is given by the SPDX expression above (PEP 639), not a classifier.
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: POSIX :: Linux",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Chemistry",
 ]
 
@@ -33,7 +49,10 @@ dependencies = [
 mllf = "mllf.cli.main:main"
 
 [project.urls]
-"Repository" = "https://github.com/pbowling/mllf"
+Homepage = "https://github.com/pbowling/mllf"
+Documentation = "https://mllf.readthedocs.io/en/latest/"
+Repository = "https://github.com/pbowling/mllf"
+Issues = "https://github.com/pbowling/mllf/issues"
 
 [project.optional-dependencies]
 analysis = [
@@ -48,6 +67,8 @@ dev = [
     "isort",
     "pre-commit",
 ]
+    "build",
+    "twine",
 
 [tool.setuptools.dynamic]
 version = {attr = "mllf.__version__"}

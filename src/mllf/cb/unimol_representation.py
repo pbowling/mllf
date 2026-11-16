@@ -37,6 +37,7 @@ def _import_unimol_repr():
     logs = Path.cwd() / 'logs'
     existed = logs.exists()
     from unimol_tools import UniMolRepr
+
     # jobs started together in one directory race for it: another may have
     # removed it already, or written into it
     try:

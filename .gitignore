@@ -186,3 +186,7 @@ cython_debug/
 # outputs of the minimal example (examples/minimal/run_pipeline.sh)
 examples/minimal/output/
 mllf_minimal_*.out
+
+# Slurm job output and run logs written at the repository root
+slurm-*.out
+/logs/
