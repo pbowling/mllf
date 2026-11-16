@@ -15,6 +15,7 @@ of the pipeline (``python -m mllf`` is the same command):
    scout      scouting runs before a stage, and their summary
    train      online training from a workflow config
    export     export production biases from a trained policy
+   production production replicas with fixed biases, and their free energies
    cost       simulated ns per system: online run vs ALF
    analyze    figures and a report: pretrained model or online run
    archive    archive a run's combo directories, one .tar.gz per system
@@ -30,6 +31,7 @@ of the pipeline (``python -m mllf`` is the same command):
    mllf scout online_1.yaml --out scouting/online_1 --wait
    mllf train examples/minimal/workflow.yaml
    mllf export online_1.yaml --label checkpoints_online_1
+   mllf production run production.yaml
    mllf cost checkpoints_online_1 --pretraining-root pretraining
    mllf analyze online online_1.yaml
    mllf analyze pretrain models/14benz

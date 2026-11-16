@@ -26,6 +26,8 @@ COMMANDS = {
     'scout': ('mllf.cli.scout', 'scouting runs before a stage, and their summary'),
     'train': ('mllf.cli.train', 'online training from a workflow config'),
     'export': ('mllf.cli.export', 'export production biases from a trained policy'),
+    'production': ('mllf.cli.production',
+                   'production replicas with fixed biases, and their free energies'),
     'cost': ('mllf.cli.cost', 'simulated ns per system: online run vs ALF'),
     'analyze': ('mllf.cli.analyze', 'figures and a report: pretrained model or online run'),
     'archive': ('mllf.cli.archive', "archive a run's combo directories, one .tar.gz per system"),

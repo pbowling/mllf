@@ -59,6 +59,7 @@ analysis = [
     "matplotlib>=3.7",
     "pandas>=1.5",
     "pillow",
+    "scipy>=1.9",
 ]
 dev = [
     "pytest>=7.0",
@@ -66,9 +67,9 @@ dev = [
     "flake8",
     "isort",
     "pre-commit",
-]
     "build",
     "twine",
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "mllf.__version__"}

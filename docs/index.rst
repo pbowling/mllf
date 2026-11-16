@@ -25,6 +25,7 @@ Where to start
 * How the model learns: :doc:`cb_setup`, :doc:`cb_pretraining` and
   :doc:`unimol_representation`.
 * Figures and reports of a model or a run: :doc:`analysis`.
+* Production runs and their free energies: :doc:`production`.
 * Input and output formats: :doc:`file_handling`.
 
 .. toctree::
@@ -33,13 +34,14 @@ Where to start
 
    background
    installation
-   examples
    cli
+   examples
    workflow
    cb_setup
    cb_pretraining
    unimol_representation
    analysis
+   production
    file_handling
    references
    api
