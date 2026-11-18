@@ -204,9 +204,8 @@ The following terms are used throughout this section and in the code
 Example
 ~~~~~~~
 
-The stage below holds both pairs and groups. It is the stage of
-``training/online_1.yaml``, with the system list shortened; keys it leaves out take the
-hindsight defaults.
+The stage below holds both pairs and groups, with the system list shortened to one
+system; keys it leaves out take the hindsight defaults.
 
 .. code-block:: yaml
 
@@ -827,10 +826,9 @@ Example Configurations
 * ``examples/minimal/workflow.yaml`` is the smallest complete config (one system, one
   per-system stage with scouting, hindsight with regression replay), run with its
   pretraining by ``examples/minimal/run_pipeline.sh`` (:doc:`examples`).
-* ``training/online_1.yaml`` through ``online_4_hne_pr3.yaml`` are the staged curriculum
-  for production biases: known systems in solvent and protein (stage 1), the hardest
-  systems (1b), vacuum legs (2), and deployment on chemistry and proteins the model was
-  not trained on (3 and 4). Each header states its systems and starting model.
+* A production run scales the same keys to every prepared system: a refinement run on
+  the systems the model was trained on, then a deploy run (``mode: deploy``) on systems
+  it has not seen (:doc:`examples`).
 
 See Also
 --------

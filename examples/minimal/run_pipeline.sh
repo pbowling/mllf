@@ -11,7 +11,8 @@
 # The whole pipeline on one system (1,4-benzene in water), small enough to check
 # an installation end to end:
 #
-#   1. pretrain     10 epochs of behavior cloning on 39 collected 14benz runs
+#   1. pretrain     up to 10 epochs of behavior cloning on 39 collected 14benz
+#                   runs; each bias head keeps its best epoch on held-out runs
 #   2. replay       the regression replay set, from the runs the model saw
 #   3. scout        one scouting run of the system's group with the new model
 #   4. train        one online epoch (at least one combo, even if scouting passes)

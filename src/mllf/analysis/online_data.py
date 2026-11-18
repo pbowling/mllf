@@ -159,7 +159,8 @@ def load_online(config: Dict, run_dir=None, group_test: str = 'stage',
     ``balance_test`` ('balance'), or by every substituent sampled once
     ('sampling')."""
     if group_test not in ('stage', 'balance', 'sampling'):
-        raise ValueError(f"group_test must be 'stage', 'balance' or 'sampling', not {group_test!r}")
+        raise ValueError("group_test must be 'stage', 'balance' or 'sampling', "
+                         f"not {group_test!r}")
     if group_test == 'sampling':
         balance_test = (0.0, 0)
     import copy

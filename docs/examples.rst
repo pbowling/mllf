@@ -74,24 +74,22 @@ for pretraining on many systems at once.
 Staged Online Training
 ----------------------
 
-The configs ``training/online_1.yaml`` through ``online_4_hne_pr3.yaml`` use the
-production setup, with per-system stages over ALF-derived combo sets, hindsight targets
-with per-pair offsets, and a pretrained Bayesian model. The driver runs as one long SLURM
-job that submits the simulations:
+A production run uses the same keys at scale: per-system stages over each system's group
+combo sets, hindsight targets with per-pair offsets, and a pretrained Bayesian model. The
+driver runs as one long SLURM job that submits the simulations:
 
 .. code-block:: bash
 
-   cd training
-   sbatch --time=4-00:00:00 --export=ALL,CONFIG=online_1.yaml start_test_training.sh
-   tail -f checkpoints_online_1/epoch_summary.log   # one block per epoch
+   sbatch --time=4-00:00:00 --wrap "mllf train online.yaml"
+   tail -f checkpoints/epoch_summary.log          # output.base_dir; one block per epoch
 
    # simulated time so far, against the iterative-flattening runs of the same systems
-   mllf cost checkpoints_online_1 --pretraining-root ../pretraining
+   mllf cost checkpoints --pretraining-root pretraining
 
-Each stage starts from the previous stage's final model, and stages 3 and 4 test the
-trained model on systems it has not seen (``mode: deploy``, :ref:`Testing on New
-Systems`). The system lists illustrate the setup; which systems enter a run should follow
-from what is prepared and from how well the pretrained model predicts each one.
+A refinement run on the systems the model was trained on comes first. A deploy run
+(``mode: deploy``, :ref:`Testing on New Systems`) then starts from its final model on
+systems it has not seen. Which systems enter a run should follow from what is prepared
+and from how well the pretrained model predicts each one.
 
 Adding a System
 ---------------

@@ -73,6 +73,7 @@ slurm:
   module: charmm/charmm/c51a1
 
 reward:
+  barrier_target: 2.0
   T_baseline: 20.0
   min_transitions_per_site: 10
   no_transition_weight: 0.15

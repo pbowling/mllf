@@ -34,9 +34,11 @@ def test_end_state_of_a_whole_run():
 
 
 def test_cap_keeps_passing_runs_first_and_exempts_long_runs(tmp_path):
-    runs = [_run(tmp_path, 'pair01', f'run_{i:03d}', _sim(1.0, *POOR[:2], POOR[2])) for i in range(4)]
+    runs = [_run(tmp_path, 'pair01', f'run_{i:03d}', _sim(1.0, *POOR[:2], POOR[2]))
+            for i in range(4)]
     runs.append(_run(tmp_path, 'pair01', 'run_good', _sim(1.0, *GOOD[:2], GOOD[2])))
-    runs += [_run(tmp_path, 'pair01', f'prod_{i}', _sim(7.0, *POOR[:2], POOR[2])) for i in range(3)]
+    runs += [_run(tmp_path, 'pair01', f'prod_{i}', _sim(7.0, *POOR[:2], POOR[2]))
+             for i in range(3)]
     runs.append(_run(tmp_path, 'pair02', 'run_000', _sim(1.0, *POOR[:2], POOR[2])))
     kept = cap_runs_per_combo(runs, 2, exempt_ns=5.0)
     names = [(r['run_dir'].parent.name, r['run_dir'].name) for r in kept]
@@ -51,7 +53,8 @@ def test_cap_keeps_passing_runs_first_and_exempts_long_runs(tmp_path):
 
 
 def test_select_runs_applies_the_cap(tmp_path):
-    runs = [_run(tmp_path, 'pair01', f'run_{i:03d}', _sim(1.0, *GOOD[:2], GOOD[2])) for i in range(5)]
+    runs = [_run(tmp_path, 'pair01', f'run_{i:03d}', _sim(1.0, *GOOD[:2], GOOD[2]))
+            for i in range(5)]
     opts = PretrainOptions(filter_outliers=False, max_runs_per_combo=3)
     assert len(select_runs(runs, opts, {})) == 3
     assert len(select_runs(runs, PretrainOptions(filter_outliers=False), {})) == 5

@@ -362,7 +362,8 @@ def population_figure(reps, nsubs, names, cutoff):
         bottom = np.zeros(nsubs[i])
         for k, r in enumerate(reps):
             c = np.asarray(counts[k, i], float) / 1000.0
-            ax.bar(x, c, bottom=bottom, width=0.75, label=r['name'].replace('replica_', 'Replica '),
+            label = r['name'].replace('replica_', 'Replica ')
+            ax.bar(x, c, bottom=bottom, width=0.75, label=label,
                    **fills[k])
             bottom += c
         ax.axhline(bottom.mean(), color=bs.INK, ls='--', lw=1.0, label='Even split')
