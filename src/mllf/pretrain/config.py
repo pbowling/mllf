@@ -19,12 +19,20 @@ class PretrainOptions:
             negative-reward buckets with a quadratic ramp up to this fraction;
             takes precedence over min_reward_threshold.
         min_reward_threshold: keep runs with reward >= this.
+        max_runs_per_combo / cap_exempt_ns: keep at most N runs of each combo,
+            end-state passes first (``filters.cap_runs_per_combo``); runs of
+            at least cap_exempt_ns ns are exempt (None: none).
         filter_outliers / outlier_std_threshold: drop runs with any coefficient
             outside mean +- N std.
 
     Training:
-        epochs, learning_rate (cosine annealed to lr/100), device (None: auto),
-        patience: early stopping after this many epochs without a lower loss.
+        epochs: the most epochs; learning_rate (cosine annealed to lr/100 over
+            them), device (None: auto).
+        val_fraction / val_seed: hold out every run of this fraction of the
+            combo directories (seeded) as a validation set. Each bias head keeps
+            the weights of its epoch with the lowest validation loss
+            (training loss without a split), and best_policy.pt joins them.
+        patience: stop after this many epochs in which no head improved.
         reward_weighted: weight each run's loss by its (clamped) reward.
         awr_temperature: beta in exp(r / beta).
         use_per_pair_awr: per-edge, per-bias-type advantages from the online
@@ -47,7 +55,11 @@ class PretrainOptions:
     min_reward_threshold: Optional[float] = None
     min_transitions: Optional[int] = None
     stratified_negative_fraction: Optional[float] = None
+    max_runs_per_combo: Optional[int] = None
+    cap_exempt_ns: Optional[float] = 5.0
     patience: int = 10
+    val_fraction: float = 0.05
+    val_seed: int = 0
     reward_weighted: bool = False
     awr_temperature: float = 0.5
     use_per_pair_awr: bool = True

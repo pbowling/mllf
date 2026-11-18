@@ -74,13 +74,14 @@ def combo_labels(name: str) -> List[Tuple[int, int]]:
 
 
 def pairs_passing(sim_results: Dict, nsubs: List[int]) -> Tuple[int, int]:
-    """(pairs passing the success test for the run's length, pairs)."""
+    """(pairs passing the pair success test for the run's length, pairs)."""
     import torch
 
     from mllf.cb.graph_utils import build_directed_pairs
     from mllf.pretrain.rewards import run_pair_success
     pairs = build_directed_pairs(nsubs)
-    ok = run_pair_success({'sim_results': sim_results}, torch.tensor(pairs).T, {})
+    ok = run_pair_success({'sim_results': sim_results}, torch.tensor(pairs).T,
+                          {'success_test': 'pair'})
     if ok is None:
         return 0, 0
     half = [k for k, (i, j) in enumerate(pairs) if i < j]

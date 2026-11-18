@@ -118,11 +118,46 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
              "When specified, --min-reward-threshold is ignored. Default: disabled.",
     )
     parser.add_argument(
+        "--max-runs-per-combo",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Keep at most K runs of each combo directory, applied after the reward filters "
+             "(runs passing the online end-state test first, then by reward), so combos "
+             "repeated many times (online epochs, ALF's short runs) do not dominate. "
+             "Default: no cap.",
+    )
+    parser.add_argument(
+        "--cap-exempt-ns",
+        type=float,
+        default=5.0,
+        metavar="NS",
+        help="Runs at least this long (production runs) are kept regardless of "
+             "--max-runs-per-combo and do not count toward it (default: 5.0).",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=0.05,
+        metavar="F",
+        help="Hold out every run of this fraction of the combo directories (seeded, "
+             "--val-seed) for validation (default: 0.05). Each bias head keeps the weights of "
+             "its epoch with the lowest validation loss, and best_policy.pt joins them; 0 "
+             "selects on the training loss.",
+    )
+    parser.add_argument(
+        "--val-seed",
+        type=int,
+        default=0,
+        help="Seed of the validation split (default: 0).",
+    )
+    parser.add_argument(
         "--patience",
         type=int,
         default=10,
-        help="Early stopping patience (default: 10). Training stops if the MSE loss does "
-             "not improve for this many consecutive epochs.",
+        help="Early stopping patience (default: 10): training stops once no bias head's "
+             "selection loss (validation, see --val-fraction) has improved for this many "
+             "consecutive epochs.",
     )
     parser.add_argument(
         "--reward-weighted",
@@ -333,7 +368,11 @@ def _run(args: argparse.Namespace, dirs: List[str]) -> None:
         min_reward_threshold=args.min_reward_threshold,
         min_transitions=args.min_transitions,
         stratified_negative_fraction=args.stratified_negative_fraction,
+        max_runs_per_combo=args.max_runs_per_combo,
+        cap_exempt_ns=args.cap_exempt_ns,
         patience=args.patience,
+        val_fraction=args.val_fraction,
+        val_seed=args.val_seed,
         reward_weighted=args.reward_weighted,
         awr_temperature=args.awr_temperature,
         use_per_pair_awr=not args.no_per_pair_awr,

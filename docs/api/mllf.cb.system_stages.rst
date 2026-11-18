@@ -18,6 +18,7 @@
       combo_sites
       combos_progress
       criterion_met
+      endpoint_nodes_sampled
       group_failed_pairs
       group_ready
       held_off_sites

@@ -14,6 +14,7 @@ from mllf.cb.hindsight import (
     pair_succeeded,
     site_nodes,
 )
+from mllf.cb.system_stages import FRAMES_PER_NS, endpoint_nodes_sampled
 from mllf.cb.workflow_utils import (
     BARRIER_TARGET,
     BARRIER_WIDTH,
@@ -43,6 +44,27 @@ EXPLORE_MIN_TRANSITIONS = 3
 
 
 EXPLORE_MIN_FRACTION = 0.0
+
+
+# Success gate (reward.success_test): online training's end-state test, the
+# group stage's advance.production in training/online_refine.yaml. Each of a
+# site's n substituents needs >= END_STATE_MIN_SHARE / n of the frames at
+# lambda >= 0.99, >= END_STATE_MIN_VISITS entries into that endpoint per ns and
+# >= END_STATE_MIN_ENTRIES entries in the run.
+# 'pair' keeps the earlier pair test (crossings and minority fraction).
+SUCCESS_TEST = 'end_state'
+
+
+END_STATE_MIN_SHARE = 0.02
+
+
+END_STATE_MIN_VISITS = 2.0
+
+
+# Entries into its endpoint each substituent needs in the run itself, whatever
+# the run's length (reward.min_end_entries): the per-ns rate alone lets a
+# 0.1 ns ALF run pass on one entry.
+END_STATE_MIN_ENTRIES = 5
 
 
 # Keyword arguments of compute_reward_from_sim_results a config's reward section may set.
@@ -424,21 +446,109 @@ def run_pair_reward(
         return None
 
 
+def _nsubs_from_edges(edge_index: torch.Tensor) -> List[int]:
+    """Substituents per site, in node order, from a graph's within-site edges."""
+    sites = site_nodes(edge_index)
+    seen, out = set(), []
+    for n in sorted(sites):
+        if sites[n][0] not in seen:
+            seen.add(sites[n][0])
+            out.append(len(sites[n]))
+    return out
+
+
+def run_endpoint_nodes(sim_results: Dict, ns: float) -> Optional[Dict]:
+    """The run's ``endpoint_nodes`` (read_output.parse_endpoint_nodes) rebuilt
+    from simulation_results.json: each block's frames at lambda >= 0.99 is
+    CHARMM's population count at 0.99, out of ns x FRAMES_PER_NS frames (the
+    save frequency of ALF's runs and ours). None without 0.99 counts."""
+    core = {}
+    for block, info in (sim_results.get("populations") or {}).items():
+        counts = info.get("counts") if isinstance(info, dict) else None
+        if not counts or "0.99" not in counts:
+            return None
+        core[str(block)] = counts["0.99"]
+    if not core or ns <= 0:
+        return None
+    return {"frames": ns * FRAMES_PER_NS, "core": core}
+
+
+def substituents_end_state(run: Dict, nsubs_per_site: List[int],
+                           reward_config: Dict) -> Optional[List[bool]]:
+    """Per substituent (node order): did it pass online training's end-state
+    test (``system_stages.endpoint_nodes_sampled``, the per-substituent part of
+    ``production_balanced``) in this run? None without the counts it needs."""
+    sim_results = run.get("sim_results", {})
+    if not sim_results.get("transition_pairs"):
+        return None
+    full = reward_config.get("full_length_ns", FULL_LENGTH_NS)
+    ratio, _ = run_length(sim_results, full)
+    nodes = run_endpoint_nodes(sim_results, ratio * full)
+    if nodes is None:
+        return None
+    return endpoint_nodes_sampled(
+        {"endpoint_nodes": nodes, "transition_pairs": sim_results["transition_pairs"]},
+        nsubs_per_site,
+        {"min_end_share": reward_config.get("min_end_share", END_STATE_MIN_SHARE),
+         "min_visits_per_ns": reward_config.get("min_visits_per_ns", END_STATE_MIN_VISITS),
+         "min_entries": reward_config.get("min_end_entries", END_STATE_MIN_ENTRIES)})
+
+
+def run_end_state(run: Dict, reward_config: Dict) -> Optional[bool]:
+    """Did every substituent of the run pass the end-state test (online
+    training's group test)? None without the counts or ``nsubs_per_site``."""
+    nsubs = (run.get("metadata") or {}).get("nsubs_per_site")
+    ok = substituents_end_state(run, nsubs, reward_config) if nsubs else None
+    return None if ok is None else all(ok)
+
+
+def _end_state_success(run: Dict, edge_index: torch.Tensor,
+                       reward_config: Dict) -> Optional[torch.Tensor]:
+    """Per edge: both substituents passed online training's end-state test
+    (``substituents_end_state``)."""
+    ei = edge_index.detach().cpu()
+    nsubs = (run.get("metadata") or {}).get("nsubs_per_site") or _nsubs_from_edges(ei)
+    ok = substituents_end_state(run, nsubs, reward_config)
+    if ok is None:
+        return None
+    return torch.tensor([
+        bool(i < len(ok) and j < len(ok) and ok[i] and ok[j])
+        for i, j in ((int(ei[0, k]), int(ei[1, k])) for k in range(ei.size(1)))
+    ], dtype=torch.bool)
+
+
 def run_pair_success(run: Dict, edge_index: torch.Tensor,
                      reward_config: Dict) -> Optional[torch.Tensor]:
-    """Per edge: did the run pass online training's success test for that pair?
+    """Per edge: did the run pass online training's success test?
 
-    The test online training uses to call a pair's run good
-    (``hindsight.pair_succeeded``): both substituents sampled with minority
-    fraction >= min_fraction, and >= min_transitions crossings (on a site of
-    3+ substituents, each of the two entered or left that often). A full run
-    needs SUCCESS_MIN_TRANSITIONS / SUCCESS_MIN_FRACTION; a short one
-    (``run_length``) the reward config's explore_min_transitions /
-    explore_min_fraction, the curriculum stage keys of the same name.
+    ``success_test`` in the reward config picks the test:
 
-    Returns a [E] bool tensor, or None when the run lacks per-pair transitions
-    ('transition_pairs'; ``collect_pretraining_data --backfill-barrier``).
+    * ``end_state`` (default): online training's end-state test
+      (``advance.production``, ``system_stages.production_balanced``) per
+      substituent. An edge passes when both of its substituents spent
+      >= min_end_share / n of the frames at lambda >= 0.99 (n = substituents
+      at the site; default 0.02), entered that endpoint >= min_visits_per_ns
+      times per ns (default 2) and >= min_end_entries times in the run
+      (default 5, any length). Shares and entries per ns are measured against
+      the run's own length.
+    * ``pair``: the pair test (``hindsight.pair_succeeded``): both
+      substituents sampled with minority fraction >= min_fraction, and
+      >= min_transitions crossings (on a site of 3+ substituents, each of the
+      two entered or left that often). A full run needs
+      SUCCESS_MIN_TRANSITIONS / SUCCESS_MIN_FRACTION; a short one
+      (``run_length``) the reward config's explore_min_transitions /
+      explore_min_fraction, the curriculum stage keys of the same name.
+
+    Returns a [E] bool tensor, or None when the run lacks the counts the test
+    needs (per-pair transitions, 'transition_pairs', from
+    ``collect_pretraining_data --backfill-barrier``; for ``end_state`` also the
+    populations at lambda 0.99).
     """
+    test = reward_config.get("success_test", SUCCESS_TEST)
+    if test == "end_state":
+        return _end_state_success(run, edge_index, reward_config)
+    if test != "pair":
+        raise ValueError(f"reward.success_test must be 'end_state' or 'pair', not {test!r}")
     sim_results = run.get("sim_results", {})
     pair_trans = sim_results.get("transition_pairs")
     if not pair_trans:
@@ -470,13 +580,11 @@ def pair_advantages(
     * Rewards are normalised per bias type by the mean / std over all runs.
     * ``success_floor`` (``reward.success_advantage_floor``) clamps from below,
       so one badly scored pair cannot dominate its run's loss.
-    * Success gate (``pair_success``, from ``run_pair_success``): the online
-      success test for a run of that length decides whether a pair's biases
-      are imitated more or less than average -- a pair that passed gets
-      advantage >= 0, one that failed <= 0 -- and the reward ranks pairs
-      within each side. As online, a short run's success counts as much as a
-      full run's: the length sets which test a pair must pass, not how much a
-      pass is worth. Runs without a success entry are not gated.
+    * Success gate (``pair_success``, from ``run_pair_success``): online
+      training's success test decides whether a pair's biases are imitated
+      more or less than average -- a pair that passed gets advantage >= 0,
+      one that failed <= 0 -- and the reward ranks pairs within each side.
+      Runs without a success entry are not gated.
 
     Returns (advantages aligned with ``pair_rewards``, baseline mean [4], std [4]).
     """
@@ -505,11 +613,12 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
                           reward_config: Dict) -> Optional[List]:
     """Per-edge, per-bias-type advantages for each run (``pretrain_epoch``'s
     per-pair AWR), from the online pair reward; with the success gate (on by
-    default) edges whose run failed the online success test get at most
-    ``success_advantage_floor``. None if no run has pair data."""
+    default) edges that failed online training's success test
+    (``run_pair_success``) get advantage <= 0. None if no run has pair data."""
     full_length_ns = reward_config.get("full_length_ns", FULL_LENGTH_NS)
     short_runs = [run_length(run.get("sim_results", {}), full_length_ns)[1] for run in runs]
     success_gate = bool(reward_config.get("success_gate", True))
+    success_test = reward_config.get("success_test", SUCCESS_TEST)
     pair_reward_cache = [None] * len(runs)
     pair_success_cache = [None] * len(runs)
 
@@ -548,9 +657,11 @@ def build_pair_advantages(runs: List[Dict], graph_cache: List,
                      if ok is not None and sh == short]
             n_edges = sum(int(f.numel()) for f in flags)
             n_passed = sum(int(f.sum()) for f in flags)
+            test = ('end-state test' if success_test == 'end_state' else
+                    'short-run pair test' if short else 'full-run pair test')
             log.info(f"  Success gate, {name} runs (short = under "
                      f"{0.5 * full_length_ns:g} ns): {n_passed}/{n_edges} edges passed "
-                     f"the online {'short-run' if short else 'full-run'} test")
+                     f"the online {test}")
     return advantages
 
 

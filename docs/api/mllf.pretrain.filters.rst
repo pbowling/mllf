@@ -1,4 +1,4 @@
-mllf.pretrain.filters
+﻿mllf.pretrain.filters
 =====================
 
 .. automodule:: mllf.pretrain.filters
@@ -8,6 +8,7 @@ mllf.pretrain.filters
 
    .. autosummary::
    
+      cap_runs_per_combo
       compute_coefficient_statistics
       extract_site_number
       filter_best_runs_per_system

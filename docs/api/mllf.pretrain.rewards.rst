@@ -1,4 +1,4 @@
-mllf.pretrain.rewards
+﻿mllf.pretrain.rewards
 =====================
 
 .. automodule:: mllf.pretrain.rewards
@@ -13,7 +13,10 @@ mllf.pretrain.rewards
       compute_reward_from_sim_results
       pair_advantages
       reward_kwargs
+      run_end_state
+      run_endpoint_nodes
       run_length
       run_pair_reward
       run_pair_success
+      substituents_end_state
    

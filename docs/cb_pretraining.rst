@@ -75,26 +75,43 @@ to weight runs (below) and the Uni-Mol options, ``unimol.env_input``,
 ``ligand_other_sites``, ``site_size_input``, ``structure_selection``,
 ``environment_cutoff`` and ``cache_embeddings``. The first three are recorded in
 ``pretrain_metadata.json``, and an online config must use the same values; online
-training and ``mllf scout`` check them (:doc:`unimol_representation`). Filters and optimizer settings are command-line flags.
+training and ``mllf scout`` check them (:doc:`unimol_representation`). Filters and
+optimizer settings are command-line flags.
 
 * ``--no-data-hygiene``, ``--no-per-pair-awr`` and ``--awr-temperature`` (default 1.0) set
   the objective (below).
 * ``--use-best-only``, ``--min-transitions``, ``--min-reward-threshold``,
-  ``--stratified-negative-fraction`` and ``--no-filter-outliers`` /
-  ``--outlier-std-threshold`` filter runs (below).
+  ``--stratified-negative-fraction``, ``--max-runs-per-combo`` (with
+  ``--cap-exempt-ns``) and ``--no-filter-outliers`` / ``--outlier-std-threshold`` filter
+  runs (below).
 * ``--reward-weighted`` and ``--emphasize-systems`` add per-run weights.
 * ``--bayesian-heads`` (with ``--bayesian-prior-precision``) also saves
   ``best_policy_bayesian.pt``, the checkpoint for ``algorithm: hindsight``. Each posterior
   mean starts from the trained readout, and its precision is calibrated on the pretraining
   data, so the posterior's spread reflects how much real biases vary.
 
-``examples/pretrain_with_filtering.sh`` is the SLURM launcher, driven by a per-run script
-such as ``examples/pretrain_wUnimol_Nov02b.sh`` that sets the config, output directory and
-flags. The learning rate follows a cosine schedule down to ``lr / 100``. The output
-directory holds:
+``examples/pretrain_with_filtering.sh`` is the SLURM launcher, driven by a short per-run
+script that sets the config, output directory and flags. The learning rate follows a
+cosine schedule down to ``lr / 100`` over ``--epochs``, the most epochs a run trains.
 
-* ``best_policy.pt`` and ``best_policy_bayesian.pt``, either of which can be
-  ``pretrain.model_path`` in a workflow config, and ``final_policy*.pt``
+**Model selection.** Every run of ``--val-fraction`` (default 0.05) of the combo
+directories is held out as a validation set, so a combo's repeated runs are never split
+between training and validation. Each epoch logs a table of the loss of each bias head
+(linear, quadratic, skew, end) on the training and validation runs. The four heads share
+no weights, so each keeps its own best epoch, the one with its lowest validation loss
+(its training loss with ``--val-fraction 0``). The training loss keeps falling as the
+model fits its own data, so it cannot show when a head stops improving on runs it has not
+seen. ``best_policy.pt`` joins the four heads' best weights and records each head's
+epoch. Training stops once no head has improved for
+``--patience`` epochs. Each head's gradient is clipped separately, so one head's large
+step does not shrink the others'.
+
+The output directory holds:
+
+* ``best_policy.pt`` and ``best_policy_bayesian.pt`` (each head from its best epoch),
+  either of which can be ``pretrain.model_path`` in a workflow config, and
+  ``final_policy*.pt`` (the last epoch)
+* ``validation_runs.json``: the held-out runs
 * ``checkpoint_epoch_NNN.pt``, from which ``--resume-checkpoint`` continues
 * ``pretrain_metadata.json``: the Uni-Mol settings the model was trained with
 * ``pretraining_manifest.json``: every directory pretraining read, as absolute paths, the
@@ -127,27 +144,35 @@ the run's set of active targets, :math:`k` is the bias type, and
 the starting exploration scale.
 
 * **Per-pair weighting** (default). :math:`R` is computed per edge and per coefficient with
-  the per-edge reward used online (:doc:`cb_setup`), so well-resolved pairs drive more
+  the per-edge reward used online (:doc:`cb_setup`), with the same settings in the
+  config's ``reward`` section (``barrier_target`` 2.0 and ``T_baseline`` 20 in
+  ``examples/workflow_pretrain.yaml``, as online), so well-resolved pairs drive more
   gradient than poorly resolved pairs in the same run. A pair's weight is zero if a
   substituent was never sampled or its ΔΔG is missing (a missing direction is filled from
   the reverse one). ``--no-per-pair-awr`` uses one weight per run.
-* **Run length.** The data mix short runs (∼0.1 ns) with 1 ns runs, and a short run has a
-  tenth of the time to cross and balance. Pretraining therefore judges each run the way
-  online training judges its short and full-length runs, and a run under half of
-  ``full_length_ns`` (default 1.0) is short.
+* **Success gate.** A pair that passed online training's success test gets an advantage
+  of at least 0, so its biases are imitated at least as much as average, and a pair that
+  failed gets at most 0. The reward then ranks pairs within each side.
+  ``success_gate: false`` turns the gate off. ``success_test`` selects the test:
 
-  - *Success gate.* A pair counts as a success when it passes the online test for a run of
-    its length. A full-length run needs at least 10 crossings and a minority fraction of at
-    least 0.2. A short run needs ``explore_min_transitions`` crossings and
-    ``explore_min_fraction`` (defaults 3 and 0.0), which should match the online pair
-    stage. A pair that passed gets an advantage of at least 0, so its biases are imitated
-    at least as much as average, and a pair that failed gets at most 0. The reward then
-    ranks pairs within each side. As online, length decides which test a pair must pass
-    rather than how much passing is worth. ``success_gate: false`` turns the gate off.
-  - *Counts scale with length.* In the whole-run reward used for stratified sampling,
-    reward filtering and the fallback weight, the population and transition baselines
-    scale with run length, and a short run needs only ``explore_min_transitions``
-    crossings per site.
+  - ``end_state`` (default) is the end-state test on which online training's group
+    stage passes (``advance.production``, :doc:`workflow`), applied to each substituent,
+    with the same keys (``min_end_share`` 0.02 and ``min_visits_per_ns`` 2). A pair
+    passes when both of its substituents do. Pretraining adds ``min_end_entries``
+    (default 5): each substituent must also enter its endpoint that many times in the run.
+    The rate alone scales with length, so a 0.1 ns run would pass on a single entry. The
+    frames at the endpoint are the stored population counts at λ 0.99.
+  - ``pair`` is the earlier pair test. A full-length run needs at least 10 crossings and
+    a minority fraction of at least 0.2. A short run needs ``explore_min_transitions``
+    crossings and ``explore_min_fraction`` (defaults 3 and 0.0). This test asks for
+    near-even populations within each pair, so it weights many runs that sampled every
+    endpoint below average.
+
+* **Run length.** The data mix short runs (∼0.1 ns) with 1 ns and longer runs. A run
+  under half of ``full_length_ns`` (default 1.0) is short. In the whole-run reward used
+  for stratified sampling, reward filtering and the fallback weight, the population and
+  transition baselines scale with run length, and a short run needs only
+  ``explore_min_transitions`` crossings per site.
 
   These keys go in the config's ``reward`` section. The length comes from
   ``simulated_ns`` in ``simulation_results.json``, recorded at collection
@@ -178,7 +203,16 @@ no weight for it, so the filters are optional. They are:
   working poorly with few systems;
 * **Stratified negatives**, which keeps every positive-reward run and a share of each
   negative-reward bucket that rises quadratically toward zero (up to 55% for the best
-  bucket), so the model sees near misses as well as successes.
+  bucket), so the model sees near misses as well as successes;
+* **Per-combo cap** (``--max-runs-per-combo K``, applied after the filters above), which
+  keeps at most K runs of each combo directory. Runs that passed the end-state test come
+  first, then the rest by reward. Every run is its own gradient step, and online training
+  repeats a combo each epoch while short iterative-flattening runs repeat a group up to
+  ∼200 times, so without a cap a few combos dominate. The cap removes repeats, not combos. Runs of at
+  least ``--cap-exempt-ns`` (default 5 ns, the production runs) are always kept.
+
+Every run is used once, even when the manifest lists a dataset and its combo directories
+both (reading a dataset also reads one level into its combos).
 
 Graphs are built once and kept in memory for all epochs. Many runs share a prep
 directory, so embedding computation scales with the number of distinct preps rather than

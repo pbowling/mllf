@@ -2,7 +2,7 @@
 import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -52,6 +52,28 @@ def _awr_run_loss(w, logp_per, combined_mask, active_mask, w_sum, data_hygiene):
     return total / w_sum
 
 
+def _awr_head_losses(w, logp_per, combined_mask, active_mask, w_sum, data_hygiene):
+    """``_awr_run_loss`` split by bias type: [D] terms that sum to the run's
+    loss (same denominator), so each head's share of the objective can be
+    followed and its best epoch chosen on its own."""
+    terms = torch.where(combined_mask, -(w * logp_per), torch.zeros_like(logp_per)).sum(dim=0)
+    if data_hygiene:
+        return terms / active_mask.sum().clamp(min=1)
+    return terms / w_sum
+
+
+def _clip_per_head(policy, max_norm: float = 1.0) -> None:
+    """Clip each bias head's gradient norm separately: the heads share no
+    weights, so one head's large step (a poorly fit run's linear target, say)
+    does not shrink the others'."""
+    mlps = getattr(getattr(policy, 'edge_mlp', None), 'mlps', None)
+    if mlps is None:
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=max_norm)
+        return
+    for mlp in mlps:
+        torch.nn.utils.clip_grad_norm_(mlp.parameters(), max_norm=max_norm)
+
+
 def _edge_confidence(pairwise_weights_cache, run_idx, logp_per, device, data_hygiene):
     """Per-edge (or per-edge, per-bias-type) confidence for one run's BC loss.
 
@@ -85,8 +107,13 @@ def pretrain_epoch(
     pair_advantage_cache: Optional[List] = None,
     system_emphasis: Optional[Dict[str, float]] = None,
     data_hygiene: bool = False,
+    train: bool = True,
 ) -> Dict[str, float]:
     """Run one behavior cloning AWR epoch for UnimolPolicy with optional pairwise weighting.
+
+    ``train=False`` scores the runs of ``groups`` with the same loss and takes
+    no step (the validation pass). The result's 'head_loss' is the loss of
+    each bias head [linear, quadratic, skew, end], which sum to 'loss'.
 
     Args:
         policy: UnimolPolicy model
@@ -168,6 +195,10 @@ def pretrain_epoch(
     epoch_loss = 0.0
     num_updates = 0
     total_runs = 0
+    n_heads = getattr(policy, 'mlp_out_dim', 4)
+    head_loss = [0.0] * n_heads
+    if not train:
+        policy.eval()
 
     if groups is not None and graph_cache is not None:
         # Per-group gradient accumulation (one step per unique Uni-Mol embedding set)
@@ -181,8 +212,11 @@ def pretrain_epoch(
             if not valid:
                 continue
             n_valid = len(valid)
-            optimizer.zero_grad()
+            if train:
+                optimizer.zero_grad()
             group_loss = 0.0
+            group_heads = [0.0] * n_heads
+            contributed = False
 
             for run_idx, rw in valid:
                 unimol_emb, edge_idx, targets_list = graph_cache[run_idx]
@@ -193,7 +227,8 @@ def pretrain_epoch(
                 edge_idx = edge_idx.to(device)
 
                 # Forward pass through UnimolPolicy
-                mean, log_std = policy._forward_edges(unimol_emb, edge_idx)
+                with torch.set_grad_enabled(train):
+                    mean, log_std = policy._forward_edges(unimol_emb, edge_idx)
 
                 active_mask = targets.abs() > 1e-8
                 if not active_mask.any():
@@ -234,27 +269,38 @@ def pretrain_epoch(
                 w_sum = w[combined_mask].sum() if combined_mask.any(
                 ) else torch.tensor(0.0, device=device)
                 if combined_mask.any() and w_sum > 1e-8:
-                    run_loss = rw * _awr_run_loss(w, logp_per, combined_mask, active_mask,
+                    heads = rw * _awr_head_losses(w, logp_per, combined_mask, active_mask,
                                                   w_sum, data_hygiene) / n_valid
+                    run_loss = heads.sum()
                 else:
                     continue
 
                 if torch.isnan(run_loss) or torch.isinf(run_loss):
                     continue
-                run_loss.backward()
+                if train:
+                    run_loss.backward()
                 group_loss += run_loss.item()
+                for d in range(n_heads):
+                    group_heads[d] += float(heads[d])
+                contributed = True
 
-            if group_loss > 0.0:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-                optimizer.step()
+            # A Gaussian NLL is negative once a run is fit tightly; every run that
+            # contributed counts and steps, whatever the sign of its loss.
+            if contributed:
+                if train:
+                    _clip_per_head(policy, max_norm=1.0)
+                    optimizer.step()
                 epoch_loss += group_loss
+                for d in range(n_heads):
+                    head_loss[d] += group_heads[d]
                 num_updates += 1
                 total_runs += n_valid
-            else:
+            elif train:
                 optimizer.zero_grad()
 
         avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
-        return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates}
+        return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates,
+                'head_loss': [h / num_updates if num_updates else 0.0 for h in head_loss]}
 
     # Legacy per-run updates (when graph_cache provided but groups not)
     for run_idx, run in enumerate(runs):
@@ -341,7 +387,8 @@ def pretrain_epoch(
             total_runs += 1
 
     avg_loss = epoch_loss / num_updates if num_updates > 0 else 0.0
-    return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates}
+    return {'loss': avg_loss, 'num_runs': total_runs, 'num_updates': num_updates,
+            'head_loss': None}
 
 
 RELATION_NAMES = ['linear_ij', 'linear_ji', 'quadratic_ij', 'quadratic_ji',
@@ -382,86 +429,188 @@ def _print_model(policy, unimol: UnimolSettings, opts: PretrainOptions, n_runs: 
     log.debug(f"  Graphs for all {n_runs} runs are built once and reused across epochs")
 
 
+HEADS = ('linear', 'quadratic', 'skew', 'end')
+
+
 @dataclass
 class _Progress:
-    """Early-stopping state (restored on resume)."""
+    """Per-head model selection and early-stopping state (restored on resume).
+
+    Each bias head has its own best loss (validation loss with a validation
+    split, else training loss), the epoch it was reached and that epoch's
+    weights; best_policy.pt joins the four. Training stops when no head has
+    improved for ``patience`` epochs."""
     start_epoch: int = 0
-    best_loss: float = float('inf')
+    last_epoch: int = 0
+    best_head_loss: List[float] = field(default_factory=lambda: [float('inf')] * len(HEADS))
+    best_head_epoch: List[int] = field(default_factory=lambda: [0] * len(HEADS))
+    best_head_state: List[Optional[Dict]] = field(default_factory=lambda: [None] * len(HEADS))
     epochs_without_improvement: int = 0
+
+    @property
+    def best_loss(self) -> float:
+        return float(sum(self.best_head_loss))
+
+
+def _head_prefix(d: int) -> str:
+    return f'edge_mlp.mlps.{d}.'
+
+
+def _head_state(policy, d: int) -> Dict:
+    """Copy of head ``d``'s weights (the heads share none)."""
+    pre = _head_prefix(d)
+    return {k: v.detach().clone().cpu() for k, v in policy.state_dict().items()
+            if k.startswith(pre)}
+
+
+def _joined_state(policy, progress: _Progress) -> Dict:
+    """The policy's state with each head's weights from its best epoch."""
+    state = {k: v.detach().clone().cpu() for k, v in policy.state_dict().items()}
+    for head in progress.best_head_state:
+        if head:
+            state.update(head)
+    return state
 
 
 def _resume(path: Path, policy, optimizer, scheduler, output_dir: Path, device) -> _Progress:
     """Restore model, optimizer and LR schedule from a checkpoint_epoch_NNN.pt,
-    and early stopping from the run's best_policy.pt."""
+    and per-head selection and early stopping from the run's best_policy.pt."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
     policy.load_state_dict(ckpt['policy_state'])
     optimizer.load_state_dict(ckpt['optimizer_state'])
     scheduler.load_state_dict(ckpt['scheduler_state'])
-    progress = _Progress(start_epoch=int(ckpt['epoch']))
+    progress = _Progress(start_epoch=int(ckpt['epoch']), last_epoch=int(ckpt['epoch']))
     best_path = output_dir / "best_policy.pt"
     if best_path.exists():
         best = torch.load(best_path, map_location='cpu', weights_only=False)
-        progress.best_loss = float(best['loss'])
-        progress.epochs_without_improvement = progress.start_epoch - int(best['epoch'])
-    log.info(f"\nResuming from {path}: epoch {progress.start_epoch} done; "
-             f"best loss {progress.best_loss:.4f}, {progress.epochs_without_improvement} epoch(s) "
-             "without improvement")
+        if 'head_loss' in best:
+            progress.best_head_loss = [float(x) for x in best['head_loss']]
+            progress.best_head_epoch = [int(x) for x in best['head_epoch']]
+            state = best['policy_state']
+            progress.best_head_state = [
+                {k: v for k, v in state.items() if k.startswith(_head_prefix(d))}
+                for d in range(len(HEADS))]
+            progress.epochs_without_improvement = progress.start_epoch - max(
+                progress.best_head_epoch)
+    log.info(f"\nResuming from {path}: epoch {progress.start_epoch} done; best epoch per head "
+             f"{dict(zip(HEADS, progress.best_head_epoch))}, "
+             f"{progress.epochs_without_improvement} epoch(s) without improvement")
     return progress
+
+
+def split_validation(runs: List[Dict], fraction: float, seed: int = 0) -> List[int]:
+    """Indices of the runs held out for validation: every run of a random
+    ``fraction`` of the combo directories (seeded), so a held-out combo's
+    repeated runs are not also trained on."""
+    if fraction <= 0:
+        return []
+    import random
+    combos = sorted({str(Path(r['run_dir']).resolve().parent) for r in runs})
+    n = max(1, round(fraction * len(combos))) if len(combos) > 1 else 0
+    held = set(random.Random(seed).sample(combos, n))
+    return [i for i, r in enumerate(runs) if str(Path(r['run_dir']).resolve().parent) in held]
+
+
+def _fmt(values) -> str:
+    return '  '.join(f'{v:9.4f}' for v in values)
 
 
 def _train_epochs(policy, optimizer, scheduler, runs, inputs: RunInputs, weights_cache,
                   advantages, reward_weighted: bool, unimol: UnimolSettings,
                   opts: PretrainOptions, reward_config: Dict, output_dir: Path, device,
-                  progress: _Progress) -> None:
-    """The behavior-cloning epochs: best_policy.pt on each lower loss, a
-    checkpoint per epoch, early stopping after ``patience`` epochs."""
+                  progress: _Progress, val_idx: Optional[List[int]] = None) -> None:
+    """The behavior-cloning epochs, at most ``opts.epochs``.
+
+    Each epoch logs the loss of each bias head on the training runs and, with
+    a validation split, on the held-out runs. Each head keeps the weights of
+    its epoch with the lowest selection loss (validation if there is a split,
+    else training); best_policy.pt joins the four heads' best weights and is
+    rewritten whenever a head improves. Training stops once no head has
+    improved for ``opts.patience`` epochs. A checkpoint is written per epoch."""
+    held = set(val_idx or [])
+    ok = [i for i in range(len(runs)) if inputs.graph_cache[i] is not None]
     # one run per group: pretrain_epoch's per-group gradient accumulation
-    groups = {f"run_{i}": [i] for i in range(len(runs)) if inputs.graph_cache[i] is not None}
+    groups = {f"run_{i}": [i] for i in ok if i not in held}
+    val_groups = {f"run_{i}": [i] for i in ok if i in held}
+    on = 'validation' if val_groups else 'training'
+    kw = dict(graph_cache=inputs.graph_cache, reward_weighted=reward_weighted,
+              awr_temperature=opts.awr_temperature, pairwise_weights_cache=weights_cache,
+              unimol_config=unimol.epoch_config(), consensus_dict=inputs.consensus,
+              pair_advantage_cache=advantages, system_emphasis=opts.system_emphasis,
+              data_hygiene=opts.data_hygiene)
+    log.info(f"\nTraining on {len(groups)} runs; validation on {len(val_groups)} runs "
+             f"({opts.val_fraction:.0%} of combo directories). Each head keeps its epoch with "
+             f"the lowest {on} loss; training stops after {opts.patience} epochs in which no "
+             f"head improves (at most {opts.epochs} epochs).")
+    cols = '  '.join(f'{h:>9s}' for h in HEADS)
+    log.info(f"Per-head AWR loss ('*' = that head's best {on} loss so far)")
+    log.info(f"  epoch  | training:  {cols} | {'validation: ' + cols if val_groups else ''}"
+             f" | lr")
     for epoch in range(progress.start_epoch, opts.epochs):
-        stats = pretrain_epoch(
-            policy, optimizer, runs, reward_config, device,
-            graph_cache=inputs.graph_cache,
-            groups=groups,
-            reward_weighted=reward_weighted,
-            awr_temperature=opts.awr_temperature,
-            pairwise_weights_cache=weights_cache,
-            unimol_config=unimol.epoch_config(),
-            consensus_dict=inputs.consensus,
-            pair_advantage_cache=advantages,
-            system_emphasis=opts.system_emphasis,
-            data_hygiene=opts.data_hygiene,
-        )
+        stats = pretrain_epoch(policy, optimizer, runs, reward_config, device, groups=groups,
+                               train=True, **kw)
         lr = scheduler.get_last_lr()[0]
         scheduler.step()
-
-        improved = stats['loss'] < progress.best_loss
+        val = (pretrain_epoch(policy, optimizer, runs, reward_config, device, groups=val_groups,
+                              train=False, **kw) if val_groups else None)
+        sel = (val or stats)['head_loss']
+        improved = []
+        for d in range(len(HEADS)):
+            if sel[d] < progress.best_head_loss[d]:
+                progress.best_head_loss[d] = sel[d]
+                progress.best_head_epoch[d] = epoch + 1
+                progress.best_head_state[d] = _head_state(policy, d)
+                improved.append(d)
+        progress.last_epoch = epoch + 1
         if improved:
-            progress.best_loss = stats['loss']
             progress.epochs_without_improvement = 0
-            torch.save({'policy_state': policy.state_dict(), 'epoch': epoch + 1,
-                        'loss': stats['loss']}, output_dir / "best_policy.pt")
+            torch.save({'policy_state': _joined_state(policy, progress),
+                        'epoch': max(progress.best_head_epoch),
+                        'head_epoch': list(progress.best_head_epoch),
+                        'head_loss': list(progress.best_head_loss),
+                        'loss': progress.best_loss, 'selected_on': on},
+                       output_dir / "best_policy.pt")
         else:
             progress.epochs_without_improvement += 1
-        log.info(f"Epoch {epoch + 1}/{opts.epochs}: AWR loss {stats['loss']:.4f}, "
-                 f"{stats['num_runs']} runs ({stats.get('num_updates', stats['num_runs'])} "
-                 f"gradient steps), learning rate {lr:.6f}"
-                 + ("; saved as best" if improved else ""))
+
+        def row(losses, mark):
+            return '  '.join(f"{v:9.4f}{'*' if mark and d in improved else ' '}"
+                             for d, v in enumerate(losses))
+        log.info(f"  {epoch + 1:3d}/{opts.epochs:<3d}| training:  "
+                 f"{row(stats['head_loss'], not val_groups)}"
+                 + (f"| validation: {row(val['head_loss'], True)}" if val else '')
+                 + f"| {lr:.2e}")
+        log.debug(f"    {stats['num_runs']} training runs ({stats['num_updates']} gradient "
+                  f"steps), loss {stats['loss']:.4f}"
+                  + (f"; validation {val['num_runs']} runs, loss {val['loss']:.4f}"
+                     if val else ''))
 
         torch.save({'policy_state': policy.state_dict(),
                     'optimizer_state': optimizer.state_dict(),
                     'scheduler_state': scheduler.state_dict(),
                     'epoch': epoch + 1,
-                    'stats': stats}, output_dir / f"checkpoint_epoch_{epoch + 1:03d}.pt")
+                    'stats': stats, 'validation': val},
+                   output_dir / f"checkpoint_epoch_{epoch + 1:03d}.pt")
 
         if progress.epochs_without_improvement >= opts.patience:
-            log.info(f"\nEarly stopping: no improvement for {opts.patience} epochs (best loss: "
-                     f"{progress.best_loss:.4f})")
+            log.info(f"\nEarly stopping: no head improved for {opts.patience} epochs")
             break
+    log.info(f"\nBest epoch per head ({on} loss):")
+    for d, h in enumerate(HEADS):
+        log.info(f"  {h:9s} epoch {progress.best_head_epoch[d]:3d}  loss "
+                 f"{progress.best_head_loss[d]:.4f}")
+    log.info("best_policy.pt joins these heads' weights")
+
+
+def _write_validation_runs(output_dir: Path, runs: List[Dict], val_idx: List[int]) -> None:
+    """validation_runs.json: the held-out runs (not trained on), for analyses."""
+    (output_dir / 'validation_runs.json').write_text(json.dumps(
+        {'runs': [str(runs[i]['run_dir']) for i in val_idx]}, indent=1))
 
 
 def _save_bayesian_siblings(policy, config: Dict, unimol: UnimolSettings,
                             inputs: RunInputs, weights_cache, opts: PretrainOptions,
-                            output_dir: Path, device) -> None:
+                            output_dir: Path, device, last_epoch: int) -> None:
     """final_policy_bayesian.pt (and best_policy_bayesian.pt): the trained
     trunks with each BayesianLinearHead's posterior mean warm-started from the
     deterministic readout (``initialize_bayesian_heads_from_pretrained``) and
@@ -470,10 +619,12 @@ def _save_bayesian_siblings(policy, config: Dict, unimol: UnimolSettings,
     log.info("Building the Bayesian-head checkpoint(s)")
     try:
         hygiene_weights = weights_cache if opts.data_hygiene else None
-        noise_vars = estimate_reward_noise_variance(
-            policy, inputs.graph_cache, device, weights_cache=hygiene_weights)
 
         def save(det_policy, out_path, extra_fields):
+            # residual noise of the model being saved (best_policy's heads come
+            # from different epochs than the final model's)
+            noise_vars = estimate_reward_noise_variance(
+                det_policy, inputs.graph_cache, device, weights_cache=hygiene_weights)
             bayes_policy = initialize_bayesian_heads_from_pretrained(
                 det_policy, bayesian_prior_precision=opts.bayesian_prior_precision,
                 graph_cache=inputs.graph_cache, device=device,
@@ -486,14 +637,15 @@ def _save_bayesian_siblings(policy, config: Dict, unimol: UnimolSettings,
             torch.save(ckpt, out_path)
             log.info(f"  Saved {out_path}")
 
-        save(policy, output_dir / "final_policy_bayesian.pt", {'epoch': opts.epochs})
+        save(policy, output_dir / "final_policy_bayesian.pt", {'epoch': last_epoch})
         best_path = output_dir / "best_policy.pt"
         if best_path.exists():
             best = torch.load(best_path, map_location=device, weights_only=False)
             best_policy = build_policy(config, unimol, device)
             best_policy.load_state_dict(best['policy_state'])
             save(best_policy, output_dir / "best_policy_bayesian.pt",
-                 {'epoch': best.get('epoch'), 'loss': best.get('loss')})
+                 {k: best.get(k) for k in ('epoch', 'loss', 'head_epoch', 'head_loss',
+                                           'selected_on')})
     except Exception as e:
         log.warning(f"  Warning: Bayesian-head post-pass failed: {e}")
 
@@ -585,18 +737,20 @@ def pretrain_with_runs(runs: List[Dict], output_dir: Path, config: Dict,
             log.warning("  Warning: all rewards zero or negative; disabling reward weighting.")
             reward_weighted = False
 
-        log.info(f"\nBehavior cloning: {opts.epochs} epochs on {len(runs)} runs "
+        log.info(f"\nBehavior cloning: up to {opts.epochs} epochs on {len(runs)} runs "
                  f"({inputs.n_ok} with valid graphs)"
                  + ("; reward-weighted loss" if reward_weighted else ""))
+        val_idx = split_validation(runs, opts.val_fraction, seed=opts.val_seed)
+        _write_validation_runs(output_dir, runs, val_idx)
         _train_epochs(policy, optimizer, scheduler, runs, inputs, weights_cache, advantages,
                       reward_weighted, unimol, opts, reward_config, output_dir, device,
-                      progress)
-        torch.save({'policy_state': policy.state_dict(), 'epoch': opts.epochs},
+                      progress, val_idx=val_idx)
+        torch.save({'policy_state': policy.state_dict(), 'epoch': progress.last_epoch},
                    output_dir / "final_policy.pt")
         if opts.bayesian_heads:
             _save_bayesian_siblings(policy, config, unimol, inputs, weights_cache, opts,
-                                    output_dir, device)
+                                    output_dir, device, progress.last_epoch)
         _write_metadata(config, unimol, opts, len(runs), inputs.n_ok, progress.best_loss,
                         output_dir, device)
-        log.info(f"\nBehavior cloning complete: best loss {progress.best_loss:.4f}; "
-                 f"saved to {output_dir}")
+        log.info(f"\nBehavior cloning complete: best loss (sum over heads) "
+                 f"{progress.best_loss:.4f}; saved to {output_dir}")

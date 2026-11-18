@@ -447,16 +447,30 @@ def production_balanced(saved_data: Dict, nsubs_per_site: Sequence[int], cfg: Di
     substituents needs >= min_end_share / n of the frames (its fair share of
     min_end_share), so a large site is not held to a small site's floor.
     False when the run lacks the per-substituent counts."""
+    ok = endpoint_nodes_sampled(saved_data, nsubs_per_site, cfg)
+    return ok is not None and all(ok)
+
+
+def endpoint_nodes_sampled(saved_data: Dict, nsubs_per_site: Sequence[int],
+                           cfg: Dict) -> Optional[List[bool]]:
+    """Per substituent (node order): did it pass the end-state test of
+    ``production_balanced`` (its share of the frames at its endpoint and its
+    entries per ns)? ``min_entries`` in ``cfg`` also requires that many
+    entries in the run itself, whatever its length (pretraining's
+    ``reward.min_end_entries``; a 0.1 ns run otherwise passes on one entry).
+    None when the run lacks the per-substituent counts."""
     from mllf.cb.hindsight import node_transition_counts
     nd = saved_data.get('endpoint_nodes') or {}
     frames = nd.get('frames') or 0
     if frames <= 0 or not saved_data.get('transition_pairs'):
-        return False
+        return None
     share = cfg.get('min_end_share')
     min_end = float(cfg.get('min_end_fraction', 0.01))
     min_visits = float(cfg.get('min_visits_per_ns', 2.0))
+    min_entries = float(cfg.get('min_entries') or 0)
     ns = frames / float(cfg.get('frames_per_ns', FRAMES_PER_NS))
     core = nd.get('core') or {}
+    out: List[bool] = []
     start = 0
     for n in nsubs_per_site:
         nodes = list(range(start, start + n))
@@ -464,11 +478,10 @@ def production_balanced(saved_data: Dict, nsubs_per_site: Sequence[int], cfg: Di
         counts = node_transition_counts(saved_data, nodes)
         floor = float(share) / n if share is not None else min_end
         for v in nodes:
-            if core.get(str(v + 2), 0) / frames < floor:
-                return False
-            if counts is None or counts[v] / 2.0 / ns < min_visits:
-                return False
-    return True
+            entries = counts[v] / 2.0 if counts is not None else 0.0
+            out.append(core.get(str(v + 2), 0) / frames >= floor and counts is not None
+                       and entries / ns >= min_visits and entries >= min_entries)
+    return out
 
 
 def pooled_group_test(history: Sequence[Dict], nsubs_per_site: Sequence[int],

@@ -1,4 +1,4 @@
-mllf.pretrain.trainer
+﻿mllf.pretrain.trainer
 =====================
 
 .. automodule:: mllf.pretrain.trainer
@@ -11,4 +11,5 @@ mllf.pretrain.trainer
       build_policy
       pretrain_epoch
       pretrain_with_runs
+      split_validation
    

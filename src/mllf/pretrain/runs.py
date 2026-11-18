@@ -103,14 +103,26 @@ def system_label(pretraining_dir: Path) -> str:
 
 def load_runs_from_dirs(pretraining_dirs: List) -> List[Dict]:
     """Every run of every directory, each tagged with ``system_label``
-    (matched by ``PretrainOptions.system_emphasis``)."""
-    all_runs = []
+    (matched by ``PretrainOptions.system_emphasis``), and each run once.
+
+    A dataset holding both its own runs and combo directories is often listed
+    with its combos (as in the launch scripts' manifest scans), and reading
+    the dataset also reads one level into each combo; a run reached twice is
+    kept at its first occurrence."""
+    all_runs, seen, n_dup = [], set(), 0
     for d in pretraining_dirs:
         pretrain_dir = Path(d)
         runs = load_pretraining_runs(pretrain_dir)
         log.debug(f"Loaded {len(runs)} runs from {pretrain_dir}")
         label = system_label(pretrain_dir)
         for run in runs:
+            key = Path(run['run_dir']).resolve()
+            if key in seen:
+                n_dup += 1
+                continue
+            seen.add(key)
             run['system_label'] = label
-        all_runs.extend(runs)
+            all_runs.append(run)
+    if n_dup:
+        log.info(f"Skipped {n_dup} runs listed more than once (each run is used once)")
     return all_runs

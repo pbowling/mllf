@@ -17,6 +17,7 @@ from mllf.file_handling.generate_combinations import is_combo_dir_name
 from mllf.pretrain.rewards import (
     compute_reward_from_sim_results,
     reward_kwargs,
+    run_end_state,
 )
 
 
@@ -794,6 +795,56 @@ def sample_runs_stratified_negative(
     return result
 
 
+def cap_runs_per_combo(runs: List[Dict], max_runs: int, exempt_ns: Optional[float] = 5.0,
+                       reward_config: Optional[Dict] = None) -> List[Dict]:
+    """Keep at most ``max_runs`` runs of each combo (the run directory's parent).
+
+    Online training repeats a combo every epoch and ALF's short runs repeat a
+    group up to ~200 times, and every run is its own gradient step, so without
+    a cap a few combos dominate. Within a combo, runs that passed online
+    training's end-state test (``rewards.run_end_state``) are kept first, then
+    by whole-run reward. Runs of at least ``exempt_ns`` (production runs: other
+    bias sets with long sampling) are always kept and do not count toward the
+    cap; None exempts none. Input order is kept.
+    """
+    rc = reward_config or {}
+    kwargs = reward_kwargs(rc)
+    by_combo: Dict[Path, List[int]] = defaultdict(list)
+    exempt = 0
+    for i, run in enumerate(runs):
+        ns = (run.get('sim_results') or {}).get('simulated_ns')
+        try:
+            long_run = exempt_ns is not None and float(ns) >= exempt_ns
+        except (TypeError, ValueError):
+            long_run = False
+        if long_run:
+            exempt += 1
+            continue
+        by_combo[Path(run['run_dir']).resolve().parent].append(i)
+
+    def rank(i: int):
+        run = runs[i]
+        passed = bool(run_end_state(run, rc))
+        nsubs = (run.get('metadata') or {}).get('nsubs_per_site')
+        try:
+            r = compute_reward_from_sim_results(run['sim_results'], len(nsubs), nsubs, **kwargs)
+        except Exception:
+            r = -math.inf
+        return (not passed, -r)
+
+    keep = set(i for i, run in enumerate(runs)) - {i for idx in by_combo.values() for i in idx}
+    n_capped = 0
+    for idx in by_combo.values():
+        if len(idx) <= max_runs:
+            keep.update(idx)
+            continue
+        n_capped += 1
+        keep.update(sorted(idx, key=rank)[:max_runs])
+    log.debug(f"  Per-combo cap {max_runs}: {n_capped} of {len(by_combo)} combos capped; "
+              f"{exempt} runs >= {exempt_ns} ns exempt")
+    return [run for i, run in enumerate(runs) if i in keep]
+
+
 def select_runs(runs: List[Dict], opts, reward_config: Dict) -> Optional[List[Dict]]:
     """Apply the run filters of ``PretrainOptions`` in order; None (after
     logging why) when no run is left. The details of each filter go to the
@@ -834,6 +885,16 @@ def select_runs(runs: List[Dict], opts, reward_config: Dict) -> Optional[List[Di
                                      reward_config=reward_config)
         if not kept(f'reward filter (>= {opts.min_reward_threshold})', n, runs):
             log.info("Try lowering min_reward_threshold or disable reward filtering")
+            return None
+
+    if opts.max_runs_per_combo is not None:
+        n = len(runs)
+        runs = cap_runs_per_combo(runs, opts.max_runs_per_combo, opts.cap_exempt_ns,
+                                  reward_config)
+        exempt = (f', runs >= {opts.cap_exempt_ns:g} ns exempt'
+                  if opts.cap_exempt_ns is not None else '')
+        if not kept(f'per-combo cap ({opts.max_runs_per_combo} runs, end-state passes '
+                    f'first{exempt})', n, runs):
             return None
 
     if opts.filter_outliers:
