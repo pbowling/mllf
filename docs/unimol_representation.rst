@@ -11,25 +11,26 @@ biases in different molecules.
 Node Features
 -------------
 
-``get_substituent_dual_embeddings()`` returns two 512-D halves per substituent, and the
-node feature is their concatenation (1024-D).
+``get_substituent_dual_embeddings()`` returns two parts per substituent, and the node
+feature is their concatenation: 515-D for the phase inputs (the default), 1024-D for
+``dual`` (``policy.node_width``).
 
 1. **Ligand**: the core and substituent, in that order after the substituent itself
    (``construct_full_ligand()``). With ``unimol.ligand_other_sites: true``, it also holds
    every other site's reference substituent (``sub1``), so a substituent is embedded in
    the molecule it belongs to.
-2. **Second half**, set by ``unimol.env_input``:
+2. **Second part**, set by ``unimol.env_input``:
 
-   * ``phase`` (the default) and ``phase_ligmean``: two flags, [condensed, protein]
-     (vacuum [0, 0], solvent [1, 0], protein [1, 1]), read from the system name and
-     followed by zeros.
-   * ``dual``: a second Uni-Mol embedding of the ligand together with its environment
-     (below).
+   * ``phase`` (the default) and ``phase_ligmean``: three values, the flags
+     [condensed, protein] (vacuum [0, 0], solvent [1, 0], protein [1, 1]), read from the
+     system name, and the site-size slot.
+   * ``dual`` (an alternative): a second 512-D Uni-Mol embedding of the ligand together
+     with its environment (below).
 
-The policy combines the halves per edge (:doc:`cb_setup`), using the *difference* of the
-ligand halves and the symmetric second half, so the two halves carry different
-information. With ``unimol.site_size_input``, the slot after the phase flags holds each
-substituent's site size for the current run. That value is set per run and is never
+The policy combines the parts per edge (:doc:`cb_setup`), using the *difference* of the
+ligand embeddings and the symmetric second part, so the two carry different
+information. With ``unimol.site_size_input``, the site-size slot holds each
+substituent's site size for the current run (0 otherwise). That value is set per run and is never
 cached, since the same substituent appears in pairs and in groups.
 
 The ``unimol`` settings change what the model sees, so online training and pretraining

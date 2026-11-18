@@ -78,7 +78,10 @@ class FakeCluster:
         for s, u in labels:
             by_site.setdefault(s, []).append(u)
         nsubs = [len(by_site[s]) for s in sorted(by_site)]
-        x = torch.stack([torch.randn(1024, generator=torch.Generator().manual_seed(
+        # node rows of the config's env_input (515 for the phase inputs, the default)
+        from mllf.cb.policy import node_width, unimol_options
+        width = node_width(unimol_options(global_config)['env_input'])
+        x = torch.stack([torch.randn(width, generator=torch.Generator().manual_seed(
             _seed(system_config.get('name'), s, u))) for s, u in labels])
         pairs = build_directed_pairs(nsubs)
         data = type('Data', (), {})()

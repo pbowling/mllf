@@ -1,7 +1,7 @@
 """Graph + Uni-Mol embedding construction for the online-training loop.
 
-Builds the per-combo PyG-like ``Data`` object (dual 1024D Uni-Mol node
-embeddings, directed within-site edges) that ``mllf.cb.reinforce_trainer``'s
+Builds the per-combo PyG-like ``Data`` object (Uni-Mol node inputs,
+``policy.node_width`` wide; directed within-site edges) that ``mllf.cb.reinforce_trainer``'s
 ``train_epoch`` samples policy actions on.
 
 Moved here from ``training/workflow.py`` as part of making the online CB
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from mllf.cb.pairs import build_directed_pairs
-from mllf.cb.policy import fill_site_size, unimol_options
+from mllf.cb.policy import fill_site_size, node_width, unimol_options
 from mllf.cb.unimol_representation import (
     build_environment_consensus,
     get_substituent_dual_embeddings,
@@ -134,11 +134,11 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
         else:
             custom_search_paths.append(solvent_pdb)
 
-    # Each node is [ligand (512) | second half (512)]. With unimol.env_input
-    # 'dual' the second half embeds the ligand in its environment, filtered
-    # per site to the atoms near the core (identical for every substituent at
-    # the site, as in pretraining); with 'phase' / 'phase_ligmean' it holds
-    # the phase flags and no environment is read.
+    # Each node is [ligand (512) | second part]. With unimol.env_input 'phase' /
+    # 'phase_ligmean' (515-D nodes) the second part is the phase flags and the
+    # site-size slot, and no environment is read; with 'dual' (1024-D) it embeds
+    # the ligand in its environment, filtered per site to the atoms near the
+    # core (identical for every substituent at the site, as in pretraining).
     combo_name = combo_path.name
     unimol = unimol_options(global_config)
     env_input = unimol['env_input']
@@ -194,18 +194,18 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
                     # other sites' reference subs in the ligand half
                     ligand_other_sites=unimol['ligand_other_sites'],
                 )
-                sub_emb = np.concatenate([emb_ligand, emb_full])  # [1024]
+                sub_emb = np.concatenate([emb_ligand, emb_full])  # [node_width(env_input)]
                 if sub_emb.ndim == 1:
-                    sub_emb = sub_emb[np.newaxis, :]  # [1024] -> [1, 1024]
+                    sub_emb = sub_emb[np.newaxis, :]  # [W] -> [1, W]
                 unimol_embeddings.append(sub_emb)
             except Exception as e:
                 warnings.warn(
                     f"Failed to compute dual Uni-Mol embedding for {Path(sub_pdb_path).name}: {e}")
-                # Create a zero embedding as fallback (1024D)
-                unimol_embeddings.append(np.zeros((1, 1024), dtype=np.float32))
+                # Create a zero embedding as fallback
+                unimol_embeddings.append(np.zeros((1, node_width(env_input)), dtype=np.float32))
 
     if unimol_embeddings:
-        unimol_emb_array = np.vstack(unimol_embeddings)  # [N, 1024] where N = total number of subs
+        unimol_emb_array = np.vstack(unimol_embeddings)  # [N, W] where N = total number of subs
     else:
         raise ValueError(f"No Uni-Mol embeddings computed for {combo_dir}")
 
@@ -238,9 +238,9 @@ def build_graph_and_data(combo_dir: str, system_config: Dict,
         site_index.extend([site_idx] * nsubs)
     site_index = torch.LongTensor(site_index)
 
-    # Prepare embedding as node features (now 1024D for dual embeddings)
-    unimol_emb_t = torch.from_numpy(unimol_emb_array).float().to(device)  # [N, 1024]
-    # unimol.site_size_input: this combo's site sizes in the full half (UnimolPolicy)
+    # Node features: [N, 515] for the phase inputs, [N, 1024] for 'dual'
+    unimol_emb_t = torch.from_numpy(unimol_emb_array).float().to(device)
+    # unimol.site_size_input: this combo's site sizes in the site-size slot (UnimolPolicy)
     if unimol['site_size_input']:
         fill_site_size(unimol_emb_t, nsubs_per_site)
 

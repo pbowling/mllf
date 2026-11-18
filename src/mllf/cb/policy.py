@@ -180,6 +180,20 @@ ENV_INPUTS = ('dual', 'phase', 'phase_ligmean')
 # Inputs whose node 'full' half holds the phase flags (no environment embedding).
 PHASE_NODE_INPUTS = ('phase', 'phase_ligmean')
 PHASE_DIM = 2
+# A phase-mode node is [ligand embedding (512) | phase flags (PHASE_DIM) |
+# site size (1)]: PHASE_SLOTS values after the ligand embedding (the site-size
+# slot stays 0 without site_size_input). 'dual' nodes are [ligand-only (512) |
+# full (512)].
+PHASE_SLOTS = PHASE_DIM + 1
+PHASE_NODE_WIDTH = 512 + PHASE_SLOTS
+DUAL_NODE_WIDTH = 1024
+
+
+def node_width(env_input: str) -> int:
+    """Width of a node row for ``env_input``: PHASE_NODE_WIDTH (515) for the
+    phase inputs, DUAL_NODE_WIDTH (1024) for 'dual'."""
+    return PHASE_NODE_WIDTH if env_input in PHASE_NODE_INPUTS else DUAL_NODE_WIDTH
+
 
 # Defaults of a config's unimol: block: the settings of the current pretrained
 # model (pretraining_Nov02b). The edge input is the ligand difference (512),
@@ -219,8 +233,9 @@ def site_size_values(nsubs_per_site) -> List[float]:
 
 
 def fill_site_size(node_emb: torch.Tensor, nsubs_per_site) -> torch.Tensor:
-    """Write site_size_values into SITE_SIZE_SLOT of a [N, 1024] phase-mode node
-    tensor (nodes ordered site by site, as every graph builder orders them)."""
+    """Write site_size_values into SITE_SIZE_SLOT of a [N, PHASE_NODE_WIDTH]
+    phase-mode node tensor (nodes ordered site by site, as every graph builder
+    orders them)."""
     vals = site_size_values(nsubs_per_site)
     if len(vals) != node_emb.size(0):
         raise ValueError(f"nsubs_per_site {list(nsubs_per_site)} gives {len(vals)} nodes, "
@@ -270,11 +285,13 @@ class UnimolPolicy(nn.Module):
     - Allows MLPs to simultaneously learn substituent-dependent and
       environment-dependent information
 
-    **Phase input** (use_dual_embeddings=True, env_input='phase'):
-    - Same [N, 1024] node layout, but the 'full' half holds the phase flags
-      [condensed, protein] padded with zeros (unimol_representation.phase_embedding)
-    - Edge input: [diff_ligand(512), phase(2)] = 514D -- the environment enters
-      only as vacuum / solvent / protein, not as a 512D embedding
+    **Phase input** (use_dual_embeddings=True, env_input='phase'; the default):
+    - [N, 515] nodes (PHASE_NODE_WIDTH): the ligand-only embedding, then the
+      phase flags [condensed, protein] (unimol_representation.phase_embedding)
+      and the site size (fill_site_size)
+    - Edge input: [diff_ligand(512), phase(2)] = 514D, 515D with the site size --
+      the environment enters only as vacuum / solvent / protein, not as a 512D
+      embedding
 
     **Phase + ligand mean** (use_dual_embeddings=True, env_input='phase_ligmean'):
     - Node layout as for 'phase'
@@ -282,9 +299,9 @@ class UnimolPolicy(nn.Module):
       the pair's mean ligand-only embedding, symmetric pair context with no
       environment (what the full half gave vacuum pairs in 'dual' mode)
 
-    Each edge is passed as 1024D directly to EdgeValueMLP, which contains four
+    Each edge input goes directly to EdgeValueMLP, which contains four
     independent BiasHeadMLPs (one per bias type). Each BiasHeadMLP learns its
-    own feature extraction: 1024D -> 512D -> 256D -> 64D -> 2D (mean, log_std).
+    own feature extraction: in -> in/2 -> in/4 -> 64D -> 2D (mean, log_std).
     This allows each bias type to independently discover what information is
     important for its prediction, without a shared projection bottleneck.
 
@@ -333,13 +350,13 @@ class UnimolPolicy(nn.Module):
         self.use_bayesian_heads = bool(use_bayesian_heads)
         self.env_input = env_input
         self.site_size_input = bool(site_size_input)
-        # leading slots of the 'full' half fed to the edge: phase flags (+ site size)
+        # slots after the ligand embedding fed to the edge: phase flags (+ site size)
         self._phase_dim = PHASE_DIM + int(self.site_size_input)
 
-        # When using dual embeddings:
-        # - Input format: [N, 1024] where first 512 = ligand-only, last 512 = full system with
-        # environment
-        # - Edge input: [diff_ligand, mean_full] = 1024D
+        # Node inputs (use_dual_embeddings), node_width(env_input) wide:
+        # - phase inputs: [N, 515] = ligand-only (512), phase flags (2), site size (1)
+        # - 'dual': [N, 1024] = ligand-only (512), full system with environment (512);
+        #   edge input [diff_ligand, mean_full] = 1024D
         # Otherwise:
         # - Input format: [N, 512] ligand+environment
         # - Edge input: [diff, mean] = 1024D
@@ -394,35 +411,42 @@ class UnimolPolicy(nn.Module):
         Args:
             unimol_embeddings: [N, emb_dim] pre-computed Uni-Mol embeddings.
                 - When use_dual_embeddings=False: [N, 512] ligand+environment
-                - When use_dual_embeddings=True: [N, 1024] stacked [ligand_only, full]
+                - When use_dual_embeddings=True: [N, node_width(env_input)]:
+                  [N, 515] [ligand_only, phase flags, site size] for the phase
+                  inputs, [N, 1024] [ligand_only, full] for 'dual'
             edge_index: [2, E] directed edge index.
 
         Returns:
-            [E, in_dim] edge input tensor (in_dim = 1024 either way).
+            [E, in_dim] edge input tensor.
         """
         src = edge_index[0]
         dst = edge_index[1]
 
         if self.use_dual_embeddings:
-            # Dual embedding mode: [ligand_only, full]
-            # Split the 1024D input into two 512D components
-            src_emb = unimol_embeddings[src]  # [E, 1024]
-            dst_emb = unimol_embeddings[dst]  # [E, 1024]
+            width = node_width(self.env_input)
+            if unimol_embeddings.size(-1) != width:
+                raise ValueError(
+                    f"env_input={self.env_input!r} needs [N, {width}] node inputs, got "
+                    f"{tuple(unimol_embeddings.shape)}; graphs or replay caches built with "
+                    "another layout (e.g. the 1024-D padded phase nodes used before Nov 2026) "
+                    "must be rebuilt")
+            # [ligand_only (512) | second part]: the full embedding (512) for 'dual',
+            # the phase flags and site size (PHASE_SLOTS) for the phase inputs
+            src_emb = unimol_embeddings[src]
+            dst_emb = unimol_embeddings[dst]
 
             src_ligand = src_emb[:, :512]      # [E, 512] ligand-only
-            src_full = src_emb[:, 512:]        # [E, 512] full
+            src_full = src_emb[:, 512:]
             dst_ligand = dst_emb[:, :512]      # [E, 512] ligand-only
-            dst_full = dst_emb[:, 512:]        # [E, 512] full
+            dst_full = dst_emb[:, 512:]
 
             # Build edge input using:
             # - Antisymmetric component from ligand (captures substituent variation)
-            # - Symmetric component from full (captures environment effects)
+            # - Symmetric component from the second part (environment, or phase)
             diff_ligand = src_ligand - dst_ligand     # [E, 512] - antisymmetric (sub-dependent)
-            # [E, 512] - symmetric (environment-dependent)
             mean_full = (src_full + dst_full) / 2.0
             if self.env_input == 'phase':
-                # 'full' half = phase flags (+ site size, the same for both nodes of
-                # an edge) + zero padding
+                # phase flags (+ site size, the same for both nodes of an edge)
                 return torch.cat([diff_ligand, mean_full[:, :self._phase_dim]],
                                  dim=-1)  # [E, 514 / 515]
             if self.env_input == 'phase_ligmean':

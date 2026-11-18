@@ -24,8 +24,10 @@ def _config(tmp_path, systems, **extra):
 
 def _policy(bayesian):
     torch.manual_seed(0)
+    # the default model inputs (UNIMOL_DEFAULTS: phase flags and site size, 515-D nodes),
+    # which the fake cluster's graphs are built with
     return UnimolPolicy(unimol_dim=512, mlp_hidden=64, mlp_out_dim=4, use_dual_embeddings=True,
-                        use_bayesian_heads=bayesian)
+                        use_bayesian_heads=bayesian, env_input='phase', site_size_input=True)
 
 
 def _hindsight(cfg):

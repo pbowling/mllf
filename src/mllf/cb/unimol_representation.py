@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from mllf.cb.policy import ENV_INPUTS, PHASE_DIM, PHASE_NODE_INPUTS
+from mllf.cb.policy import ENV_INPUTS, PHASE_DIM, PHASE_NODE_INPUTS, PHASE_SLOTS
 from mllf.file_handling.generate_combinations import is_combo_dir_name
 from mllf.file_handling.read_pdb import (
     extract_site_number,
@@ -400,11 +400,11 @@ def phase_flags(prep_dir: Path) -> np.ndarray:
     return np.array([1.0, 1.0 if 'prot' in name else 0.0], dtype=np.float32)
 
 
-def phase_embedding(prep_dir: Path, dim: int = 512) -> np.ndarray:
-    """The phase flags in the first PHASE_DIM slots of a ``dim`` vector of zeros:
-    the 'full' half of a substituent's [ligand, full] input when env_input='phase',
-    so its layout (and every cache built on it) keeps the dual shape."""
-    v = np.zeros(dim, dtype=np.float32)
+def phase_embedding(prep_dir: Path) -> np.ndarray:
+    """The PHASE_SLOTS values of a phase-mode node after its ligand embedding:
+    the phase flags, then the site-size slot (0 here; set per run by
+    policy.fill_site_size)."""
+    v = np.zeros(PHASE_SLOTS, dtype=np.float32)
     v[:PHASE_DIM] = phase_flags(prep_dir)
     return v
 
@@ -2174,7 +2174,9 @@ def get_substituent_dual_embeddings(
             unimol.ligand_from_minimized), else the unrelaxed files.
 
     Returns:
-        A pair of 512-dimensional ligand-only and context embeddings.
+        The 512-dimensional ligand-only embedding and the node's second part:
+        the 512-dimensional context embedding ('dual'), or the PHASE_SLOTS phase
+        values (``phase_embedding``; the phase inputs).
     """
     if env_input not in ENV_INPUTS:
         raise ValueError(f"env_input must be one of {ENV_INPUTS}, got {env_input!r}")
@@ -2245,7 +2247,7 @@ def get_substituent_dual_embeddings(
             )
 
     if env_input in PHASE_NODE_INPUTS:
-        return embedding_ligand_only, phase_embedding(prep_dir, dim=len(embedding_ligand_only))
+        return embedding_ligand_only, phase_embedding(prep_dir)
 
     # Ligand+environment half: get_substituent_unimol_with_environment handles
     # its own cache check/save internally (variant='full' keeps it distinct

@@ -11,7 +11,7 @@ from mllf.cb.hindsight_regression import (
     regression_config,
     regression_step,
 )
-from mllf.cb.policy import PHASE_DIM, UnimolPolicy, env_input_from_state
+from mllf.cb.policy import PHASE_NODE_WIDTH, UnimolPolicy, env_input_from_state
 
 
 def _policy():
@@ -134,13 +134,24 @@ def test_env_input_read_back_from_a_saved_policy(env_input):
 
 
 def test_replay_cache_built_for_another_env_input_is_refused():
-    phase_graph = torch.zeros(2, 1024)
-    phase_graph[:, :512 + PHASE_DIM] = 1.0                 # zero past the phase flags
-    data = [(phase_graph, None)]
-    _check_replay_env_input(data, 'phase', 'cache.pt')
-    with pytest.raises(ValueError, match='env_input=phase'):
-        _check_replay_env_input(data, 'dual', 'cache.pt')
+    phase_graph = torch.ones(2, PHASE_NODE_WIDTH)
+    _check_replay_env_input([(phase_graph, None)], 'phase', 'cache.pt')
+    with pytest.raises(ValueError, match="env_input='dual' needs 1024"):
+        _check_replay_env_input([(phase_graph, None)], 'dual', 'cache.pt')
     _check_replay_env_input([(torch.ones(2, 1024), None)], 'dual', 'cache.pt')
+    # the 1024-D padded phase nodes built before Nov 2026: rebuild
+    with pytest.raises(ValueError, match='rebuild'):
+        _check_replay_env_input([(torch.zeros(2, 1024), None)], 'phase', 'cache.pt')
+
+
+def test_phase_policy_refuses_padded_nodes():
+    pol = UnimolPolicy(unimol_dim=512, use_dual_embeddings=True, env_input='phase',
+                       site_size_input=True)
+    ei = torch.tensor([[0, 1], [1, 0]])
+    mean, _ = pol._forward_edges(torch.randn(2, PHASE_NODE_WIDTH), ei)
+    assert mean.shape == (2, 4)
+    with pytest.raises(ValueError, match='515'):
+        pol._forward_edges(torch.randn(2, 1024), ei)
 
 
 def test_replay_cache_built_with_other_ligand_embeddings_is_refused(tmp_path):

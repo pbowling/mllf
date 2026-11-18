@@ -20,9 +20,8 @@ from mllf.cb.pair_weights import (
 )
 from mllf.cb.pairs import build_directed_pairs
 from mllf.cb.policy import (
-    PHASE_NODE_INPUTS,
-    SITE_SIZE_SLOT,
     UNIMOL_DEFAULTS,
+    node_width,
     unimol_options,
 )
 from mllf.cb.replay_selection import manifest_resolver, plan_replay
@@ -183,17 +182,16 @@ def _coverage_choice(cfg: Dict, manifest, verbose: bool = True) -> List[Tuple]:
 
 
 def _check_replay_env_input(data, env_input: str, cache) -> None:
-    """A replay set built for the other env_input would feed the policy the
-    wrong environment half; phase-mode graphs are zero past the phase flags."""
-    sample = [e for e, *_ in data[:50] if e.dim() == 2 and e.size(1) >= 1024]
-    if not sample:
-        return
-    # past the phase flags and the site-size slot
-    built_phase = all(float(e[:, SITE_SIZE_SLOT + 1:].abs().sum()) == 0.0 for e in sample)
-    if built_phase != (env_input in PHASE_NODE_INPUTS):
-        raise ValueError(f"replay cache {cache} was built with "
-                         f"env_input={'phase' if built_phase else 'dual'}, but the model "
-                         f"uses {env_input!r}; set regression.replay_cache to a new file")
+    """Every replay graph's node rows must have the model's width
+    (policy.node_width: 515 for the phase inputs, 1024 for 'dual'). A cache
+    built for the other env_input, or with the 1024-D padded phase nodes used
+    before Nov 2026, has to be rebuilt."""
+    want = node_width(env_input)
+    widths = {int(e.size(1)) for e, *_ in data if e.dim() == 2}
+    if widths and widths != {want}:
+        raise ValueError(f"replay cache {cache} has node rows {sorted(widths)} wide, but "
+                         f"env_input={env_input!r} needs {want}; rebuild it (mllf replay) "
+                         "or set regression.replay_cache to a new file")
 
 
 def _replay_info_path(cache) -> Path:

@@ -19,11 +19,12 @@ Architecture
 
 .. code-block:: text
 
-   Uni-Mol [frozen]        per substituent (512 each):
+   Uni-Mol [frozen]        per substituent:
                              ligand = UniMol(core + sub [+ other sites' reference subs])
-                             second half, by unimol.env_input:
+                             second part, by unimol.env_input:
+                               phase: [condensed, protein] flags, site size  (3; 515-D nodes)
                                dual:  UniMol(core + sub + reference subs + environment)
-                               phase: [condensed, protein] flags (+ site size), zeros
+                                      (512; 1024-D nodes)
           │
           ▼
    Edge input (A → B)      dual:          [ligand_A − ligand_B, (full_A + full_B)/2]   1024

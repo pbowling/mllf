@@ -23,7 +23,7 @@ from mllf.cb.pair_weights import (
     compute_pairwise_measured_mask,
 )
 from mllf.cb.pairs import build_directed_pairs
-from mllf.cb.policy import fill_site_size
+from mllf.cb.policy import fill_site_size, node_width
 from mllf.cb.unimol_representation import (
     get_substituent_dual_embeddings,
     get_substituent_unimol_with_environment,
@@ -195,12 +195,13 @@ def compute_unimol_embeddings_and_edges(
 ) -> tuple:
     """Compute Uni-Mol embeddings for all substituents in a run.
 
-    env_input='phase' or 'phase_ligmean' keeps the [ligand, full] layout but puts
-    the phase flags (unimol_representation.phase_embedding) in the full half,
-    computing no environment embedding (see UnimolPolicy env_input).
+    env_input='phase' or 'phase_ligmean' builds [N, 515] nodes: the ligand
+    embedding, then the phase flags and the site-size slot
+    (unimol_representation.phase_embedding), computing no environment embedding
+    (see UnimolPolicy env_input).
     ligand_other_sites: the ligand half also holds every other site's
     reference substituent (unimol_representation.other_site_reference_subs).
-    site_size_input: the full half also holds the run's site size
+    site_size_input: the node's site-size slot holds the run's site size
     (policy.fill_site_size; unimol.site_size_input).
     ligand_minimized: for a 'minimized' run, the ligand half takes its
     coordinates from the prep's minimized.pdb (unimol.ligand_from_minimized).
@@ -241,8 +242,9 @@ def compute_unimol_embeddings_and_edges(
         cache_dir: Optional directory to cache/load embeddings
         run_idx: Run index (for reference in tracking)
         env_cutoff: Environment distance cutoff in Ångströms (default: 8.0)
-        use_environment_difference: If True, compute dual embeddings:
-            [ligand-only(512), full(512)] = 1024D per node.
+        use_environment_difference: If True, compute two-part node inputs:
+            [ligand-only(512), full(512)] = 1024D per node for env_input 'dual',
+            [ligand-only(512), phase flags(2), site size(1)] = 515D for the phase inputs.
             If False, use standard embedding: ligand+environment(512) per node.
         consensus_dict: Optional nested dict mapping systems to site consensus atoms.
             Structure: {prep_dir_str: {site_key: {(resnum, chain, atomname), ...}, ...}, ...}
@@ -254,7 +256,8 @@ def compute_unimol_embeddings_and_edges(
         where:
         - N = total substituents
         - E = directed pairs within sites
-        - emb_dim = 1024 when use_environment_difference=True (dual embeddings)
+        - emb_dim = policy.node_width(env_input) when use_environment_difference=True
+          (515 for the phase inputs, 1024 for 'dual')
         - emb_dim = 512 when use_environment_difference=False (standard embeddings)
         - representation_source = dict with 'structure_type', 'prep_dir_used', 'source',
           'explicit_mapping'
@@ -331,8 +334,8 @@ def compute_unimol_embeddings_and_edges(
     }
 
     # Determine embedding dimension based on representation type
-    # Dual embeddings (ligand-only + full) = 1024D, standard = 512D
-    emb_dim = 1024 if use_environment_difference else 512
+    # Two-part nodes: 515D for the phase inputs, 1024D for 'dual'; standard = 512D
+    emb_dim = node_width(env_input) if use_environment_difference else 512
     unimol_embeddings = torch.zeros((n_nodes, emb_dim), dtype=torch.float32)
 
     # Read core PDB once (needed for environment loading)
@@ -377,8 +380,8 @@ def compute_unimol_embeddings_and_edges(
 
             # Compute Uni-Mol embeddings
             if use_environment_difference:
-                # Compute dual embeddings: ligand-only and full
-                # Stack as [512 ligand + 512 full] = 1024D for edge computation
+                # The ligand-only embedding and the node's second part (the full
+                # embedding for 'dual', the phase values for the phase inputs)
                 emb_ligand, emb_full = get_substituent_dual_embeddings(
                     sub_pdb=str(sub_pdb),
                     core_pdb=str(core_pdb),
@@ -394,8 +397,8 @@ def compute_unimol_embeddings_and_edges(
                     ligand_other_sites=ligand_other_sites,
                     ligand_minimized=ligand_minimized and structure_type == 'minimized',
                 )
-                # Concatenate for storage: UnimolPolicy._forward_edges() will split [ligand, full]
-                emb = np.concatenate([emb_ligand, emb_full])  # [1024]
+                # UnimolPolicy._forward_edges() splits it at column 512
+                emb = np.concatenate([emb_ligand, emb_full])  # [emb_dim]
             else:
                 # Compute standard embedding with environment context (512D)
                 emb = get_substituent_unimol_with_environment(

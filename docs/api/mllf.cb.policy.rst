@@ -1,4 +1,4 @@
-mllf.cb.policy
+﻿mllf.cb.policy
 ==============
 
 .. automodule:: mllf.cb.policy
@@ -10,6 +10,7 @@ mllf.cb.policy
    
       env_input_from_state
       fill_site_size
+      node_width
       site_size_from_state
       site_size_values
       unimol_options
