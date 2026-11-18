@@ -281,7 +281,7 @@ def pretrain_epoch(
                     run_loss.backward()
                 group_loss += run_loss.item()
                 for d in range(n_heads):
-                    group_heads[d] += float(heads[d])
+                    group_heads[d] += float(heads[d].detach())
                 contributed = True
 
             # A Gaussian NLL is negative once a run is fit tightly; every run that

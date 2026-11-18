@@ -1,5 +1,6 @@
 """Pretraining's epoch loop: per-head losses, the validation split, per-head model
 selection, early stopping, and 515-D phase nodes."""
+import pytest
 import torch
 
 from mllf.cb.policy import PHASE_NODE_WIDTH, UnimolPolicy
@@ -74,6 +75,8 @@ def test_tightly_fit_runs_still_count_and_validation_takes_no_step():
     assert any(not torch.equal(before[k], v) for k, v in pol.state_dict().items())
 
 
+# the scripted epochs take no optimizer step, so the scheduler warns about the order
+@pytest.mark.filterwarnings('ignore:Detected call of:UserWarning')
 def test_each_head_keeps_its_best_epoch_and_training_stops_when_none_improve(
         tmp_path, monkeypatch):
     # scripted validation loss per head: linear best at epoch 2, quadratic at 5,

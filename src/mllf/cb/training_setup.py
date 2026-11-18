@@ -240,8 +240,9 @@ def make_rl_optimizer(policy: UnimolPolicy, lr: float):
 
 
 def make_scheduler(opt):
+    # no verbose= (removed in PyTorch 2.7); the training loop logs each LR change
     return torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=3,
-                                                      min_lr=1e-7, verbose=False)
+                                                      min_lr=1e-7)
 
 
 def make_context_baseline(train_cfg: Dict, algorithm: str, system_to_idx: Dict[str, int],
