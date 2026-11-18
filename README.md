@@ -67,7 +67,8 @@ The extras are:
 
 **Simulations.** Training and production runs launch MSLD simulations through CHARMM with
 pyCHARMM and submit them with Slurm. Neither is installed by `pip`: the workflow loads
-CHARMM through the `slurm:` block's `module` and `setup` settings. See the
+CHARMM through the `slurm:` block's `module` and `setup` settings, and the minimal
+example reads the CHARMM36 topology and parameter files from `CHARMM_TOPPAR`. See the
 [installation guide](https://mllf.readthedocs.io/en/latest/installation.html).
 
 ## Quick start
@@ -95,6 +96,7 @@ water), with the collected runs it pretrains on, and is small enough to check an
 installation end to end:
 
 ```bash
+export CHARMM_TOPPAR=/path/to/toppar    # the CHARMM36 topology and parameter files
 sbatch examples/minimal/run_pipeline.sh
 ```
 

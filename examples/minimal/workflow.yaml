@@ -1,11 +1,12 @@
 # Online training for the minimal example (examples/minimal/run_pipeline.sh):
-# one system (1,4-benzene in water), one stage of pairs and one group, scouted
-# with the pretrained model, then one epoch of online training. Paths are
-# relative to the repository root, where the pipeline runs.
+# one system (1,4-benzene in water, examples/minimal/14benz), one stage of pairs
+# and one group, scouted with the pretrained model, then one epoch of online
+# training. Paths are relative to the repository root, where the pipeline runs;
+# the simulations read the CHARMM36 parameter files from $CHARMM_TOPPAR.
 
 systems:
   - name: 14benz_solv              # 'solv' in the name sets the phase flags
-    input_dir: examples/14benz
+    input_dir: examples/minimal/14benz
     out_dir: examples/minimal/output/simulations/14benz_solv/
     solvent_state: solv
     include_patterns: [msld_flat.py]

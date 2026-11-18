@@ -21,6 +21,10 @@
 # Submit from the repository root:
 #   sbatch examples/minimal/run_pipeline.sh
 # Settings (environment variables):
+#   CHARMM_TOPPAR     directory of the CHARMM36 topology and parameter files
+#                     (top_all36_prot.rtf, par_all36_cgenff.prm,
+#                     toppar_water_ions.str, ...), read by every simulation
+#                     (examples/minimal/14benz/msld_flat.py); required
 #   PRETRAINING_ROOT  collected runs, holding 14benz_solv/ (default: the 39 runs
 #                     shipped in examples/minimal/pretraining/)
 #   MLLF              the mllf command (default: mllf)
@@ -36,6 +40,14 @@ if [ -n "${CONDA_ENV-mllf}" ] && [ -f ~/miniconda3/etc/profile.d/conda.sh ]; the
     conda activate "${CONDA_ENV:-mllf}"
 fi
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/../..}"
+for f in top_all36_prot.rtf par_all36m_prot.prm top_all36_cgenff.rtf par_all36_cgenff.prm \
+         toppar_water_ions.str; do
+    if [ ! -f "${CHARMM_TOPPAR:-}/$f" ]; then
+        echo "Set CHARMM_TOPPAR to the CHARMM36 toppar directory (missing ${CHARMM_TOPPAR:-<unset>}/$f)"
+        exit 1
+    fi
+done
+export CHARMM_TOPPAR     # the simulation jobs inherit it (sbatch exports the environment)
 EX=examples/minimal
 OUT=$EX/output
 mkdir -p "$OUT"

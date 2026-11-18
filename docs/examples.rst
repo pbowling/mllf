@@ -9,11 +9,14 @@ Minimal Example: 14benz
 -----------------------
 
 ``examples/minimal/`` runs the whole pipeline on one system, 1,4-benzene in water
-(``examples/14benz/``: 6 substituents at site 1, 5 at site 2), and is small enough to check
-an installation end to end. From the repository root:
+(``examples/minimal/14benz/``: 6 substituents at site 1, 5 at site 2), and is small
+enough to check an installation end to end. Its simulations read the CHARMM36 topology
+and parameter files from ``CHARMM_TOPPAR``, which the pipeline checks before it starts.
+From the repository root:
 
 .. code-block:: bash
 
+   export CHARMM_TOPPAR=/path/to/toppar       # top_all36_prot.rtf, ..., toppar_water_ions.str
    sbatch examples/minimal/run_pipeline.sh
    # or with another install, or collected runs of your own:
    sbatch --export=ALL,PRETRAINING_ROOT=/path/to/pretraining,MLLF=/path/to/mllf \
@@ -49,7 +52,7 @@ a log file per step (``pretrain/pretrain.log``, ``replay.log``, ``scouting/scout
 ``training/training.log``). A rerun skips the steps whose outputs exist and resumes
 training from its checkpoint, so delete that directory to start over.
 
-Set ``input_dir: examples/14benz``, not ``.../prep``, for this system. Fragment files are
+Set ``input_dir: examples/minimal/14benz``, not ``.../prep``, for this system. Fragment files are
 found in both the input directory and its ``prep/``, but ``msld_flat.py`` and the support
 files are copied from the input directory itself.
 

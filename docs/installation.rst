@@ -26,7 +26,9 @@ The ``analysis`` extra adds matplotlib, pandas, scipy and pillow for :doc:`analy
 
 Simulations need CHARMM with pyCHARMM and a Slurm cluster, neither of which ``pip``
 installs. The workflow loads CHARMM through the ``slurm:`` block's ``module`` and
-``setup`` settings (:doc:`workflow`).
+``setup`` settings (:doc:`workflow`). Each system's simulation script also reads the
+CHARMM36 topology and parameter files; the minimal example's script reads them from the
+directory in ``CHARMM_TOPPAR`` (:doc:`examples`).
 
 Run the tests with:
 

@@ -51,8 +51,9 @@ unimol:
     # embedding pre-build phase entirely on a RESUBMITTED/rerun job (e.g.
     # after hitting a SLURM time limit), since it's persisted to cache_dir.
 
-  cache_dir: /home/pbowling/mllf/pretraining/embeddings_cache
-    # Path to embedding cache directory. Explicit absolute path (rather than
+  cache_dir: pretraining/embeddings_cache
+    # Path to embedding cache directory (relative to where pretraining runs; an
+    # absolute path works from anywhere). Set explicitly (rather than
     # the <pretraining_dir>/embeddings_cache/ default) since this config is
     # invoked with many separate --pretraining-dir args (one per system/combo)
     # -- a single shared cache dir here means every system's embeddings land

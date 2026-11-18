@@ -200,8 +200,20 @@ if 'bias' not in globals():
 ##############################################
 # Read in toppar files, coordinate files, etc.
 settings.set_bomb_level(-2)
-# toppar files
-pycharmm.lingo.charmm_script('stream prep/toppar.str')
+# toppar files: the CHARMM36 topologies and parameters, from the directory in
+# the CHARMM_TOPPAR environment variable (protein, nucleic acids, carbohydrates,
+# CGenFF, then water and ions)
+toppar = os.environ.get('CHARMM_TOPPAR')
+if not toppar or not os.path.isdir(toppar):
+    raise SystemExit('Set CHARMM_TOPPAR to the directory holding the CHARMM36 toppar files '
+                     f'(top_all36_prot.rtf, ...); got {toppar!r}')
+for i, (rtf, prm) in enumerate([('top_all36_prot.rtf', 'par_all36m_prot.prm'),
+                                ('top_all36_na.rtf', 'par_all36_na.prm'),
+                                ('top_all36_carb.rtf', 'par_all36_carb.prm'),
+                                ('top_all36_cgenff.rtf', 'par_all36_cgenff.prm')]):
+    read.rtf(os.path.join(toppar, rtf), append=i > 0)
+    read.prm(os.path.join(toppar, prm), flex=True, append=i > 0)
+pycharmm.lingo.charmm_script(f'stream "{os.path.join(toppar, "toppar_water_ions.str")}"')
 #read.rtf('prep/top_all36_msld.rtf')
 #read.rtf('prep/full_ligand.rtf',append=True)
 #read.prm('prep/par_all36_msld.prm',flex=True)
