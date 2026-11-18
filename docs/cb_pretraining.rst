@@ -90,9 +90,11 @@ optimizer settings are command-line flags.
   mean starts from the trained readout, and its precision is calibrated on the pretraining
   data, so the posterior's spread reflects how much real biases vary.
 
-``examples/pretrain_with_filtering.sh`` is the SLURM launcher, driven by a short per-run
-script that sets the config, output directory and flags. The learning rate follows a
-cosine schedule down to ``lr / 100`` over ``--epochs``, the most epochs a run trains.
+``examples/pretrain_with_filtering.sh`` is a SLURM launcher for pretraining on every
+dataset under ``pretraining/`` with the settings of the current models. Environment
+variables set the output directory, exclusions and the main options, and the header of
+the script lists them. The learning rate follows a cosine schedule down to ``lr / 100``
+over ``--epochs``, the most epochs a run trains.
 
 **Model selection.** Every run of ``--val-fraction`` (default 0.05) of the combo
 directories is held out as a validation set, so a combo's repeated runs are never split
