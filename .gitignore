@@ -190,3 +190,6 @@ mllf_minimal_*.out
 # Slurm job output and run logs written at the repository root
 slurm-*.out
 /logs/
+
+# editor settings (kept locally)
+.vscode/
