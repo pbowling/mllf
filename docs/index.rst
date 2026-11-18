@@ -5,44 +5,28 @@
 Machine Learned Landscape Flattening (mllf)
 ===========================================
 
-Brief introduction
-------------------
+Multisite λ-dynamics samples many alchemical perturbations in one simulation, but only
+after each system has bias coefficients that flatten its alchemical landscape. Finding
+those biases iteratively costs many simulations per system, and nothing learned on one
+system carries over to the next.
 
-Machine Learned Landscape Flattening (mllf) provides tools and
-documentation for applying adaptive biasing and multisite λ-dynamics to
-accelerate alchemical free-energy calculations. The project includes a
-contextual bandit (CB) framework using graph neural networks to predict
-optimal bias coefficients, complete training workflows, and utilities for
-working with simulation outputs.
+``mllf`` predicts the biases instead. A shared model, conditioned on Uni-Mol embeddings
+of each substituent in its environment, proposes biases for systems it has never
+simulated. Each simulation then corrects both the model and the pair of substituents it
+sampled. The aim is converged biases in fewer simulated nanoseconds than iterative
+flattening, including for systems absent from the training data.
 
-What you'll find in these docs
-------------------------------
+Where to start
+--------------
 
-- **Background**: conceptual and mathematical background for multisite
-  λ-dynamics and Adaptive Landscape Flattening (ALF)
-- **Installation**: how to install the package and dependencies
-- **File Handling**: parsers and writers for RTF, PDB, bias coefficients, and output files
-- **DeepSet Pretraining**: learned physical representations from atomic structure
-- **CB Behavior Cloning**: transfer learning from expert bias coefficients
-- **Contextual Bandit Setup**: graph neural network architecture for bias prediction
-- **Workflow System**: complete pipeline from combination generation to training
-- **Examples**: runnable training workflows with SLURM integration
-- **References**: bibliography for cited literature
-- **API**: generated API reference for the ``mllf`` package
-
-Quick start (recommended)
--------------------------
-
-1. Read the **Background** section to understand the modeling approach
-2. Follow **Installation** to set up the environment
-3. Review **File Handling** to understand input/output formats
-4. Review **Workflow System** for the complete pipeline overview
-5. (Optional) Read **DeepSet Pretraining** and **CB Behavior Cloning** for advanced features
-6. Check **Examples** for running the training workflow
-7. Inspect the **API** reference for integration details
-
-Contents (top-level)
---------------------
+* New to MSLD biases: :doc:`background`.
+* Running something: :doc:`installation`, then :doc:`examples`.
+* Configuring online training: :doc:`workflow`.
+* How the model learns: :doc:`cb_setup`, :doc:`cb_pretraining` and
+  :doc:`unimol_representation`.
+* Figures and reports of a model or a run: :doc:`analysis`.
+* Production runs and their free energies: :doc:`production`.
+* Input and output formats: :doc:`file_handling`.
 
 .. toctree::
    :maxdepth: 2
@@ -50,11 +34,14 @@ Contents (top-level)
 
    background
    installation
-   file_handling
+   cli
+   examples
    workflow
    cb_setup
-   deepset_pretraining
    cb_pretraining
-   examples
+   unimol_representation
+   analysis
+   production
+   file_handling
    references
    api

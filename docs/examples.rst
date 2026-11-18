@@ -1,178 +1,108 @@
 Running Examples
 ================
 
-Overview
---------
+This page runs the pipeline end to end: first on a single small system, then with the
+staged setup used for production biases. Configuration keys are explained in
+:doc:`workflow`.
 
-The repository includes a complete training workflow for multisite λ-dynamics 
-bias coefficient optimization. The main example demonstrates the end-to-end pipeline 
-from combination generation through training and simulation execution.
-
-For architectural details, see :doc:`cb_setup`. For workflow configuration options, 
-see :doc:`workflow`.
-
-Main Training Workflow
-----------------------
-
-The primary example is ``examples/run_workflow_deepset.py``, which implements the
-complete training pipeline using pretrained DeepSet embeddings.
-
-Quick Start
-~~~~~~~~~~~
-
-.. code-block:: bash
-
-   cd examples
-   python run_workflow_deepset.py workflow_14benz.yaml
-
-- Generate combinations from the 14benz system
-- Split into train/val/test sets (70/15/15)
-- Train for 50 epochs with SLURM job submission
-- Save checkpoints every 5 epochs
-- Write outputs to ``training_output/``
-
-Configuration
-~~~~~~~~~~~~~
-
-Edit ``examples/workflow_14benz.yaml`` to customize paths and basic settings:
-
-.. code-block:: yaml
-
-   system:
-     solvent_state: solv
-   
-   create_combos:
-     input_dir: /path/to/site_sub_fragments
-     out_dir: /path/to/generated_combos
-   
-   split:
-     train_frac: 0.70
-     val_frac: 0.15
-   
-   training:
-     num_epochs: 50
-   
-   output:
-     base_dir: /path/to/training_output
-     save_checkpoints: true
-     checkpoint_freq: 5
-
-See :doc:`workflow` for complete configuration options including curriculum learning, 
-pretraining, archiving, and reward function tuning.
-
-Pretraining Example
--------------------
-
-To pretrain from existing simulations:
-
-.. code-block:: bash
-
-   # Organize existing simulation data
-   mkdir -p pretraining
-   cp -r previous_runs/good_combos/* pretraining/
-   
-   # Run pretraining
-   python run_deepset_pretraining.py --pretraining-dir pretraining --output-dir models --steps all
-   
-   # Use pretrained model in main training
-   python run_workflow_deepset.py workflow_14benz.yaml
-
-See :doc:`workflow` for detailed pretraining configuration, data organization, 
-and benefits.
-
-Example System: 14benz
-----------------------
-
-The ``examples/14benz/`` directory contains:
-
-- ``site1_sub1_pres.rtf`` through ``site1_sub5_pres.rtf``: Site 1 substituents
-- ``site2_sub1_pres.rtf`` through ``site2_sub6_pres.rtf``: Site 2 substituents
-- ``msld_flat.py``: CHARMM/pyCHARMM simulation script
-- ``prep/``: Pre-equilibrated structures
-
-With 5 substituents at site 1 and 6 at site 2, the rotating anchor strategy
-generates:
-
-- 75 within-site combinations for site 1 (5 anchors × 15 each)
-- 186 within-site combinations for site 2 (6 anchors × 31 each)
-- 13,950 cross-site combinations (75 × 186)
-- **Total: 14,211 unique combinations**
-
-SLURM Job Submission
---------------------
-
-For production training on a cluster:
-
-.. code-block:: bash
-
-   cd examples/
-   sbatch training_test.sh
-
-The training script:
-
-- Activates the conda environment
-- Runs ``python -u run_workflow_deepset.py workflow_14benz.yaml``
-- Submits MSLD simulations as separate SLURM jobs
-- Manages up to 30 concurrent simulation jobs
-- Writes progress to ``training_status.out``
-
-The ``-u`` flag enables unbuffered output for real-time monitoring:
-
-.. code-block:: bash
-
-   tail -f training_status.out
-
-Resume Capability
------------------
-
-Training automatically resumes from the latest checkpoint if interrupted:
-
-.. code-block:: bash
-
-   sbatch training_test.sh  # Automatically detects and resumes
-
-See :doc:`workflow` for checkpoint configuration and resume details.
-
-Customizing the Workflow
-------------------------
-
-To adapt for your system:
-
-1. **Prepare fragments**: Create ``siteN_subM_pres.rtf`` files for your sites/substituents
-2. **Update config**: Edit ``workflow_14benz.yaml`` with your paths and ``system.solvent_state``
-   (see ``workflow_deepset.yaml`` for an alternate template)
-3. **Modify simulation script**: Adapt ``msld_flat.py`` for your force field and protocol
-4. **Run training**: Execute ``python run_workflow_deepset.py your_config.yaml``
-
-See :doc:`workflow` for configuration options and :doc:`cb_setup` for architecture details.
-
-Tips
-----
-
-- Start with fewer epochs (e.g., 5) to test the full pipeline
-- Use ``max_concurrent_jobs`` to control cluster load
-- Monitor ``training_status.out`` for real-time progress
-- Check ``training_output/epoch_NNN/`` for per-epoch results
-- Verify checkpoint files are saved at ``checkpoint_freq`` intervals
-
-Reward Function Tuning
+Minimal Example: 14benz
 -----------------------
 
-Epoch checkpoints enable testing different reward configurations without re-running simulations:
+``examples/minimal/`` runs the whole pipeline on one system, 1,4-benzene in water
+(``examples/minimal/14benz/``: 6 substituents at site 1, 5 at site 2), and is small
+enough to check an installation end to end. Its simulations read the CHARMM36 topology
+and parameter files from ``CHARMM_TOPPAR``, which the pipeline checks before it starts.
+From the repository root:
 
 .. code-block:: bash
 
-   python examples/test_reward_configs.py training_output/epoch_005 \
-       --configs reward_configs_example.yaml
+   export CHARMM_TOPPAR=/path/to/toppar       # top_all36_prot.rtf, ..., toppar_water_ions.str
+   sbatch examples/minimal/run_pipeline.sh
+   # or with another install, or collected runs of your own:
+   sbatch --export=ALL,PRETRAINING_ROOT=/path/to/pretraining,MLLF=/path/to/mllf \
+       examples/minimal/run_pipeline.sh
 
-See :doc:`workflow` for reward function details and experimentation workflow.
+The driver runs on a CPU node and submits each simulation as its own SLURM job (the
+``slurm:`` block of ``workflow.yaml``; adjust it for your cluster). Its steps are:
 
-See Also
---------
+1. **Pretraining** (``mllf pretrain``): up to 10 epochs with Bayesian heads on the
+   collected ``14benz_solv`` runs of 39 combos (``pretraining_combos.txt``: the 31 one-site
+   pair and triplet combos and 8 two-site combos). They ship with the example in
+   ``examples/minimal/pretraining/``, trimmed to what pretraining reads (each run's
+   biases, sampling statistics and graph, and the combo's fragment and RTF files);
+   ``PRETRAINING_ROOT`` points the step at another collection. Pretraining also writes
+   ``pretraining_manifest.json``, the list of runs the model saw.
+2. **Replay** (``mllf replay``): 20 of those runs, prebuilt into ``output/replay.pt`` for
+   the regression update (``bandit.regression``).
+3. **Scouting** (``mllf scout``): one run of the system's group (site 1 substituents 1-3,
+   site 2 substituents 1-2) with the new model's biases, then ``scout_summary.json`` and
+   ``pair_priority.json`` (:ref:`Scouting`).
+4. **Online training** (``mllf train``): one epoch of the ``pairs_groups`` stage. The
+   training pairs cover site 1 substituents 1-4 and site 2 substituents 1-3, so 5 of the
+   9 pairs lie outside the scouted group and run even when scouting passes the group;
+   ``advance.min_epochs: 1`` also keeps the system in the stage for that epoch. The
+   system's export and the archive of its combo directories follow the epoch.
+5. **Cost** (``mllf cost``): simulated time of the online run, scouting included.
 
-* :doc:`file_handling` - File format documentation and parsers
-* :doc:`workflow` - Complete workflow system documentation
-* :doc:`cb_setup` - Contextual bandit architecture details
-* :doc:`deepset_pretraining` - DeepSet pretraining for node embeddings
-* :doc:`cb_pretraining` - Behavior cloning from expert coefficients
-* :doc:`api` - API reference for workflow modules
+Every unimol setting is left at its default, so the online config matches the model it
+pretrains (:doc:`unimol_representation`). The simulations are shortened to 13,000
+equilibration and 39,000 production steps (``run_steps``), so the example tests the
+pipeline, not the quality of the biases. Outputs go to ``examples/minimal/output/``, with
+a log file per step (``pretrain/pretrain.log``, ``replay.log``, ``scouting/scouting.log``,
+``training/training.log``). A rerun skips the steps whose outputs exist and resumes
+training from its checkpoint, so delete that directory to start over.
+
+Set ``input_dir: examples/minimal/14benz``, not ``.../prep``, for this system. Fragment files are
+found in both the input directory and its ``prep/``, but ``msld_flat.py`` and the support
+files are copied from the input directory itself.
+
+Pretraining
+-----------
+
+Pretraining warm-starts the policy from completed simulations (:doc:`cb_pretraining`):
+
+.. code-block:: bash
+
+   # collect run directories into pretraining records
+   mllf collect previous_runs/14benz_solv \
+       --output-dir pretraining/14benz_solv
+
+   # behavior cloning
+   mllf pretrain --pretraining-dir pretraining/14benz_solv \
+       --output-dir models/14benz_pretrain --config examples/workflow_pretrain.yaml \
+       --epochs 50
+
+Then set ``pretrain.model_path: models/14benz_pretrain/best_policy.pt`` in the workflow
+config (``best_policy_bayesian.pt``, written with ``--bayesian-heads``, for
+``algorithm: hindsight``). ``examples/pretrain_with_filtering.sh`` is the SLURM launcher
+for pretraining on many systems at once.
+
+Staged Online Training
+----------------------
+
+A production run uses the same keys at scale: per-system stages over each system's group
+combo sets, hindsight targets with per-pair offsets, and a pretrained Bayesian model. The
+driver runs as one long SLURM job that submits the simulations:
+
+.. code-block:: bash
+
+   sbatch --time=4-00:00:00 --wrap "mllf train online.yaml"
+   tail -f checkpoints/epoch_summary.log          # output.base_dir; one block per epoch
+
+   # simulated time so far, against the iterative-flattening runs of the same systems
+   mllf cost checkpoints --pretraining-root pretraining
+
+A refinement run on the systems the model was trained on comes first. A deploy run
+(``mode: deploy``, :ref:`Testing on New Systems`) then starts from its final model on
+systems it has not seen. Which systems enter a run should follow from what is prepared
+and from how well the pretrained model predicts each one.
+
+Adding a System
+---------------
+
+1. Prepare ``siteN_subM_pres.rtf`` / ``_frag.pdb`` files, ``core.rtf`` / ``core.pdb`` and a
+   working ``msld_flat.py``, typically with
+   `msld-py-prep <https://github.com/Vilseck-Lab/msld-py-prep>`_ (:doc:`file_handling`).
+2. Add an entry to ``systems:`` with its ``input_dir``, ``out_dir`` and ``solvent_state``.
+3. Run the minimal configuration first. A single stage of single-site pairs tests the
+   whole pipeline before it is widened.

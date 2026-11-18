@@ -4,7 +4,7 @@ mllf API
 File Handling
 -------------
 
-For detailed documentation on file formats and usage examples, see :doc:`file_handling`.
+For file formats and usage, see :doc:`file_handling`.
 
 .. autosummary::
    :toctree: api
@@ -16,39 +16,115 @@ For detailed documentation on file formats and usage examples, see :doc:`file_ha
    mllf.file_handling.read_output
    mllf.file_handling.generate_combinations
 
-DeepSet Modules
----------------
+Uni-Mol Representation
+-----------------------
 
-For detailed documentation on DeepSet pretraining, see :doc:`deepset_pretraining`.
-
-.. autosummary::
-   :toctree: api
-
-   mllf.cb.deepset_autoencoder
-   mllf.cb.deepset_pretraining_dataset
-   mllf.cb.train_deepset_autoencoder
-   mllf.cb.aev_processor
-
-Graph and CB Modules
---------------------
-
-For detailed documentation on CB architecture, see :doc:`cb_setup`.
+For Uni-Mol embeddings and environment context, see :doc:`unimol_representation`.
 
 .. autosummary::
    :toctree: api
 
-   mllf.cb.graph
+   mllf.cb.unimol_representation
+   mllf.cb.environment_consensus
+
+Policy Modules
+--------------
+
+For the policy architecture, see :doc:`cb_setup`.
+
+.. autosummary::
+   :toctree: api
+
+   mllf.cb.pairs
    mllf.cb.policy
-   mllf.cb.value_net
-   mllf.cb.rgcn
-   mllf.cb.graph_utils
+   mllf.cb.bayesian_head
+   mllf.cb.msld_reward
+   mllf.cb.pair_weights
+
+Pretraining (Behavior Cloning)
+-------------------------------
+
+For behavior-cloning pretraining, see :doc:`cb_pretraining`.
+
+.. autosummary::
+   :toctree: api
+
+   mllf.pretrain.config
+   mllf.pretrain.runs
+   mllf.pretrain.filters
+   mllf.pretrain.features
+   mllf.pretrain.rewards
+   mllf.pretrain.trainer
+   mllf.pretrain.bayesian_init
 
 Workflow Utilities
 ------------------
 
-For detailed documentation on the workflow system, see :doc:`workflow`.
+For the workflow system, see :doc:`workflow`.
 
 .. autosummary::
    :toctree: api
 
-   mllf.cli.workflow
+   mllf.cb.training_loop
+   mllf.cb.training_setup
+   mllf.cb.bandit_config
+   mllf.cb.reinforce_trainer
+   mllf.cb.epoch_runs
+   mllf.cb.epoch_updates
+   mllf.cb.workflow_utils
+   mllf.cb.graph_build
+   mllf.cb.hindsight
+   mllf.cb.hindsight_regression
+   mllf.cb.replay_selection
+   mllf.cb.group_correction
+   mllf.cb.curriculum
+   mllf.cb.system_stages
+   mllf.cb.scouting
+   mllf.cb.export_biases
+   mllf.cb.cost_ledger
+   mllf.cb.epoch_log
+   mllf.cb.slurm
+   mllf.file_handling.manifests
+   mllf.file_handling.combo_sets
+   mllf.file_handling.archive
+
+Command Line and Logging
+------------------------
+
+For the ``mllf`` command, see :doc:`cli`.
+
+.. autosummary::
+   :toctree: api
+
+   mllf.cli.main
+   mllf.cli.common
+   mllf.cli.combos
+   mllf.cli.collect_pretraining_data
+   mllf.cli.pretrain
+   mllf.cli.replay
+   mllf.cli.scout
+   mllf.cli.train
+   mllf.cli.export
+   mllf.cli.cost
+   mllf.cli.analyze
+   mllf.cli.archive
+   mllf.log
+   mllf.slurm
+
+Analysis
+--------
+
+Figures and reports (:doc:`analysis`). The figure style, ``mllf.analysis.style``, is
+the author's ``bowling_style.py``, kept unchanged.
+
+.. autosummary::
+   :toctree: api
+
+   mllf.analysis.online
+   mllf.analysis.online_data
+   mllf.analysis.online_plots
+   mllf.analysis.free_energy
+   mllf.analysis.pretrain
+   mllf.analysis.pretrain_data
+   mllf.analysis.pretrain_plots
+   mllf.analysis.common

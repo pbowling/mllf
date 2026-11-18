@@ -1,23 +1,25 @@
-"""mllf package
+"""mllf: machine-learned bias coefficients for multisite lambda dynamics.
 
-Expose convenient top-level symbols for the package and set package metadata.
+Subpackages:
+
+* ``mllf.file_handling`` -- reading and writing simulation inputs/outputs
+  (bias files, PDB/RTF fragments, combination directories, manifests).
+* ``mllf.cb`` -- the contextual-bandit policy and online training.
+* ``mllf.pretrain`` -- behavior-cloning pretraining on collected runs.
+* ``mllf.cli`` -- the ``mllf`` command and its subcommands.
+* ``mllf.log`` -- logging (messages go to stdout; ``mllf -q`` / ``-v``).
+
+Import from the submodules directly, e.g.
+``from mllf.file_handling.read_bias_coeff import read_bias_coeff``.
 """
 
-__all__ = [
-	"__version__",
-	"read_bias_coeff",
-	"parse_old",
-	"parse_new",
-]
+import logging
+
 
 __version__ = "0.1.0"
 __author__ = "Paige E. Bowling"
 __email__ = "pbowling@umich.edu"
 
-try:
-	from .file_handling.read_bias_coeff import read_bias_coeff, parse_old, parse_new
-except Exception:  # pragma: no cover - allow import-time failures when running static checks
-	# avoid import errors during packaging or when the submodule isn't available
-	read_bias_coeff = None
-	parse_old = None
-	parse_new = None
+# A library leaves output to the application: no console handler on import.
+# The mllf command sets up its console in mllf.log.setup_logging.
+logging.getLogger(__name__).addHandler(logging.NullHandler())

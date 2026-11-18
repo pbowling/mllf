@@ -1,4 +1,4 @@
-﻿mllf.file\_handling.write\_bias\_coeff
+mllf.file\_handling.write\_bias\_coeff
 ======================================
 
 .. automodule:: mllf.file_handling.write_bias_coeff
@@ -8,7 +8,7 @@
 
    .. autosummary::
    
-      create_variables_py_from_template
-      write_bias_inp_from_graph
+      fit_site_b
+      write_variables_from_actions
       write_variables_py_from_inp
    

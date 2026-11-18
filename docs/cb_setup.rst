@@ -4,515 +4,434 @@ Contextual Bandit Setup
 Overview
 --------
 
-The contextual bandit (CB) training framework provides a reinforcement learning approach to
-optimizing bias coefficients for multisite λ-dynamics simulations. Instead of hand-tuning
-bias parameters, we use graph neural networks to predict optimal coefficients based on the
-molecular graph structure.
+The model predicts all four bias coefficients for every pair of substituents at a λ-site
+from fixed molecular representations of those substituents. ``UnimolPolicy``
+(``mllf.cb.policy``) takes frozen Uni-Mol embeddings as node features, builds one input
+per ordered pair, and passes it to four independent heads, one per bias type, with no
+graph encoder or message passing. Its knowledge of each substituent's chemistry comes from
+Uni-Mol (:doc:`unimol_representation`), and its knowledge of biases comes from
+pretraining (:doc:`cb_pretraining`) and from the online corrections described below.
 
-**Architecture Pipeline**:
-
-The policy network uses a three-stage architecture to predict bias coefficients:
-
-1. **AtomBondGNN (Phase 1, frozen)**: A graph neural network pretrained on diverse molecular
-   data that encodes each substituent's 3D atomic structure into a 64-dimensional vector.
-   It uses GINConv message passing over the molecular bond graph (topology from RDKit;
-   RTF BOND section as fallback) followed by GlobalAttentionPool. Weights are loaded from
-   a pre-trained checkpoint and held fixed during all CB training.
-
-2. **RGCN Encoder (Phase 2, frozen during RL)**: Processes the 64-dimensional AtomBondGNN
-   embeddings through a 3-layer Relational GCN (64→64→64→32) with LayerNorm pre-conditioning,
-   producing 32-dimensional context-aware node embeddings. Trained during behavior-cloning
-   pretraining; weights are frozen when the REINFORCE loop begins.
-
-3. **EdgeValueMLP + Q-Critic (Phase 3, trained by RL)**: A pairwise edge network that
-   receives the concatenated Phase 1 (64D) and Phase 2 (32D) embeddings for both endpoint
-   substituents, plus an 8-dimensional one-hot edge-type feature — 200D total — and
-   outputs Gaussian distributions over bias coefficients via a shared trunk and four
-   per-type heads. A companion Q-network provides per-edge advantage estimates for
-   variance-reduced REINFORCE.
-
-This staged design allows Phase 1 and 2 to capture general molecular representations while
-Phase 3 specializes in per-edge coefficient prediction with reinforcement feedback.
+Architecture
+------------
 
 .. _Architecture Diagram:
 
-**Full Architecture**:
-
 .. code-block:: text
 
-   ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PHASE 1 — AtomBondGNN  [FROZEN in all training phases]                ║
-   ║                                                                          ║
-   ║  Per substituent, independently:                                         ║
-   ║  AEV[2288] + charge[1] + atom_id[11] = 2300D per atom                  ║
-   ║      │  Linear projection: 2300 → 256D + ReLU                          ║
-   ║      │  GINConv layer 1 (bond topology from RDKit / RTF BOND) + ReLU   ║
-   ║      │       bond weights: single=1.0, double=2.0, aromatic=1.5        ║
-   ║      │       (computed but not consumed by GINConv; topology only)      ║
-   ║      │  GINConv layer 2 + ReLU                                          ║
-   ║      │  GlobalAttentionPool (gate_nn: 256→1, nn: 256→64)               ║
-   ║      ▼                                                                   ║
-   ║   64D  P1 embedding  (data.x)  ─────────────────────── skip ──────────►║
-   ╚══════════════════════════════════════════════════════════════════════════╝
-                       │
-                       │ data.x (same tensor, passed to RGCN)
-                       ▼
-   ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PHASE 2 — RGCNEncoder  [FROZEN during RL; trained by BC pretraining]  ║
-   ║                                                                          ║
-   ║  LayerNorm(64)                                                           ║
-   ║  → RGCNConv(64→64, 8 relations) → ReLU                                 ║
-   ║  → RGCNConv(64→64, 8 relations) → ReLU                                 ║
-   ║  → RGCNConv(64→32, 8 relations)                                         ║
-   ║      ▼                                                                   ║
-   ║   32D  P2 embedding (per substituent node)                              ║
-   ╚══════════════════════════════════════════════════════════════════════════╝
-            │                                         │
-            │  P2 per node                            │  P1 = data.x (skip)
-            └──────────────────┬──────────────────────┘
-                               ▼
-   ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PHASE 3 — Pairwise edge inputs  (Sub_A ↔ Sub_B)                       ║
-   ║                                                                          ║
-   ║  concat(P1_A[64], P2_A[32], P1_B[64], P2_B[32], edge_type[8]) = 200D  ║
-   ║           64% atomic/topo    32% system context    4% relation          ║
-   ║                     │                                                    ║
-   ║          ┌──────────┴──────────┐                                        ║
-   ║          ▼                     ▼                                        ║
-   ║  ┌── ACTOR ──────────┐  ┌── Q-CRITIC ─────────────────────────────┐   ║
-   ║  │  EdgeValueMLP     │  │  QNetwork                               │   ║
-   ║  │  Trunk:           │  │  Linear(200→64) → ReLU                  │   ║
-   ║  │  Linear(200→64)   │  │  Linear(64→32)  → ReLU                  │   ║
-   ║  │  → ReLU           │  │  Linear(32→1)                           │   ║
-   ║  │  4 heads (l/q/s/x)│  │  Output: Q(s,pair) per edge [E]         │   ║
-   ║  │  each head input: │  │  Updated by MSE on R_pair each episode  │   ║
-   ║  │  [trunk(64),      │  └─────────────────────────────────────────┘   ║
-   ║  │   bias_emb(16)]   │                                                  ║
-   ║  │  = 80D            │  ┌── V-BASELINE ───────────────────────────┐   ║
-   ║  │  Linear(80→64)    │  │  GlobalMeanPool(P2 nodes) → 32D         │   ║
-   ║  │  → ReLU           │  │  Linear(32→64) → ReLU                   │   ║
-   ║  │  Linear(64→32)    │  │  Linear(64→32) → ReLU                   │   ║
-   ║  │  → ReLU           │  │  Linear(32→1)  → V(s) scalar            │   ║
-   ║  │  Linear(32→2)     │  │  Updated by MSE on R_global each episode│   ║
-   ║  │  → (μ, logσ) per  │  └─────────────────────────────────────────┘   ║
-   ║  │    bias per edge  │                                                  ║
-   ║  │  [RL only]        │                                                  ║
-   ║  └───────────────────┘                                                  ║
-   ╚══════════════════════════════════════════════════════════════════════════╝
-                               ▼
-   ╔══════════════════════════════════════════════════════════════════════════╗
-   ║  PER-PAIR REWARD  (from simulation output)                              ║
-   ║                                                                          ║
-   ║  R_pair(i,j) = -1.0                            if DDG is None (stuck)  ║
-   ║  R_pair(i,j) = +1.0 + min(pop_i, pop_j)       if DDG is finite        ║
-   ║                        ──────────────────                               ║
-   ║                        pop_i + pop_j                                    ║
-   ║                                                                          ║
-   ║  Range: [-1.0, +1.5]   (balance adds 0→0.5 only on successes)         ║
-   ║                                                                          ║
-   ║  A_pair = R_pair - Q(s,pair).detach()          [E] per directed edge   ║
-   ║  A_pair normalised across edges within episode                          ║
-   ║                                                                          ║
-   ║  policy_loss = -(logp_edge × A_pair).sum()     per-pair REINFORCE      ║
-   ╚══════════════════════════════════════════════════════════════════════════╝
+   Uni-Mol [frozen]        per substituent:
+                             ligand = UniMol(core + sub [+ other sites' reference subs])
+                             second part, by unimol.env_input:
+                               phase: [condensed, protein] flags, site size  (3; 515-D nodes)
+                               dual:  UniMol(core + sub + reference subs + environment)
+                                      (512; 1024-D nodes)
+          │
+          ▼
+   Edge input (A → B)      dual:          [ligand_A − ligand_B, (full_A + full_B)/2]   1024
+                           phase:         [ligand_A − ligand_B, flags (+ site size)]   514 (515)
+                           phase_ligmean: phase + (ligand_A + ligand_B)/2               1026 (1027)
+          │
+          ▼
+   Four BiasHeadMLP heads  linear, quadratic, skew, end; no shared weights
+                             trunk  in → in/2 → in/4 → 64 (ReLU)
+                             readout Linear(64, 2) → (μ, log σ), or BayesianLinearHead(64)
+          │
+          ▼
+   Output per edge         softsign(μ) × scale,  scale = [305, 520, 85, 30]          [E, 4]
 
-Core Components
----------------
+The edge input combines halves of different symmetry. The difference of the ligand
+embeddings is antisymmetric and carries how the two substituents differ. The second half
+is symmetric and carries what they share. In ``dual`` mode, it is the mean of the
+context embeddings (substituent, reference substituents and environment). In ``phase``
+mode, it is two flags, condensed and protein, so vacuum, solvent and protein legs are told
+apart directly rather than through an environment embedding that would vary between
+systems for reasons unrelated to the biases. ``phase_ligmean`` adds the pair's mean ligand
+embedding as symmetric chemical context.
 
-Graph Representation
-~~~~~~~~~~~~~~~~~~~~
+With ``unimol.site_size_input``, the phase flags are followed by :math:`1/(n-1)` for the
+:math:`n` substituents at the edge's site in the current run (1 for a pair, 0.14 for eight
+substituents). In a group run, the end terms of every partner act together at a shared
+endpoint, so a pair's x and s that sample well in a pair run can hold that endpoint off in
+a group. Without the site size, the model sees both as the same edge.
 
-Molecular systems are represented as directed graphs where:
+The ``unimol`` settings must match those of the pretrained model. The driver checks
+``ligand_other_sites`` and ``site_size_input`` against the model's
+``pretrain_metadata.json``.
 
-* **Nodes** represent individual substituents at each λ-site
-* **Edges** represent transitions between substituents with associated bias coefficients
+Graph
+~~~~~
 
-For a 2-site system with 3 substituents at site 1 and 2 substituents at site 2, the graph
-contains 5 nodes total (one per substituent). Edges connect substituents within the same site,
-allowing the model to predict bias coefficients for all possible transitions.
+Each substituent is a node, and ``build_directed_pairs`` (``mllf.cb.pairs``) adds an
+edge in each direction for every pair of substituents at the same site. There are no
+cross-site edges, so cross-site couplings are not predicted. ``build_graph_and_data``
+(``mllf.cb.graph_build``) parses the combination's RTF and PDB files, builds each site's
+consensus environment (in ``dual`` mode), embeds every substituent at every site, and
+stores ``data.x``, ``edge_index`` and ``site_index`` for the forward pass.
 
-**Bias Types**:
+Bias Heads
+~~~~~~~~~~
 
-Each edge can have multiple bias coefficient types:
+Each bias type has its own trunk, so the gradient of one coefficient cannot overwrite
+features another has learned. The output scales (±305 linear, ±520 quadratic, ±85 skew,
+±30 end) are the largest values in more than 20,000 pretraining runs plus ∼10%. Softsign
+rather than tanh keeps a usable gradient at large inputs (:math:`1/(1+|z|)^2`), so heads do
+not saturate over long training. The exploration σ of each head is bounded between 0.2%
+and 25% of its scale, which gives every head the same proportional room to explore.
 
-* **Linear (b)**: Per-node bias ensuring equal population of all substituents at each site
-  when correctly parameterized.
+From Edge Predictions to Biases
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-* **Quadratic (c)**: Pairwise interaction bias removing alchemical barriers due to 
-  electrostatic interactions between sites. Antisymmetric: :math:`c_{ij} = -c_{ji}`, 
-  meaning the forward and backward transitions have equal magnitude but opposite sign.
+``write_variables_from_actions`` (``mllf.file_handling.write_bias_coeff``) turns the per-edge predictions
+into the per-site matrices of ``variables.py`` (storage conventions in
+:doc:`file_handling`), combining each coefficient according to its symmetry.
 
-* **Skew (x)**: Asymmetry correction fitting residuals beyond quadratic and end biases,
-  particularly important after soft-core introduction. Forward and backward transitions
-  are independent (not antisymmetric).
+* **Quadratic** is symmetric (:math:`c_{ij} = c_{ji}`). The two directed predictions are
+  averaged and stored once, in the upper triangle.
+* **Skew and end** are independent per direction and stored directly
+  (``x[i][j] = v_fwd``, ``x[j][i] = v_bwd``).
+* **Linear** predictions approximate :math:`b_j - b_i`, which is antisymmetric, so
+  averaging the two directions would cancel the signal. b is instead fitted per site from
+  every within-site edge, weighted by each pair's linear-offset variance, with the site's
+  reference at 0.
 
-* **End (s)**: End-state bias compensating for entropic and surface tension costs of
-  displacing solvent and nearby molecules when substituents appear. Forward and backward
-  transitions are independent (not antisymmetric).
+Training Signals
+----------------
 
-Graph Construction
-^^^^^^^^^^^^^^^^^^
+Per-Edge Reward
+~~~~~~~~~~~~~~~
 
-Graphs are constructed with **AtomBondGNN embeddings** as the primary node features, representing
-each substituent's 3D atomic structure and chemical composition as a learned 64-dimensional
-vector. These embeddings replace manual feature engineering with neural representations
-pretrained on diverse molecular data.
-
-**AtomBondGNN-Based Construction**:
-
-The standard construction pipeline:
-
-1. Parse RTF files to identify substituents and extract metadata (site numbers, charges, atom types)
-2. Build graph topology: one node per substituent, edges connecting substituents within each site
-3. Compute AtomBondGNN embeddings for each node from PDB coordinates, RTF charges, and bond topology
-4. Store embeddings as node features for neural network input
-
-The AtomBondGNN embeddings capture rich molecular information automatically:
-
-* **Spatial structure**: Bond lengths, angles, 3D conformations from atomic coordinates
-* **Chemical composition**: Element types, functional groups, charge distributions
-* **Bond-topology context**: GINConv message passing propagates bonded-neighbor information before pooling
-* **Environmental context**: Nearby protein atoms and core structure atoms (via context-aware AEV computation)
-
-See :doc:`deepset_pretraining` for technical details on the AtomBondGNN pretraining
-pipeline (atom-level AEV features + bond topology → GINConv × 2 → GlobalAttentionPool).
-
-**Environmental Context Encoding**:
-
-The environment type influences how DeepSet embeddings are computed. When a
-``minimized.pdb`` file is present in the prep directory, post-minimization coordinates
-are used to provide the most accurate representation of each atom's environment—the
-minimized geometry reflects the actual sampled ensemble rather than the initial placement.
-
-* **Protein systems**: All protein atoms within 5.1 Å of the substituent are extracted
-  from ``minimized.pdb`` and included in AEV computation. This encodes protein-specific
-  interactions (hydrogen bonds, hydrophobic contacts, electrostatics) directly into the
-  molecular representation. Falls back to a standalone ``protein.pdb`` if no
-  ``minimized.pdb`` is found.
-
-* **Solvent systems**: Water molecules within 5.1 Å of the substituent are extracted
-  from ``minimized.pdb`` and included as solvent context, capturing the immediate
-  solvation shell. Without ``minimized.pdb``, only the core and nearby substituents
-  from other sites contribute.
-
-* **Vacuum systems**: No additional environment atoms (core + other-site substituents
-  within cutoff only). ``minimized.pdb`` is checked but not used for extra context.
-
-
-This context-aware approach eliminates the need for explicit environment flags as node
-features—the environmental information is implicitly encoded in the embeddings themselves.
-
-**Legacy RTF-Only Construction**:
-
-Graphs can also be built directly from RTF topology fragments without DeepSet embeddings,
-using manually engineered features (atom counts, charge, element compositions). This approach
-is maintained for backward compatibility and systems where PDB coordinates are unavailable,
-but the DeepSet-based method is strongly preferred for production use due to its superior
-representation quality.
-
-
-Neural Network Graph Format
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-For neural network processing, the molecular graph (with its DeepSet node embeddings) is
-converted to PyTorch Geometric format. This conversion handles the technical details of
-edge expansion and relation type encoding for the RGCN policy network.
-
-**Node Features**:
-
-The 64-dimensional AtomBondGNN embeddings computed during graph construction become the
-node feature matrix. Each row represents one substituent with its learned molecular
-representation encoding structure, chemistry, and environment. These embeddings are passed
-directly to the RGCN encoder — no additional feature engineering is applied.
-
-**Edge Expansion**:
-
-Each undirected molecular edge is expanded into **directed relation edges** based on bias type:
-
-* **Linear bias**: Only edges FROM reference substituent (sub1) TO others
-  
-  - Creates one directed edge per transition (e.g., sub1→sub2, sub1→sub3)
-  - No backward edges (sub2→sub1, sub3→sub1) since linear bias is node-level
-
-* **Quadratic bias**: Only upper-triangle edges (i→j where i < j)
-  
-  - Creates one directed edge per undirected pair
-  - Antisymmetry enforced during coefficient mapping (forward value negated for backward)
-
-* **Skew and End biases**: Both forward AND backward edges (i→j and j→i)
-  
-  - Creates two directed edges per undirected pair
-  - Independent values for each direction (no symmetry constraint)
-
-Each directed edge has a relation type (``linear_fwd``, ``quadratic_fwd``, ``skew_bwd``, etc.)
-that identifies which bias type and direction it represents. The RGCN learns separate
-transformation matrices for each relation type, allowing bias-specific edge processing.
-
-Policy Network Architecture
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-RGCN Encoder
-^^^^^^^^^^^^
-
-Node embeddings are computed using a 3-layer Relational Graph Convolutional Network 
-that handles different edge types explicitly by learning separate transformation matrices 
-for each relation type. The standard architecture uses:
+REINFORCE, the ``awr`` update target and pretraining learn from a reward per edge and per
+coefficient (``compute_pair_reward``, ``mllf.cb.workflow_utils``) rather than one number
+per run. Each head is trained only on its own dimension, so credit is assigned per
+coefficient without masking or a critic:
 
 .. math::
 
-   \text{RGCN}: \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{64} \to \mathbb{R}^{32}
+   \mathcal{L}_{\text{policy}} = -\sum_{e} \sum_{d} R_{e}^{(d)} \cdot \log \pi_\theta(a_e^{(d)} \mid s)
 
-The input to the RGCN is the **64-dimensional DeepSet embedding** for each substituent node.
-A **LayerNorm** layer is applied to these embeddings before the first convolution. This
-normalises the per-feature mean and variance across nodes, stabilising training when
-sum-pool magnitudes vary with substituent atom count (5–50 atoms). The learnable γ/β
-parameters preserve size-related information after normalisation.
+An edge whose pair was never visited (no finite ΔΔG, or neither substituent sampled) gets
+−1 in every dimension, and its weight is ``reward.no_transition_weight`` (default 0.2).
+For a visited pair, each dimension measures the part of the λ profile its coefficient
+controls.
 
-The RGCN then processes the normalised embeddings through 3 layers of relational graph
-convolutions, where each layer learns separate transformation matrices for different bias
-types (linear, quadratic, skew, end). The final output produces 32-dimensional node
-embeddings used by the policy and value networks.
+* **Linear**: the minority fraction :math:`\min(p_i, p_j)/(p_i + p_j) \in [0, 0.5]`.
+* **Quadratic**: :math:`0.5 + 0.5\exp[-\tfrac{1}{2}((B - B_0)/\sigma)^2]`, from the pair's
+  biased midpoint barrier
 
+  .. math::
 
-Edge Policy
-^^^^^^^^^^^
+     B = G(\lambda \approx 0.5) - \tfrac{1}{2}\left[G(\lambda \approx 0) + G(\lambda \approx 1)\right],
+     \qquad G = -kT \ln P(\lambda)
 
-Per-edge coefficients are predicted by an edge-level policy network with **separate heads**
-architecture. This design allows specialized predictions for each bias type while sharing
-common feature representations.
+  (``parse_pair_barriers``; for three or more substituents, the frames on the pair's edge
+  of the simplex). The quadratic term :math:`-c\,\lambda_i\lambda_j` is zero at both
+  endpoints and :math:`-c/4` at the midpoint, while the linear term cancels between the
+  midpoint and the mean of the endpoints, so B responds to c alone. The reward is
+  two-sided, since an over-flattened barrier and one too high both score lower.
+  :math:`B_0` and :math:`\sigma` (``reward.barrier_target``, 1.2 kcal/mol, and
+  ``reward.barrier_width``, 1.29 kcal/mol) come from the pretraining bias-sensitivity
+  analysis.
+* **Skew and end**: :math:`0.5 + 0.5\exp[-\tfrac{1}{2}(v/w)^2]`, where :math:`v` is an
+  asymmetry of the *biased* λ profile along the pair's edge (``parse_pair_profile``). The
+  physical surface is asymmetric, which is why these coefficients exist, and
+  :math:`v = 0` means they have cancelled that asymmetry. Across 26 pretraining systems,
+  runs that kept less asymmetry succeeded more often.
 
-**Architecture Overview**:
+  - **end** :math:`= K_{hi} - K_{lo}`, the difference in sharpness of the two endpoints,
+    with :math:`K = G(\text{shoulder}) - G(\text{core})` (λ in [0.95, 0.99) against
+    ≥ 0.99). The end term peaks just short of an endpoint and vanishes at it, so each K
+    responds to one direction of s (≈ −0.45 per unit) and barely to b, c or x.
+  - **skew** :math:`= [G(r{\approx}0.7) - G(r{\approx}0.3)] - 0.4\,\text{tilt} - 0.687\,\text{end}`,
+    with :math:`r = \lambda_{hi}/(\lambda_{lo}+\lambda_{hi})`. The skew term is a broad
+    hump near :math:`r \approx 0.7` (0.3 for the other direction), so the flank difference
+    tracks ``x[lo][hi] − x[hi][lo]``. Subtracting the tilt removes b, and the end
+    correction removes the end terms' reach into the flanks.
 
-The ``EdgeValueMLP`` uses a two-stage design:
+  The widths ``reward.skew_width`` (0.78) and ``reward.end_width`` (0.58 kcal/mol) put the
+  reward at 0.75 where the success probability halves in a pooled fit.
 
-1. **Shared Trunk**: Two-layer MLP that processes concatenated node embeddings
-   
-   * Input: Concatenated node features [h_i, h_j] from encoder
-   * Layer 1: Linear(in_dim → 64) + ReLU
-   * Layer 2: Linear(64 → 64) + ReLU
-   * Output: 64-dimensional shared representation
+Without a λ trajectory, the three nonlinear dimensions fall back to visit, transition and
+population-balance signals.
 
-2. **Separate Heads**: Independent deep MLPs per bias type, each enriched with a
-   learnable bias-type embedding (16D)
+Bayesian Heads and Thompson Sampling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-   * 4 heads (one per bias type: linear, quadratic, skew, end)
-   * Each head input: [trunk output (64D), bias-type embedding (16D)] = 80D
-   * Each head: Linear(80 → 64) + ReLU → Linear(64 → 32) + ReLU → Linear(32 → 2)
-   * Each head outputs [mean, log_std] for its bias type
-   * Total output: 8 values per edge (4 means + 4 log_stds)
-   * Bias-type embeddings are learned during training, giving each head a unique identity
-     signal that reinforces specialisation
+With ``bandit.algorithm: hindsight``, each head's readout is a
+:class:`~mllf.cb.bayesian_head.BayesianLinearHead`, a Bayesian linear regression on the
+trunk's 64-D features with a full Gaussian posterior. Acting draws one weight sample per
+decision (Thompson sampling, ``UnimolPolicy.get_actions_thompson``), scaled by
+``bandit.exploration_scale``, and the posterior variance tells selection where the model
+is uncertain. Pretraining with ``--bayesian-heads`` converts a pretrained policy, starting
+each posterior mean from the trained readout and calibrating its precision on the
+pretraining data (:doc:`cb_pretraining`).
 
-**Key Features**:
+.. _Bandit Defaults:
 
-* **Specialized Predictions**: Each bias type gets its own predictor head
-  
-  - Reduces interference between different bias types
-  - Allows learning type-specific patterns
-  - Improves sample efficiency
+Bandit Defaults
+~~~~~~~~~~~~~~~
 
-* **Output Scaling**: Mean predictions use bias-specific scale factors via ``tanh(mean) * scale_factors``
-  
-  - **Linear**: ±305, **Quadratic**: ±520, **Skew**: ±85, **End**: ±30
-  - Derived from a full scan of 20,000+ pretraining runs with margin above the empirical maximum
-  - Covers the full observed range: linear max 235, quadratic max 470, skew max 77, end max 27
-  - Earlier bounds (±61–±70) were derived from a small biased sample and clipped ~17–34% of targets
+With ``algorithm: hindsight``, settings a config leaves out take the values below
+(``mllf.cb.bandit_config``). A key set in the config wins, ``null`` turns off ``c_cap``
+and ``group_holdoff``, and ``group_correction: false`` turns off the correction. The
+sections that follow explain each setting.
 
-* **Enhanced Exploration**: Log standard deviation clamped to [-20, 2.0]
-  
-  - Standard deviation range: [~0, 7.4]
-  - Provides exploration while preventing extreme outliers
-  - Higher values (e.g., 3.5 → std≈33) can produce samples far beyond intended ranges
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
 
-The policy outputs:
+   * - Key
+     - Default
+   * - ``update_target`` / ``shared_update``
+     - ``hindsight`` / ``regression``
+   * - ``exploration_scale``
+     - 0.4
+   * - ``offset_sampling`` / ``selection_attention_weight``
+     - true / 0.5
+   * - ``b_direction_requires_crossing`` / ``c_up_requires_b_bracket``
+     - false / true
+   * - ``linear_step_max``
+     - 12.0
+   * - ``hindsight_weight_scale``
+     - linear 0.1, quadratic 0.01, skew 0.1, end 0.1
+   * - ``c_cap``
+     - floor 15.0, fraction 0.5
+   * - ``group_holdoff``
+     - dominant_min 0.7, at_max 0.05, partner_min 0.02, min_partners 2
+   * - ``group_correction``
+     - step_x 0.35, floor_x 0.4, step_s 0.15, floor_s 0.7
+   * - ``revisit``
+     - enabled, max_visits 12
+   * - ``regression.replay_selection`` / ``regression.replay_pretraining_only``
+     - ``coverage`` / false
+   * - stage ``bracketed_runs_sticky`` / ``partial_runs_to_resolve`` / ``group_pass_window``
+     - true / 3 / 3 (:doc:`workflow`)
+   * - ``training.policy.use_bayesian_heads``
+     - true
 
-* ``actions``: Sampled coefficient values (shape: [num_edges, 4])
-* ``logp``: Log-probabilities for REINFORCE updates
-* ``mean``: Mean of the Gaussian distribution per edge per bias type (scaled to [-20, 20])
-* ``log_std``: Log standard deviation per edge per bias type (clamped to [-20, 2.0])
+Hindsight Targets
+~~~~~~~~~~~~~~~~~
 
-Each directed edge receives 4 independent Gaussian distributions (one per bias type),
-and actions are sampled independently:
+A reward says whether a run's biases were good, but not which way they were off or by how
+much, and the ``awr`` target (which regresses toward the sampled actions, weighted by
+reward) moves little because those actions sit near the current mean. With
+``update_target: hindsight`` (:mod:`mllf.cb.hindsight`), each run is relabelled with the
+biases it *measured* it should have used, and the heads in ``hindsight_dims`` (all four by
+default) regress toward them. Each target comes from the run's own λ profile, using the
+responses measured in the pretraining bias-sensitivity analysis.
 
-.. math::
+* **linear**, edge :math:`(i \to j)`: :math:`\Delta b^* = \Delta b - kT \ln(p_j / p_i)`,
+  or a capped step toward an unsampled substituent.
+* **quadratic**: :math:`c^* = c + (B - B_0)/|s_c|`, where :math:`s_c` is the barrier's
+  response to c.
+* **skew / end**: the step that removes the pair's skew or end asymmetry, split between
+  the two directions. When λ crowds up to an endpoint without holding it, the end term
+  there is holding λ off, and that s moves part of the way toward a typical converged
+  value (``end_reference_s``, 1.5). This signal exists exactly when the others do not.
 
-   v_{ij}^{(k)} \\sim \\mathcal{N}(\\mu_{ij}^{(k)}, (\\sigma_{ij}^{(k)})^2)
+Steps are capped (``hindsight_{linear,quadratic,skew,end}_step_cap``, 3.0, 12.0, 3.0 and
+1.5) because the linearized responses hold only near sensible biases.
 
-where :math:`k \\in \\{\\text{linear, quadratic, skew, end}\\}`.
+``endpoint_depth`` (off by default) makes s[i][j] target the depth of j's own endpoint
+well instead, :math:`K = kT \ln[(N_{0.99} / 0.01) / (N_{0.95-0.99} / 0.04)]` from the
+frames at and just short of it, where the run measures it. The targets by site size are
+where iterative flattening's production-good runs sit (1.2, 1.0 and 0.75 kcal/mol for 2, 3
+and 4+ substituents), and the change in K per unit of s summed over j's partners is split
+equally over them. ``true`` uses these defaults; a mapping may set ``targets``,
+``slopes``, ``sd`` and ``groups_only``, which applies the depth target to group runs only
+and leaves pair runs on the asymmetry targets above.
 
-Training and Optimization
+``group_offset_dims`` (default all of ``hindsight_dims``) sets which per-pair offsets
+group runs use. x and s offsets are tuned to a pair alone and add up over a
+substituent's partners in a group: ``[linear, quadratic]`` keeps only the b and c offsets
+for groups, and ``[]`` starts group runs from the model's prediction plus the group
+correction.
+
+Iterative flattening also corrects biases from each simulation, but only for the system
+being simulated. Hindsight targets add four things to that correction.
+
+* **Transfer.** The targets train a shared model conditioned on Uni-Mol embeddings, so a
+  correction learned on one pair improves the first guess for pairs and systems never
+  simulated.
+* **Calibrated weighting.** Each target enters with its own measurement variance
+  (crossings for b, scatter of the barrier or asymmetry, and a term that grows with step
+  size), so well-measured runs count for more without fixed regularization.
+  ``hindsight_weight_scale`` sets how strongly the shared model follows the training
+  pairs, per head. A head whose update would shift every pair can be damped while the
+  per-pair offsets still correct it pair by pair.
+* **Per-pair offsets.** Each pair's own measurements are combined with the model as a
+  prior, and proposals sample from that posterior.
+* **Active selection.** The shared posterior's uncertainty and each pair's state choose
+  which pairs to run next.
+
+Assigning a Failed Run to b or c
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A pair run that never crosses has one of two problems. Either b favors one substituent, or
+the barrier is too high to cross. Raising c helps only in the second case and makes the
+landscape harder to sample in the first, so the λ trajectory is used to tell them apart.
+
+* **Pinned**: λ never left its starting substituent (≥ 99% of frames, nothing else
+  sampled), which is evidence that the barrier holds λ.
+* **Stranded**: nothing at the site was sampled, and λ stayed between endpoints. The
+  quadratic bias flattens too much, so c steps down (unless the run measured a barrier).
+* **One-sided**: one substituent sampled and the other not, so b steps toward the
+  unsampled one.
+
+Repeated one-sided steps in the same direction double, up to ``linear_step_max``, for the
+pair's offset (the shared model keeps the base step). Each pair also keeps a **b
+bracket**, the b values at which it was stuck on either side. Once both bounds exist, the
+next target is their midpoint. If the bracket has closed to within ``barrier_trap_width``
+(2.0) and λ still does not cross, b is no longer the problem, and the **barrier trap**
+steps c up. c steps double the same way, up to ``quadratic_step_max`` (48), and bisect
+between a c that was too low and one that was too high.
+
+A bracket can **invert**, stuck needing a higher b at a b above one where it was stuck
+needing a lower b. λ then ends wherever the barrier catches it rather than where b points,
+and bisecting would fix b at a tight spread that only a crossing could release. An
+inverted b bracket is therefore cleared, b goes to its midpoint with the ordinary step's
+spread, and the run counts as a barrier trap, so c steps up. An inverted c bracket is
+cleared in the same way, and c takes an ordinary step from there.
+
+By default, b is tried first. With ``b_direction_requires_crossing: false``, a one-sided
+run that never crossed still gives b a direction, and with
+``c_up_requires_b_bracket: true``, even a pinned run steps b first, so c rises only
+through the barrier trap. We prefer this order because b is measured directly by the
+population ratio and is cheaper to get right, whereas a c raised too early must be walked
+back down by stranded runs.
+
+A stranded run's step down reaches the shared model as well as the pairs' offsets. With
+``stranded_c_shared: false`` it changes only the offsets. A group stranded by something
+other than c (its end terms, or its inputs) then cannot lower the c the model predicts
+for every other system: in a refinement run without the replay, these steps lowered c
+across all environments, solvent and protein included.
+
+The c cap (``c_cap``) bounds the other direction. Each pair's c stays within
+:math:`\max(\text{floor}, \text{fraction} \times |c_{\text{model}}|)` of the model's
+prediction in every proposal and in the exported biases, while the pair's offset itself
+is kept. Repeated barrier-trap steps can otherwise carry c far beyond the model's
+prediction. A pair that still fails at such a c is likely limited by something other than
+its barrier, so further steps would raise c without producing crossings.
+
+Per-Pair Offsets and Exploration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each training pair's last ``offset_history`` (5) targets are stored in
+``bandit_state.json`` under its original site and substituent numbers, per coefficient and,
+for x and s, per direction. The next proposal combines them with the model's prediction
+as a prior of sd ``offset_prior_sd``. A pair the model predicts well moves little, and one
+it predicts poorly is corrected from its own data without distorting the shared model.
+The shared model carries what generalizes, and the offsets hold what is specific to a
+pair. Validation never applies offsets, so it measures the shared model alone.
+
+With ``offset_sampling``, proposals draw each pair's offset rather than using its mean.
+
+* An unmeasured coefficient is explored with sd ``offset_base_sd × factor`` on top of the
+  Thompson sample, and a measured one is drawn from the pair's offset posterior, so
+  exploration narrows as data accumulate.
+* A failure with no direction for *any* coefficient doubles the pair's factors, up to
+  ``explore_factor_max`` (8), and a success halves them. A failure that does give a
+  direction leaves them alone, since the targets address it.
+* ``explore_after_failures`` (3) failures in a row double all factors, measured
+  coefficients included (capped by the offset sd). Because b gets a target whenever either
+  substituent is sampled, this is how a stuck pair usually widens its search.
+
+Diagnosable failures are corrected directly, and undiagnosable ones widen the search until
+something measurable happens, which lets a new system converge even when its failure mode
+was not anticipated.
+
+Group End-Term Correction
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The policy network is trained using an **Actor-Critic** architecture (REINFORCE with
-per-pair Q-critic and a global value baseline) that provides variance-reduced credit
-assignment at the substituent-pair level.
+In a group run, each substituent's endpoint collects the end terms (x, s) of every partner
+at the site. Each pair's terms can sample well in its own pair run and still sum to a well
+that holds the endpoint off in the group, which no pair run can see. Two patterns are
+detected (``mllf.cb.group_correction``).
 
-**Actor-Critic Components**:
+* **Endpoint**: one substituent dominates the site but almost never reaches λ = 0.99,
+  while several partners hold the rest (``group_holdoff``, logged as ``[HOLDOFF]``).
+* **Site**: no substituent at a site of three or more reaches λ = 0.99 and the site barely
+  transitions, while another site in the same run samples normally.
 
-* **Actor (Policy Network)**: ``EdgeValueMLP`` that predicts bias coefficients from the
-  200D per-edge inputs assembled from Phase 1 and Phase 2 embeddings. Only the EdgeValueMLP
-  (Phase 3) has its weights updated by RL; the RGCN encoder (Phase 2) and AtomBondGNN
-  (Phase 1) are both frozen before the REINFORCE loop begins.
-* **Q-Critic (Per-Edge)**: ``QNetwork`` — a 3-layer MLP (200→64→32→1) receiving the
-  same 200D edge inputs as the actor. Estimates :math:`Q(s, \text{pair})` per directed
-  edge and is updated each episode by MSE against the per-pair reward.
-* **Value Baseline (Global)**: ``ValueNetwork`` — GlobalMeanPool over 32D RGCN node
-  embeddings then MLP (32→64→32→1). Predicts the expected episode reward :math:`V(s)`
-  and is updated by MSE against the global reward to reduce variance.
+A flagged run lowers those pairs' x and s for that group, each by its own fraction of
+its first value per run (``step_x`` / ``step_s``), scaled by each partner's λ share for an
+endpoint, down to ``floor_x`` / ``floor_s``. x is stepped harder than s: where groups
+were flagged, the x summed on one substituent was about twice what a working ALF run of
+the group used, and the summed s only slightly more. If a substituent whose partners'
+terms were shrunk is then trapped at its own endpoint (it dominates the site at λ ≥ 0.99
+in at least ``guard_at_min`` of those frames while a partner goes unsampled), half of the
+last step of the pairs acting on it is undone; a site trapped for other reasons is left
+alone. The corrections are stored per group in ``bandit_state.json``, the group's
+later runs and its export use them, the model trains on the corrected values for those
+edges, and c and b are left unchanged. A run that stepped does not count toward
+``group_max_failures`` (:doc:`workflow`).
 
-**Per-Pair Reward**:
+Selection
+~~~~~~~~~
 
-Rather than a single global reward, each directed edge :math:`(i, j)` receives an
-independent signal based on whether the simulation produced lambda-space transitions
-between substituents *i* and *j*:
+With ``bandit.selection: uncertainty`` (the hindsight default), combos are ranked by the
+percentile of their shared posterior variance plus ``selection_attention_weight`` times
+the pair's own state (+1 if its last run failed, up to +1 for widened exploration), so
+stuck pairs keep coming back. With REINFORCE, the score is the policy's mean action
+standard deviation, which measures how much the policy is exploring a combo rather than
+how much it would learn from it, and the default is ``random`` (stratified) selection.
 
-.. math::
+**Revisits** (``bandit.revisit``). The per-pair corrections above need *consecutive*
+visits, and in a large pool, selection may not draw a pair again for many epochs. Pairs in
+progress are therefore rerun each epoch, taking up to ``revisit.fraction`` (0.5) of each
+system's ``min_combos_per_system`` slots. A pair leaves the revisit pool once *satisfied*
+(``revisit.successes`` good runs, 2) or *exhausted* (``revisit.max_visits`` visits), so a
+pair that cannot be fixed stops holding a slot.
 
-   R_{\text{pair}}(i,j) = \begin{cases}
-     -1.0 & \text{if } \Delta\Delta G_{ij} \text{ is None, NaN, or } \pm\infty \\
-     1.0 + \dfrac{\min(p_i, p_j)}{p_i + p_j} & \text{if } \Delta\Delta G_{ij} \text{ is finite}
-   \end{cases}
+Full-Network Regression
+~~~~~~~~~~~~~~~~~~~~~~~
 
-where :math:`p_i, p_j` are the block populations at the highest :math:`\lambda` window.
-Finite DDG means transitions were observed; the population-balance term (0–0.5) gives
-additional credit when both substituents were sampled roughly equally. Total range: [-1.0, +1.5].
+With ``shared_update: regression`` (:mod:`mllf.cb.hindsight_regression`), the epoch's
+hindsight targets train the whole policy by gradient descent rather than only each head's
+last layer (``shared_update: posterior``).
 
-**Per-Pair Advantage**:
+* Each prediction is pulled toward its target, weighted by the target's variance.
+* Pretraining runs are replayed in the same loss (``regression.replay_weight``, 0.5, with
+  the data-hygiene weights), so fitting new pairs does not overwrite what the model knows.
+  Each source's error is measured against its own starting residual, so the noisier
+  pretraining targets do not swamp the online signal.
+* ``regression.replay_selection: coverage`` (:mod:`mllf.cb.replay_selection`) gives each
+  system a share of ``replay_runs`` (2000) proportional to its substituents, at least
+  ``replay_min_per_system`` (3), and fills it with the runs that cover the system's pairs
+  best. A pair's score in a run is its population balance times its crossings relative to
+  the run length's success test. Runs are picked greedily by the pair coverage they add (a
+  pair counts as covered at score 0.5), so a group run that samples many pairs well wins
+  over pair runs that each sample one slightly better. A system stops below its share once
+  nothing adds coverage, and the share it leaves goes to systems that used all of theirs,
+  in proportion to their uncovered pairs. Each run keeps weight only on the pairs it is
+  the best chosen run for. Substituents are matched across ALF groups, combinations and
+  online runs by fragment content against ``replay_systems_root/<system>/prep``, and a
+  per-pair report (``<replay_cache>_pairs.csv``) lists each pair's run, source and score.
+  ``random`` takes one random run per combination directory instead.
+* Scoring reads every run of the manifest, which is bound by the filesystem rather than
+  the CPU, so ``regression.replay_workers`` (32) threads read the runs. Each directory's
+  scan is kept in ``regression.replay_scan_cache`` (``~/.cache/mllf/replay_scan.pkl``,
+  shared by every build; ``null`` turns it off) and reused while the directory is
+  unchanged, so a later build reads only the runs added since.
+* ``regression.replay_pretraining_only: true`` skips online runs collected into the
+  datasets (tagged with ``collection_tag``, :doc:`cb_pretraining`), for a model that was
+  not pretrained on them.
+* Targets from the last ``regression.online_history`` (5) epochs are kept.
+* Each Bayesian head is then re-seeded with the trained weights and its calibrated prior
+  precision. The precision is not updated from online runs, so the posterior variance
+  reflects distance from the pretraining data, and the attention term is what brings back
+  pairs that fail online.
+* With ``regression.validation_gate`` (on by default), a validation pass worse than the
+  last accepted one by more than ``gate_margin`` (2) restores that model, keeping the
+  offsets.
 
-The per-edge advantage subtracts the Q-network prediction as baseline:
-
-.. math::
-
-   A_{\text{pair}}(i,j) = R_{\text{pair}}(i,j) - Q_\phi(s, \text{pair}_{ij})
-
-Advantages are normalised (zero-mean, unit-variance) across all edges within an episode
-before computing the policy loss:
-
-.. math::
-
-   \mathcal{L}_{\text{policy}} = -\sum_{(i,j)} \log \pi_\theta(a_{ij} | s) \cdot A_{\text{pair}}(i,j)
-
-**Training Updates**:
-
-For each combination:
-
-1. Encode graph via AtomBondGNN (frozen) → 64D P1 node embeddings
-2. Refine via RGCN (frozen) → 32D P2 node embeddings
-3. Build 200D per-edge inputs: [P1ₚ₁, P2ₚ₁, P1ₚ₂, P2ₚ₂, edge\_type]
-4. Sample bias coefficients :math:`a \sim \pi_\theta(\cdot | s)` from EdgeValueMLP
-5. Run simulation; parse DDG pairs and block populations
-6. Compute per-edge :math:`R_{\text{pair}}` via ``compute_pair_reward``
-7. Update Q-critic: minimize :math:`(Q_\phi(s, \text{pair}) - R_{\text{pair}})^2`
-8. Compute advantage :math:`A_{\text{pair}} = R_{\text{pair}} - Q_\phi.\text{detach()}`, normalise
-9. Update EdgeValueMLP: maximise :math:`\sum \log \pi_\theta(a) \cdot A_{\text{pair}}`
-10. Update value baseline: minimize :math:`(V_\psi(s) - R_{\text{global}})^2`
-
-For details on reward function components, curriculum learning, and workflow configuration,
-see :doc:`workflow`.
-
-Variables.py Format
-~~~~~~~~~~~~~~~~~~~
-
-MSLD simulation setup files read bias coefficients from ``variables.py`` files containing YAML-formatted
-bias matrices. The policy network's per-edge predictions are assembled into these matrices
-following specific composition rules for each bias type.
-
-**Matrix Format**:
-
-Bias coefficients are organized as:
-
-* **b (linear)**: 1D vector of length N (one value per substituent)
-* **c (quadratic)**: N×N antisymmetric matrix (upper triangle stored)
-* **x (skew)**: N×N full matrix (both triangles stored independently)
-* **s (end)**: N×N full matrix (both triangles stored independently)
-
-For a system with N=5 substituents (e.g., 3 at site 1, 2 at site 2), the matrices have
-shapes [5], [5×5], [5×5], and [5×5] respectively.
-
-**Example Structure**:
-
-.. code-block:: python
-
-   # Auto-generated variables.py
-   bias_string = '''
-   b:  # Per-node linear bias vector (length N)
-   - 0.1
-   - 0.2
-   - -0.05
-   c:  # NxN quadratic bias matrix (antisymmetric: c[j][i] = -c[i][j])
-   - [0.0, 0.3, -0.1]
-   - [0.0, 0.0, 0.2]
-   - [0.0, 0.0, 0.0]
-   x:  # NxN skew bias matrix (both directions independent)
-   - [0.0, 0.05, -0.02]
-   - [-0.05, 0.0, 0.03]
-   - [0.02, -0.03, 0.0]
-   s:  # NxN end bias matrix (both directions independent)
-   - [0.0, 0.1, -0.05]
-   - [-0.1, 0.0, 0.08]
-   - [0.05, -0.08, 0.0]
-   '''
-
-Edge-to-Matrix Mapping
-^^^^^^^^^^^^^^^^^^^^^^
-
-The policy network operates on directed graph edges and predicts coefficients for each
-edge-bias type combination. These per-edge predictions are assembled into simulation-ready
-matrices using bias-specific composition rules:
-
-**Linear Bias Composition**:
-
-Linear bias values are predicted for edges FROM the reference substituent (sub1 at each site)
-TO other substituents at the same site. Since linear bias is fundamentally per-node rather
-than per-edge, the individual edge predictions are averaged at each target node:
-
-* Edge sub1→sub2 predicts value v₁₂
-* Edge sub1→sub3 predicts value v₁₃  
-* Node 2 receives: b[2] = mean(v₁₂)
-* Node 3 receives: b[3] = mean(v₁₃)
-
-This averaging provides robustness when multiple edges target the same node in complex graphs.
-
-**Quadratic Bias Composition**:
-
-Quadratic bias is antisymmetric: forward and backward transitions have equal magnitude but
-opposite sign. Only upper-triangle edges (i→j where i<j) are created in the graph. The
-predicted forward value defines both matrix entries:
-
-* Edge i→j predicts forward value v
-* Matrix stores: c[i][j] = v and c[j][i] = -v
-
-
-**Skew and End Bias Composition**:
-
-Skew and end biases are NOT antisymmetric—forward and backward transitions are physically
-independent. Both directed edges exist in the graph, and predictions are stored directly:
-
-* Edge i→j predicts forward value v_fwd
-* Edge j→i predicts backward value v_bwd
-* Matrix stores: x[i][j] = v_fwd and x[j][i] = v_bwd
-
-This allows the model to learn asymmetric transition barriers without symmetry constraints.
-
-**Matrix Assembly**:
-
-During simulation preparation:
-
-1. Policy network samples coefficients for all directed edges
-2. Edge coefficients are grouped by bias type
-3. Each bias type is assembled into its matrix format using the rules above
-4. Matrices are serialized to YAML in ``variables.py``
-5. CHARMM reads the file and applies biases during λ-dynamics simulation
+Unlike REINFORCE, which learns only whether an action scored above or below average, each
+run here supplies a direction and size for every coefficient it measured. The replay set
+can be prebuilt with ``training/build_regression_replay.sh``.
 
 See Also
 --------
 
-* :doc:`file_handling` - File format documentation (RTF, PDB, bias coefficients)
-* :doc:`deepset_pretraining` - DeepSet pretraining for node embeddings
-* :doc:`cb_pretraining` - Behavior cloning from expert bias coefficients
-* :doc:`workflow` - Complete workflow from combo generation to training
-* :doc:`examples` - Running the full training workflow
-* :doc:`api` - API reference for CB modules
-* ``examples/run_workflow_deepset.py`` - Full training implementation
-* ``examples/workflow_14benz.yaml`` - Configuration file for the 14benz system
-* ``examples/workflow_deepset.yaml`` - Alternate configuration file template
+* :doc:`workflow`: stages, configuration and outputs of online training
+* :doc:`unimol_representation`: node embeddings and environment consensus
+* :doc:`cb_pretraining`: behavior cloning and data hygiene
+* :doc:`file_handling`: ``variables.py`` storage conventions

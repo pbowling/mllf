@@ -1,343 +1,129 @@
 #!/bin/bash
 #SBATCH --job-name=mllf_pretrain
-#SBATCH --output=pretrain_status.out
+#SBATCH --output=mllf_pretrain_%j.out
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
 #SBATCH -p cpu
 #SBATCH --export=ALL
-#SBATCH --time=15:00:00  # 15 hours for large pretraining datasets
+#SBATCH --time=48:00:00
+#SBATCH --open-mode=append
+#
+# Pretraining on every collected dataset under a pretraining/ directory, with
+# the settings of the current models: the run filters, per-pair AWR with the
+# online end-state success gate, Bayesian heads for online training
+# (bandit.algorithm: hindsight), and each bias head's best epoch chosen on
+# held-out combos. docs/cb_pretraining.rst explains each setting;
+# examples/minimal/ is the smaller, single-system example.
+#
+# Submit from the repository root (or from examples/):
+#   sbatch examples/pretrain_with_filtering.sh
+#   sbatch --export=ALL,OUTPUT_DIR=models/my_run,EXCLUDE_DATASETS="sysA sysB" \
+#       examples/pretrain_with_filtering.sh
+#
+# Settings (environment variables; defaults in parentheses):
+#   PRETRAINING_DIR      collected datasets, one directory each (pretraining)
+#   EXCLUDE_DATASETS     space-separated dataset names to leave out (none)
+#   CONFIG_FILE          pretraining config, reward and unimol settings
+#                        (examples/workflow_pretrain.yaml)
+#   OUTPUT_DIR           where the model and its log go (models/pretraining)
+#   EPOCHS               most epochs (100); PATIENCE: stop once no head has
+#                        improved for this many epochs (5)
+#   LEARNING_RATE        cosine annealed to 1/100 of it (0.0001)
+#   VAL_FRACTION         combo directories held out to choose each head's best
+#                        epoch (0.05)
+#   STRATIFIED_FRACTION  keep every positive-reward run and up to this share of
+#                        the best negative-reward bucket (0.90)
+#   MAX_RUNS_PER_COMBO   runs kept per combo after that filter (15)
+#   AWR_TEMPERATURE      beta in the advantage weight exp(A / beta) (0.5)
+#   EXTRA_ARGS           any other mllf pretrain flags, e.g. "--no-data-hygiene"
+#                        or "--emphasize-systems luis_tyk2:5" (mllf pretrain -h)
+#   CONDA_ENV            conda environment to activate (mllf)
+# A requeued job (e.g. after a node failure) resumes from its latest
+# checkpoint in OUTPUT_DIR; delete that directory to start over.
+set -euo pipefail
 
-# SLURM script for running CB policy pretraining on collected MSLD simulation data.
-#
-# Uses the full AtomBondGNN (GINConv + GlobalAttentionPool) → RGCN pipeline by default:
-#   - Loads the pretrained AtomBondGNN encoder from pretraining/deepset_pretraining_output/
-#   - Replaces standard atom-type node features with 64-dim AEV-based embeddings
-#   - Trains the RGCN+EdgePolicy on behavior-cloning MSE loss
-#
-# Automatic outlier filtering excludes runs with abnormal coefficient values.
-#
-# Usage:
-#   sbatch pretrain_with_filtering.sh
-#
-# With custom parameters:
-#   sbatch --export=ALL,OUTLIER_THRESHOLD=2.5,EPOCHS=100 pretrain_with_filtering.sh
-#
-# To use stratified negative sampling (quadratic ramp: 0% for worst bucket to 55% for best):
-#   sbatch --export=ALL,STRATIFIED_FRACTION=0.55 pretrain_with_filtering.sh
-#
-# To enable reward-weighted loss (high-reward runs get proportionally more gradient signal):
-#   sbatch --export=ALL,REWARD_WEIGHTED=true pretrain_with_filtering.sh
-#
-# To disable stratified sampling and fall back to reward threshold filtering:
-#   sbatch --export=ALL,STRATIFIED_FRACTION=0,REWARD_THRESHOLD=0 pretrain_with_filtering.sh
-#
-# To disable DeepSet (standard atom-type features):
-#   sbatch --export=ALL,DEEPSET_ENCODER=none pretrain_with_filtering.sh
-#
-# To use a different encoder checkpoint:
-#   sbatch --export=ALL,DEEPSET_ENCODER=/path/to/best_encoder.pt pretrain_with_filtering.sh
-#
-# Default excluded datasets (EXCLUDE_DATASETS):
-#   14benz_pair_combos  - combo structure handled separately; exclude from normal scan
-#   luis_cdk2_*         - all 4 groups have zero positive-reward runs (max <= -7), genuinely poor sampling
-#   luis_ptp1b_{protein,solvent}_group1 - max -14, no positive runs, large datasets (220 runs each)
-#   p38_protein_groupA/B/C - max -1.66 to -21.6, zero positive runs across all protein groups
-#   mup1_solvent_group2 - max -2.86, zero positive runs
-#   luis_p38_protein_group2 - max -8.01, zero positive runs
-#   (Systems that only hit the completeness gate, max=-0.01, are left in as their
-#    coefficients were partially effective and the data may still be informative.)
-
-set -e  # Exit on error
-
-echo "========================================="
-echo "MLLF Policy Pretraining with Filtering"
-echo "========================================="
-echo "Job ID: $SLURM_JOB_ID"
-echo "Started: $(date)"
-echo ""
-
-# Initialize conda for bash shell    
-source ~/miniconda3/etc/profile.d/conda.sh
-
-# Activate the mllf environment
-conda activate mllf
-
-cd $SLURM_SUBMIT_DIR
-
-echo "Working directory: $(pwd)"
-echo "Conda environment: $CONDA_DEFAULT_ENV"
-echo ""
-
-# Locate workflow_pretrain.yaml regardless of submission directory
-# (works whether sbatch is run from mllf/ or examples/)
-if [ -z "$CONFIG_FILE" ]; then
-    if [ -f "workflow_pretrain.yaml" ]; then
-        CONFIG_FILE="workflow_pretrain.yaml"
-    elif [ -f "examples/workflow_pretrain.yaml" ]; then
-        CONFIG_FILE="examples/workflow_pretrain.yaml"
-    else
-        echo "Error: workflow_pretrain.yaml not found. Set CONFIG_FILE explicitly."
-        exit 1
-    fi
+if [ -n "${CONDA_ENV-mllf}" ] && [ -f ~/miniconda3/etc/profile.d/conda.sh ]; then
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate "${CONDA_ENV:-mllf}"
 fi
+cd "${SLURM_SUBMIT_DIR:-.}"
+[ -d examples ] || cd ..          # submitted from examples/
+
+PRETRAINING_DIR="${PRETRAINING_DIR:-pretraining}"
+EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-}"
+CONFIG_FILE="${CONFIG_FILE:-examples/workflow_pretrain.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-models/pretraining}"
-EPOCHS="${EPOCHS:-50}"
-LEARNING_RATE="${LEARNING_RATE:-0.001}"
-OUTLIER_THRESHOLD="${OUTLIER_THRESHOLD:-3.0}"
-REWARD_THRESHOLD="${REWARD_THRESHOLD:-0}"
-NO_FILTER="${NO_FILTER:-true}"
-USE_BEST_ONLY="${USE_BEST_ONLY:-false}"
-STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.55}"
-REWARD_WEIGHTED="${REWARD_WEIGHTED:-false}"
-DEEPSET_ENCODER="${DEEPSET_ENCODER:-$SLURM_SUBMIT_DIR/../pretraining/deepset_pretraining_output/trained_models/best_encoder.pt}"
-#EXCLUDE_DATASETS="${EXCLUDE_DATASETS:-14benz_pair_combos luis_cdk2_protein_group1 luis_cdk2_protein_group2 luis_cdk2_solvent_group1 luis_cdk2_solvent_group2 luis_ptp1b_protein_group1 luis_ptp1b_solvent_group1 p38_protein_groupA p38_protein_groupB p38_protein_groupC mup1_solvent_group2 luis_p38_protein_group2}"
-PATIENCE="${PATIENCE:-10}"
-Q_EPOCHS="${Q_EPOCHS:-0}"
-Q_LR="${Q_LR:-1e-3}"
-Q_STRATIFIED_FRACTION="${Q_STRATIFIED_FRACTION:-}"
+EPOCHS="${EPOCHS:-100}"
+PATIENCE="${PATIENCE:-5}"
+LEARNING_RATE="${LEARNING_RATE:-0.0001}"
+VAL_FRACTION="${VAL_FRACTION:-0.05}"
+STRATIFIED_FRACTION="${STRATIFIED_FRACTION:-0.90}"
+MAX_RUNS_PER_COMBO="${MAX_RUNS_PER_COMBO:-15}"
+AWR_TEMPERATURE="${AWR_TEMPERATURE:-0.5}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-echo "Configuration:"
-echo "  Config file: $CONFIG_FILE"
-echo "  Output dir: $OUTPUT_DIR"
-echo "  Epochs: $EPOCHS"
-echo "  Learning rate: $LEARNING_RATE"
-echo "  Outlier threshold: ${OUTLIER_THRESHOLD}σ"
-echo "  Reward threshold: >= $REWARD_THRESHOLD"
-echo "  Filtering enabled: $([ "$NO_FILTER" = "false" ] && echo "yes" || echo "no")"
-echo "  Use best only: $([ "$USE_BEST_ONLY" = "true" ] && echo "yes" || echo "no")"
-if [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
-    echo "  Stratified negative sampling: ${STRATIFIED_FRACTION} (max fraction, quadratic ramp)"
-else
-    echo "  Stratified negative sampling: DISABLED"
-fi
-echo "  Reward-weighted loss: $([ "$REWARD_WEIGHTED" = "true" ] && echo "ENABLED" || echo "disabled")"
-if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ] && [ -f "$DEEPSET_ENCODER" ]; then
-    echo "  DeepSet encoder: $DEEPSET_ENCODER"
-else
-    echo "  DeepSet encoder: DISABLED (standard atom-type node features)"
-fi
-if [ -n "$EXCLUDE_DATASETS" ]; then
-    echo "  Excluded datasets: $EXCLUDE_DATASETS"
-fi
-echo "  Early stopping patience: $PATIENCE epochs"
-if [ "$Q_EPOCHS" != "0" ] && [ -n "$Q_EPOCHS" ]; then
-    if [ -n "$Q_STRATIFIED_FRACTION" ]; then
-        echo "  Q-network warmup: $Q_EPOCHS epochs (lr=$Q_LR, stratified fraction=$Q_STRATIFIED_FRACTION)"
-    else
-        echo "  Q-network warmup: $Q_EPOCHS epochs (lr=$Q_LR, uses BC runs)"
-    fi
-else
-    echo "  Q-network warmup: DISABLED"
-fi
-echo ""
-
-# Find pretraining directory
-PRETRAIN_DIR=""
-if [ -d "pretraining" ]; then
-    PRETRAIN_DIR="pretraining"
-elif [ -d "../pretraining" ]; then
-    PRETRAIN_DIR="../pretraining"
-else
-    echo "Error: pretraining/ directory not found"
-    exit 1
-fi
-
-echo "========================================="
-echo "Scanning Pretraining Data"
-echo "========================================="
-echo ""
-
-# Auto-detect all subdirectories in pretraining/
-# Handle two structures:
-# 1. Normal: pretraining/system/run_*/ (e.g., 14benz_solv/run1/)
-# 2. Combos: pretraining/system/comb_*/run_*/ (e.g., 14benz_pair_combos/comb_0063.../run_046/)
-total_systems=0
-total_runs_available=0
-pretrain_dirs=""
-
-for dataset_dir in $PRETRAIN_DIR/*/; do
-    if [ -d "$dataset_dir" ]; then
-        dataset_name=$(basename "$dataset_dir")
-
-        # Skip the DeepSet pretraining output directory — it holds encoder weights,
-        # not MSLD simulation runs, so it is not valid input for CB pretraining.
-        if [ "$dataset_name" = "deepset_pretraining_output" ]; then
-            continue
-        fi
-
-        # Skip any datasets listed in EXCLUDE_DATASETS (space-separated names)
-        skip_dataset=false
-        for excl in $EXCLUDE_DATASETS; do
-            if [ "$dataset_name" = "$excl" ]; then
-                skip_dataset=true
-                break
-            fi
-        done
-        if [ "$skip_dataset" = "true" ]; then
-            echo "  - $dataset_name: EXCLUDED"
-            continue
-        fi
-        
-        # Check if this has combo subdirectories (like 14benz_pair_combos)
-        has_combos=false
-        if [ -d "$dataset_dir" ]; then
-            # Look for directories starting with "comb_"
-            combo_dirs=$(find "$dataset_dir" -mindepth 1 -maxdepth 1 -type d -name "comb_*" 2>/dev/null | wc -l)
-            if [ $combo_dirs -gt 0 ]; then
-                has_combos=true
-            fi
-        fi
-        
-        if [ "$has_combos" = true ]; then
-            # Handle combo structure: add each comb_* directory separately
-            echo "  - $dataset_name (combo structure):"
-            for comb_dir in "$dataset_dir"comb_*/; do
-                if [ -d "$comb_dir" ]; then
-                    comb_name=$(basename "$comb_dir")
-                    run_count=$(find "$comb_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-                    if [ $run_count -gt 0 ]; then
-                        total_systems=$((total_systems + 1))
-                        total_runs_available=$((total_runs_available + run_count))
-                        echo "      $comb_name: $run_count runs"
-                        pretrain_dirs="$pretrain_dirs --pretraining-dir $comb_dir"
-                    fi
-                fi
-            done
-        else
-            # Normal structure: add the system directory directly
-            count=$(find "$dataset_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-            if [ $count -gt 0 ]; then
-                total_systems=$((total_systems + 1))
-                total_runs_available=$((total_runs_available + count))
-                echo "  - $dataset_name: $count runs"
-                pretrain_dirs="$pretrain_dirs --pretraining-dir $dataset_dir"
-            fi
-        fi
-    fi
+for path in "$PRETRAINING_DIR" "$CONFIG_FILE"; do
+    [ -e "$path" ] || { echo "Not found: $path (see the settings at the top of this script)"; exit 1; }
 done
+mkdir -p "$OUTPUT_DIR"
+echo "Started $(date) in $(pwd); output in $OUTPUT_DIR"
 
-echo ""
-echo "Total: $total_systems systems, $total_runs_available runs available"
-echo ""
+# The manifest: every combo directory (comb_*, pairNN_site*, groupNN_site*)
+# with runs, a dataset's own runs, and each dataset without combos. Pretraining
+# loads each run once, even where a dataset and its combos are both listed.
+MANIFEST="$OUTPUT_DIR/pretraining_manifest_scan.json"
+python - "$PRETRAINING_DIR" "$MANIFEST" $EXCLUDE_DATASETS <<'EOF'
+import json, re, sys
+from pathlib import Path
+root, out, exclude = Path(sys.argv[1]), sys.argv[2], set(sys.argv[3:])
+skip = exclude | {'embeddings_cache'}
+combo = re.compile(r'^(comb_.*|pair[0-9]+.*_site.*|group[0-9]+.*_site.*)$')
+dirs, runs = [], 0
+for ds in sorted(p for p in root.iterdir() if p.is_dir() and p.name not in skip):
+    combos = sorted(d for d in ds.iterdir() if d.is_dir() and combo.match(d.name))
+    own = [r for r in ds.iterdir() if r.is_dir() and (r / 'graph_info.json').exists()]
+    for c in combos:
+        n = sum(1 for r in c.iterdir() if r.is_dir() and r.name != 'prep')
+        if n:
+            dirs.append(str(c)); runs += n
+    if own or not combos:
+        n = len(own) if combos else sum(1 for r in ds.iterdir()
+                                        if r.is_dir() and r.name != 'prep')
+        if n:
+            dirs.append(str(ds)); runs += n
+Path(out).write_text(json.dumps({'directories': dirs}, indent=1))
+print(f"manifest: {len(dirs)} directories, {runs} run directories"
+      + (f"; excluded {sorted(exclude)}" if exclude else ''))
+EOF
 
-if [ -z "$pretrain_dirs" ]; then
-    echo "Error: No pretraining directories found"
-    exit 1
+RESUME=()
+LAST=$(ls "$OUTPUT_DIR"/checkpoint_epoch_*.pt 2>/dev/null | sort | tail -1 || true)
+if [ -n "$LAST" ]; then
+    echo "Resuming from $LAST"
+    RESUME=(--resume-checkpoint "$LAST")
 fi
 
-echo "========================================="
-echo "Starting Pretraining"
-echo "========================================="
-echo ""
+# The settings and the per-head loss table of each epoch go to the console and
+# to $OUTPUT_DIR/pretrain.log; --analyze writes $OUTPUT_DIR/analysis at the end.
+# shellcheck disable=SC2086  # EXTRA_ARGS is split into flags on purpose
+mllf pretrain \
+    --manifest-file "$MANIFEST" \
+    --output-dir "$OUTPUT_DIR" \
+    --config "$CONFIG_FILE" \
+    --epochs "$EPOCHS" \
+    --patience "$PATIENCE" \
+    --learning-rate "$LEARNING_RATE" \
+    --val-fraction "$VAL_FRACTION" \
+    --no-filter-outliers \
+    --stratified-negative-fraction "$STRATIFIED_FRACTION" \
+    --max-runs-per-combo "$MAX_RUNS_PER_COMBO" \
+    --awr-temperature "$AWR_TEMPERATURE" \
+    --bayesian-heads \
+    --analyze \
+    "${RESUME[@]}" $EXTRA_ARGS
 
-# Build command with optional flags
-CMD="python -u -m mllf.cb.pretrain_policy \
-    $pretrain_dirs \
-    --output-dir $OUTPUT_DIR \
-    --config $CONFIG_FILE \
-    --epochs $EPOCHS \
-    --learning-rate $LEARNING_RATE"
-
-# Add optional filtering parameters
-if [ "$NO_FILTER" = "true" ]; then
-    CMD="$CMD --no-filter-outliers"
-    echo "Statistical filtering: DISABLED"
-else
-    CMD="$CMD --outlier-std-threshold $OUTLIER_THRESHOLD"
-    echo "Statistical filtering: ENABLED (±${OUTLIER_THRESHOLD}σ threshold)"
-fi
-
-# Add reward filtering
-if [ -n "$MIN_TRANSITIONS" ] && [ "$MIN_TRANSITIONS" != "0" ]; then
-    CMD="$CMD --min-transitions $MIN_TRANSITIONS"
-    echo "Transition filtering: ENABLED (>= $MIN_TRANSITIONS per site)"
-elif [ -n "$STRATIFIED_FRACTION" ] && [ "$STRATIFIED_FRACTION" != "0" ]; then
-    CMD="$CMD --stratified-negative-fraction $STRATIFIED_FRACTION"
-    echo "Stratified negative sampling: ENABLED (max ${STRATIFIED_FRACTION}, quadratic ramp)"
-elif [ -n "$REWARD_THRESHOLD" ]; then
-    CMD="$CMD --min-reward-threshold $REWARD_THRESHOLD"
-    echo "Reward filtering: ENABLED (>= $REWARD_THRESHOLD)"
-else
-    echo "Reward filtering: DISABLED"
-fi
-
-# Add best-only flag if requested
-if [ "$USE_BEST_ONLY" = "true" ]; then
-    CMD="$CMD --use-best-only"
-    echo "Training mode: Best run per system only"
-else
-    echo "Training mode: All valid runs"
-fi
-
-# Add DeepSet encoder if available
-if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ] && [ -f "$DEEPSET_ENCODER" ]; then
-    CMD="$CMD --deepset-encoder $DEEPSET_ENCODER"
-    echo "DeepSet encoder: ENABLED ($DEEPSET_ENCODER)"
-else
-    echo "DeepSet encoder: DISABLED"
-    if [ -n "$DEEPSET_ENCODER" ] && [ "$DEEPSET_ENCODER" != "none" ]; then
-        echo "  Warning: DEEPSET_ENCODER path not found: $DEEPSET_ENCODER"
-    fi
-fi
-
-# Add early stopping patience
-CMD="$CMD --patience $PATIENCE"
-echo "Early stopping patience: $PATIENCE epochs"
-
-# Add reward-weighted loss if requested
-if [ "$REWARD_WEIGHTED" = "true" ]; then
-    CMD="$CMD --reward-weighted"
-    echo "Reward-weighted loss: ENABLED"
-fi
-
-# Add Q-network warmup if requested
-if [ "$Q_EPOCHS" != "0" ] && [ -n "$Q_EPOCHS" ]; then
-    CMD="$CMD --q-epochs $Q_EPOCHS --q-lr $Q_LR"
-    if [ -n "$Q_STRATIFIED_FRACTION" ]; then
-        CMD="$CMD --q-stratified-fraction $Q_STRATIFIED_FRACTION"
-        echo "Q-network warmup: ENABLED ($Q_EPOCHS epochs, lr=$Q_LR, stratified fraction=$Q_STRATIFIED_FRACTION)"
-    else
-        echo "Q-network warmup: ENABLED ($Q_EPOCHS epochs, lr=$Q_LR, uses BC run set)"
-    fi
-fi
-
-echo ""
-echo "Command:"
-echo "$CMD"
-echo ""
-echo "Starting pretraining at $(date)..."
-echo ""
-
-# Run pretraining with unbuffered output for real-time logging
-eval $CMD
-
-EXIT_CODE=$?
-
-echo ""
-echo "========================================="
-echo "Pretraining Complete"
-echo "========================================="
-echo "Exit code: $EXIT_CODE"
-echo "Finished: $(date)"
-echo ""
-
-if [ $EXIT_CODE -eq 0 ]; then
-    echo "✓ Pretraining successful!"
-    echo ""
-    echo "Output saved to: $OUTPUT_DIR"
-    echo ""
-    echo "Next steps:"
-    echo "1. Check pretrain_status.out for filtering statistics and per-run losses"
-    echo "2. Update your workflow config to use the pretrained policy:"
-    echo "   pretrain:"
-    echo "     model_path: $OUTPUT_DIR/best_policy.pt"
-    echo "3. If DeepSet was enabled, also set the encoder path in your workflow config:"
-    echo "   deepset:"
-    echo "     encoder_path: $DEEPSET_ENCODER"
-    echo "4. Run the training workflow"
-else
-    echo "✗ Pretraining failed with exit code $EXIT_CODE"
-    echo "Check pretrain_status.out for error details"
-fi
-
-exit $EXIT_CODE
+echo "Finished $(date). For online training set, in the workflow config:"
+echo "  pretrain:"
+echo "    model_path: $OUTPUT_DIR/best_policy_bayesian.pt"
+echo "and keep its unimol settings equal to the model's (pretrain_metadata.json)."

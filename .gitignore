@@ -29,7 +29,8 @@ generated_combos*/
 pretraining/
 old_files/
 models/
-examples/14benz/training_output/
+training/
+examples/
 *status.out
 *.tar.gz
 deepset_pretraining_output*
@@ -181,3 +182,14 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# outputs of the minimal example (examples/minimal/run_pipeline.sh)
+examples/minimal/output/
+mllf_minimal_*.out
+
+# Slurm job output and run logs written at the repository root
+slurm-*.out
+/logs/
+
+# editor settings (kept locally)
+.vscode/

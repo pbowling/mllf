@@ -1,0 +1,87 @@
+{
+ "solvent_state": "solvent",
+ "sites": {
+  "site1_sub1": {
+   "site": 1,
+   "sub": 1,
+   "atom_names": [
+    "C062",
+    "H063"
+   ],
+   "atom_types": [
+    "CG2R61",
+    "HGR61"
+   ],
+   "charges": [
+    -0.1108,
+    0.1212
+   ],
+   "total_charge": 0.010400000000000006,
+   "bonds": [
+    [
+     "C001",
+     "C062"
+    ],
+    [
+     "C003",
+     "C062"
+    ],
+    [
+     "C062",
+     "H063"
+    ]
+   ],
+   "filename": "site1_sub1_pres.rtf",
+   "filepath": "examples/minimal/pretraining/14benz_solv/comb_0001_site2_subs_1_2/prep/site1_sub1_pres.rtf"
+  },
+  "site1_sub2": {
+   "site": 1,
+   "sub": 2,
+   "atom_names": [
+    "C064",
+    "O065",
+    "H066"
+   ],
+   "atom_types": [
+    "CG2R61",
+    "OG311",
+    "HGP1"
+   ],
+   "charges": [
+    0.112134,
+    -0.526867,
+    0.425133
+   ],
+   "total_charge": 0.01040000000000002,
+   "bonds": [
+    [
+     "C001",
+     "C064"
+    ],
+    [
+     "C003",
+     "C064"
+    ],
+    [
+     "C064",
+     "O065"
+    ],
+    [
+     "O065",
+     "H066"
+    ]
+   ],
+   "filename": "site1_sub2_pres.rtf",
+   "filepath": "examples/minimal/pretraining/14benz_solv/comb_0001_site2_subs_1_2/prep/site1_sub2_pres.rtf"
+  }
+ },
+ "active_subs_ordered": {
+  "site1": [
+   "site1_sub1",
+   "site1_sub2"
+  ]
+ },
+ "nsubs_per_site": [
+  2
+ ]
+}

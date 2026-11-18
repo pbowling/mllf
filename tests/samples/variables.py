@@ -1,5 +1,6 @@
-import yaml
 import numpy as np
+import yaml
+
 
 bias_string="""
 b:

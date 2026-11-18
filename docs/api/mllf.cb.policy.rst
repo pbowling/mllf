@@ -4,10 +4,23 @@
 .. automodule:: mllf.cb.policy
 
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      env_input_from_state
+      fill_site_size
+      node_width
+      site_size_from_state
+      site_size_values
+      unimol_options
+   
    .. rubric:: Classes
 
    .. autosummary::
    
-      EdgePolicy
+      BiasHeadMLP
+      ContextBaseline
       EdgeValueMLP
+      UnimolPolicy
    

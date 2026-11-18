@@ -1,7 +1,27 @@
 import re
 from pathlib import Path
 from typing import List, Optional
+
 import yaml
+
+
+# Sign convention between the two ways bias coefficients are written down.
+#
+# * Matrix form (``b``, ``c``, ``x``, ``s`` in variables*.py / variablesflat.py
+#   and in every pretraining variables.py) -- what the policy predicts.
+# * Flat CHARMM form (``set lams*/cs*/xs*/ss* = ...`` in variables*.inp, and the
+#   scalar keys ALF also stores in variablesflat.py) -- the values CHARMM
+#   receives via ``ldbv ... @coeff``.
+#
+# For the nonlinear terms the flat value is the NEGATIVE of the matrix entry
+# (ALF files store both, e.g. c[0][1] = +19.53 next to cs1s1s1s2 = -19.53, and
+# the matrix-reading driver msld_flat.py writes ``ldbv ... -bias['c'][i,j]``).
+# The linear bias has the same sign in both (lams1s2 == b[1]).
+FLAT_TO_MATRIX_NONLINEAR = -1.0   # matrix c/x/s = FLAT_TO_MATRIX_NONLINEAR * flat cs/xs/ss
+FLAT_TO_MATRIX_LINEAR = 1.0       # matrix b     = FLAT_TO_MATRIX_LINEAR * flat lams
+# Written into variables.py files whose c/x/s were converted from flat values,
+# so later tools can tell they are already in the matrix convention.
+NONLINEAR_SIGN_KEY = "_nonlinear_sign_convention"
 
 
 def _extract_nsubs(content: str, prep_dir: Optional[Path] = None) -> Optional[List[int]]:
@@ -9,7 +29,7 @@ def _extract_nsubs(content: str, prep_dir: Optional[Path] = None) -> Optional[Li
 
     Tries in order:
       1. ``alf_info_string`` YAML block embedded in *content*.
-      2. ``prep_dir/alf_info.py`` — ``alf_info['nsubs'] = [...]`` assignment.
+      2. ``prep_dir/alf_info.py``; ``alf_info['nsubs'] = [...]`` assignment.
       3. Module-level ``nsubs = [...]`` assignment in *content*.
     """
     # 1. alf_info_string YAML block
@@ -50,7 +70,11 @@ def _extract_nsubs(content: str, prep_dir: Optional[Path] = None) -> Optional[Li
 
 
 def parse_old(filename):
-    """Parses a variables#.inp file and returns a dictionary of parameter types and values."""
+    """Parses a variables#.inp file and returns a dictionary of parameter types and values.
+
+    Values are returned as written, i.e. in the flat CHARMM convention: cs/xs/ss
+    are the negatives of the c/x/s matrix entries (see FLAT_TO_MATRIX_NONLINEAR).
+    """
     data = {"lams": {}, "cs": {}, "xs": {}, "ss": {}}
     with open(filename, 'r') as file:
         for line in file:
@@ -73,7 +97,7 @@ def parse_new(filename, prep_dir=None):
     """Parse the newer variables#.py style file.
 
     The file contains a bias_string with YAML-formatted data including:
-    - b: nested list (single row vector, or 2-D ``[[b1, b2, …]]`` — normalised to 1-D)
+    - b: nested list (single row vector, or 2-D ``[[b1, b2, ...]]``; normalised to 1-D)
     - c, x, s: NxN matrices
     - scalar entries: lams*, cs*, xs*, ss* as YAML scalars
 
@@ -88,7 +112,10 @@ def parse_new(filename, prep_dir=None):
     Returns:
         Dict with ``'lams'``, ``'cs'``, ``'xs'``, ``'ss'`` subdicts,
         ``'b'``, ``'c'``, ``'x'``, ``'s'`` matrix keys (where present),
-        and ``'_nsubs_per_site'`` when it can be determined.
+        and ``'_nsubs_per_site'`` when it can be determined. The matrix keys
+        are in the matrix convention; the ``cs``/``xs``/``ss`` scalar subdicts
+        are in the flat CHARMM convention (negated), see
+        FLAT_TO_MATRIX_NONLINEAR.
     """
     data = {"lams": {}, "cs": {}, "xs": {}, "ss": {}}
 
@@ -128,7 +155,7 @@ def parse_new(filename, prep_dir=None):
             # Fall through to line-by-line parsing
             pass
         else:
-            # Normalise b: "variablesflat" format stores b as [[b1, b2, …]] (2-D).
+            # Normalise b: "variablesflat" format stores b as [[b1, b2, ...]] (2-D).
             b = data.get('b', [])
             if b and isinstance(b[0], list):
                 data['b'] = b[0]

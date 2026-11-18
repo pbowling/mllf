@@ -1,0 +1,171 @@
+{
+ "solvent_state": "solvent",
+ "sites": {
+  "site1_sub1": {
+   "site": 1,
+   "sub": 1,
+   "atom_names": [
+    "C035",
+    "H036",
+    "C037",
+    "C038",
+    "C039",
+    "H040",
+    "H041",
+    "H042",
+    "O043",
+    "C044",
+    "H045"
+   ],
+   "atom_types": [
+    "CG2R61",
+    "HGR61",
+    "CG2R61",
+    "CG2O5",
+    "CG331",
+    "HGA3",
+    "HGA3",
+    "HGA3",
+    "OG2D3",
+    "CG2R61",
+    "HGR61"
+   ],
+   "charges": [
+    -0.119939,
+    0.117061,
+    0.069061,
+    0.361061,
+    -0.230939,
+    0.091061,
+    0.091061,
+    0.09106,
+    -0.46494,
+    -0.11994,
+    0.11706
+   ],
+   "total_charge": 0.0016669999999999602,
+   "bonds": [
+    [
+     "C001",
+     "C035"
+    ],
+    [
+     "C035",
+     "H036"
+    ],
+    [
+     "C035",
+     "C037"
+    ],
+    [
+     "C044",
+     "H045"
+    ],
+    [
+     "C044",
+     "C003"
+    ],
+    [
+     "C044",
+     "C037"
+    ],
+    [
+     "C037",
+     "C038"
+    ],
+    [
+     "C038",
+     "O043"
+    ],
+    [
+     "C038",
+     "C039"
+    ],
+    [
+     "C039",
+     "H040"
+    ],
+    [
+     "C039",
+     "H041"
+    ],
+    [
+     "C039",
+     "H042"
+    ]
+   ],
+   "filename": "site1_sub1_pres.rtf",
+   "filepath": "examples/minimal/pretraining/14benz_solv/comb_0200_site1_subs_5_1/prep/site1_sub1_pres.rtf"
+  },
+  "site1_sub2": {
+   "site": 1,
+   "sub": 2,
+   "atom_names": [
+    "C005",
+    "H006",
+    "C007",
+    "H008",
+    "C009",
+    "H010"
+   ],
+   "atom_types": [
+    "CG2R61",
+    "HGR61",
+    "CG2R61",
+    "HGR61",
+    "CG2R61",
+    "HGR61"
+   ],
+   "charges": [
+    -0.115722,
+    0.116278,
+    -0.115722,
+    0.116278,
+    -0.115722,
+    0.116277
+   ],
+   "total_charge": 0.0016670000000000018,
+   "bonds": [
+    [
+     "C001",
+     "C005"
+    ],
+    [
+     "C005",
+     "H006"
+    ],
+    [
+     "C005",
+     "C007"
+    ],
+    [
+     "C009",
+     "H010"
+    ],
+    [
+     "C009",
+     "C003"
+    ],
+    [
+     "C009",
+     "C007"
+    ],
+    [
+     "C007",
+     "H008"
+    ]
+   ],
+   "filename": "site1_sub2_pres.rtf",
+   "filepath": "examples/minimal/pretraining/14benz_solv/comb_0200_site1_subs_5_1/prep/site1_sub2_pres.rtf"
+  }
+ },
+ "active_subs_ordered": {
+  "site1": [
+   "site1_sub1",
+   "site1_sub2"
+  ]
+ },
+ "nsubs_per_site": [
+  2
+ ]
+}

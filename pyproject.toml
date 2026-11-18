@@ -1,42 +1,96 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+# 77: SPDX license expression and license-files (PEP 639)
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mllf"
-version = "0.1.0"
-description = "MLLF bias coefficient file handling"
+dynamic = ["version"]
+description = "Machine-learned bias coefficients for multisite lambda dynamics"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
 maintainers = [ {name = "Paige E. Bowling", email = "pbowling@umich.edu"} ]
-keywords = ["machine learning", "neural networks", "molecular dynamics", "multisite lambda dynamics"]
-requires-python = ">=3.8"
+keywords = [
+    "machine learning",
+    "neural networks",
+    "molecular dynamics",
+    "multisite lambda dynamics",
+    "free energy",
+    "alchemical",
+    "CHARMM",
+]
+# X | None annotations (generate_combinations) need 3.10.
+requires-python = ">=3.10"
+# The license is given by the SPDX expression above (PEP 639), not a classifier.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
 
 dependencies = [
     "numpy>=1.24",
     "torch>=2.0",
-    "torch_geometric>=2.6.0",
     "pyyaml>=6.0",
     "rdkit>=2022.9.1",
-    "torchani>=2.7.9"
+    "unimol_tools>=0.1.6",
 ]
 
+[project.scripts]
+mllf = "mllf.cli.main:main"
+
 [project.urls]
-"Repository" = "https://github.com/pbowling/mllf"
+Homepage = "https://github.com/pbowling/mllf"
+Documentation = "https://mllf.readthedocs.io/en/latest/"
+Repository = "https://github.com/pbowling/mllf"
+Issues = "https://github.com/pbowling/mllf/issues"
 
 [project.optional-dependencies]
+analysis = [
+    "matplotlib>=3.7",
+    "pandas>=1.5",
+    "pillow",
+    "scipy>=1.9",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
     "flake8",
+    "isort",
+    "pre-commit",
+    "build",
+    "twine",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "mllf.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
-addopts = "-q"
+addopts = "-q -ra --strict-markers"
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.isort]
+# Import order: standard library, third party, mllf; one name per line when wrapped.
+profile = "black"
+line_length = 99
+known_first_party = ["mllf"]
+src_paths = ["src", "tests"]
+extend_skip = ["examples", "tests/samples"]
+extend_skip_glob = ["src/mllf/analysis/style.py"]   # the author's bowling_style.py, unchanged
+lines_after_imports = 2
+
+# flake8 does not read pyproject.toml; its settings are in .flake8.
