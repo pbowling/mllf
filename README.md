@@ -91,7 +91,8 @@ console shows progress and per-epoch summaries. Every message, including per-com
 also goes to a log file in the run's output directory (`training.log`, `pretrain.log`).
 
 [`examples/minimal`](examples/minimal) runs the whole pipeline on one system (1,4-benzene in
-water) and is small enough to check an installation end to end:
+water), with the collected runs it pretrains on, and is small enough to check an
+installation end to end:
 
 ```bash
 sbatch examples/minimal/run_pipeline.sh

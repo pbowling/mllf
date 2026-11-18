@@ -15,17 +15,20 @@ an installation end to end. From the repository root:
 .. code-block:: bash
 
    sbatch examples/minimal/run_pipeline.sh
-   # or with another install and dataset location:
+   # or with another install, or collected runs of your own:
    sbatch --export=ALL,PRETRAINING_ROOT=/path/to/pretraining,MLLF=/path/to/mllf \
        examples/minimal/run_pipeline.sh
 
 The driver runs on a CPU node and submits each simulation as its own SLURM job (the
 ``slurm:`` block of ``workflow.yaml``; adjust it for your cluster). Its steps are:
 
-1. **Pretraining** (``mllf pretrain``): 10 epochs with Bayesian heads on 39 collected
-   ``14benz_solv`` runs (``pretraining_combos.txt``: the 31 one-site pair and triplet
-   combos and 8 two-site combos) under ``$PRETRAINING_ROOT/14benz_solv``. Pretraining also
-   writes ``pretraining_manifest.json``, the list of runs the model saw.
+1. **Pretraining** (``mllf pretrain``): up to 10 epochs with Bayesian heads on the
+   collected ``14benz_solv`` runs of 39 combos (``pretraining_combos.txt``: the 31 one-site
+   pair and triplet combos and 8 two-site combos). They ship with the example in
+   ``examples/minimal/pretraining/``, trimmed to what pretraining reads (each run's
+   biases, sampling statistics and graph, and the combo's fragment and RTF files);
+   ``PRETRAINING_ROOT`` points the step at another collection. Pretraining also writes
+   ``pretraining_manifest.json``, the list of runs the model saw.
 2. **Replay** (``mllf replay``): 20 of those runs, prebuilt into ``output/replay.pt`` for
    the regression update (``bandit.regression``).
 3. **Scouting** (``mllf scout``): one run of the system's group (site 1 substituents 1-3,

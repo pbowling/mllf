@@ -1,5 +1,6 @@
-# 14benz_solv runs used by the minimal example (directories under <PRETRAINING_ROOT>/14benz_solv):
-# the 31 one-site pair and triplet combos and 8 two-site combos, one run each.
+# 14benz_solv runs used by the minimal example (directories under <PRETRAINING_ROOT>/14benz_solv,
+# by default examples/minimal/pretraining/14benz_solv): the 31 one-site pair and triplet combos
+# and 8 two-site combos.
 comb_0001_site2_subs_1_2
 comb_0002_site2_subs_1_3
 comb_0003_site2_subs_1_4

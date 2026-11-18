@@ -1,0 +1,15 @@
+{
+ "source_run_dir": "training/simulations/14benz_solv/comb_0487_site1_subs_1_5__site2_subs_1_2/run_021",
+ "combo_name": "comb_0487_site1_subs_1_5__site2_subs_1_2",
+ "system_name": "14benz_solv",
+ "terminated_normally": true,
+ "total_transitions": 58,
+ "num_populated_blocks": 4,
+ "num_sites": 2,
+ "num_substituents": 4,
+ "nsubs_per_site": [
+  2,
+  2
+ ],
+ "solvent_state": "solvent"
+}

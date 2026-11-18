@@ -21,14 +21,15 @@
 # Submit from the repository root:
 #   sbatch examples/minimal/run_pipeline.sh
 # Settings (environment variables):
-#   PRETRAINING_ROOT  collected runs, holding 14benz_solv/ (default below)
+#   PRETRAINING_ROOT  collected runs, holding 14benz_solv/ (default: the 39 runs
+#                     shipped in examples/minimal/pretraining/)
 #   MLLF              the mllf command (default: mllf)
 #   CONDA_ENV         conda environment to activate (default: mllf)
 # Outputs go to examples/minimal/output/; a rerun skips the steps whose output
 # exists, so delete that directory to start over.
 set -euo pipefail
 
-PRETRAINING_ROOT="${PRETRAINING_ROOT:-/home/pbowling/mllf/pretraining}"
+PRETRAINING_ROOT="${PRETRAINING_ROOT:-examples/minimal/pretraining}"
 MLLF="${MLLF:-mllf}"
 if [ -n "${CONDA_ENV-mllf}" ] && [ -f ~/miniconda3/etc/profile.d/conda.sh ]; then
     source ~/miniconda3/etc/profile.d/conda.sh
